@@ -1,0 +1,581 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3D Heightmap Terrain with Rolling Ball Physics</title>
+<script type="importmap">
+{ "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+} }
+</script>
+<style>
+body { margin: 0; overflow: hidden; font-family: 'Segoe UI', Arial, sans-serif; }
+canvas { display: block; }
+#hud {
+    position: absolute; top: 10px; left: 10px;
+    background: rgba(0,0,0,0.7); color: #fff; padding: 12px 16px;
+    border-radius: 8px; font-size: 13px; line-height: 1.6;
+    pointer-events: none; min-width: 200px;
+}
+#hud span { color: #8cf; font-weight: bold; }
+#controls {
+    position: absolute; bottom: 10px; left: 10px;
+    background: rgba(0,0,0,0.7); color: #fff; padding: 12px 16px;
+    border-radius: 8px; font-size: 13px; line-height: 2;
+}
+#controls label { display: block; }
+#controls input[type="range"] { width: 180px; vertical-align: middle; }
+#instructions {
+    position: absolute; top: 10px; right: 10px;
+    background: rgba(0,0,0,0.7); color: #ccc; padding: 12px 16px;
+    border-radius: 8px; font-size: 12px; line-height: 1.8;
+}
+#instructions kbd {
+    background: #555; color: #fff; padding: 1px 5px; border-radius: 3px;
+    font-size: 11px;
+}
+</style>
+</head>
+<body>
+<div id="hud">
+    <div>Balls: <span id="hud-balls">0</span></div>
+    <div>Total KE: <span id="hud-ke">0.0</span></div>
+    <div>Collisions/frame: <span id="hud-collisions">0</span></div>
+    <div>Terrain seed: <span id="hud-seed">0</span></div>
+    <div>Gravity: <span id="hud-gravity">9.8</span></div>
+    <div>Status: <span id="hud-paused">Playing</span></div>
+</div>
+<div id="controls">
+    <label>Gravity: <input type="range" id="slider-gravity" min="1" max="30" step="1" value="10"> <span id="grav-val">9.8</span></label>
+    <label>Friction: <input type="range" id="slider-friction" min="0" max="1" step="0.05" value="0.3"> <span id="fric-val">0.3</span></label>
+</div>
+<div id="instructions">
+    <div><kbd>Click</kbd> terrain to spawn ball</div>
+    <div><kbd>B</kbd> spawn random ball</div>
+    <div><kbd>C</kbd> clear all balls</div>
+    <div><kbd>R</kbd> regenerate terrain</div>
+    <div><kbd>Space</kbd> pause/play</div>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// --- Perlin Noise Implementation ---
+class PerlinNoise {
+    constructor(seed) {
+        this.seed = seed;
+        this.p = new Uint8Array(512);
+        const perm = new Uint8Array(256);
+        for (let i = 0; i < 256; i++) perm[i] = i;
+        // Fisher-Yates shuffle with seed
+        let s = seed;
+        for (let i = 255; i > 0; i--) {
+            s = (s * 16807 + 0) % 2147483647;
+            const j = s % (i + 1);
+            [perm[i], perm[j]] = [perm[j], perm[i]];
+        }
+        for (let i = 0; i < 512; i++) this.p[i] = perm[i & 255];
+    }
+
+    fade(t) { return t * t * t * (t * (t * 6 - 15) + 10); }
+    lerp(a, b, t) { return a + t * (b - a); }
+
+    grad(hash, x, y) {
+        const h = hash & 3;
+        const u = h < 2 ? x : y;
+        const v = h < 2 ? y : x;
+        return ((h & 1) ? -u : u) + ((h & 2) ? -v : v);
+    }
+
+    noise2D(x, y) {
+        const X = Math.floor(x) & 255;
+        const Y = Math.floor(y) & 255;
+        const xf = x - Math.floor(x);
+        const yf = y - Math.floor(y);
+        const u = this.fade(xf);
+        const v = this.fade(yf);
+        const p = this.p;
+        const aa = p[p[X] + Y];
+        const ab = p[p[X] + Y + 1];
+        const ba = p[p[X + 1] + Y];
+        const bb = p[p[X + 1] + Y + 1];
+        return this.lerp(
+            this.lerp(this.grad(aa, xf, yf), this.grad(ba, xf - 1, yf), u),
+            this.lerp(this.grad(ab, xf, yf - 1), this.grad(bb, xf - 1, yf - 1), u),
+            v
+        );
+    }
+
+    octaveNoise(x, y, octaves, persistence, lacunarity) {
+        let total = 0, amplitude = 1, frequency = 1, maxVal = 0;
+        for (let i = 0; i < octaves; i++) {
+            total += this.noise2D(x * frequency, y * frequency) * amplitude;
+            maxVal += amplitude;
+            amplitude *= persistence;
+            frequency *= lacunarity;
+        }
+        return total / maxVal;
+    }
+}
+
+// --- Globals ---
+let scene, camera, renderer, controls;
+let terrainMesh, terrainGeometry;
+let heightData = []; // 65x65 grid (64 segments = 65 vertices per side)
+let balls = [];
+let isPaused = false;
+let terrainSeed = Math.floor(Math.random() * 100000);
+let frameCount = 0;
+let collisionsThisFrame = 0;
+let perlin;
+
+const TERRAIN_SIZE = 40;
+const TERRAIN_SEGMENTS = 64;
+const TERRAIN_VERTS = TERRAIN_SEGMENTS + 1; // 65
+const MAX_BALLS = 20;
+const BALL_RADIUS = 0.4;
+const BALL_MASS = 1.0;
+const BALL_COLORS = [0xff4444, 0x44ff44, 0x4444ff, 0xffff44, 0xff44ff];
+const SUBSTEPS = 3;
+const DT = 1 / 60;
+
+let gravity = 9.81;
+let friction = 0.3;
+const restitutionTerrain = 0.4;
+const restitutionBall = 0.7;
+
+window.__3D_STATE__ = {
+    ballCount: 0, totalKE: 0, collisionsThisFrame: 0,
+    terrainSeed: 0, gravity: 9.81, friction: 0.3,
+    isPaused: false, frameCount: 0, ballsValid: true,
+    allBallsAboveTerrain: true, avgBallY: 0
+};
+
+// --- Init ---
+function init() {
+    scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x87ceeb);
+
+    camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 200);
+    camera.position.set(30, 25, 30);
+    camera.lookAt(0, 0, 0);
+
+    renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(window.devicePixelRatio);
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    document.body.appendChild(renderer.domElement);
+
+    controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.1;
+    controls.target.set(0, 0, 0);
+
+    // Lights
+    const ambient = new THREE.AmbientLight(0x6688aa, 0.5);
+    scene.add(ambient);
+
+    const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+    dirLight.position.set(15, 30, 15);
+    dirLight.castShadow = true;
+    dirLight.shadow.mapSize.width = 2048;
+    dirLight.shadow.mapSize.height = 2048;
+    dirLight.shadow.camera.left = -25;
+    dirLight.shadow.camera.right = 25;
+    dirLight.shadow.camera.top = 25;
+    dirLight.shadow.camera.bottom = -25;
+    dirLight.shadow.camera.near = 1;
+    dirLight.shadow.camera.far = 80;
+    scene.add(dirLight);
+
+    generateTerrain();
+    setupEvents();
+    animate();
+}
+
+// --- Terrain ---
+function generateTerrain() {
+    if (terrainMesh) {
+        scene.remove(terrainMesh);
+        terrainGeometry.dispose();
+    }
+
+    perlin = new PerlinNoise(terrainSeed);
+    heightData = new Float32Array(TERRAIN_VERTS * TERRAIN_VERTS);
+
+    for (let j = 0; j < TERRAIN_VERTS; j++) {
+        for (let i = 0; i < TERRAIN_VERTS; i++) {
+            const nx = i / TERRAIN_SEGMENTS * 3;
+            const ny = j / TERRAIN_SEGMENTS * 3;
+            const h = (perlin.octaveNoise(nx, ny, 3, 0.5, 2.0) + 1) * 0.5 * 6;
+            heightData[j * TERRAIN_VERTS + i] = h;
+        }
+    }
+
+    terrainGeometry = new THREE.PlaneGeometry(TERRAIN_SIZE, TERRAIN_SIZE, TERRAIN_SEGMENTS, TERRAIN_SEGMENTS);
+    terrainGeometry.rotateX(-Math.PI / 2);
+
+    const positions = terrainGeometry.attributes.position;
+    const colors = new Float32Array(positions.count * 3);
+
+    const lowColor = new THREE.Color(0x336633);
+    const midColor = new THREE.Color(0x886644);
+    const highColor = new THREE.Color(0xeeeeff);
+
+    for (let i = 0; i < positions.count; i++) {
+        const ix = i % TERRAIN_VERTS;
+        const iz = Math.floor(i / TERRAIN_VERTS);
+        const h = heightData[iz * TERRAIN_VERTS + ix];
+        positions.setY(i, h);
+
+        // Vertex colors
+        let color = new THREE.Color();
+        if (h < 2) {
+            color.copy(lowColor).lerp(midColor, h / 2);
+        } else if (h < 4.5) {
+            color.copy(midColor).lerp(highColor, (h - 2) / 2.5);
+        } else {
+            color.copy(highColor);
+        }
+        colors[i * 3] = color.r;
+        colors[i * 3 + 1] = color.g;
+        colors[i * 3 + 2] = color.b;
+    }
+
+    terrainGeometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+    terrainGeometry.computeVertexNormals();
+
+    // Create a procedural texture instead of loading external file
+    const canvas = document.createElement('canvas');
+    canvas.width = 256;
+    canvas.height = 256;
+    const ctx = canvas.getContext('2d');
+    // Draw brick-like pattern
+    ctx.fillStyle = '#aa8866';
+    ctx.fillRect(0, 0, 256, 256);
+    for (let y = 0; y < 256; y += 32) {
+        for (let x = 0; x < 256; x += 64) {
+            const offset = (Math.floor(y / 32) % 2) * 32;
+            ctx.fillStyle = `rgb(${150 + Math.random()*40}, ${120 + Math.random()*30}, ${90 + Math.random()*20})`;
+            ctx.fillRect(x + offset, y, 60, 28);
+            ctx.strokeStyle = '#665544';
+            ctx.strokeRect(x + offset, y, 60, 28);
+        }
+    }
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.wrapS = THREE.RepeatWrapping;
+    texture.wrapT = THREE.RepeatWrapping;
+    texture.repeat.set(8, 8);
+
+    const terrainMaterial = new THREE.MeshStandardMaterial({
+        map: texture,
+        vertexColors: true,
+        roughness: 0.9,
+        metalness: 0.0,
+    });
+
+    terrainMesh = new THREE.Mesh(terrainGeometry, terrainMaterial);
+    terrainMesh.castShadow = true;
+    terrainMesh.receiveShadow = true;
+    scene.add(terrainMesh);
+
+    document.getElementById('hud-seed').textContent = terrainSeed;
+}
+
+function getTerrainHeight(x, z) {
+    // Convert world coords to grid coords
+    const halfSize = TERRAIN_SIZE / 2;
+    const gx = (x + halfSize) / TERRAIN_SIZE * TERRAIN_SEGMENTS;
+    const gz = (z + halfSize) / TERRAIN_SIZE * TERRAIN_SEGMENTS;
+
+    const ix = Math.floor(gx);
+    const iz = Math.floor(gz);
+
+    if (ix < 0 || ix >= TERRAIN_SEGMENTS || iz < 0 || iz >= TERRAIN_SEGMENTS) {
+        return 0;
+    }
+
+    const fx = gx - ix;
+    const fz = gz - iz;
+
+    const h00 = heightData[iz * TERRAIN_VERTS + ix];
+    const h10 = heightData[iz * TERRAIN_VERTS + ix + 1];
+    const h01 = heightData[(iz + 1) * TERRAIN_VERTS + ix];
+    const h11 = heightData[(iz + 1) * TERRAIN_VERTS + ix + 1];
+
+    // Bilinear interpolation
+    const h = h00 * (1 - fx) * (1 - fz) + h10 * fx * (1 - fz) + h01 * (1 - fx) * fz + h11 * fx * fz;
+    return h;
+}
+
+function getTerrainNormal(x, z) {
+    const eps = 0.2;
+    const hL = getTerrainHeight(x - eps, z);
+    const hR = getTerrainHeight(x + eps, z);
+    const hD = getTerrainHeight(x, z - eps);
+    const hU = getTerrainHeight(x, z + eps);
+
+    const normal = new THREE.Vector3(hL - hR, 2 * eps, hD - hU);
+    normal.normalize();
+    return normal;
+}
+
+// --- Balls ---
+function spawnBall(x, y, z) {
+    if (balls.length >= MAX_BALLS) return;
+
+    const color = BALL_COLORS[Math.floor(Math.random() * BALL_COLORS.length)];
+    const geometry = new THREE.SphereGeometry(BALL_RADIUS, 24, 24);
+    const material = new THREE.MeshStandardMaterial({
+        color: color,
+        metalness: 0.3,
+        roughness: 0.5,
+    });
+    const mesh = new THREE.Mesh(geometry, material);
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+    mesh.position.set(x, y, z);
+    scene.add(mesh);
+
+    balls.push({
+        mesh,
+        position: new THREE.Vector3(x, y, z),
+        velocity: new THREE.Vector3(0, 0, 0),
+        radius: BALL_RADIUS,
+        mass: BALL_MASS,
+    });
+}
+
+function clearBalls() {
+    for (const ball of balls) {
+        scene.remove(ball.mesh);
+        ball.mesh.geometry.dispose();
+        ball.mesh.material.dispose();
+    }
+    balls = [];
+}
+
+// --- Physics ---
+function physicsTick(dt) {
+    collisionsThisFrame = 0;
+    const subDt = dt / SUBSTEPS;
+
+    for (let step = 0; step < SUBSTEPS; step++) {
+        for (const ball of balls) {
+            // Gravity
+            ball.velocity.y -= gravity * subDt;
+
+            // Integrate position
+            ball.position.x += ball.velocity.x * subDt;
+            ball.position.y += ball.velocity.y * subDt;
+            ball.position.z += ball.velocity.z * subDt;
+
+            // Terrain collision
+            const halfSize = TERRAIN_SIZE / 2 - 1;
+            ball.position.x = THREE.MathUtils.clamp(ball.position.x, -halfSize, halfSize);
+            ball.position.z = THREE.MathUtils.clamp(ball.position.z, -halfSize, halfSize);
+
+            const terrainH = getTerrainHeight(ball.position.x, ball.position.z);
+            const normal = getTerrainNormal(ball.position.x, ball.position.z);
+
+            if (ball.position.y - ball.radius < terrainH) {
+                ball.position.y = terrainH + ball.radius;
+
+                // Decompose velocity into normal and tangential
+                const vn = normal.clone().multiplyScalar(ball.velocity.dot(normal));
+                const vt = ball.velocity.clone().sub(vn);
+
+                // Reflect normal component with restitution
+                ball.velocity.sub(vn.multiplyScalar(1 + restitutionTerrain));
+
+                // Apply friction to tangential
+                ball.velocity.sub(vt.multiplyScalar(friction * subDt * 10));
+
+                // Slope force: gravity projected onto terrain surface
+                const gravVec = new THREE.Vector3(0, -gravity, 0);
+                const gravNormal = normal.clone().multiplyScalar(gravVec.dot(normal));
+                const slopeForce = gravVec.clone().sub(gravNormal);
+                ball.velocity.add(slopeForce.multiplyScalar(subDt));
+            }
+
+            // Boundary walls
+            if (ball.position.x < -halfSize) { ball.position.x = -halfSize; ball.velocity.x = Math.abs(ball.velocity.x) * restitutionTerrain; }
+            if (ball.position.x > halfSize) { ball.position.x = halfSize; ball.velocity.x = -Math.abs(ball.velocity.x) * restitutionTerrain; }
+            if (ball.position.z < -halfSize) { ball.position.z = -halfSize; ball.velocity.z = Math.abs(ball.velocity.z) * restitutionTerrain; }
+            if (ball.position.z > halfSize) { ball.position.z = halfSize; ball.velocity.z = -Math.abs(ball.velocity.z) * restitutionTerrain; }
+        }
+
+        // Ball-ball collisions
+        for (let i = 0; i < balls.length; i++) {
+            for (let j = i + 1; j < balls.length; j++) {
+                const a = balls[i];
+                const b = balls[j];
+                const diff = a.position.clone().sub(b.position);
+                const dist = diff.length();
+                const minDist = a.radius + b.radius;
+
+                if (dist < minDist && dist > 0.0001) {
+                    collisionsThisFrame++;
+
+                    // Separate
+                    const overlap = minDist - dist;
+                    const n = diff.normalize();
+                    a.position.add(n.clone().multiplyScalar(overlap * 0.5));
+                    b.position.sub(n.clone().multiplyScalar(overlap * 0.5));
+
+                    // Elastic collision (equal masses)
+                    const relVel = a.velocity.clone().sub(b.velocity);
+                    const vnRel = relVel.dot(n);
+
+                    if (vnRel < 0) {
+                        const impulse = -(1 + restitutionBall) * vnRel / 2;
+                        a.velocity.add(n.clone().multiplyScalar(impulse));
+                        b.velocity.sub(n.clone().multiplyScalar(impulse));
+                    }
+                }
+            }
+        }
+    }
+
+    // Sync meshes
+    for (const ball of balls) {
+        ball.mesh.position.copy(ball.position);
+        // Rotate ball based on velocity
+        const speed = ball.velocity.length();
+        if (speed > 0.01) {
+            const axis = new THREE.Vector3(-ball.velocity.z, 0, ball.velocity.x).normalize();
+            const angle = speed * DT / ball.radius;
+            ball.mesh.rotateOnWorldAxis(axis, angle);
+        }
+    }
+}
+
+// --- Events ---
+function setupEvents() {
+    const raycaster = new THREE.Raycaster();
+    const mouse = new THREE.Vector2();
+
+    renderer.domElement.addEventListener('click', (e) => {
+        mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
+        mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+        raycaster.setFromCamera(mouse, camera);
+
+        const intersects = raycaster.intersectObject(terrainMesh);
+        if (intersects.length > 0) {
+            const p = intersects[0].point;
+            spawnBall(p.x, p.y + 5, p.z);
+        }
+    });
+
+    window.addEventListener('keydown', (e) => {
+        if (e.code === 'KeyB') {
+            const x = (Math.random() - 0.5) * 30;
+            const z = (Math.random() - 0.5) * 30;
+            const h = getTerrainHeight(x, z);
+            spawnBall(x, h + 5, z);
+        } else if (e.code === 'KeyC') {
+            clearBalls();
+        } else if (e.code === 'KeyR') {
+            terrainSeed = Math.floor(Math.random() * 100000);
+            generateTerrain();
+            // Reset balls onto new terrain
+            for (const ball of balls) {
+                const h = getTerrainHeight(ball.position.x, ball.position.z);
+                if (ball.position.y < h + ball.radius) {
+                    ball.position.y = h + ball.radius + 2;
+                    ball.velocity.set(0, 0, 0);
+                }
+            }
+        } else if (e.code === 'Space') {
+            e.preventDefault();
+            isPaused = !isPaused;
+        }
+    });
+
+    document.getElementById('slider-gravity').addEventListener('input', (e) => {
+        gravity = parseFloat(e.target.value);
+        document.getElementById('grav-val').textContent = gravity.toFixed(1);
+    });
+
+    document.getElementById('slider-friction').addEventListener('input', (e) => {
+        friction = parseFloat(e.target.value);
+        document.getElementById('fric-val').textContent = friction.toFixed(2);
+    });
+
+    window.addEventListener('resize', () => {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+}
+
+// --- Update State ---
+function updateState() {
+    let totalKE = 0;
+    let allValid = true;
+    let allAbove = true;
+    let sumY = 0;
+
+    for (const ball of balls) {
+        const speed2 = ball.velocity.lengthSq();
+        totalKE += 0.5 * ball.mass * speed2;
+
+        if (isNaN(ball.position.x) || isNaN(ball.position.y) || isNaN(ball.position.z)) {
+            allValid = false;
+        }
+
+        const th = getTerrainHeight(ball.position.x, ball.position.z);
+        if (ball.position.y < th - 0.1) {
+            allAbove = false;
+        }
+
+        sumY += ball.position.y;
+    }
+
+    const avgY = balls.length > 0 ? sumY / balls.length : 0;
+
+    window.__3D_STATE__ = {
+        ballCount: balls.length,
+        totalKE: Math.round(totalKE * 1000) / 1000,
+        collisionsThisFrame,
+        terrainSeed,
+        gravity,
+        friction,
+        isPaused,
+        frameCount,
+        ballsValid: allValid,
+        allBallsAboveTerrain: allAbove,
+        avgBallY: Math.round(avgY * 100) / 100,
+    };
+
+    // HUD
+    document.getElementById('hud-balls').textContent = balls.length;
+    document.getElementById('hud-ke').textContent = totalKE.toFixed(1);
+    document.getElementById('hud-collisions').textContent = collisionsThisFrame;
+    document.getElementById('hud-seed').textContent = terrainSeed;
+    document.getElementById('hud-gravity').textContent = gravity.toFixed(1);
+    document.getElementById('hud-paused').textContent = isPaused ? 'Paused' : 'Playing';
+}
+
+// --- Animate ---
+function animate() {
+    requestAnimationFrame(animate);
+
+    if (!isPaused) {
+        physicsTick(DT);
+    }
+
+    frameCount++;
+    updateState();
+    controls.update();
+    renderer.render(scene, camera);
+}
+
+init();
+</script>
+</body>
+</html>

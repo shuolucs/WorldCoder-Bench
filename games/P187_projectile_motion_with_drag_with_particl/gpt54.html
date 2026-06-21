@@ -1,0 +1,590 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Three.js Projectile Motion with Quadratic Drag</title>
+  <style>
+    html, body {
+      margin: 0;
+      overflow: hidden;
+      background: #111;
+      font-family: Arial, sans-serif;
+      color: white;
+    }
+
+    canvas {
+      display: block;
+    }
+
+    #hud {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      background: rgba(0,0,0,0.55);
+      padding: 12px 14px;
+      border-radius: 8px;
+      font-size: 14px;
+      line-height: 1.5;
+      min-width: 240px;
+      z-index: 10;
+    }
+
+    #controls {
+      position: absolute;
+      bottom: 18px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(0,0,0,0.55);
+      padding: 14px 18px;
+      border-radius: 12px;
+      display: flex;
+      gap: 18px;
+      align-items: center;
+      flex-wrap: wrap;
+      justify-content: center;
+      z-index: 10;
+    }
+
+    .control-group {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: white;
+      font-size: 14px;
+    }
+
+    input[type="range"] {
+      width: 140px;
+    }
+
+    button {
+      background: #2d7ef7;
+      color: white;
+      border: none;
+      padding: 8px 14px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 14px;
+    }
+
+    button:hover {
+      background: #4a92f8;
+    }
+
+    #hint {
+      position: absolute;
+      top: 12px;
+      right: 12px;
+      background: rgba(0,0,0,0.45);
+      padding: 8px 10px;
+      border-radius: 8px;
+      font-size: 13px;
+      z-index: 10;
+    }
+  </style>
+</head>
+<body>
+  <div id="hud">
+    <div><strong>Projectile HUD</strong></div>
+    <div id="posText">Position: x=0.00, y=0.00</div>
+    <div id="velText">Speed: 0.00 m/s</div>
+    <div id="timeText">Flight Time: 0.00 s</div>
+    <div id="particleText">Particles: 0</div>
+    <div id="maxHeightText">Max Height: 0.00</div>
+    <div id="impactText">Impact X: --</div>
+  </div>
+
+  <div id="hint">Press <b>C</b> to toggle camera follow</div>
+
+  <div id="controls">
+    <div class="control-group">
+      <label for="angleSlider">Angle</label>
+      <input id="angleSlider" type="range" min="10" max="80" step="1" value="45" />
+      <span id="angleLabel">45°</span>
+    </div>
+
+    <div class="control-group">
+      <label for="speedSlider">Speed</label>
+      <input id="speedSlider" type="range" min="5" max="50" step="1" value="25" />
+      <span id="speedLabel">25 m/s</span>
+    </div>
+
+    <button id="launchBtn">Launch</button>
+    <button id="resetBtn">Reset</button>
+  </div>
+
+  <script type="module">
+    import * as THREE from "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js";
+    import { GLTFLoader } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/GLTFLoader.js";
+
+    // Renderer
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.shadowMap.enabled = true;
+    document.body.appendChild(renderer.domElement);
+
+    // Scene
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x87b7e3);
+
+    // Camera
+    const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 500);
+    camera.position.set(0, 10, 30);
+    camera.lookAt(0, 0, 0);
+
+    const defaultCameraPos = new THREE.Vector3(0, 10, 30);
+    const cameraOffset = new THREE.Vector3(-8, 5, 12);
+
+    // Lights
+    const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+    dirLight.position.set(5, 15, 10);
+    dirLight.castShadow = true;
+    scene.add(dirLight);
+
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+    scene.add(ambientLight);
+
+    // Ground
+    const groundGeo = new THREE.PlaneGeometry(100, 100);
+    const groundMat = new THREE.MeshStandardMaterial({ color: 0x2f8f2f });
+    const ground = new THREE.Mesh(groundGeo, groundMat);
+    ground.rotation.x = -Math.PI / 2;
+    ground.position.y = 0;
+    ground.receiveShadow = true;
+    scene.add(ground);
+
+    const grid = new THREE.GridHelper(100, 100, 0x333333, 0x666666);
+    grid.position.y = 0.01;
+    scene.add(grid);
+
+    // Physics constants
+    const g = 9.81;
+    const Cd = 0.47;
+    const rho = 1.225;
+    const A = 0.01;
+    const mass = 1.0;
+    const dt = 1 / 60;
+
+    const startPos = new THREE.Vector3(-20, 0.5, 0);
+
+    // Projectile fallback mesh
+    const fallbackProjectile = new THREE.Mesh(
+      new THREE.SphereGeometry(0.25, 24, 24),
+      new THREE.MeshStandardMaterial({ color: 0xffcc66 })
+    );
+    fallbackProjectile.castShadow = true;
+    fallbackProjectile.position.copy(startPos);
+    scene.add(fallbackProjectile);
+
+    let projectile = fallbackProjectile;
+    let modelLoaded = false;
+
+    // Load facecap.glb
+    const loader = new GLTFLoader();
+    loader.load(
+      "facecap.glb",
+      (gltf) => {
+        const model = gltf.scene;
+        model.scale.setScalar(0.5);
+        model.position.copy(startPos);
+
+        model.traverse((child) => {
+          if (child.isMesh) {
+            child.castShadow = true;
+            child.receiveShadow = true;
+          }
+        });
+
+        scene.remove(projectile);
+        projectile = model;
+        scene.add(projectile);
+        modelLoaded = true;
+        syncState();
+      },
+      undefined,
+      (err) => {
+        console.warn("Could not load facecap.glb, using fallback sphere.", err);
+        modelLoaded = false;
+        syncState();
+      }
+    );
+
+    // Trajectory line (actual path)
+    let trailPoints = [];
+    let trailGeometry = new THREE.BufferGeometry();
+    let trailMaterial = new THREE.LineBasicMaterial({ color: 0xff2222 });
+    let trailLine = new THREE.Line(trailGeometry, trailMaterial);
+    scene.add(trailLine);
+
+    // Ideal no-drag arc
+    let idealArcLine = null;
+
+    function updateIdealArc() {
+      if (idealArcLine) {
+        scene.remove(idealArcLine);
+        idealArcLine.geometry.dispose();
+        idealArcLine.material.dispose();
+      }
+
+      const angleDeg = Number(angleSlider.value);
+      const speed = Number(speedSlider.value);
+      const angleRad = THREE.MathUtils.degToRad(angleDeg);
+
+      const v0x = speed * Math.cos(angleRad);
+      const v0y = speed * Math.sin(angleRad);
+
+      const points = [];
+      const totalTime = Math.max(0.1, (v0y + Math.sqrt(v0y * v0y + 2 * g * startPos.y)) / g);
+
+      for (let t = 0; t <= totalTime; t += 0.05) {
+        const x = startPos.x + v0x * t;
+        const y = startPos.y + v0y * t - 0.5 * g * t * t;
+        if (y < 0) break;
+        points.push(new THREE.Vector3(x, y, startPos.z));
+      }
+
+      const geo = new THREE.BufferGeometry().setFromPoints(points);
+      const mat = new THREE.LineBasicMaterial({
+        color: 0x3399ff,
+        transparent: true,
+        opacity: 0.45
+      });
+
+      idealArcLine = new THREE.Line(geo, mat);
+      scene.add(idealArcLine);
+    }
+
+    // Particle system
+    const particleTexture = createCircleTexture();
+
+    function createCircleTexture() {
+      const size = 64;
+      const canvas = document.createElement("canvas");
+      canvas.width = size;
+      canvas.height = size;
+      const ctx = canvas.getContext("2d");
+      const gradient = ctx.createRadialGradient(size/2, size/2, 6, size/2, size/2, size/2);
+      gradient.addColorStop(0, "rgba(255,255,255,1)");
+      gradient.addColorStop(0.4, "rgba(255,255,255,1)");
+      gradient.addColorStop(1, "rgba(255,255,255,0)");
+      ctx.fillStyle = gradient;
+      ctx.fillRect(0, 0, size, size);
+      const texture = new THREE.CanvasTexture(canvas);
+      return texture;
+    }
+
+    const particles = [];
+    const maxParticles = 500;
+
+    function spawnParticle(position, velocity, color = new THREE.Color(1, 0.5, 0), size = 0.25, life = 1.5) {
+      if (particles.length >= maxParticles) {
+        const old = particles.shift();
+        scene.remove(old.sprite);
+        old.material.dispose();
+      }
+
+      const material = new THREE.SpriteMaterial({
+        map: particleTexture,
+        color: color,
+        transparent: true,
+        opacity: 1,
+        depthWrite: false
+      });
+
+      const sprite = new THREE.Sprite(material);
+      sprite.position.copy(position);
+      sprite.scale.set(size, size, size);
+      scene.add(sprite);
+
+      particles.push({
+        sprite,
+        material,
+        velocity: velocity.clone(),
+        age: 0,
+        life,
+        startColor: color.clone()
+      });
+    }
+
+    function emitTrailParticle() {
+      const rand = () => (Math.random() - 0.5);
+      spawnParticle(
+        projectile.position.clone(),
+        new THREE.Vector3(rand() * 0.3, rand() * 0.2 - 0.3, rand() * 0.3),
+        new THREE.Color(1.0, 0.55, 0.1),
+        0.32,
+        1.5
+      );
+    }
+
+    function emitImpactBurst() {
+      for (let i = 0; i < 50; i++) {
+        const theta = Math.random() * Math.PI * 2;
+        const phi = Math.random() * (Math.PI / 2);
+        const speed = 2 + Math.random() * 4;
+
+        const vx = Math.cos(theta) * Math.cos(phi) * speed;
+        const vy = Math.sin(phi) * speed;
+        const vz = Math.sin(theta) * Math.cos(phi) * speed;
+
+        spawnParticle(
+          projectile.position.clone(),
+          new THREE.Vector3(vx, vy, vz),
+          new THREE.Color(1, 1, 1),
+          0.28,
+          1.2
+        );
+      }
+    }
+
+    function updateParticles(delta) {
+      for (let i = particles.length - 1; i >= 0; i--) {
+        const p = particles[i];
+        p.age += delta;
+
+        p.velocity.y -= g * 0.35 * delta;
+        p.sprite.position.addScaledVector(p.velocity, delta);
+
+        const alpha = Math.max(0, 1 - p.age / p.life);
+        p.material.opacity = alpha;
+        p.material.color.copy(p.startColor);
+
+        if (p.age >= p.life) {
+          scene.remove(p.sprite);
+          p.material.dispose();
+          particles.splice(i, 1);
+        }
+      }
+    }
+
+    // UI
+    const launchBtn = document.getElementById("launchBtn");
+    const resetBtn = document.getElementById("resetBtn");
+    const angleSlider = document.getElementById("angleSlider");
+    const speedSlider = document.getElementById("speedSlider");
+    const angleLabel = document.getElementById("angleLabel");
+    const speedLabel = document.getElementById("speedLabel");
+
+    const posText = document.getElementById("posText");
+    const velText = document.getElementById("velText");
+    const timeText = document.getElementById("timeText");
+    const particleText = document.getElementById("particleText");
+    const maxHeightText = document.getElementById("maxHeightText");
+    const impactText = document.getElementById("impactText");
+
+    // State
+    let launched = false;
+    let landed = false;
+    let impactX = null;
+    let flightTime = 0;
+    let maxHeight = startPos.y;
+    let velocity = new THREE.Vector3(0, 0, 0);
+    let cameraFollow = false;
+
+    function resetSimulation() {
+      launched = false;
+      landed = false;
+      impactX = null;
+      flightTime = 0;
+      maxHeight = startPos.y;
+      velocity.set(0, 0, 0);
+
+      projectile.position.copy(startPos);
+
+      trailPoints = [startPos.clone()];
+      updateTrail();
+
+      for (const p of particles) {
+        scene.remove(p.sprite);
+        p.material.dispose();
+      }
+      particles.length = 0;
+
+      camera.position.copy(defaultCameraPos);
+      camera.lookAt(0, 0, 0);
+
+      updateIdealArc();
+      syncState();
+    }
+
+    function launchProjectile() {
+      resetSimulation();
+      launched = true;
+      landed = false;
+
+      const angleDeg = Number(angleSlider.value);
+      const speed = Number(speedSlider.value);
+      const angleRad = THREE.MathUtils.degToRad(angleDeg);
+
+      velocity.set(
+        speed * Math.cos(angleRad),
+        speed * Math.sin(angleRad),
+        0
+      );
+
+      syncState();
+    }
+
+    function updateTrail() {
+      if (trailPoints.length < 2) {
+        trailGeometry.setFromPoints(trailPoints);
+        return;
+      }
+      trailGeometry.dispose();
+      trailGeometry = new THREE.BufferGeometry().setFromPoints(trailPoints);
+      trailLine.geometry = trailGeometry;
+    }
+
+    function updatePhysics() {
+      if (!launched || landed) return;
+
+      const speedMag = velocity.length();
+
+      const dragAccel = new THREE.Vector3();
+      if (speedMag > 0) {
+        const dragFactor = 0.5 * Cd * rho * A * speedMag / mass;
+        dragAccel.copy(velocity).multiplyScalar(-dragFactor);
+      }
+
+      const accel = new THREE.Vector3(
+        dragAccel.x,
+        dragAccel.y - g,
+        dragAccel.z
+      );
+
+      // Semi-implicit Euler
+      velocity.addScaledVector(accel, dt);
+      projectile.position.addScaledVector(velocity, dt);
+
+      flightTime += dt;
+      maxHeight = Math.max(maxHeight, projectile.position.y);
+
+      trailPoints.push(projectile.position.clone());
+      updateTrail();
+
+      emitTrailParticle();
+
+      if (projectile.position.y <= 0) {
+        projectile.position.y = 0;
+        velocity.set(0, 0, 0);
+        landed = true;
+        impactX = projectile.position.x;
+        emitImpactBurst();
+      }
+
+      syncState();
+    }
+
+    function updateHUD() {
+      posText.textContent = `Position: x=${projectile.position.x.toFixed(2)}, y=${projectile.position.y.toFixed(2)}`;
+      velText.textContent = `Speed: ${velocity.length().toFixed(2)} m/s`;
+      timeText.textContent = `Flight Time: ${flightTime.toFixed(2)} s`;
+      particleText.textContent = `Particles: ${particles.length}`;
+      maxHeightText.textContent = `Max Height: ${maxHeight.toFixed(2)}`;
+      impactText.textContent = `Impact X: ${impactX !== null ? impactX.toFixed(2) : "--"}`;
+    }
+
+    function updateCamera() {
+      if (cameraFollow) {
+        const targetPos = projectile.position.clone();
+        const desired = targetPos.clone().add(cameraOffset);
+        camera.position.lerp(desired, 0.08);
+        camera.lookAt(targetPos);
+      }
+    }
+
+    function syncState() {
+      window.__3D_STATE__ = {
+        launched,
+        landed,
+        projectilePos: {
+          x: projectile.position.x,
+          y: projectile.position.y,
+          z: projectile.position.z
+        },
+        projectileVel: {
+          x: velocity.x,
+          y: velocity.y,
+          z: velocity.z
+        },
+        speed: velocity.length(),
+        launchAngle: Number(angleSlider.value),
+        launchSpeed: Number(speedSlider.value),
+        flightTime,
+        particleCount: particles.length,
+        cameraFollow,
+        trailPointCount: trailPoints.length,
+        impactX,
+        modelLoaded,
+        dragEnabled: true,
+        maxHeight
+      };
+    }
+
+    angleSlider.addEventListener("input", () => {
+      angleLabel.textContent = `${angleSlider.value}°`;
+      updateIdealArc();
+      syncState();
+    });
+
+    speedSlider.addEventListener("input", () => {
+      speedLabel.textContent = `${speedSlider.value} m/s`;
+      updateIdealArc();
+      syncState();
+    });
+
+    launchBtn.addEventListener("click", launchProjectile);
+    resetBtn.addEventListener("click", resetSimulation);
+
+    window.addEventListener("keydown", (e) => {
+      if (e.key === "c" || e.key === "C") {
+        cameraFollow = !cameraFollow;
+        if (!cameraFollow) {
+          camera.position.copy(defaultCameraPos);
+          camera.lookAt(0, 0, 0);
+        }
+        syncState();
+      }
+    });
+
+    window.addEventListener("resize", () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    // Init
+    angleLabel.textContent = `${angleSlider.value}°`;
+    speedLabel.textContent = `${speedSlider.value} m/s`;
+    updateIdealArc();
+    resetSimulation();
+
+    // Render loop
+    const clock = new THREE.Clock();
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      const delta = Math.min(clock.getDelta(), 0.033);
+
+      // Fixed timestep-ish integration for stability
+      let accumulator = delta;
+      while (accumulator >= dt) {
+        updatePhysics();
+        updateParticles(dt);
+        accumulator -= dt;
+      }
+
+      updateCamera();
+      updateHUD();
+      syncState();
+
+      renderer.render(scene, camera);
+    }
+
+    animate();
+  </script>
+</body>
+</html>

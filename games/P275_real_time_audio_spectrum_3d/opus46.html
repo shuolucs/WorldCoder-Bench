@@ -1,0 +1,434 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3D Audio Spectrum Visualizer</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { overflow: hidden; background: #000; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+  canvas { display: block; }
+  #hud {
+    position: absolute;
+    top: 15px;
+    left: 15px;
+    background: rgba(0, 0, 0, 0.75);
+    color: #fff;
+    padding: 15px 20px;
+    border-radius: 10px;
+    font-size: 14px;
+    line-height: 1.8;
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    backdrop-filter: blur(10px);
+    min-width: 220px;
+    z-index: 10;
+  }
+  #hud h3 {
+    margin-bottom: 8px;
+    font-size: 16px;
+    color: #0ff;
+    border-bottom: 1px solid rgba(255,255,255,0.2);
+    padding-bottom: 6px;
+  }
+  #hud .label {
+    color: #aaa;
+  }
+  #hud .value {
+    color: #0f0;
+    font-weight: bold;
+  }
+  #btn-reset {
+    margin-top: 10px;
+    padding: 8px 20px;
+    background: rgba(255, 50, 50, 0.8);
+    color: #fff;
+    border: none;
+    border-radius: 5px;
+    cursor: pointer;
+    font-size: 14px;
+    width: 100%;
+    transition: background 0.2s;
+  }
+  #btn-reset:hover {
+    background: rgba(255, 80, 80, 1.0);
+  }
+  #controls-help {
+    position: absolute;
+    bottom: 15px;
+    left: 15px;
+    background: rgba(0, 0, 0, 0.7);
+    color: #888;
+    padding: 10px 15px;
+    border-radius: 8px;
+    font-size: 12px;
+    line-height: 1.6;
+    border: 1px solid rgba(255,255,255,0.1);
+    z-index: 10;
+  }
+  #controls-help span { color: #0ff; }
+</style>
+</head>
+<body>
+
+<div id="hud">
+  <h3>🎵 Spectrum Visualizer</h3>
+  <div><span class="label">Mode: </span><span class="value" id="hud-mode">circular</span></div>
+  <div><span class="label">Status: </span><span class="value" id="hud-playing">Paused</span></div>
+  <div><span class="label">Gain: </span><span class="value" id="hud-gain">0.3</span></div>
+  <div><span class="label">Frequency: </span><span class="value" id="hud-freq">220 Hz</span></div>
+  <div><span class="label">Auto-Rotate: </span><span class="value" id="hud-rotate">ON</span></div>
+  <div><span class="label">Bars: </span><span class="value" id="hud-barcount">64</span></div>
+  <button id="btn-reset">Reset</button>
+</div>
+
+<div id="controls-help">
+  <span>Space</span> Play/Pause &nbsp;|&nbsp;
+  <span>1/2/3</span> Mode &nbsp;|&nbsp;
+  <span>R</span> Rotate &nbsp;|&nbsp;
+  <span>↑↓</span> Gain &nbsp;|&nbsp;
+  <span>←→</span> Freq
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<script>
+(function() {
+  // --- State ---
+  const BAR_COUNT = 64;
+  let mode = 'circular';
+  let isPlaying = false;
+  let currentGain = 0.3;
+  let currentFrequency = 220;
+  let autoRotate = true;
+  let frameCount = 0;
+
+  // --- Three.js Setup ---
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x000000);
+
+  const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+  camera.position.set(0, 30, 60);
+  camera.lookAt(0, 0, 0);
+
+  const renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.setPixelRatio(window.devicePixelRatio);
+  document.body.appendChild(renderer.domElement);
+
+  const controls = new THREE.OrbitControls(camera, renderer.domElement);
+  controls.enableDamping = true;
+  controls.dampingFactor = 0.05;
+
+  // Lights
+  const ambientLight = new THREE.AmbientLight(0x404040);
+  scene.add(ambientLight);
+
+  const directionalLight = new THREE.DirectionalLight(0xffffff, 1.0);
+  directionalLight.position.set(10, 40, 20);
+  scene.add(directionalLight);
+
+  // Grid
+  const gridHelper = new THREE.GridHelper(80, 40, 0x444444, 0x222222);
+  gridHelper.position.y = 0;
+  scene.add(gridHelper);
+
+  // --- Audio Setup ---
+  let audioCtx = null;
+  let analyser = null;
+  let oscillator = null;
+  let gainNode = null;
+  let dataArray = null;
+
+  function initAudio() {
+    if (audioCtx) return;
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 256;
+    analyser.smoothingTimeConstant = 0.8;
+
+    gainNode = audioCtx.createGain();
+    gainNode.gain.value = currentGain;
+
+    gainNode.connect(analyser);
+    analyser.connect(audioCtx.destination);
+
+    dataArray = new Uint8Array(analyser.frequencyBinCount);
+  }
+
+  function createOscillator() {
+    if (oscillator) {
+      try { oscillator.stop(); } catch(e) {}
+      oscillator.disconnect();
+    }
+    oscillator = audioCtx.createOscillator();
+    oscillator.type = 'sawtooth';
+    oscillator.frequency.setValueAtTime(currentFrequency, audioCtx.currentTime);
+    oscillator.connect(gainNode);
+    oscillator.start();
+  }
+
+  // --- Bars ---
+  const barGroup = new THREE.Group();
+  scene.add(barGroup);
+
+  const bars = [];
+  const barGeometry = new THREE.BoxGeometry(1, 1, 1);
+
+  for (let i = 0; i < BAR_COUNT; i++) {
+    const hue = i / BAR_COUNT;
+    const color = new THREE.Color();
+    color.setHSL(hue, 1.0, 0.5);
+
+    const material = new THREE.MeshStandardMaterial({
+      color: color,
+      emissive: color.clone().multiplyScalar(0.3),
+      metalness: 0.3,
+      roughness: 0.7
+    });
+
+    const mesh = new THREE.Mesh(barGeometry, material);
+    bars.push(mesh);
+    barGroup.add(mesh);
+  }
+
+  // --- Position bars based on mode ---
+  function positionBars() {
+    const radius = 20;
+    for (let i = 0; i < BAR_COUNT; i++) {
+      const bar = bars[i];
+      if (mode === 'circular') {
+        const angle = i * (2 * Math.PI / BAR_COUNT);
+        bar.position.x = radius * Math.cos(angle);
+        bar.position.z = radius * Math.sin(angle);
+        bar.rotation.y = -angle;
+      } else if (mode === 'linear') {
+        bar.position.x = i - 32;
+        bar.position.z = 0;
+        bar.rotation.y = 0;
+      } else if (mode === 'wave') {
+        const x = i - 32;
+        bar.position.x = x;
+        bar.position.z = 10 * Math.sin(x * Math.PI / 32);
+        bar.rotation.y = 0;
+      }
+    }
+  }
+
+  positionBars();
+
+  // --- Update HUD ---
+  function updateHUD() {
+    document.getElementById('hud-mode').textContent = mode;
+    document.getElementById('hud-playing').textContent = isPlaying ? 'Playing' : 'Paused';
+    document.getElementById('hud-gain').textContent = currentGain.toFixed(1);
+    document.getElementById('hud-freq').textContent = currentFrequency + ' Hz';
+    document.getElementById('hud-rotate').textContent = autoRotate ? 'ON' : 'OFF';
+    document.getElementById('hud-barcount').textContent = BAR_COUNT;
+  }
+
+  updateHUD();
+
+  // --- Global State ---
+  window.__3D_STATE__ = {
+    mode: mode,
+    isPlaying: isPlaying,
+    gain: currentGain,
+    frequency: currentFrequency,
+    autoRotate: autoRotate,
+    barCount: BAR_COUNT,
+    groupRotationY: 0,
+    maxBarHeight: 0.5,
+    minBarHeight: 0.5,
+    avgBarHeight: 0.5,
+    cameraDistance: 0,
+    frameCount: 0,
+    barsValid: true,
+    analyserFFTSize: 256
+  };
+
+  // --- Keyboard Controls ---
+  document.addEventListener('keydown', function(e) {
+    if (e.code === 'Space') {
+      e.preventDefault();
+      togglePlayPause();
+    } else if (e.key === '1') {
+      mode = 'circular';
+      positionBars();
+      updateHUD();
+    } else if (e.key === '2') {
+      mode = 'linear';
+      positionBars();
+      updateHUD();
+    } else if (e.key === '3') {
+      mode = 'wave';
+      positionBars();
+      updateHUD();
+    } else if (e.key === 'r' || e.key === 'R') {
+      autoRotate = !autoRotate;
+      updateHUD();
+    } else if (e.code === 'ArrowUp') {
+      e.preventDefault();
+      currentGain = Math.min(1.0, Math.round((currentGain + 0.1) * 10) / 10);
+      if (gainNode) gainNode.gain.value = currentGain;
+      updateHUD();
+    } else if (e.code === 'ArrowDown') {
+      e.preventDefault();
+      currentGain = Math.max(0.0, Math.round((currentGain - 0.1) * 10) / 10);
+      if (gainNode) gainNode.gain.value = currentGain;
+      updateHUD();
+    } else if (e.code === 'ArrowRight') {
+      e.preventDefault();
+      currentFrequency = Math.min(2000, currentFrequency + 50);
+      if (oscillator && isPlaying) {
+        oscillator.frequency.setValueAtTime(currentFrequency, audioCtx.currentTime);
+      }
+      updateHUD();
+    } else if (e.code === 'ArrowLeft') {
+      e.preventDefault();
+      currentFrequency = Math.max(50, currentFrequency - 50);
+      if (oscillator && isPlaying) {
+        oscillator.frequency.setValueAtTime(currentFrequency, audioCtx.currentTime);
+      }
+      updateHUD();
+    }
+  });
+
+  function togglePlayPause() {
+    initAudio();
+    if (!isPlaying) {
+      if (audioCtx.state === 'suspended') {
+        audioCtx.resume();
+      }
+      createOscillator();
+      isPlaying = true;
+    } else {
+      if (oscillator) {
+        try { oscillator.stop(); } catch(e) {}
+        oscillator.disconnect();
+        oscillator = null;
+      }
+      isPlaying = false;
+    }
+    updateHUD();
+  }
+
+  // --- Reset ---
+  document.getElementById('btn-reset').addEventListener('click', function() {
+    // Stop if playing
+    if (isPlaying && oscillator) {
+      try { oscillator.stop(); } catch(e) {}
+      oscillator.disconnect();
+      oscillator = null;
+    }
+    isPlaying = false;
+    mode = 'circular';
+    currentGain = 0.3;
+    currentFrequency = 220;
+    autoRotate = true;
+    if (gainNode) gainNode.gain.value = currentGain;
+    barGroup.rotation.y = 0;
+    positionBars();
+    updateHUD();
+  });
+
+  // --- Resize ---
+  window.addEventListener('resize', function() {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  });
+
+  // --- Animation Loop ---
+  function animate() {
+    requestAnimationFrame(animate);
+    frameCount++;
+
+    // Get frequency data
+    let freqData = new Uint8Array(BAR_COUNT);
+    if (analyser && isPlaying) {
+      analyser.getByteFrequencyData(dataArray);
+      for (let i = 0; i < BAR_COUNT; i++) {
+        freqData[i] = dataArray[i];
+      }
+    }
+
+    // Update bars
+    let maxH = 0;
+    let minH = Infinity;
+    let sumH = 0;
+    let allValid = true;
+
+    for (let i = 0; i < BAR_COUNT; i++) {
+      const bar = bars[i];
+      let targetHeight;
+
+      if (isPlaying) {
+        targetHeight = 0.5 + (freqData[i] / 255) * 29.5; // maps 0-255 to 0.5-30
+      } else {
+        targetHeight = 0.5;
+      }
+
+      // Smooth transition
+      const currentHeight = bar.scale.y;
+      const newHeight = currentHeight + (targetHeight - currentHeight) * 0.15;
+
+      bar.scale.y = newHeight;
+      bar.position.y = newHeight / 2;
+
+      // Track stats
+      if (newHeight > maxH) maxH = newHeight;
+      if (newHeight < minH) minH = newHeight;
+      sumH += newHeight;
+
+      // Validate
+      if (isNaN(bar.position.x) || isNaN(bar.position.y) || isNaN(bar.position.z) ||
+          isNaN(bar.scale.x) || isNaN(bar.scale.y) || isNaN(bar.scale.z)) {
+        allValid = false;
+      }
+
+      // Update emissive based on height
+      const intensity = (newHeight - 0.5) / 29.5;
+      const hue = i / BAR_COUNT;
+      const emissiveColor = new THREE.Color();
+      emissiveColor.setHSL(hue, 1.0, 0.15 + intensity * 0.35);
+      bar.material.emissive = emissiveColor;
+    }
+
+    if (minH === Infinity) minH = 0.5;
+    const avgH = sumH / BAR_COUNT;
+
+    // Auto-rotate
+    if (autoRotate) {
+      barGroup.rotation.y += 0.005;
+    }
+
+    // Camera distance
+    const camDist = camera.position.length();
+
+    // Update global state
+    window.__3D_STATE__ = {
+      mode: mode,
+      isPlaying: isPlaying,
+      gain: parseFloat(currentGain.toFixed(1)),
+      frequency: currentFrequency,
+      autoRotate: autoRotate,
+      barCount: BAR_COUNT,
+      groupRotationY: barGroup.rotation.y,
+      maxBarHeight: parseFloat(maxH.toFixed(2)),
+      minBarHeight: parseFloat(minH.toFixed(2)),
+      avgBarHeight: parseFloat(avgH.toFixed(2)),
+      cameraDistance: parseFloat(camDist.toFixed(1)),
+      frameCount: frameCount,
+      barsValid: allValid,
+      analyserFFTSize: analyser ? analyser.fftSize : 256
+    };
+
+    controls.update();
+    renderer.render(scene, camera);
+  }
+
+  animate();
+})();
+</script>
+</body>
+</html>

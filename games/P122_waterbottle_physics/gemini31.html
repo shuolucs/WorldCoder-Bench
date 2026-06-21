@@ -1,0 +1,449 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bottle Flip Challenge</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #222;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            user-select: none;
+            -webkit-user-select: none;
+        }
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+        }
+        #hud {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            color: #fff;
+            text-shadow: 1px 1px 3px rgba(0,0,0,0.8);
+            pointer-events: none;
+            font-size: 18px;
+            line-height: 1.5;
+            background: rgba(0, 0, 0, 0.3);
+            padding: 15px;
+            border-radius: 8px;
+        }
+        #hud span {
+            font-weight: bold;
+            color: #4da6ff;
+        }
+        #flash {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100vw;
+            height: 100vh;
+            pointer-events: none;
+            opacity: 0;
+            z-index: 10;
+        }
+        #instructions {
+            position: absolute;
+            bottom: 20px;
+            width: 100%;
+            text-align: center;
+            color: rgba(255,255,255,0.6);
+            pointer-events: none;
+            font-size: 14px;
+        }
+    </style>
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+            "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+        }
+    }
+    </script>
+</head>
+<body>
+    <div id="hud">
+        <div>得分: <span id="score">0</span></div>
+        <div>投掷次数: <span id="throwCount">0</span></div>
+        <div>上次角度: <span id="lastAngle">0</span>°</div>
+        <div>最佳连击: <span id="bestStreak">0</span></div>
+    </div>
+    <div id="instructions">在瓶子上按下鼠标并向上拖拽发射</div>
+    <div id="flash"></div>
+    <div id="canvas-container"></div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        // --- State Initialization ---
+        window.__3D_STATE__ = {
+            modelLoaded: false,
+            score: 0,
+            throwCount: 0,
+            lastAngle: 0,
+            bestStreak: 0,
+            bottlePos: { x: 0, y: 0, z: 0 },
+            bottleRotation: { x: 0, y: 0, z: 0 },
+            isFlying: false
+        };
+
+        let currentStreak = 0;
+
+        // --- Scene Setup ---
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x333333);
+        scene.fog = new THREE.Fog(0x333333, 5, 15);
+
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+        camera.position.set(0, 1.5, 3);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        container.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.05;
+        controls.maxPolarAngle = Math.PI / 2 - 0.05; // Don't go below table
+        controls.minDistance = 1;
+        controls.maxDistance = 6;
+        controls.target.set(0, 0.5, 0);
+
+        // --- Lighting ---
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 1.2);
+        dirLight.position.set(2, 5, 3);
+        dirLight.castShadow = true;
+        dirLight.shadow.mapSize.width = 1024;
+        dirLight.shadow.mapSize.height = 1024;
+        dirLight.shadow.camera.near = 0.5;
+        dirLight.shadow.camera.far = 15;
+        dirLight.shadow.camera.left = -3;
+        dirLight.shadow.camera.right = 3;
+        dirLight.shadow.camera.top = 3;
+        dirLight.shadow.camera.bottom = -3;
+        scene.add(dirLight);
+
+        // --- Environment ---
+        const tableGeo = new THREE.PlaneGeometry(10, 10);
+        const tableMat = new THREE.MeshStandardMaterial({ 
+            color: 0x888888,
+            roughness: 0.8,
+            metalness: 0.2
+        });
+        const table = new THREE.Mesh(tableGeo, tableMat);
+        table.rotation.x = -Math.PI / 2;
+        table.receiveShadow = true;
+        scene.add(table);
+
+        // Grid helper for better depth perception
+        const grid = new THREE.GridHelper(10, 20, 0x000000, 0x000000);
+        grid.material.opacity = 0.1;
+        grid.material.transparent = true;
+        scene.add(grid);
+
+        // --- Bottle Setup ---
+        const pivotGroup = new THREE.Group();
+        scene.add(pivotGroup);
+        
+        // Physics constants
+        const BOTTLE_HALF_HEIGHT = 0.1;
+        const BOTTLE_RADIUS = 0.035;
+        pivotGroup.position.y = BOTTLE_HALF_HEIGHT; // Center of Mass
+
+        let bottleMesh;
+        const loader = new GLTFLoader();
+        
+        // Fallback creation function
+        function createFallbackBottle() {
+            const geo = new THREE.CylinderGeometry(BOTTLE_RADIUS, BOTTLE_RADIUS, BOTTLE_HALF_HEIGHT * 2, 32);
+            const mat = new THREE.MeshStandardMaterial({ color: 0x00aaff, roughness: 0.3, metalness: 0.1 });
+            bottleMesh = new THREE.Mesh(geo, mat);
+            bottleMesh.castShadow = true;
+            bottleMesh.receiveShadow = true;
+            // Cylinder origin is center, so it aligns perfectly with pivotGroup
+            pivotGroup.add(bottleMesh);
+            window.__3D_STATE__.modelLoaded = true;
+        }
+
+        loader.load(
+            'assets/WaterBottle.glb',
+            (gltf) => {
+                bottleMesh = gltf.scene;
+                
+                // Normalize scale and center
+                const box = new THREE.Box3().setFromObject(bottleMesh);
+                const size = box.getSize(new THREE.Vector3());
+                const scale = (BOTTLE_HALF_HEIGHT * 2) / size.y;
+                bottleMesh.scale.set(scale, scale, scale);
+                
+                // Recompute box to find bottom
+                const box2 = new THREE.Box3().setFromObject(bottleMesh);
+                const center = box2.getCenter(new THREE.Vector3());
+                
+                // Position mesh so its center aligns with pivotGroup
+                bottleMesh.position.sub(center);
+                
+                bottleMesh.traverse((child) => {
+                    if (child.isMesh) {
+                        child.castShadow = true;
+                        child.receiveShadow = true;
+                    }
+                });
+                
+                pivotGroup.add(bottleMesh);
+                window.__3D_STATE__.modelLoaded = true;
+            },
+            undefined,
+            (error) => {
+                console.warn("Failed to load WaterBottle.glb, using fallback cylinder.", error);
+                createFallbackBottle();
+            }
+        );
+
+        // --- Trajectory Line ---
+        const lineGeo = new THREE.BufferGeometry();
+        const lineMat = new THREE.LineDashedMaterial({ 
+            color: 0xffffff, 
+            dashSize: 0.05, 
+            gapSize: 0.05,
+            linewidth: 2
+        });
+        const trajectoryLine = new THREE.Line(lineGeo, lineMat);
+        scene.add(trajectoryLine);
+        trajectoryLine.visible = false;
+
+        // --- Interaction Logic ---
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+        let isDragging = false;
+        let dragStart = { x: 0, y: 0 };
+        let dragCurrent = { x: 0, y: 0 };
+        
+        // Physics state
+        let velocity = new THREE.Vector3();
+        let angularVelocity = new THREE.Vector3();
+        const gravity = -9.8;
+        let isResetting = false;
+
+        window.addEventListener('pointerdown', (e) => {
+            if (window.__3D_STATE__.isFlying || isResetting) return;
+            
+            mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+            
+            raycaster.setFromCamera(mouse, camera);
+            const intersects = raycaster.intersectObject(pivotGroup, true);
+            
+            if (intersects.length > 0) {
+                isDragging = true;
+                dragStart.x = e.clientX;
+                dragStart.y = e.clientY;
+                dragCurrent.x = e.clientX;
+                dragCurrent.y = e.clientY;
+                controls.enabled = false;
+                trajectoryLine.visible = true;
+            }
+        });
+
+        window.addEventListener('pointermove', (e) => {
+            if (!isDragging) return;
+            dragCurrent.x = e.clientX;
+            dragCurrent.y = e.clientY;
+            updateTrajectory();
+        });
+
+        window.addEventListener('pointerup', (e) => {
+            if (!isDragging) return;
+            isDragging = false;
+            controls.enabled = true;
+            trajectoryLine.visible = false;
+            
+            const dx = dragCurrent.x - dragStart.x;
+            const dy = dragCurrent.y - dragStart.y; // Negative means dragged UP
+            
+            // Require a minimum upward drag to launch
+            if (dy < -20) {
+                launch(dx, dy);
+            }
+        });
+
+        function calculateLaunchParams(dx, dy) {
+            // Tuning parameters for feel
+            const forceY = -dy * 0.018; 
+            const forceZ = dy * 0.012; // Throw forward
+            const forceX = dx * 0.01;
+            
+            const vel = new THREE.Vector3(forceX, forceY, forceZ);
+            
+            // Angular velocity: forward throw causes forward flip (rotation around X)
+            const angVel = new THREE.Vector3(-forceZ * 2.5, 0, forceX * 1.0);
+            
+            return { vel, angVel };
+        }
+
+        function updateTrajectory() {
+            const dx = dragCurrent.x - dragStart.x;
+            const dy = dragCurrent.y - dragStart.y;
+            
+            if (dy >= 0) {
+                trajectoryLine.visible = false;
+                return;
+            }
+            trajectoryLine.visible = true;
+
+            const { vel } = calculateLaunchParams(dx, dy);
+            
+            const points = [];
+            let tempPos = pivotGroup.position.clone();
+            let tempVel = vel.clone();
+            const dt = 0.03;
+            
+            for (let i = 0; i < 30; i++) {
+                points.push(tempPos.clone());
+                tempVel.y += gravity * dt;
+                tempPos.add(tempVel.clone().multiplyScalar(dt));
+                if (tempPos.y < 0) break;
+            }
+            
+            trajectoryLine.geometry.setFromPoints(points);
+            trajectoryLine.computeLineDistances();
+        }
+
+        function launch(dx, dy) {
+            const { vel, angVel } = calculateLaunchParams(dx, dy);
+            velocity.copy(vel);
+            angularVelocity.copy(angVel);
+            
+            window.__3D_STATE__.isFlying = true;
+            window.__3D_STATE__.throwCount++;
+            document.getElementById('throwCount').innerText = window.__3D_STATE__.throwCount;
+        }
+
+        // --- Game Logic ---
+        function getRequiredHeight() {
+            // Calculate the lowest point of the cylinder based on current rotation
+            const up = new THREE.Vector3(0, 1, 0).applyQuaternion(pivotGroup.quaternion);
+            // Height needed so the lowest corner touches y=0
+            return Math.abs(up.y) * BOTTLE_HALF_HEIGHT + Math.sqrt(1 - up.y * up.y) * BOTTLE_RADIUS;
+        }
+
+        function handleLanding() {
+            window.__3D_STATE__.isFlying = false;
+            isResetting = true;
+            
+            // Calculate angle from vertical
+            const worldUp = new THREE.Vector3(0, 1, 0);
+            const bottleUp = new THREE.Vector3(0, 1, 0).applyQuaternion(pivotGroup.quaternion);
+            const angleRad = worldUp.angleTo(bottleUp);
+            const angleDeg = angleRad * (180 / Math.PI);
+            
+            window.__3D_STATE__.lastAngle = Math.round(angleDeg);
+            document.getElementById('lastAngle').innerText = window.__3D_STATE__.lastAngle;
+
+            const isSuccess = angleDeg < 15;
+            const flash = document.getElementById('flash');
+
+            if (isSuccess) {
+                window.__3D_STATE__.score++;
+                currentStreak++;
+                if (currentStreak > window.__3D_STATE__.bestStreak) {
+                    window.__3D_STATE__.bestStreak = currentStreak;
+                }
+                document.getElementById('score').innerText = window.__3D_STATE__.score;
+                document.getElementById('bestStreak').innerText = window.__3D_STATE__.bestStreak;
+                
+                // Snap to perfect upright for visual satisfaction
+                pivotGroup.quaternion.identity();
+                pivotGroup.position.y = BOTTLE_HALF_HEIGHT;
+                
+                flash.style.backgroundColor = 'rgba(0, 255, 0, 0.4)';
+            } else {
+                currentStreak = 0;
+                flash.style.backgroundColor = 'rgba(255, 0, 0, 0.4)';
+            }
+
+            // Trigger flash animation
+            flash.style.transition = 'none';
+            flash.style.opacity = '1';
+            void flash.offsetWidth; // Force reflow
+            flash.style.transition = 'opacity 0.5s ease-out';
+            flash.style.opacity = '0';
+
+            setTimeout(resetBottle, 2000);
+        }
+
+        function resetBottle() {
+            pivotGroup.position.set(0, BOTTLE_HALF_HEIGHT, 0);
+            pivotGroup.quaternion.identity();
+            velocity.set(0, 0, 0);
+            angularVelocity.set(0, 0, 0);
+            isResetting = false;
+        }
+
+        function updateState() {
+            window.__3D_STATE__.bottlePos = {
+                x: pivotGroup.position.x,
+                y: pivotGroup.position.y - BOTTLE_HALF_HEIGHT, // Report bottom position
+                z: pivotGroup.position.z
+            };
+            const euler = new THREE.Euler().setFromQuaternion(pivotGroup.quaternion);
+            window.__3D_STATE__.bottleRotation = {
+                x: euler.x, y: euler.y, z: euler.z
+            };
+        }
+
+        // --- Animation Loop ---
+        const clock = new THREE.Clock();
+
+        function animate() {
+            requestAnimationFrame(animate);
+            
+            const dt = Math.min(clock.getDelta(), 0.1); // Cap dt to prevent physics explosion
+
+            if (window.__3D_STATE__.isFlying) {
+                // Apply gravity
+                velocity.y += gravity * dt;
+                
+                // Apply translation
+                pivotGroup.position.add(velocity.clone().multiplyScalar(dt));
+                
+                // Apply rotation (world space)
+                pivotGroup.rotateOnWorldAxis(new THREE.Vector3(1, 0, 0), angularVelocity.x * dt);
+                pivotGroup.rotateOnWorldAxis(new THREE.Vector3(0, 0, 1), angularVelocity.z * dt);
+
+                // Collision detection with floor
+                const requiredHeight = getRequiredHeight();
+                if (pivotGroup.position.y <= requiredHeight && velocity.y < 0) {
+                    pivotGroup.position.y = requiredHeight; // Prevent sinking
+                    handleLanding();
+                }
+            }
+
+            controls.update();
+            renderer.render(scene, camera);
+            updateState();
+        }
+
+        // Handle window resize
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        animate();
+    </script>
+</body>
+</html>

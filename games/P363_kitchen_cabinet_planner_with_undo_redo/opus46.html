@@ -1,0 +1,591 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3D Kitchen Cabinet Planner</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { overflow: hidden; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #1a1a2e; }
+  canvas { display: block; }
+
+  #toolbar {
+    position: absolute;
+    top: 12px;
+    left: 12px;
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    z-index: 10;
+  }
+
+  .btn {
+    padding: 8px 16px;
+    border-radius: 4px;
+    background: #4A90D9;
+    color: white;
+    border: none;
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: 500;
+    transition: background 0.2s, transform 0.1s;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.3);
+  }
+
+  .btn:hover { background: #357ABD; transform: translateY(-1px); }
+  .btn:active { transform: translateY(0); }
+  .btn.danger { background: #D94A4A; }
+  .btn.danger:hover { background: #BD3535; }
+  .btn.secondary { background: #6C757D; }
+  .btn.secondary:hover { background: #5A6268; }
+
+  #hud {
+    position: absolute;
+    top: 12px;
+    right: 12px;
+    background: rgba(20, 20, 40, 0.9);
+    color: #e0e0e0;
+    padding: 16px 20px;
+    border-radius: 8px;
+    font-size: 13px;
+    line-height: 1.8;
+    min-width: 220px;
+    border: 1px solid rgba(74, 144, 217, 0.3);
+    box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+    z-index: 10;
+  }
+
+  #hud h3 {
+    margin-bottom: 8px;
+    color: #4A90D9;
+    font-size: 14px;
+    border-bottom: 1px solid rgba(74, 144, 217, 0.3);
+    padding-bottom: 6px;
+  }
+
+  #hud .label { color: #888; }
+  #hud .value { color: #fff; font-weight: 600; }
+
+  #instructions {
+    position: absolute;
+    bottom: 12px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: rgba(20, 20, 40, 0.85);
+    color: #aaa;
+    padding: 8px 16px;
+    border-radius: 6px;
+    font-size: 12px;
+    z-index: 10;
+  }
+</style>
+</head>
+<body>
+
+<div id="toolbar">
+  <button class="btn" id="btnAddBase">Add Base Cabinet</button>
+  <button class="btn" id="btnAddWall">Add Wall Cabinet</button>
+  <button class="btn" id="btnAddTall">Add Tall Cabinet</button>
+  <button class="btn secondary" id="btnUndo">Undo</button>
+  <button class="btn secondary" id="btnRedo">Redo</button>
+  <button class="btn danger" id="btnDelete">Delete</button>
+</div>
+
+<div id="hud">
+  <h3>📊 Cabinet Planner</h3>
+  <div><span class="label">Cabinets: </span><span class="value" id="hudCount">0</span></div>
+  <div><span class="label">History: </span><span class="value" id="hudHistory">0</span></div>
+  <div><span class="label">Redo: </span><span class="value" id="hudRedo">0</span></div>
+  <div><span class="label">Selected: </span><span class="value" id="hudSelected">None</span></div>
+</div>
+
+<div id="instructions">
+  Click cabinet to select • Arrow keys to move • Ctrl+Z Undo • Ctrl+Y Redo
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.163.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.163.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+// --- State ---
+const state = {
+  cabinets: [],       // { mesh, type, id, position }
+  selected: null,     // cabinet object or null
+  history: [],        // action stack
+  redoStack: [],
+  nextId: 0,
+  lastAction: 'none',
+  horseLoaded: false,
+  sceneReady: false,
+  placementOffsets: { base: 0, wall: 0, tall: 0 }
+};
+
+window.__3D_STATE__ = {
+  cabinetCount: 0,
+  historySize: 0,
+  redoSize: 0,
+  selectedCabinetId: -1,
+  selectedCabinetType: 'none',
+  lastAction: 'none',
+  horseLoaded: false,
+  cabinetPositions: [],
+  sceneReady: false
+};
+
+function syncState(action) {
+  if (action) state.lastAction = action;
+  window.__3D_STATE__.cabinetCount = state.cabinets.length;
+  window.__3D_STATE__.historySize = state.history.length;
+  window.__3D_STATE__.redoSize = state.redoStack.length;
+  window.__3D_STATE__.selectedCabinetId = state.selected ? state.selected.id : -1;
+  window.__3D_STATE__.selectedCabinetType = state.selected ? state.selected.type : 'none';
+  window.__3D_STATE__.lastAction = state.lastAction;
+  window.__3D_STATE__.horseLoaded = state.horseLoaded;
+  window.__3D_STATE__.cabinetPositions = state.cabinets.map(c => ({
+    x: c.mesh.position.x,
+    y: c.mesh.position.y,
+    z: c.mesh.position.z
+  }));
+  window.__3D_STATE__.sceneReady = state.sceneReady;
+  updateHUD();
+}
+
+function updateHUD() {
+  document.getElementById('hudCount').textContent = state.cabinets.length;
+  document.getElementById('hudHistory').textContent = state.history.length;
+  document.getElementById('hudRedo').textContent = state.redoStack.length;
+  document.getElementById('hudSelected').textContent = state.selected ? state.selected.type : 'None';
+}
+
+// --- Scene Setup ---
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x2a2a3e);
+
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+camera.position.set(0, 5, 10);
+camera.lookAt(0, 0, 0);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+
+// Lights
+const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
+scene.add(ambientLight);
+
+const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+dirLight.position.set(5, 10, 5);
+dirLight.castShadow = true;
+dirLight.shadow.mapSize.width = 2048;
+dirLight.shadow.mapSize.height = 2048;
+dirLight.shadow.camera.near = 0.5;
+dirLight.shadow.camera.far = 50;
+dirLight.shadow.camera.left = -15;
+dirLight.shadow.camera.right = 15;
+dirLight.shadow.camera.top = 15;
+dirLight.shadow.camera.bottom = -15;
+scene.add(dirLight);
+
+// Floor
+const floorGeo = new THREE.PlaneGeometry(20, 20);
+const floorMat = new THREE.MeshStandardMaterial({
+  color: 0xd0d0d0,
+  roughness: 0.8,
+  metalness: 0.1
+});
+const floor = new THREE.Mesh(floorGeo, floorMat);
+floor.rotation.x = -Math.PI / 2;
+floor.position.y = 0;
+floor.receiveShadow = true;
+scene.add(floor);
+
+// Floor grid lines for tile effect
+const tileLines = new THREE.GridHelper(20, 20, 0xbbbbbb, 0xbbbbbb);
+tileLines.position.y = 0.01;
+scene.add(tileLines);
+
+// Walls
+function createWall(width, height, depth, x, y, z) {
+  const geo = new THREE.BoxGeometry(width, height, depth);
+  const mat = new THREE.MeshStandardMaterial({ color: 0xF5F0E1, roughness: 0.9, metalness: 0.0 });
+  const wall = new THREE.Mesh(geo, mat);
+  wall.position.set(x, y, z);
+  wall.receiveShadow = true;
+  wall.castShadow = false;
+  scene.add(wall);
+  return wall;
+}
+
+// Back wall at z=-5, 20 wide, 6 tall
+createWall(20, 6, 0.2, 0, 3, -5);
+// Left wall at x=-10, 10 deep, 6 tall
+createWall(0.2, 6, 10, -10, 3, 0);
+// Right wall at x=10, 10 deep, 6 tall
+createWall(0.2, 6, 10, 10, 3, 0);
+
+// Controls
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+controls.target.set(0, 2, -2);
+controls.update();
+
+// --- Cabinet Catalog ---
+const cabinetCatalog = {
+  base: { w: 1.2, h: 1.8, d: 0.6, color: 0x8B4513, defaultY: 0.9, defaultPos: { x: 0, y: 0.9, z: -4 } },
+  wall: { w: 1.2, h: 0.9, d: 0.4, color: 0x654321, defaultY: 3.0, defaultPos: { x: 0, y: 3.0, z: -4.7 } },
+  tall: { w: 0.8, h: 4.0, d: 0.6, color: 0x7B3F00, defaultY: 2.0, defaultPos: { x: 0, y: 2.0, z: -4 } }
+};
+
+function createCabinetMesh(type) {
+  const cat = cabinetCatalog[type];
+  const geo = new THREE.BoxGeometry(cat.w, cat.h, cat.d);
+  const mat = new THREE.MeshStandardMaterial({
+    color: cat.color,
+    roughness: 0.6,
+    metalness: 0.1
+  });
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.castShadow = true;
+  mesh.receiveShadow = true;
+
+  // Edges
+  const edges = new THREE.EdgesGeometry(geo);
+  const lineMat = new THREE.LineBasicMaterial({ color: 0x000000 });
+  const lineSegments = new THREE.LineSegments(edges, lineMat);
+  mesh.add(lineSegments);
+
+  // Door detail - front face line
+  const doorW = cat.w * 0.4;
+  const doorH = cat.h * 0.7;
+  const doorGeo = new THREE.PlaneGeometry(doorW, doorH);
+  const doorMat = new THREE.MeshStandardMaterial({
+    color: new THREE.Color(cat.color).multiplyScalar(0.85),
+    roughness: 0.5,
+    metalness: 0.15
+  });
+  const door = new THREE.Mesh(doorGeo, doorMat);
+  door.position.z = cat.d / 2 + 0.005;
+  mesh.add(door);
+
+  // Handle
+  const handleGeo = new THREE.CylinderGeometry(0.015, 0.015, 0.15, 8);
+  const handleMat = new THREE.MeshStandardMaterial({ color: 0xC0C0C0, metalness: 0.8, roughness: 0.2 });
+  const handle = new THREE.Mesh(handleGeo, handleMat);
+  handle.position.set(doorW * 0.35, 0, cat.d / 2 + 0.03);
+  mesh.add(handle);
+
+  return mesh;
+}
+
+function addCabinet(type, position, pushHistory = true) {
+  const mesh = createCabinetMesh(type);
+  mesh.position.set(position.x, position.y, position.z);
+
+  const id = state.nextId++;
+  mesh.userData.cabinetId = id;
+  mesh.userData.cabinetType = type;
+
+  const cabinet = { mesh, type, id };
+  state.cabinets.push(cabinet);
+  scene.add(mesh);
+
+  if (pushHistory) {
+    state.redoStack = [];
+    state.history.push({
+      type: 'add',
+      cabinet,
+      position: { x: position.x, y: position.y, z: position.z }
+    });
+  }
+
+  syncState('add_' + type);
+  return cabinet;
+}
+
+function removeCabinetFromScene(cabinet) {
+  scene.remove(cabinet.mesh);
+  const idx = state.cabinets.indexOf(cabinet);
+  if (idx !== -1) state.cabinets.splice(idx, 1);
+  if (state.selected === cabinet) {
+    deselectCurrent();
+  }
+}
+
+function restoreCabinetToScene(cabinet, position) {
+  cabinet.mesh.position.set(position.x, position.y, position.z);
+  state.cabinets.push(cabinet);
+  scene.add(cabinet.mesh);
+}
+
+// --- Selection ---
+const raycaster = new THREE.Raycaster();
+const mouse = new THREE.Vector2();
+
+function deselectCurrent() {
+  if (state.selected) {
+    state.selected.mesh.material.emissive.setHex(0x000000);
+    state.selected = null;
+  }
+}
+
+function selectCabinet(cabinet) {
+  deselectCurrent();
+  state.selected = cabinet;
+  cabinet.mesh.material.emissive.setHex(0xFFFF00);
+  cabinet.mesh.material.emissiveIntensity = 0.3;
+  syncState(state.lastAction);
+}
+
+function onMouseClick(event) {
+  // Ignore clicks on UI
+  if (event.target.tagName === 'BUTTON') return;
+
+  mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+  mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+  raycaster.setFromCamera(mouse, camera);
+
+  const meshes = state.cabinets.map(c => c.mesh);
+  const intersects = raycaster.intersectObjects(meshes, true);
+
+  if (intersects.length > 0) {
+    // Find the cabinet
+    let obj = intersects[0].object;
+    while (obj.parent && !obj.userData.cabinetId && obj.userData.cabinetId === undefined) {
+      obj = obj.parent;
+    }
+    // If we hit a child, walk up
+    let target = obj;
+    while (target && target.userData.cabinetId === undefined) {
+      target = target.parent;
+    }
+    if (target) {
+      const cab = state.cabinets.find(c => c.id === target.userData.cabinetId);
+      if (cab) selectCabinet(cab);
+    }
+  } else {
+    deselectCurrent();
+    syncState(state.lastAction);
+  }
+}
+
+// --- Movement ---
+function moveCabinet(cabinet, dx, dz) {
+  const oldPos = { x: cabinet.mesh.position.x, y: cabinet.mesh.position.y, z: cabinet.mesh.position.z };
+  cabinet.mesh.position.x += dx;
+  cabinet.mesh.position.z += dz;
+  const newPos = { x: cabinet.mesh.position.x, y: cabinet.mesh.position.y, z: cabinet.mesh.position.z };
+
+  state.redoStack = [];
+  state.history.push({
+    type: 'move',
+    cabinet,
+    oldPosition: oldPos,
+    newPosition: newPos
+  });
+
+  syncState('move');
+}
+
+// --- Undo / Redo ---
+function undo() {
+  if (state.history.length === 0) return;
+  const action = state.history.pop();
+
+  if (action.type === 'add') {
+    removeCabinetFromScene(action.cabinet);
+    state.redoStack.push(action);
+  } else if (action.type === 'move') {
+    action.cabinet.mesh.position.set(action.oldPosition.x, action.oldPosition.y, action.oldPosition.z);
+    state.redoStack.push(action);
+  } else if (action.type === 'delete') {
+    restoreCabinetToScene(action.cabinet, action.position);
+    state.redoStack.push(action);
+  }
+
+  syncState('undo');
+}
+
+function redo() {
+  if (state.redoStack.length === 0) return;
+  const action = state.redoStack.pop();
+
+  if (action.type === 'add') {
+    restoreCabinetToScene(action.cabinet, action.position);
+    state.history.push(action);
+  } else if (action.type === 'move') {
+    action.cabinet.mesh.position.set(action.newPosition.x, action.newPosition.y, action.newPosition.z);
+    state.history.push(action);
+  } else if (action.type === 'delete') {
+    removeCabinetFromScene(action.cabinet);
+    state.history.push(action);
+  }
+
+  syncState('redo');
+}
+
+// --- Delete ---
+function deleteCabinet() {
+  if (!state.selected) return;
+  const cabinet = state.selected;
+  const pos = { x: cabinet.mesh.position.x, y: cabinet.mesh.position.y, z: cabinet.mesh.position.z };
+
+  removeCabinetFromScene(cabinet);
+
+  state.redoStack = [];
+  state.history.push({
+    type: 'delete',
+    cabinet,
+    position: pos
+  });
+
+  syncState('delete');
+}
+
+// --- Button Handlers ---
+document.getElementById('btnAddBase').addEventListener('click', () => {
+  const cat = cabinetCatalog.base;
+  const offset = state.placementOffsets.base;
+  addCabinet('base', {
+    x: cat.defaultPos.x + offset * 1.5,
+    y: cat.defaultPos.y,
+    z: cat.defaultPos.z
+  });
+  state.placementOffsets.base++;
+});
+
+document.getElementById('btnAddWall').addEventListener('click', () => {
+  const cat = cabinetCatalog.wall;
+  const offset = state.placementOffsets.wall;
+  addCabinet('wall', {
+    x: cat.defaultPos.x + offset * 1.5,
+    y: cat.defaultPos.y,
+    z: cat.defaultPos.z
+  });
+  state.placementOffsets.wall++;
+});
+
+document.getElementById('btnAddTall').addEventListener('click', () => {
+  const cat = cabinetCatalog.tall;
+  const offset = state.placementOffsets.tall;
+  addCabinet('tall', {
+    x: cat.defaultPos.x + offset * 1.5,
+    y: cat.defaultPos.y,
+    z: cat.defaultPos.z
+  });
+  state.placementOffsets.tall++;
+});
+
+document.getElementById('btnUndo').addEventListener('click', undo);
+document.getElementById('btnRedo').addEventListener('click', redo);
+document.getElementById('btnDelete').addEventListener('click', deleteCabinet);
+
+// --- Keyboard ---
+window.addEventListener('keydown', (e) => {
+  if (e.ctrlKey && e.key === 'z') {
+    e.preventDefault();
+    undo();
+    return;
+  }
+  if (e.ctrlKey && e.key === 'y') {
+    e.preventDefault();
+    redo();
+    return;
+  }
+
+  if (!state.selected) return;
+
+  switch (e.key) {
+    case 'ArrowLeft':
+      e.preventDefault();
+      moveCabinet(state.selected, -0.5, 0);
+      break;
+    case 'ArrowRight':
+      e.preventDefault();
+      moveCabinet(state.selected, 0.5, 0);
+      break;
+    case 'ArrowUp':
+      e.preventDefault();
+      moveCabinet(state.selected, 0, -0.5);
+      break;
+    case 'ArrowDown':
+      e.preventDefault();
+      moveCabinet(state.selected, 0, 0.5);
+      break;
+  }
+});
+
+window.addEventListener('click', onMouseClick);
+
+// --- Horse Model ---
+const loader = new GLTFLoader();
+try {
+  loader.load(
+    '._horse.glb',
+    (gltf) => {
+      const model = gltf.scene;
+      model.scale.set(0.3, 0.3, 0.3);
+      model.position.set(2, 1.8, -2);
+      model.castShadow = true;
+      scene.add(model);
+      state.horseLoaded = true;
+      syncState(state.lastAction);
+    },
+    undefined,
+    (error) => {
+      console.warn('Horse model failed to load, using placeholder:', error);
+      const sphereGeo = new THREE.SphereGeometry(0.15, 16, 16);
+      const sphereMat = new THREE.MeshStandardMaterial({ color: 0xD4A574, roughness: 0.4, metalness: 0.3 });
+      const sphere = new THREE.Mesh(sphereGeo, sphereMat);
+      sphere.position.set(2, 1.8, -2);
+      sphere.castShadow = true;
+      scene.add(sphere);
+      state.horseLoaded = false;
+      syncState(state.lastAction);
+    }
+  );
+} catch (e) {
+  const sphereGeo = new THREE.SphereGeometry(0.15, 16, 16);
+  const sphereMat = new THREE.MeshStandardMaterial({ color: 0xD4A574, roughness: 0.4, metalness: 0.3 });
+  const sphere = new THREE.Mesh(sphereGeo, sphereMat);
+  sphere.position.set(2, 1.8, -2);
+  sphere.castShadow = true;
+  scene.add(sphere);
+  state.horseLoaded = false;
+}
+
+// --- Resize ---
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// --- Animation Loop ---
+function animate() {
+  requestAnimationFrame(animate);
+  controls.update();
+  renderer.render(scene, camera);
+}
+
+// Mark scene ready
+state.sceneReady = true;
+syncState('none');
+animate();
+</script>
+</body>
+</html>

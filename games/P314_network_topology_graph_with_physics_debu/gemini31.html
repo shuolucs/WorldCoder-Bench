@@ -1,0 +1,514 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Network Topology</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #0a0a1a;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            color: #fff;
+        }
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            position: absolute;
+            top: 0;
+            left: 0;
+            z-index: 1;
+        }
+        #ui-panel {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            z-index: 10;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            background: rgba(10, 10, 26, 0.8);
+            padding: 15px;
+            border-radius: 8px;
+            border: 1px solid #333;
+        }
+        button {
+            background: #1a1a3a;
+            color: #fff;
+            border: 1px solid #4488ff;
+            padding: 8px 12px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: all 0.2s;
+        }
+        button:hover {
+            background: #4488ff;
+            color: #000;
+        }
+        #debug-overlay {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            z-index: 10;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 15px;
+            border-radius: 8px;
+            border: 1px solid #555;
+            font-family: monospace;
+            font-size: 12px;
+            min-width: 200px;
+            pointer-events: none;
+        }
+        .debug-row {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 5px;
+        }
+        .debug-label {
+            color: #aaa;
+        }
+        .debug-value {
+            color: #44ff88;
+            font-weight: bold;
+        }
+    </style>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="canvas-container"></div>
+
+    <div id="ui-panel">
+        <button id="btn-toggle-physics">Pause Physics</button>
+        <button id="btn-toggle-debug">Toggle Debug</button>
+        <button id="btn-reset-layout">Reset Layout</button>
+        <button id="btn-pin-hub">Pin Hub</button>
+        <button id="btn-add-traffic">Simulate Traffic Burst</button>
+        <button id="btn-highlight-path">Highlight Path (c0 -> c2)</button>
+    </div>
+
+    <div id="debug-overlay">
+        <div class="debug-row"><span class="debug-label">FPS:</span><span class="debug-value" id="dbg-fps">0</span></div>
+        <div class="debug-row"><span class="debug-label">Physics:</span><span class="debug-value" id="dbg-physics">RUNNING</span></div>
+        <div class="debug-row"><span class="debug-label">Nodes:</span><span class="debug-value" id="dbg-nodes">0</span></div>
+        <div class="debug-row"><span class="debug-label">Edges:</span><span class="debug-value" id="dbg-edges">0</span></div>
+        <div class="debug-row"><span class="debug-label">Kinetic Energy:</span><span class="debug-value" id="dbg-ke">0.00</span></div>
+        <div class="debug-row"><span class="debug-label">Avg Edge Len:</span><span class="debug-value" id="dbg-ael">0.00</span></div>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+        // --- State Management ---
+        window.__3D_STATE__ = {
+            modelLoaded: false,
+            nodeCount: 9,
+            edgeCount: 12,
+            physicsRunning: true,
+            hubPinned: false,
+            debugVisible: true,
+            totalKineticEnergy: 0,
+            averageEdgeLength: 0,
+            selectedNodeId: null,
+            trafficBurstApplied: false,
+            pathHighlighted: false,
+            nodePositions: [],
+            hubPosition: { x: 0, y: 0, z: 0 },
+            dampingFactor: 0.95,
+            frameCount: 0,
+            nodesHaveNaN: false,
+            fps: 0
+        };
+
+        const state = window.__3D_STATE__;
+
+        // --- Scene Setup ---
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x0a0a1a);
+
+        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.set(0, 15, 30);
+        camera.lookAt(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        container.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.05;
+
+        // Lights
+        scene.add(new THREE.AmbientLight(0xffffff, 0.3));
+        const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+        dirLight.position.set(10, 20, 10);
+        scene.add(dirLight);
+
+        // Grid Floor
+        const gridHelper = new THREE.GridHelper(50, 50, 0x1a1a3a, 0x1a1a3a);
+        gridHelper.position.y = -5;
+        scene.add(gridHelper);
+
+        // --- Data Structures ---
+        const nodes = [];
+        const edges = [];
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+
+        // --- Helper: Text Sprite ---
+        function createTextSprite(text, color) {
+            const canvas = document.createElement('canvas');
+            const context = canvas.getContext('2d');
+            canvas.width = 256;
+            canvas.height = 64;
+            context.font = 'Bold 24px Arial';
+            context.fillStyle = color;
+            context.textAlign = 'center';
+            context.fillText(text, 128, 40);
+            
+            const texture = new THREE.CanvasTexture(canvas);
+            const spriteMaterial = new THREE.SpriteMaterial({ map: texture, depthTest: false });
+            const sprite = new THREE.Sprite(spriteMaterial);
+            sprite.scale.set(4, 1, 1);
+            sprite.position.y = 1.2;
+            return sprite;
+        }
+
+        // --- Node Creation ---
+        // Hub Node Group
+        const hubGroup = new THREE.Group();
+        scene.add(hubGroup);
+        const hubNode = {
+            id: 'hub',
+            mesh: hubGroup,
+            pos: new THREE.Vector3(0, 0, 0),
+            vel: new THREE.Vector3(0, 0, 0),
+            pinned: state.hubPinned,
+            isHub: true
+        };
+        nodes.push(hubNode);
+
+        // Load GLTF
+        const loader = new GLTFLoader();
+        loader.load('https://raw.githubusercontent.com/mrdoob/three.js/master/examples/models/gltf/facecap.glb', (gltf) => {
+            const model = gltf.scene;
+            model.scale.set(2, 2, 2);
+            hubGroup.add(model);
+            const sprite = createTextSprite('HUB', '#ffffff');
+            sprite.position.y = 3;
+            hubGroup.add(sprite);
+            state.modelLoaded = true;
+        });
+
+        // Satellite Nodes
+        const satelliteMeshes = [];
+        for (let i = 0; i < 8; i++) {
+            const isServer = i < 4;
+            const id = isServer ? `server_${i}` : `client_${i - 4}`;
+            const colorHex = isServer ? 0x4488ff : 0x44ff88;
+            const colorStr = isServer ? '#4488ff' : '#44ff88';
+
+            const angle = (i / 8) * Math.PI * 2;
+            const x = Math.cos(angle) * 12;
+            const z = Math.sin(angle) * 12;
+
+            const geometry = new THREE.SphereGeometry(0.5, 32, 32);
+            const material = new THREE.MeshStandardMaterial({
+                color: colorHex,
+                emissive: colorHex,
+                emissiveIntensity: 0.5
+            });
+            const mesh = new THREE.Mesh(geometry, material);
+            mesh.position.set(x, 0, z);
+            mesh.userData = { id: id, originalEmissive: 0.5 };
+            
+            const sprite = createTextSprite(id, colorStr);
+            mesh.add(sprite);
+            scene.add(mesh);
+            satelliteMeshes.push(mesh);
+
+            nodes.push({
+                id: id,
+                mesh: mesh,
+                pos: mesh.position.clone(),
+                vel: new THREE.Vector3(0, 0, 0),
+                pinned: false,
+                isHub: false
+            });
+        }
+
+        // --- Edge Creation ---
+        const lineMaterialBase = new THREE.LineBasicMaterial({ color: 0x44ff88, transparent: true, opacity: 0.6 });
+        const highlightMaterial = new THREE.LineBasicMaterial({ color: 0xffffff, linewidth: 2, transparent: false, opacity: 1 });
+
+        function createEdge(sourceId, targetId, restLength, isPath = false) {
+            const source = nodes.find(n => n.id === sourceId);
+            const target = nodes.find(n => n.id === targetId);
+            
+            const geometry = new THREE.BufferGeometry().setFromPoints([source.pos, target.pos]);
+            const material = lineMaterialBase.clone();
+            const line = new THREE.Line(geometry, material);
+            scene.add(line);
+
+            const edge = {
+                source, target, restLength, line, traffic: 0, isPathEdge: isPath
+            };
+            edges.push(edge);
+            return edge;
+        }
+
+        // Hub connections (8)
+        for (let i = 1; i < 9; i++) {
+            createEdge('hub', nodes[i].id, 12);
+        }
+
+        // Peer connections (4) - forming a path c0 -> s1 -> c2
+        createEdge('client_0', 'server_1', 8, true);
+        createEdge('server_1', 'client_2', 8, true);
+        createEdge('client_2', 'server_3', 8);
+        createEdge('server_3', 'client_0', 8);
+
+        // --- Physics Parameters ---
+        const REPULSION = 50;
+        const SPRING_K = 0.02;
+        const GRAVITY = 0.01;
+
+        // --- Interaction ---
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        window.addEventListener('click', (event) => {
+            mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+            raycaster.setFromCamera(mouse, camera);
+
+            const intersects = raycaster.intersectObjects(satelliteMeshes);
+            if (intersects.length > 0) {
+                const mesh = intersects[0].object;
+                const nodeId = mesh.userData.id;
+                const node = nodes.find(n => n.id === nodeId);
+
+                if (state.selectedNodeId === nodeId) {
+                    // Deselect
+                    state.selectedNodeId = null;
+                    node.pinned = false;
+                    mesh.material.emissiveIntensity = mesh.userData.originalEmissive;
+                } else {
+                    // Deselect previous
+                    if (state.selectedNodeId) {
+                        const prevNode = nodes.find(n => n.id === state.selectedNodeId);
+                        if (prevNode) {
+                            prevNode.pinned = false;
+                            prevNode.mesh.material.emissiveIntensity = prevNode.mesh.userData.originalEmissive;
+                        }
+                    }
+                    // Select new
+                    state.selectedNodeId = nodeId;
+                    node.pinned = true;
+                    mesh.material.emissiveIntensity = 1.0;
+                }
+            }
+        });
+
+        // --- Controls ---
+        const btnTogglePhysics = document.getElementById('btn-toggle-physics');
+        const btnToggleDebug = document.getElementById('btn-toggle-debug');
+        const btnResetLayout = document.getElementById('btn-reset-layout');
+        const btnPinHub = document.getElementById('btn-pin-hub');
+        const btnAddTraffic = document.getElementById('btn-add-traffic');
+        const btnHighlightPath = document.getElementById('btn-highlight-path');
+        const debugOverlay = document.getElementById('debug-overlay');
+
+        function togglePhysics() {
+            state.physicsRunning = !state.physicsRunning;
+            btnTogglePhysics.innerText = state.physicsRunning ? 'Pause Physics' : 'Resume Physics';
+        }
+
+        function toggleDebug() {
+            state.debugVisible = !state.debugVisible;
+            debugOverlay.style.display = state.debugVisible ? 'block' : 'none';
+        }
+
+        function resetLayout() {
+            nodes.forEach((node, i) => {
+                node.vel.set(0, 0, 0);
+                if (node.isHub) {
+                    node.pos.set(0, 0, 0);
+                } else {
+                    const angle = ((i - 1) / 8) * Math.PI * 2;
+                    node.pos.set(Math.cos(angle) * 12, 0, Math.sin(angle) * 12);
+                }
+            });
+        }
+
+        function togglePinHub() {
+            state.hubPinned = !state.hubPinned;
+            hubNode.pinned = state.hubPinned;
+            btnPinHub.innerText = state.hubPinned ? 'Unpin Hub' : 'Pin Hub';
+        }
+
+        function getTrafficColor(traffic) {
+            if (traffic < 0.33) return 0x44ff88;
+            if (traffic < 0.66) return 0xffff44;
+            return 0xff4444;
+        }
+
+        function addTraffic() {
+            state.trafficBurstApplied = true;
+            edges.forEach(edge => {
+                edge.traffic = Math.random();
+                if (!state.pathHighlighted || !edge.isPathEdge) {
+                    edge.line.material.color.setHex(getTrafficColor(edge.traffic));
+                }
+            });
+        }
+
+        function highlightPath() {
+            state.pathHighlighted = true;
+            edges.forEach(edge => {
+                if (edge.isPathEdge) {
+                    edge.line.material = highlightMaterial;
+                }
+            });
+        }
+
+        btnTogglePhysics.addEventListener('click', togglePhysics);
+        btnToggleDebug.addEventListener('click', toggleDebug);
+        btnResetLayout.addEventListener('click', resetLayout);
+        btnPinHub.addEventListener('click', togglePinHub);
+        btnAddTraffic.addEventListener('click', addTraffic);
+        btnHighlightPath.addEventListener('click', highlightPath);
+
+        window.addEventListener('keydown', (e) => {
+            if (e.code === 'Space') togglePhysics();
+            if (e.code === 'KeyD') toggleDebug();
+            if (e.code === 'KeyR') resetLayout();
+            if (e.code === 'KeyP') togglePinHub();
+        });
+
+        // --- Animation Loop ---
+        let lastTime = performance.now();
+        let frames = 0;
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const time = performance.now();
+            frames++;
+            if (time >= lastTime + 1000) {
+                state.fps = Math.round((frames * 1000) / (time - lastTime));
+                frames = 0;
+                lastTime = time;
+            }
+
+            state.frameCount++;
+
+            if (state.physicsRunning) {
+                // Forces
+                for (let i = 0; i < nodes.length; i++) {
+                    const n1 = nodes[i];
+                    let force = new THREE.Vector3();
+
+                    // Gravity to origin
+                    force.addScaledVector(n1.pos, -GRAVITY);
+
+                    // Repulsion
+                    for (let j = 0; j < nodes.length; j++) {
+                        if (i === j) continue;
+                        const n2 = nodes[j];
+                        const diff = new THREE.Vector3().subVectors(n1.pos, n2.pos);
+                        const distSq = diff.lengthSq() + 0.1;
+                        const dist = Math.sqrt(distSq);
+                        force.addScaledVector(diff.normalize(), REPULSION / distSq);
+                    }
+                    n1.vel.add(force);
+                }
+
+                // Springs
+                edges.forEach(edge => {
+                    const diff = new THREE.Vector3().subVectors(edge.target.pos, edge.source.pos);
+                    const dist = diff.length();
+                    const forceMag = (dist - edge.restLength) * SPRING_K;
+                    const force = diff.normalize().multiplyScalar(forceMag);
+                    
+                    edge.source.vel.add(force);
+                    edge.target.vel.sub(force);
+                });
+
+                // Update Pos & Vel
+                nodes.forEach(node => {
+                    node.vel.multiplyScalar(state.dampingFactor);
+                    if (!node.pinned) {
+                        node.pos.add(node.vel);
+                    }
+                    // Keep y near 0 for satellites
+                    if (!node.isHub) {
+                        node.pos.y *= 0.9; 
+                    }
+                });
+            }
+
+            // Update Meshes & Lines & State
+            let ke = 0;
+            let totalEdgeLen = 0;
+            state.nodePositions = [];
+            state.nodesHaveNaN = false;
+
+            nodes.forEach(node => {
+                if (isNaN(node.pos.x)) state.nodesHaveNaN = true;
+                node.mesh.position.copy(node.pos);
+                ke += 0.5 * node.vel.lengthSq();
+                state.nodePositions.push({ id: node.id, x: node.pos.x, y: node.pos.y, z: node.pos.z });
+            });
+
+            state.hubPosition = { x: hubNode.pos.x, y: hubNode.pos.y, z: hubNode.pos.z };
+
+            edges.forEach(edge => {
+                const positions = edge.line.geometry.attributes.position.array;
+                positions[0] = edge.source.pos.x;
+                positions[1] = edge.source.pos.y;
+                positions[2] = edge.source.pos.z;
+                positions[3] = edge.target.pos.x;
+                positions[4] = edge.target.pos.y;
+                positions[5] = edge.target.pos.z;
+                edge.line.geometry.attributes.position.needsUpdate = true;
+                
+                totalEdgeLen += edge.source.pos.distanceTo(edge.target.pos);
+            });
+
+            state.totalKineticEnergy = ke;
+            state.averageEdgeLength = edges.length > 0 ? totalEdgeLen / edges.length : 0;
+
+            // Update Debug DOM
+            if (state.debugVisible) {
+                document.getElementById('dbg-fps').innerText = state.fps;
+                document.getElementById('dbg-physics').innerText = state.physicsRunning ? 'RUNNING' : 'PAUSED';
+                document.getElementById('dbg-nodes').innerText = state.nodeCount;
+                document.getElementById('dbg-edges').innerText = state.edgeCount;
+                document.getElementById('dbg-ke').innerText = state.totalKineticEnergy.toFixed(2);
+                document.getElementById('dbg-ael').innerText = state.averageEdgeLength.toFixed(2);
+            }
+
+            controls.update();
+            renderer.render(scene, camera);
+        }
+
+        animate();
+    </script>
+</body>
+</html>

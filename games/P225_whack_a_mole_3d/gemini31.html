@@ -1,0 +1,447 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Whack-a-Mole</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            user-select: none;
+            background-color: #87CEEB;
+        }
+        #hud {
+            position: absolute;
+            top: 15px;
+            left: 15px;
+            color: white;
+            font-size: 22px;
+            font-weight: bold;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.8);
+            pointer-events: none;
+            z-index: 10;
+        }
+        #startButton {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            padding: 15px 40px;
+            font-size: 28px;
+            font-weight: bold;
+            color: white;
+            background-color: #ff4757;
+            border: none;
+            border-radius: 10px;
+            cursor: pointer;
+            box-shadow: 0 6px 0 #ff1e34, 0 10px 20px rgba(0,0,0,0.3);
+            transition: transform 0.1s, box-shadow 0.1s;
+            z-index: 20;
+        }
+        #startButton:active {
+            transform: translate(-50%, calc(-50% + 6px));
+            box-shadow: 0 0 0 #ff1e34, 0 4px 10px rgba(0,0,0,0.3);
+        }
+        #gameOverOverlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.8);
+            color: white;
+            display: none;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            z-index: 30;
+        }
+        #gameOverOverlay h1 {
+            font-size: 64px;
+            margin: 0 0 20px 0;
+            color: #ff4757;
+            text-shadow: 0 0 10px rgba(255, 71, 87, 0.5);
+        }
+        #gameOverOverlay p {
+            font-size: 32px;
+            margin: 0;
+        }
+    </style>
+</head>
+<body>
+    <div id="hud">Score: 0 | Time: 30s | Combo: x0</div>
+    <button id="startButton">Start Game</button>
+    <div id="gameOverOverlay">
+        <h1>Game Over!</h1>
+        <p id="finalScore">Score: 0</p>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js';
+        import { GLTFLoader } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/GLTFLoader.js';
+
+        // --- State Management ---
+        window.__3D_STATE__ = {
+            phase: 'waiting',
+            score: 0,
+            timeLeft: 30,
+            molesWhacked: 0,
+            misses: 0,
+            currentCombo: 0,
+            maxCombo: 0,
+            activeMoles: 0,
+            totalPops: 0,
+            molePositions: Array(9).fill({x: 0, y: 0, z: 0}),
+            particlesActive: 0,
+            gameStarted: false,
+            modelLoaded: false
+        };
+
+        // --- Scene Setup ---
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x87CEEB); // Sky blue
+
+        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+        camera.position.set(0, 8, 10);
+        camera.lookAt(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        document.body.appendChild(renderer.domElement);
+
+        // Lights
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+        dirLight.position.set(5, 10, 5);
+        dirLight.castShadow = true;
+        dirLight.shadow.camera.left = -10;
+        dirLight.shadow.camera.right = 10;
+        dirLight.shadow.camera.top = 10;
+        dirLight.shadow.camera.bottom = -10;
+        dirLight.shadow.mapSize.width = 1024;
+        dirLight.shadow.mapSize.height = 1024;
+        scene.add(dirLight);
+
+        // Ground
+        const groundGeo = new THREE.PlaneGeometry(20, 20);
+        const groundMat = new THREE.MeshStandardMaterial({ color: 0x2e8b57 }); // Green
+        const ground = new THREE.Mesh(groundGeo, groundMat);
+        ground.rotation.x = -Math.PI / 2;
+        ground.receiveShadow = true;
+        scene.add(ground);
+
+        // Holes
+        const holeGeo = new THREE.CylinderGeometry(0.6, 0.6, 0.15, 32);
+        const holeMat = new THREE.MeshStandardMaterial({ color: 0x3d2314 }); // Brown
+        const holePositions = [
+            [-2.5, -2.5], [0, -2.5], [2.5, -2.5],
+            [-2.5, 0],    [0, 0],    [2.5, 0],
+            [-2.5, 2.5],  [0, 2.5],  [2.5, 2.5]
+        ];
+
+        holePositions.forEach(pos => {
+            const hole = new THREE.Mesh(holeGeo, holeMat);
+            hole.position.set(pos[0], 0.075, pos[1]);
+            hole.receiveShadow = true;
+            hole.castShadow = true;
+            scene.add(hole);
+        });
+
+        // --- Moles Setup ---
+        const moles = [];
+        for (let i = 0; i < 9; i++) {
+            moles.push({
+                index: i,
+                mesh: null,
+                state: 'hidden', // 'hidden', 'popping', 'up', 'hiding'
+                yPos: -1.5,
+                timer: 0,
+                wasHit: false,
+                originalMaterials: new Map()
+            });
+        }
+
+        const loader = new GLTFLoader();
+        loader.load('._BrainStem.glb', (gltf) => {
+            setupMoles(gltf.scene);
+        }, undefined, (error) => {
+            console.warn("Could not load '._BrainStem.glb', falling back to basic geometry.", error);
+            // Fallback geometry if the specific file is not found
+            const fallbackGeo = new THREE.CapsuleGeometry(0.4, 0.6, 4, 8);
+            const fallbackMat = new THREE.MeshStandardMaterial({ color: 0x8B4513 });
+            const fallbackMesh = new THREE.Mesh(fallbackGeo, fallbackMat);
+            setupMoles(fallbackMesh);
+        });
+
+        function setupMoles(baseModel) {
+            baseModel.scale.set(0.4, 0.4, 0.4);
+            
+            for (let i = 0; i < 9; i++) {
+                const clone = baseModel.clone();
+                clone.position.set(holePositions[i][0], -1.5, holePositions[i][1]);
+                
+                clone.traverse((child) => {
+                    if (child.isMesh) {
+                        child.castShadow = true;
+                        child.receiveShadow = true;
+                        moles[i].originalMaterials.set(child, child.material);
+                    }
+                });
+                
+                clone.userData.holeIndex = i;
+                scene.add(clone);
+                moles[i].mesh = clone;
+            }
+            window.__3D_STATE__.modelLoaded = true;
+        }
+
+        // --- Game Mechanics Variables ---
+        let lastTime = performance.now();
+        let gameTimer = 30;
+        let spawnTimer = 0;
+        const particles = [];
+        const flashMaterial = new THREE.MeshBasicMaterial({ color: 0xff0000 });
+        const particleGeo = new THREE.SphereGeometry(0.1, 8, 8);
+        const particleMat = new THREE.MeshBasicMaterial({ color: 0xffff00 });
+
+        // --- Input Handling ---
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+
+        window.addEventListener('pointerdown', (event) => {
+            if (window.__3D_STATE__.phase !== 'playing') return;
+
+            mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+            raycaster.setFromCamera(mouse, camera);
+            
+            const interactableMeshes = moles.map(m => m.mesh).filter(m => m !== null);
+            const intersects = raycaster.intersectObjects(interactableMeshes, true);
+
+            if (intersects.length > 0) {
+                let hitObject = intersects[0].object;
+                let rootMoleMesh = hitObject;
+                
+                // Traverse up to find the root object with userData
+                while (rootMoleMesh.parent && rootMoleMesh.userData.holeIndex === undefined) {
+                    rootMoleMesh = rootMoleMesh.parent;
+                }
+
+                const holeIndex = rootMoleMesh.userData.holeIndex;
+                if (holeIndex !== undefined) {
+                    const mole = moles[holeIndex];
+                    if (mole.state === 'popping' || mole.state === 'up') {
+                        handleHit(mole);
+                    }
+                }
+            }
+        });
+
+        function handleHit(mole) {
+            mole.wasHit = true;
+            mole.state = 'hiding';
+            
+            window.__3D_STATE__.currentCombo++;
+            if (window.__3D_STATE__.currentCombo > window.__3D_STATE__.maxCombo) {
+                window.__3D_STATE__.maxCombo = window.__3D_STATE__.currentCombo;
+            }
+
+            const points = 10 * window.__3D_STATE__.currentCombo;
+            window.__3D_STATE__.score += points;
+            window.__3D_STATE__.molesWhacked++;
+
+            flashMole(mole);
+            createParticles(mole.mesh.position);
+        }
+
+        function flashMole(mole) {
+            mole.mesh.traverse((child) => {
+                if (child.isMesh) {
+                    child.material = flashMaterial;
+                }
+            });
+            
+            setTimeout(() => {
+                if (mole.mesh) {
+                    mole.mesh.traverse((child) => {
+                        if (child.isMesh) {
+                            child.material = mole.originalMaterials.get(child);
+                        }
+                    });
+                }
+            }, 200);
+        }
+
+        function createParticles(pos) {
+            for (let i = 0; i < 8; i++) {
+                const mesh = new THREE.Mesh(particleGeo, particleMat);
+                mesh.position.copy(pos);
+                mesh.position.y += 0.5; // Center of mole
+                scene.add(mesh);
+
+                const angle = (i / 8) * Math.PI * 2;
+                const speed = 3 + Math.random() * 2;
+                const velocity = new THREE.Vector3(
+                    Math.cos(angle) * speed,
+                    2 + Math.random() * 3,
+                    Math.sin(angle) * speed
+                );
+
+                particles.push({
+                    mesh: mesh,
+                    velocity: velocity,
+                    life: 0.5,
+                    maxLife: 0.5
+                });
+            }
+        }
+
+        // --- UI Logic ---
+        const startButton = document.getElementById('startButton');
+        const gameOverOverlay = document.getElementById('gameOverOverlay');
+        const hud = document.getElementById('hud');
+        const finalScoreText = document.getElementById('finalScore');
+
+        startButton.addEventListener('click', () => {
+            window.__3D_STATE__.phase = 'playing';
+            window.__3D_STATE__.score = 0;
+            window.__3D_STATE__.misses = 0;
+            window.__3D_STATE__.molesWhacked = 0;
+            window.__3D_STATE__.currentCombo = 0;
+            window.__3D_STATE__.gameStarted = true;
+            
+            gameTimer = 30;
+            spawnTimer = 0;
+            
+            startButton.style.display = 'none';
+            gameOverOverlay.style.display = 'none';
+        });
+
+        // --- Main Loop ---
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const currentTime = performance.now();
+            const dt = Math.min((currentTime - lastTime) / 1000, 0.1); // Cap dt
+            lastTime = currentTime;
+
+            const state = window.__3D_STATE__;
+
+            // Game Logic
+            if (state.phase === 'playing') {
+                // Timer
+                gameTimer -= dt;
+                state.timeLeft = Math.max(0, Math.ceil(gameTimer));
+                
+                if (gameTimer <= 0) {
+                    state.phase = 'gameover';
+                    gameOverOverlay.style.display = 'flex';
+                    finalScoreText.innerText = `Score: ${state.score}`;
+                    
+                    // Force all moles down
+                    moles.forEach(m => {
+                        if (m.state !== 'hidden') m.state = 'hiding';
+                    });
+                }
+
+                // Spawning
+                spawnTimer += dt;
+                let activeCount = moles.filter(m => m.state !== 'hidden').length;
+                
+                if (spawnTimer >= 1.2 && activeCount < 2) {
+                    spawnTimer = 0;
+                    const hiddenMoles = moles.filter(m => m.state === 'hidden');
+                    if (hiddenMoles.length > 0) {
+                        const randomMole = hiddenMoles[Math.floor(Math.random() * hiddenMoles.length)];
+                        randomMole.state = 'popping';
+                        randomMole.wasHit = false;
+                        state.totalPops++;
+                    }
+                }
+            }
+
+            // Mole Animations
+            let currentActiveMoles = 0;
+            const animSpeed = (0.5 - -1.5) / 0.3; // units per second
+
+            moles.forEach(mole => {
+                if (!mole.mesh) return;
+
+                if (mole.state === 'popping') {
+                    mole.yPos += animSpeed * dt;
+                    if (mole.yPos >= 0.5) {
+                        mole.yPos = 0.5;
+                        mole.state = 'up';
+                        mole.timer = 0;
+                    }
+                    currentActiveMoles++;
+                } else if (mole.state === 'up') {
+                    mole.timer += dt;
+                    if (mole.timer >= 1.5) {
+                        mole.state = 'hiding';
+                    }
+                    currentActiveMoles++;
+                } else if (mole.state === 'hiding') {
+                    mole.yPos -= animSpeed * dt;
+                    if (mole.yPos <= -1.5) {
+                        mole.yPos = -1.5;
+                        mole.state = 'hidden';
+                        
+                        if (state.phase === 'playing' && !mole.wasHit) {
+                            state.misses++;
+                            state.currentCombo = 0;
+                        }
+                    }
+                    currentActiveMoles++;
+                }
+
+                mole.mesh.position.y = mole.yPos;
+            });
+            state.activeMoles = currentActiveMoles;
+
+            // Update Mole Positions for State
+            state.molePositions = moles.map(m => {
+                return m.mesh ? { x: m.mesh.position.x, y: m.mesh.position.y, z: m.mesh.position.z } : { x: 0, y: 0, z: 0 };
+            });
+
+            // Particles Animation
+            for (let i = particles.length - 1; i >= 0; i--) {
+                const p = particles[i];
+                p.life -= dt;
+                if (p.life <= 0) {
+                    scene.remove(p.mesh);
+                    particles.splice(i, 1);
+                } else {
+                    p.mesh.position.addScaledVector(p.velocity, dt);
+                    p.velocity.y -= 15 * dt; // Gravity
+                    const scale = p.life / p.maxLife;
+                    p.mesh.scale.set(scale, scale, scale);
+                }
+            }
+            state.particlesActive = particles.length;
+
+            // Update HUD
+            hud.innerText = `Score: ${state.score} | Time: ${state.timeLeft}s | Combo: x${state.currentCombo}`;
+
+            renderer.render(scene, camera);
+        }
+
+        // Handle Resize
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // Start Loop
+        animate();
+    </script>
+</body>
+</html>

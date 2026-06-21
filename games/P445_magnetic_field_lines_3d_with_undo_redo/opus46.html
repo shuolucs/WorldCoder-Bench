@@ -1,0 +1,766 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3D Magnetic Field Visualizer</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { overflow: hidden; background: #1a1a2e; font-family: 'Segoe UI', Arial, sans-serif; }
+  canvas { display: block; }
+  
+  #ui-panel {
+    position: absolute;
+    top: 15px;
+    left: 15px;
+    background: rgba(10, 10, 30, 0.85);
+    border: 1px solid rgba(100, 100, 255, 0.3);
+    border-radius: 10px;
+    padding: 18px;
+    color: #e0e0ff;
+    font-size: 14px;
+    min-width: 220px;
+    backdrop-filter: blur(10px);
+    box-shadow: 0 4px 20px rgba(0,0,0,0.5);
+  }
+  
+  #ui-panel h3 {
+    margin-bottom: 12px;
+    color: #8888ff;
+    font-size: 16px;
+    border-bottom: 1px solid rgba(100,100,255,0.2);
+    padding-bottom: 8px;
+  }
+  
+  .info-row {
+    margin-bottom: 6px;
+    display: flex;
+    justify-content: space-between;
+  }
+  
+  .info-label { color: #9999cc; }
+  .info-value { color: #ffffff; font-weight: bold; }
+  
+  .btn-row {
+    margin-top: 14px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  
+  .btn {
+    padding: 8px 14px;
+    background: rgba(60, 60, 120, 0.8);
+    color: #ffffff;
+    border: 1px solid rgba(100, 100, 255, 0.4);
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 13px;
+    transition: all 0.2s;
+  }
+  
+  .btn:hover {
+    background: rgba(80, 80, 160, 0.9);
+    border-color: rgba(140, 140, 255, 0.6);
+  }
+  
+  .btn:active {
+    background: rgba(100, 100, 200, 0.9);
+  }
+  
+  .btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+  
+  #controls-help {
+    position: absolute;
+    bottom: 15px;
+    left: 15px;
+    background: rgba(10, 10, 30, 0.75);
+    border: 1px solid rgba(100, 100, 255, 0.2);
+    border-radius: 8px;
+    padding: 12px 16px;
+    color: #8888bb;
+    font-size: 12px;
+    line-height: 1.6;
+  }
+</style>
+</head>
+<body>
+
+<div id="ui-panel">
+  <h3>🧲 Magnetic Field 3D</h3>
+  <div class="info-row">
+    <span class="info-label">Magnets:</span>
+    <span class="info-value" id="magnetCount">1</span>
+  </div>
+  <div class="info-row">
+    <span class="info-label">History:</span>
+    <span class="info-value"><span id="historyCount">0</span> actions</span>
+  </div>
+  <div class="info-row">
+    <span class="info-label">Selected:</span>
+    <span class="info-value" id="selectedInfo">none</span>
+  </div>
+  <div class="info-row">
+    <span class="info-label">Field Lines:</span>
+    <span class="info-value" id="fieldStatus">visible</span>
+  </div>
+  <div class="btn-row">
+    <button class="btn" id="addMagnetBtn">Add Magnet</button>
+    <button class="btn" id="toggleFieldBtn">Toggle Field Lines</button>
+  </div>
+  <div class="btn-row">
+    <button class="btn" id="undoBtn">Undo</button>
+    <button class="btn" id="redoBtn">Redo</button>
+  </div>
+</div>
+
+<div id="controls-help">
+  <strong>Controls:</strong> Click magnet to select | WASD to move | ←→ to rotate | Delete to remove<br>
+  Ctrl+Z Undo | Ctrl+Y Redo | Mouse drag to orbit
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<script>
+(function() {
+  // ============ SCENE SETUP ============
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x1a1a2e);
+
+  const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+  camera.position.set(0, 12, 18);
+  camera.lookAt(0, 0, 0);
+
+  const renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.setPixelRatio(window.devicePixelRatio);
+  document.body.appendChild(renderer.domElement);
+
+  const controls = new THREE.OrbitControls(camera, renderer.domElement);
+  controls.enableDamping = true;
+  controls.dampingFactor = 0.08;
+  controls.target.set(0, 0, 0);
+
+  // Grid
+  const gridHelper = new THREE.GridHelper(20, 20, 0x444466, 0x333355);
+  scene.add(gridHelper);
+
+  // Lighting
+  const ambientLight = new THREE.AmbientLight(0x404040, 0.5);
+  scene.add(ambientLight);
+  const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+  dirLight.position.set(5, 10, 5);
+  scene.add(dirLight);
+
+  // ============ STATE ============
+  let magnets = []; // { id, group, northMesh, southMesh, position: {x,y,z}, rotationY, outline }
+  let nextMagnetId = 0;
+  let selectedMagnetId = -1;
+  let fieldLinesGroup = new THREE.Group();
+  scene.add(fieldLinesGroup);
+  let fieldLinesVisible = true;
+
+  let undoStack = [];
+  let redoStack = [];
+  let lastAction = 'none';
+
+  const raycaster = new THREE.Raycaster();
+  const mouse = new THREE.Vector2();
+
+  // ============ MAGNET CREATION ============
+  function createMagnetMesh(x, y, z, rotY) {
+    const group = new THREE.Group();
+
+    // North half (red) - in local space, north is +X
+    const northGeo = new THREE.BoxGeometry(0.75, 0.5, 0.5);
+    const northMat = new THREE.MeshPhongMaterial({ color: 0xff3333 });
+    const northMesh = new THREE.Mesh(northGeo, northMat);
+    northMesh.position.set(0.375, 0, 0);
+    group.add(northMesh);
+
+    // South half (blue)
+    const southGeo = new THREE.BoxGeometry(0.75, 0.5, 0.5);
+    const southMat = new THREE.MeshPhongMaterial({ color: 0x3333ff });
+    const southMesh = new THREE.Mesh(southGeo, southMat);
+    southMesh.position.set(-0.375, 0, 0);
+    group.add(southMesh);
+
+    // N/S labels
+    const canvas = document.createElement('canvas');
+    canvas.width = 64; canvas.height = 64;
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 48px Arial';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('N', 32, 32);
+    const nTex = new THREE.CanvasTexture(canvas);
+    const nSprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: nTex, transparent: true }));
+    nSprite.scale.set(0.3, 0.3, 0.3);
+    nSprite.position.set(0.375, 0.4, 0);
+    group.add(nSprite);
+
+    const canvas2 = document.createElement('canvas');
+    canvas2.width = 64; canvas2.height = 64;
+    const ctx2 = canvas2.getContext('2d');
+    ctx2.fillStyle = '#ffffff';
+    ctx2.font = 'bold 48px Arial';
+    ctx2.textAlign = 'center';
+    ctx2.textBaseline = 'middle';
+    ctx2.fillText('S', 32, 32);
+    const sTex = new THREE.CanvasTexture(canvas2);
+    const sSprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: sTex, transparent: true }));
+    sSprite.scale.set(0.3, 0.3, 0.3);
+    sSprite.position.set(-0.375, 0.4, 0);
+    group.add(sSprite);
+
+    group.position.set(x, y, z);
+    group.rotation.y = rotY;
+
+    scene.add(group);
+
+    return { group, northMesh, southMesh };
+  }
+
+  function addMagnet(x, y, z, rotY, id) {
+    if (id === undefined) id = nextMagnetId++;
+    else if (id >= nextMagnetId) nextMagnetId = id + 1;
+
+    const { group, northMesh, southMesh } = createMagnetMesh(x, y, z, rotY);
+
+    const magnet = {
+      id: id,
+      group: group,
+      northMesh: northMesh,
+      southMesh: southMesh,
+      position: { x, y, z },
+      rotationY: rotY,
+      outline: null
+    };
+
+    // Store magnet id on meshes for raycasting
+    northMesh.userData.magnetId = id;
+    southMesh.userData.magnetId = id;
+
+    magnets.push(magnet);
+    return magnet;
+  }
+
+  function removeMagnetById(id) {
+    const idx = magnets.findIndex(m => m.id === id);
+    if (idx === -1) return null;
+    const magnet = magnets[idx];
+    if (magnet.outline) {
+      magnet.group.remove(magnet.outline);
+    }
+    scene.remove(magnet.group);
+    magnets.splice(idx, 1);
+    if (selectedMagnetId === id) {
+      selectedMagnetId = -1;
+    }
+    return magnet;
+  }
+
+  function getMagnetById(id) {
+    return magnets.find(m => m.id === id);
+  }
+
+  // ============ SELECTION ============
+  function selectMagnet(id) {
+    // Deselect previous
+    if (selectedMagnetId !== -1) {
+      const prev = getMagnetById(selectedMagnetId);
+      if (prev && prev.outline) {
+        prev.group.remove(prev.outline);
+        prev.outline = null;
+      }
+    }
+
+    selectedMagnetId = id;
+
+    if (id !== -1) {
+      const magnet = getMagnetById(id);
+      if (magnet) {
+        // Create yellow wireframe outline around the full magnet
+        const outlineGeo = new THREE.BoxGeometry(1.5, 0.5, 0.5);
+        const edges = new THREE.EdgesGeometry(outlineGeo);
+        const outline = new THREE.LineSegments(edges, new THREE.LineBasicMaterial({ color: 0xffff00, linewidth: 2 }));
+        magnet.group.add(outline);
+        magnet.outline = outline;
+      }
+    }
+    updateUI();
+  }
+
+  // ============ FIELD LINE COMPUTATION ============
+  function getMagnetDipole(magnet) {
+    // Dipole moment direction: local +X rotated by rotationY
+    const angle = magnet.rotationY;
+    const mx = Math.cos(angle);
+    const mz = -Math.sin(angle);
+    return {
+      pos: new THREE.Vector3(magnet.position.x, magnet.position.y, magnet.position.z),
+      moment: new THREE.Vector3(mx, 0, mz) // unit dipole moment
+    };
+  }
+
+  function computeFieldAt(point, dipoles) {
+    const B = new THREE.Vector3(0, 0, 0);
+    const temp = new THREE.Vector3();
+    const rVec = new THREE.Vector3();
+
+    for (let i = 0; i < dipoles.length; i++) {
+      const d = dipoles[i];
+      rVec.copy(point).sub(d.pos);
+      const r = rVec.length();
+      if (r < 0.2) continue; // avoid singularity
+
+      const r3 = r * r * r;
+      const r5 = r3 * r * r;
+      const mDotR = d.moment.dot(rVec);
+
+      // B = (3(m·r̂)r̂ - m) / r³  (simplified, dropping constants)
+      temp.copy(rVec).multiplyScalar(3 * mDotR / (r5));
+      temp.sub(new THREE.Vector3().copy(d.moment).multiplyScalar(1 / r3));
+
+      B.add(temp);
+    }
+
+    return B;
+  }
+
+  function traceFieldLine(startPoint, dipoles, direction) {
+    const points = [startPoint.clone()];
+    const current = startPoint.clone();
+    const stepSize = 0.3;
+    const maxSteps = 100;
+
+    for (let i = 0; i < maxSteps; i++) {
+      const B = computeFieldAt(current, dipoles);
+      const mag = B.length();
+      if (mag < 0.0001) break;
+
+      B.normalize().multiplyScalar(stepSize * direction);
+      current.add(B);
+
+      // Stop if too far from origin
+      if (current.length() > 15) break;
+
+      // Stop if below floor
+      if (current.y < -0.5) break;
+
+      // Stop if very close to any south pole (for direction=1) or north pole (for direction=-1)
+      let nearPole = false;
+      for (const d of dipoles) {
+        const southPos = new THREE.Vector3().copy(d.pos).sub(
+          new THREE.Vector3().copy(d.moment).multiplyScalar(0.75)
+        );
+        const northPos = new THREE.Vector3().copy(d.pos).add(
+          new THREE.Vector3().copy(d.moment).multiplyScalar(0.75)
+        );
+
+        if (direction === 1 && current.distanceTo(southPos) < 0.4) {
+          points.push(current.clone());
+          nearPole = true;
+          break;
+        }
+        if (direction === -1 && current.distanceTo(northPos) < 0.4) {
+          points.push(current.clone());
+          nearPole = true;
+          break;
+        }
+      }
+      if (nearPole) break;
+
+      points.push(current.clone());
+    }
+
+    return points;
+  }
+
+  function generateFieldLines() {
+    // Clear existing
+    while (fieldLinesGroup.children.length > 0) {
+      const child = fieldLinesGroup.children[0];
+      if (child.geometry) child.geometry.dispose();
+      if (child.material) child.material.dispose();
+      fieldLinesGroup.remove(child);
+    }
+
+    if (magnets.length === 0) return;
+
+    const dipoles = magnets.map(m => getMagnetDipole(m));
+
+    for (const magnet of magnets) {
+      const dipole = getMagnetDipole(magnet);
+      // North pole face center in world space
+      const northCenter = new THREE.Vector3().copy(dipole.pos).add(
+        new THREE.Vector3().copy(dipole.moment).multiplyScalar(0.75)
+      );
+
+      // Generate 8 start points around the north pole face
+      const perpY = new THREE.Vector3(0, 1, 0);
+      const perpZ = new THREE.Vector3().crossVectors(dipole.moment, perpY).normalize();
+      if (perpZ.length() < 0.01) {
+        perpZ.set(0, 0, 1);
+      }
+      const perpYDir = new THREE.Vector3().crossVectors(perpZ, dipole.moment).normalize();
+
+      const radius = 0.2;
+      for (let i = 0; i < 8; i++) {
+        const angle = (i / 8) * Math.PI * 2;
+        const offset = new THREE.Vector3()
+          .addScaledVector(perpYDir, Math.cos(angle) * radius)
+          .addScaledVector(perpZ, Math.sin(angle) * radius);
+
+        const startPoint = northCenter.clone().add(offset);
+
+        const points = traceFieldLine(startPoint, dipoles, 1);
+
+        if (points.length < 2) continue;
+
+        // Create line with vertex colors (gradient red to blue)
+        const geometry = new THREE.BufferGeometry();
+        const positions = [];
+        const colors = [];
+
+        for (let j = 0; j < points.length; j++) {
+          positions.push(points[j].x, points[j].y, points[j].z);
+          const t = j / (points.length - 1);
+          // Red to blue gradient
+          const r = 1.0 - t * 0.7;
+          const g = 0.2 + Math.sin(t * Math.PI) * 0.3;
+          const b = 0.2 + t * 0.8;
+          colors.push(r, g, b);
+        }
+
+        geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+        geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+
+        const material = new THREE.LineBasicMaterial({
+          vertexColors: true,
+          linewidth: 1,
+          transparent: true,
+          opacity: 0.8
+        });
+
+        const line = new THREE.Line(geometry, material);
+        fieldLinesGroup.add(line);
+      }
+    }
+
+    fieldLinesGroup.visible = fieldLinesVisible;
+  }
+
+  // ============ UNDO/REDO ============
+  function pushAction(action) {
+    undoStack.push(action);
+    redoStack = [];
+    lastAction = action.type;
+    updateUI();
+  }
+
+  function performUndo() {
+    if (undoStack.length === 0) return;
+    const action = undoStack.pop();
+
+    switch (action.type) {
+      case 'add': {
+        removeMagnetById(action.magnetId);
+        break;
+      }
+      case 'delete': {
+        const m = addMagnet(action.prevState.x, action.prevState.y, action.prevState.z, action.prevState.rotationY, action.magnetId);
+        break;
+      }
+      case 'move': {
+        const magnet = getMagnetById(action.magnetId);
+        if (magnet) {
+          magnet.position.x = action.prevState.x;
+          magnet.position.y = action.prevState.y;
+          magnet.position.z = action.prevState.z;
+          magnet.group.position.set(action.prevState.x, action.prevState.y, action.prevState.z);
+        }
+        break;
+      }
+      case 'rotate': {
+        const magnet = getMagnetById(action.magnetId);
+        if (magnet) {
+          magnet.rotationY = action.prevState.rotationY;
+          magnet.group.rotation.y = action.prevState.rotationY;
+        }
+        break;
+      }
+    }
+
+    redoStack.push(action);
+    lastAction = 'undo';
+    generateFieldLines();
+    updateUI();
+  }
+
+  function performRedo() {
+    if (redoStack.length === 0) return;
+    const action = redoStack.pop();
+
+    switch (action.type) {
+      case 'add': {
+        addMagnet(action.newState.x, action.newState.y, action.newState.z, action.newState.rotationY, action.magnetId);
+        break;
+      }
+      case 'delete': {
+        removeMagnetById(action.magnetId);
+        break;
+      }
+      case 'move': {
+        const magnet = getMagnetById(action.magnetId);
+        if (magnet) {
+          magnet.position.x = action.newState.x;
+          magnet.position.y = action.newState.y;
+          magnet.position.z = action.newState.z;
+          magnet.group.position.set(action.newState.x, action.newState.y, action.newState.z);
+        }
+        break;
+      }
+      case 'rotate': {
+        const magnet = getMagnetById(action.magnetId);
+        if (magnet) {
+          magnet.rotationY = action.newState.rotationY;
+          magnet.group.rotation.y = action.newState.rotationY;
+        }
+        break;
+      }
+    }
+
+    undoStack.push(action);
+    lastAction = 'redo';
+    generateFieldLines();
+    updateUI();
+  }
+
+  // ============ UI UPDATE ============
+  function updateUI() {
+    document.getElementById('magnetCount').textContent = magnets.length;
+    document.getElementById('historyCount').textContent = undoStack.length;
+    document.getElementById('selectedInfo').textContent = selectedMagnetId === -1 ? 'none' : 'Magnet-' + selectedMagnetId;
+    document.getElementById('fieldStatus').textContent = fieldLinesVisible ? 'visible' : 'hidden';
+
+    // Update global state
+    window.__3D_STATE__ = {
+      magnetCount: magnets.length,
+      selectedMagnetId: selectedMagnetId,
+      undoStackSize: undoStack.length,
+      redoStackSize: redoStack.length,
+      fieldLinesVisible: fieldLinesVisible,
+      magnets: magnets.map(m => ({
+        id: m.id,
+        x: Math.round(m.position.x * 100) / 100,
+        y: Math.round(m.position.y * 100) / 100,
+        z: Math.round(m.position.z * 100) / 100,
+        rotationY: Math.round(m.rotationY * 100) / 100
+      })),
+      fieldLineCount: fieldLinesGroup.children.length,
+      lastAction: lastAction
+    };
+  }
+
+  // ============ EVENT HANDLERS ============
+
+  // Add Magnet
+  document.getElementById('addMagnetBtn').addEventListener('click', function() {
+    if (magnets.length >= 5) return;
+
+    const x = Math.round((Math.random() * 10 - 5) * 100) / 100;
+    const z = Math.round((Math.random() * 10 - 5) * 100) / 100;
+    const y = 0.25;
+    const rotY = 0;
+
+    const magnet = addMagnet(x, y, z, rotY);
+
+    pushAction({
+      type: 'add',
+      magnetId: magnet.id,
+      prevState: null,
+      newState: { x, y, z, rotationY: rotY }
+    });
+
+    generateFieldLines();
+    updateUI();
+  });
+
+  // Toggle Field Lines
+  document.getElementById('toggleFieldBtn').addEventListener('click', function() {
+    fieldLinesVisible = !fieldLinesVisible;
+    fieldLinesGroup.visible = fieldLinesVisible;
+    updateUI();
+  });
+
+  // Undo/Redo buttons
+  document.getElementById('undoBtn').addEventListener('click', performUndo);
+  document.getElementById('redoBtn').addEventListener('click', performRedo);
+
+  // Mouse click for selection
+  renderer.domElement.addEventListener('click', function(event) {
+    mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+    mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+    raycaster.setFromCamera(mouse, camera);
+
+    const meshes = [];
+    for (const m of magnets) {
+      meshes.push(m.northMesh, m.southMesh);
+    }
+
+    const intersects = raycaster.intersectObjects(meshes);
+
+    if (intersects.length > 0) {
+      const magnetId = intersects[0].object.userData.magnetId;
+      if (magnetId !== undefined) {
+        selectMagnet(magnetId);
+      }
+    } else {
+      selectMagnet(-1);
+    }
+  });
+
+  // Keyboard
+  document.addEventListener('keydown', function(event) {
+    // Ctrl+Z / Ctrl+Y
+    if (event.ctrlKey || event.metaKey) {
+      if (event.key === 'z' || event.key === 'Z') {
+        event.preventDefault();
+        performUndo();
+        return;
+      }
+      if (event.key === 'y' || event.key === 'Y') {
+        event.preventDefault();
+        performRedo();
+        return;
+      }
+    }
+
+    // Delete selected magnet
+    if (event.key === 'Delete' || event.key === 'Backspace') {
+      if (selectedMagnetId !== -1 && magnets.length > 1) {
+        const magnet = getMagnetById(selectedMagnetId);
+        if (magnet) {
+          const prevState = {
+            x: magnet.position.x,
+            y: magnet.position.y,
+            z: magnet.position.z,
+            rotationY: magnet.rotationY
+          };
+          const id = magnet.id;
+          removeMagnetById(id);
+
+          pushAction({
+            type: 'delete',
+            magnetId: id,
+            prevState: prevState,
+            newState: null
+          });
+
+          selectedMagnetId = -1;
+          generateFieldLines();
+          updateUI();
+        }
+      }
+      return;
+    }
+
+    // Movement and rotation of selected magnet
+    if (selectedMagnetId === -1) return;
+    const magnet = getMagnetById(selectedMagnetId);
+    if (!magnet) return;
+
+    const prevState = {
+      x: magnet.position.x,
+      y: magnet.position.y,
+      z: magnet.position.z,
+      rotationY: magnet.rotationY
+    };
+
+    let actionType = null;
+
+    switch (event.key.toLowerCase()) {
+      case 'w':
+        magnet.position.z -= 1;
+        magnet.group.position.z = magnet.position.z;
+        actionType = 'move';
+        break;
+      case 's':
+        magnet.position.z += 1;
+        magnet.group.position.z = magnet.position.z;
+        actionType = 'move';
+        break;
+      case 'a':
+        magnet.position.x -= 1;
+        magnet.group.position.x = magnet.position.x;
+        actionType = 'move';
+        break;
+      case 'd':
+        magnet.position.x += 1;
+        magnet.group.position.x = magnet.position.x;
+        actionType = 'move';
+        break;
+      case 'arrowleft':
+        event.preventDefault();
+        magnet.rotationY += Math.PI / 12; // 15 degrees
+        magnet.group.rotation.y = magnet.rotationY;
+        actionType = 'rotate';
+        break;
+      case 'arrowright':
+        event.preventDefault();
+        magnet.rotationY -= Math.PI / 12;
+        magnet.group.rotation.y = magnet.rotationY;
+        actionType = 'rotate';
+        break;
+    }
+
+    if (actionType) {
+      const newState = {
+        x: magnet.position.x,
+        y: magnet.position.y,
+        z: magnet.position.z,
+        rotationY: magnet.rotationY
+      };
+
+      pushAction({
+        type: actionType,
+        magnetId: magnet.id,
+        prevState: prevState,
+        newState: newState
+      });
+
+      generateFieldLines();
+      updateUI();
+    }
+  });
+
+  // Window resize
+  window.addEventListener('resize', function() {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  });
+
+  // ============ INITIALIZATION ============
+  addMagnet(0, 0.25, 0, 0);
+  generateFieldLines();
+  updateUI();
+
+  // ============ ANIMATION LOOP ============
+  function animate() {
+    requestAnimationFrame(animate);
+    controls.update();
+    renderer.render(scene, camera);
+  }
+  animate();
+
+})();
+</script>
+</body>
+</html>

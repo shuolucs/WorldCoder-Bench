@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GPU Water Wave Simulation</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #000;
+            font-family: monospace;
+            user-select: none;
+        }
+        #hud {
+            position: absolute;
+            top: 15px;
+            left: 15px;
+            color: #fff;
+            background: rgba(0, 0, 0, 0.6);
+            padding: 15px;
+            border-radius: 8px;
+            pointer-events: none;
+            border: 1px solid rgba(255,255,255,0.2);
+        }
+        #controls {
+            position: absolute;
+            bottom: 15px;
+            left: 15px;
+            color: #fff;
+            background: rgba(0, 0, 0, 0.6);
+            padding: 15px;
+            border-radius: 8px;
+            border: 1px solid rgba(255,255,255,0.2);
+        }
+        .row {
+            margin-bottom: 8px;
+            font-size: 14px;
+        }
+        .row:last-child {
+            margin-bottom: 0;
+        }
+        span.val {
+            color: #87CEEB;
+            font-weight: bold;
+        }
+        label {
+            display: flex;
+            align-items: center;
+            cursor: pointer;
+        }
+        input[type="range"] {
+            margin-left: 10px;
+            width: 120px;
+        }
+        input[type="checkbox"] {
+            margin-left: 10px;
+            cursor: pointer;
+        }
+    </style>
+    <script type="importmap">
+    { "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+    } }
+    </script>
+</head>
+<body>
+    <div id="hud">
+        <div class="row">Max Height: <span id="maxHeight" class="val">0.0000</span></div>
+        <div class="row">Wave Energy: <span id="waveEnergy" class="val">0.0000</span></div>
+        <div class="row">Frame: <span id="frameNum" class="val">0</span></div>
+    </div>
+    <div id="controls">
+        <div class="row">
+            <label>Damping: <input type="range" id="dampingSlider" min="0.98" max="1.0" step="0.001" value="0.995"></label>
+        </div>
+        <div class="row">
+            <label>Wind Effect: <input type="checkbox" id="windToggle"></label>
+        </div>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        // --- Configuration ---
+        const SIZE = 256;
+        const WATER_SIZE = 10;
+        
+        // --- State Initialization ---
+        window.__3D_STATE__ = {
+            maxHeight: 0,
+            waveEnergy: 0,
+            frameNum: 0,
+            dampingValue: 0.995,
+            windEnabled: false,
+            gridSize: SIZE
+        };
+
+        // --- DOM Elements ---
+        const elMaxHeight = document.getElementById('maxHeight');
+        const elWaveEnergy = document.getElementById('waveEnergy');
+        const elFrameNum = document.getElementById('frameNum');
+        const elDamping = document.getElementById('dampingSlider');
+        const elWind = document.getElementById('windToggle');
+
+        // --- Scene Setup ---
+        const scene = new THREE.Scene();
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+        camera.position.set(6, 8, 6);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        document.body.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.maxPolarAngle = Math.PI / 2 - 0.05;
+
+        // --- Lighting & Environment ---
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.3);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+        dirLight.position.set(5, 10, 5);
+        scene.add(dirLight);
+
+        // Simple Environment Map (Sky gradient)
+        const canvasEnv = document.createElement('canvas');
+        canvasEnv.width = 2;
+        canvasEnv.height = 256;
+        const ctx = canvasEnv.getContext('2d');
+        const grad = ctx.createLinearGradient(0, 0, 0, 256);
+        grad.addColorStop(0, '#ffffff');
+        grad.addColorStop(1, '#87CEEB');
+        ctx.fillStyle = grad;
+        ctx.fillRect(0, 0, 2, 256);
+        const envTex = new THREE.CanvasTexture(canvasEnv);
+        const pmremGenerator = new THREE.PMREMGenerator(renderer);
+        scene.environment = pmremGenerator.fromEquirectangular(envTex).texture;
+
+        // --- Bottom Plane ---
+        const bottomGeo = new THREE.PlaneGeometry(WATER_SIZE, WATER_SIZE);
+        bottomGeo.rotateX(-Math.PI / 2);
+        const bottomMat = new THREE.MeshBasicMaterial({ color: 0x001122 });
+        const bottomPlane = new THREE.Mesh(bottomGeo, bottomMat);
+        bottomPlane.position.y = -0.5;
+        scene.add(bottomPlane);
+
+        // --- GPGPU Simulation Setup ---
+        const rtOptions = {
+            width: SIZE,
+            height: SIZE,
+            format: THREE.RGBAFormat,
+            type: THREE.FloatType,
+            minFilter: THREE.NearestFilter,
+            magFilter: THREE.NearestFilter,
+            depthBuffer: false,
+            stencilBuffer: false
+        };
+        let rtA = new THREE.WebGLRenderTarget(SIZE, SIZE, rtOptions);
+        let rtB = new THREE.WebGLRenderTarget(SIZE, SIZE, rtOptions);
+        let readRT = rtA;
+        let writeRT = rtB;
+
+        const simScene = new THREE.Scene();
+        const simCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+        
+        const simMaterial = new THREE.ShaderMaterial({
+            uniforms: {
+                tHeight: { value: null },
+                damping: { value: 0.995 },
+                viscosity: { value: 0.3 },
+                windEnabled: { value: 0.0 },
+                clickData: { value: new THREE.Vector3(0, 0, 0) } // x,y: uv, z: active
+            },
+            vertexShader: `
+                varying vec2 vUv;
+                void main() {
+                    vUv = uv;
+                    gl_Position = vec4(position, 1.0);
+                }
+            `,
+            fragmentShader: `
+                uniform sampler2D tHeight;
+                uniform float damping;
+                uniform float viscosity;
+                uniform float windEnabled;
+                uniform vec3 clickData;
+                varying vec2 vUv;
+
+                void main() {
+                    vec2 texel = vec2(1.0 / 256.0);
+                    
+                    // R: current height h(t), G: previous height h(t-dt)
+                    vec4 texData = texture2D(tHeight, vUv);
+                    float current = texData.r;
+                    float previous = texData.g;
+
+                    float hL = texture2D(tHeight, vUv - vec2(texel.x, 0.0)).r;
+                    float hR = texture2D(tHeight, vUv + vec2(texel.x, 0.0)).r;
+                    float hD = texture2D(tHeight, vUv - vec2(0.0, texel.y)).r;
+                    float hU = texture2D(tHeight, vUv + vec2(0.0, texel.y)).r;
+
+                    // Wave Equation: h(t+dt) = 2h(t) - h(t-dt) + c^2 dt^2 Laplacian
+                    // Using a stable coefficient for the Laplacian to prevent explosion
+                    float alpha = 0.25; 
+                    float laplacian = hL + hR + hU + hD - 4.0 * current;
+                    float h_new = 2.0 * current - previous + alpha * laplacian;
+
+                    // Viscosity (High frequency dampening)
+                    float avg = (hL + hR + hU + hD) * 0.25;
+                    h_new = h_new * (1.0 - viscosity) + avg * viscosity;
+
+                    // Damping
+                    h_new *= damping;
+
+                    // Wind Effect (+x direction)
+                    if (windEnabled > 0.5) {
+                        h_new += 0.001 * hL;
+                    }
+
+                    // Click Interaction
+                    if (clickData.z > 0.5) {
+                        float dist = distance(vUv * 256.0, clickData.xy * 256.0);
+                        if (dist < 5.0) {
+                            h_new += 0.3 * pow(cos(3.14159265 * dist / 10.0), 2.0);
+                        }
+                    }
+
+                    // Output: R becomes new current, G becomes old current (new previous)
+                    gl_FragColor = vec4(h_new, current, 0.0, 1.0);
+                }
+            `
+        });
+        const simQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), simMaterial);
+        simScene.add(simQuad);
+
+        // --- Water Mesh Setup ---
+        const waterGeo = new THREE.PlaneGeometry(WATER_SIZE, WATER_SIZE, SIZE - 1, SIZE - 1);
+        waterGeo.rotateX(-Math.PI / 2);
+        
+        const waterMat = new THREE.MeshPhysicalMaterial({
+            color: 0x1565C0,
+            metalness: 0.1,
+            roughness: 0.05,
+            transparent: true,
+            opacity: 0.85,
+        });
+
+        // Inject custom shader logic to read height and compute normals
+        waterMat.userData = { tHeight: { value: null } };
+        waterMat.onBeforeCompile = (shader) => {
+            shader.uniforms.tHeight = waterMat.userData.tHeight;
+            
+            shader.vertexShader = `
+                uniform sampler2D tHeight;
+                varying vec2 vHeightUv;
+                ${shader.vertexShader}
+            `.replace(
+                `#include <begin_vertex>`,
+                `
+                #include <begin_vertex>
+                vHeightUv = uv;
+                float h = texture2D(tHeight, uv).r;
+                transformed.y += h;
+                `
+            );
+
+            shader.fragmentShader = `
+                uniform sampler2D tHeight;
+                varying vec2 vHeightUv;
+                ${shader.fragmentShader}
+            `.replace(
+                `#include <normal_fragment_begin>`,
+                `
+                float texel = 1.0 / 256.0;
+                float hL = texture2D(tHeight, vHeightUv - vec2(texel, 0.0)).r;
+                float hR = texture2D(tHeight, vHeightUv + vec2(texel, 0.0)).r;
+                float hD = texture2D(tHeight, vHeightUv - vec2(0.0, texel)).r;
+                float hU = texture2D(tHeight, vHeightUv + vec2(0.0, texel)).r;
+                
+                float worldDx = ${WATER_SIZE.toFixed(1)} / 256.0;
+                vec3 customNormal = normalize(vec3(hL - hR, 2.0 * worldDx, hU - hD));
+                vec3 normal = customNormal;
+                `
+            );
+        };
+
+        const waterMesh = new THREE.Mesh(waterGeo, waterMat);
+        scene.add(waterMesh);
+
+        // --- Interaction ---
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+        const mathPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+
+        window.addEventListener('pointerdown', (e) => {
+            mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+            raycaster.setFromCamera(mouse, camera);
+            
+            const target = new THREE.Vector3();
+            if (raycaster.ray.intersectPlane(mathPlane, target)) {
+                // Map world coordinates [-5, 5] to UV [0, 1]
+                const u = (target.x + WATER_SIZE / 2) / WATER_SIZE;
+                const v = 1.0 - (target.z + WATER_SIZE / 2) / WATER_SIZE;
+                
+                if (u >= 0 && u <= 1 && v >= 0 && v <= 1) {
+                    simMaterial.uniforms.clickData.value.set(u, v, 1.0);
+                }
+            }
+        });
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // --- Readback Buffer ---
+        const readBuffer = new Float32Array(SIZE * SIZE * 4);
+
+        // --- Animation Loop ---
+        function animate() {
+            requestAnimationFrame(animate);
+            controls.update();
+
+            // 1. Update Simulation Uniforms
+            const currentDamping = parseFloat(elDamping.value);
+            const windEnabled = elWind.checked;
+            
+            simMaterial.uniforms.damping.value = currentDamping;
+            simMaterial.uniforms.windEnabled.value = windEnabled ? 1.0 : 0.0;
+            simMaterial.uniforms.tHeight.value = readRT.texture;
+
+            // 2. Render Simulation Step
+            renderer.setRenderTarget(writeRT);
+            renderer.render(simScene, simCamera);
+            
+            // Reset click state
+            simMaterial.uniforms.clickData.value.z = 0.0;
+
+            // 3. Readback for HUD and State
+            renderer.readRenderTargetPixels(writeRT, 0, 0, SIZE, SIZE, readBuffer);
+            let maxH = 0;
+            let energy = 0;
+            for (let i = 0; i < SIZE * SIZE; i++) {
+                let h = readBuffer[i * 4]; // Read R channel (current height)
+                let absH = Math.abs(h);
+                if (absH > maxH) maxH = absH;
+                energy += h * h;
+            }
+
+            // 4. Update State & DOM
+            window.__3D_STATE__.frameNum++;
+            window.__3D_STATE__.maxHeight = maxH;
+            window.__3D_STATE__.waveEnergy = energy;
+            window.__3D_STATE__.dampingValue = currentDamping;
+            window.__3D_STATE__.windEnabled = windEnabled;
+
+            elMaxHeight.innerText = maxH.toFixed(4);
+            elWaveEnergy.innerText = energy.toFixed(4);
+            elFrameNum.innerText = window.__3D_STATE__.frameNum;
+
+            // 5. Render Main Scene
+            waterMat.userData.tHeight.value = writeRT.texture;
+            renderer.setRenderTarget(null);
+            renderer.render(scene, camera);
+
+            // 6. Swap Buffers
+            let temp = readRT;
+            readRT = writeRT;
+            writeRT = temp;
+        }
+
+        animate();
+    </script>
+</body>
+</html>

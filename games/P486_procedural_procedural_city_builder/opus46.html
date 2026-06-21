@@ -1,0 +1,735 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Procedural City Builder</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { overflow: hidden; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+canvas { display: block; }
+
+#ui-container {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    pointer-events: none;
+}
+
+#building-buttons {
+    position: absolute;
+    top: 15px;
+    left: 15px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    pointer-events: all;
+}
+
+#building-buttons button, #demolishBtn, #dayNightBtn, #resetBtn {
+    padding: 10px 18px;
+    border: 3px solid transparent;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 14px;
+    font-weight: bold;
+    color: #fff;
+    background: rgba(30, 30, 60, 0.85);
+    backdrop-filter: blur(4px);
+    transition: all 0.2s;
+    text-shadow: 0 1px 2px rgba(0,0,0,0.5);
+}
+
+#building-buttons button:hover, #demolishBtn:hover, #dayNightBtn:hover, #resetBtn:hover {
+    background: rgba(50, 50, 90, 0.9);
+}
+
+#building-buttons button.active {
+    border-color: #ffcc00;
+    box-shadow: 0 0 10px rgba(255, 204, 0, 0.4);
+}
+
+#action-buttons {
+    position: absolute;
+    top: 200px;
+    left: 15px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    pointer-events: all;
+}
+
+#demolishBtn.active {
+    background: #cc3333 !important;
+    border-color: #ff4444;
+}
+
+#right-panel {
+    position: absolute;
+    top: 15px;
+    right: 15px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    align-items: flex-end;
+    pointer-events: none;
+}
+
+#budgetDisplay, #statsPanel, #populationDisplay {
+    background: rgba(10, 10, 46, 0.85);
+    backdrop-filter: blur(4px);
+    color: #fff;
+    padding: 10px 18px;
+    border-radius: 6px;
+    font-size: 16px;
+    font-weight: bold;
+    text-shadow: 0 1px 2px rgba(0,0,0,0.5);
+    border: 1px solid rgba(255,255,255,0.1);
+}
+
+#budgetDisplay {
+    font-size: 20px;
+    color: #44ff88;
+}
+
+#statsPanel {
+    font-size: 14px;
+    color: #aabbcc;
+}
+
+#populationDisplay {
+    font-size: 14px;
+    color: #ffcc88;
+}
+
+#instructions {
+    position: absolute;
+    bottom: 15px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: rgba(10, 10, 46, 0.7);
+    color: rgba(255,255,255,0.6);
+    padding: 8px 16px;
+    border-radius: 6px;
+    font-size: 12px;
+    pointer-events: none;
+}
+</style>
+</head>
+<body>
+
+<div id="ui-container">
+    <div id="building-buttons">
+        <button id="btn-residential" class="active" data-type="residential">🏠 Residential ($10)</button>
+        <button id="btn-commercial" data-type="commercial">🏢 Commercial ($25)</button>
+        <button id="btn-park" data-type="park">🌳 Park ($5)</button>
+        <button id="btn-monument" data-type="monument">🏛️ Monument ($50)</button>
+    </div>
+    <div id="action-buttons">
+        <button id="demolishBtn">🔨 Demolish</button>
+        <button id="dayNightBtn">🌙 Day/Night</button>
+        <button id="resetBtn">🔄 Reset</button>
+    </div>
+    <div id="right-panel">
+        <div id="budgetDisplay">Budget: $500</div>
+        <div id="statsPanel">R:0 C:0 P:0 M:0</div>
+        <div id="populationDisplay">Pop: 0 | Workers: 0</div>
+    </div>
+    <div id="instructions">Click ground to build | Keys 1-4: Select type | R: Auto-rotate | Scroll to zoom</div>
+</div>
+
+<script type="importmap">
+{
+    "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.163.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.163.0/examples/jsm/"
+    }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+// --- State ---
+const state = {
+    budget: 500,
+    buildingCount: { residential: 0, commercial: 0, park: 0, monument: 0 },
+    totalBuildings: 0,
+    selectedType: 'residential',
+    isDemolishMode: false,
+    isNightMode: true,
+    population: 0,
+    workers: 0,
+    autoRotate: false,
+    gridOccupied: 0,
+    monumentExists: false,
+    lastPlacedType: null,
+    lastAction: 'none'
+};
+window.__3D_STATE__ = state;
+
+const GRID_SIZE = 4;
+const GRID_MIN = -40;
+const GRID_MAX = 40;
+const GRID_COUNT = 20;
+
+const costs = { residential: 10, commercial: 25, park: 5, monument: 50 };
+
+// Grid data: key = "x,z" -> { type, mesh, cost }
+const gridData = {};
+
+// --- Renderer ---
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.setClearColor(0x0a0a2e);
+document.body.appendChild(renderer.domElement);
+
+// --- Scene ---
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0a0a2e);
+
+// --- Camera ---
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 500);
+camera.position.set(40, 35, 40);
+camera.lookAt(0, 0, 0);
+
+// --- Controls ---
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+controls.autoRotateSpeed = 2.0;
+controls.maxPolarAngle = Math.PI / 2.1;
+controls.minDistance = 10;
+controls.maxDistance = 120;
+
+// --- Lights ---
+const ambientLight = new THREE.AmbientLight(0x404060, 0.4);
+scene.add(ambientLight);
+
+const dirLight = new THREE.DirectionalLight(0xffeedd, 1.0);
+dirLight.position.set(50, 80, 30);
+dirLight.castShadow = true;
+dirLight.shadow.mapSize.width = 2048;
+dirLight.shadow.mapSize.height = 2048;
+dirLight.shadow.camera.near = 0.5;
+dirLight.shadow.camera.far = 200;
+dirLight.shadow.camera.left = -60;
+dirLight.shadow.camera.right = 60;
+dirLight.shadow.camera.top = 60;
+dirLight.shadow.camera.bottom = -60;
+dirLight.shadow.bias = -0.001;
+scene.add(dirLight);
+
+// Night mode settings (start)
+function applyNightMode() {
+    ambientLight.color.set(0x101030);
+    ambientLight.intensity = 0.2;
+    dirLight.intensity = 0.3;
+    scene.background.set(0x0a0a2e);
+    renderer.setClearColor(0x0a0a2e);
+    state.isNightMode = true;
+}
+
+function applyDayMode() {
+    ambientLight.color.set(0x404060);
+    ambientLight.intensity = 0.4;
+    dirLight.intensity = 1.0;
+    scene.background.set(0x87CEEB);
+    renderer.setClearColor(0x87CEEB);
+    state.isNightMode = false;
+}
+
+applyNightMode();
+
+// --- Ground ---
+const groundGeo = new THREE.PlaneGeometry(200, 200);
+const groundMat = new THREE.MeshStandardMaterial({ color: 0x2a4a2a, roughness: 0.9 });
+const ground = new THREE.Mesh(groundGeo, groundMat);
+ground.rotation.x = -Math.PI / 2;
+ground.position.y = 0;
+ground.receiveShadow = true;
+scene.add(ground);
+
+// --- Grid Overlay ---
+function createGridOverlay() {
+    const points = [];
+    for (let i = GRID_MIN; i <= GRID_MAX; i += GRID_SIZE) {
+        points.push(new THREE.Vector3(i, 0.02, GRID_MIN));
+        points.push(new THREE.Vector3(i, 0.02, GRID_MAX));
+        points.push(new THREE.Vector3(GRID_MIN, 0.02, i));
+        points.push(new THREE.Vector3(GRID_MAX, 0.02, i));
+    }
+    const geo = new THREE.BufferGeometry().setFromPoints(points);
+    const mat = new THREE.LineBasicMaterial({ color: 0x3a5a3a, transparent: true, opacity: 0.4 });
+    const lines = new THREE.LineSegments(geo, mat);
+    scene.add(lines);
+}
+createGridOverlay();
+
+// --- Raycaster ---
+const raycaster = new THREE.Raycaster();
+const mouse = new THREE.Vector2();
+
+// --- GLTF Loader ---
+const gltfLoader = new GLTFLoader();
+let monumentModel = null;
+
+// --- Helper Functions ---
+function snapToGrid(val) {
+    return Math.round(val / GRID_SIZE) * GRID_SIZE;
+}
+
+function gridKey(gx, gz) {
+    return `${gx},${gz}`;
+}
+
+function updateHUD() {
+    document.getElementById('budgetDisplay').textContent = `Budget: $${state.budget}`;
+    document.getElementById('statsPanel').textContent = `R:${state.buildingCount.residential} C:${state.buildingCount.commercial} P:${state.buildingCount.park} M:${state.buildingCount.monument}`;
+    document.getElementById('populationDisplay').textContent = `Pop: ${state.population} | Workers: ${state.workers}`;
+}
+
+function recalcPopulation() {
+    state.population = state.buildingCount.residential * 10;
+    state.workers = state.buildingCount.commercial * 5;
+}
+
+function recalcGridOccupied() {
+    state.gridOccupied = Object.keys(gridData).length;
+    state.totalBuildings = state.gridOccupied;
+}
+
+// --- Building Creation ---
+function createResidential(gx, gz) {
+    const height = 4 + Math.random() * 8;
+    const group = new THREE.Group();
+
+    const bodyGeo = new THREE.BoxGeometry(3, height, 3);
+    const bodyMat = new THREE.MeshStandardMaterial({ color: 0x8899aa, roughness: 0.7 });
+    const body = new THREE.Mesh(bodyGeo, bodyMat);
+    body.position.y = height / 2;
+    body.castShadow = true;
+    body.receiveShadow = true;
+    group.add(body);
+
+    // Windows
+    const windowRows = Math.floor(height / 2);
+    for (let side = 0; side < 4; side++) {
+        for (let row = 0; row < windowRows; row++) {
+            const wGeo = new THREE.BoxGeometry(0.4, 0.6, 0.05);
+            const wMat = new THREE.MeshStandardMaterial({
+                color: 0xffffcc,
+                emissive: 0xffffaa,
+                emissiveIntensity: 0.3
+            });
+            const w = new THREE.Mesh(wGeo, wMat);
+            const wy = 1.5 + row * 2;
+            if (wy > height - 1) continue;
+            if (side === 0) { w.position.set(-0.6, wy, 1.51); }
+            else if (side === 1) { w.position.set(0.6, wy, 1.51); }
+            else if (side === 2) { w.position.set(-0.6, wy, -1.51); w.rotation.y = Math.PI; }
+            else { w.position.set(0.6, wy, -1.51); w.rotation.y = Math.PI; }
+            group.add(w);
+        }
+    }
+
+    group.position.set(gx, 0, gz);
+    scene.add(group);
+    return group;
+}
+
+function createCommercial(gx, gz) {
+    const height = 8 + Math.random() * 12;
+    const group = new THREE.Group();
+
+    const bodyGeo = new THREE.BoxGeometry(3.5, height, 3.5);
+    const bodyMat = new THREE.MeshStandardMaterial({
+        color: 0xddaa44,
+        roughness: 0.5,
+        emissive: 0x332200,
+        emissiveIntensity: 0.3
+    });
+    const body = new THREE.Mesh(bodyGeo, bodyMat);
+    body.position.y = height / 2;
+    body.castShadow = true;
+    body.receiveShadow = true;
+    group.add(body);
+
+    // Window strip (inset glowing box)
+    const windowRows = Math.floor(height / 3);
+    for (let row = 0; row < windowRows; row++) {
+        const wy = 2 + row * 3;
+        if (wy > height - 1.5) continue;
+        for (let side = 0; side < 4; side++) {
+            const wGeo = new THREE.BoxGeometry(side < 2 ? 2.5 : 0.05, 1.0, side < 2 ? 0.05 : 2.5);
+            const wMat = new THREE.MeshStandardMaterial({
+                color: 0xffeeaa,
+                emissive: 0xffcc44,
+                emissiveIntensity: 0.6
+            });
+            const w = new THREE.Mesh(wGeo, wMat);
+            if (side === 0) w.position.set(0, wy, 1.76);
+            else if (side === 1) w.position.set(0, wy, -1.76);
+            else if (side === 2) w.position.set(1.76, wy, 0);
+            else w.position.set(-1.76, wy, 0);
+            group.add(w);
+        }
+    }
+
+    group.position.set(gx, 0, gz);
+    scene.add(group);
+    return group;
+}
+
+function createPark(gx, gz) {
+    const group = new THREE.Group();
+
+    // Flat green area
+    const baseGeo = new THREE.BoxGeometry(3.8, 0.3, 3.8);
+    const baseMat = new THREE.MeshStandardMaterial({ color: 0x44aa44, roughness: 0.9 });
+    const base = new THREE.Mesh(baseGeo, baseMat);
+    base.position.y = 0.15;
+    base.receiveShadow = true;
+    base.castShadow = true;
+    group.add(base);
+
+    // Tree trunk
+    const trunkGeo = new THREE.CylinderGeometry(0.15, 0.2, 1.5, 8);
+    const trunkMat = new THREE.MeshStandardMaterial({ color: 0x664422, roughness: 0.9 });
+    const trunk = new THREE.Mesh(trunkGeo, trunkMat);
+    trunk.position.y = 1.05;
+    trunk.castShadow = true;
+    group.add(trunk);
+
+    // Tree canopy
+    const canopyGeo = new THREE.SphereGeometry(1.5, 12, 10);
+    const canopyMat = new THREE.MeshStandardMaterial({ color: 0x228822, roughness: 0.8 });
+    const canopy = new THREE.Mesh(canopyGeo, canopyMat);
+    canopy.position.y = 2.8;
+    canopy.castShadow = true;
+    canopy.receiveShadow = true;
+    group.add(canopy);
+
+    group.position.set(gx, 0, gz);
+    scene.add(group);
+    return group;
+}
+
+function createMonument(gx, gz) {
+    const group = new THREE.Group();
+
+    // Placeholder pedestal
+    const pedestalGeo = new THREE.BoxGeometry(3, 0.5, 3);
+    const pedestalMat = new THREE.MeshStandardMaterial({ color: 0x888888, roughness: 0.4 });
+    const pedestal = new THREE.Mesh(pedestalGeo, pedestalMat);
+    pedestal.position.y = 0.25;
+    pedestal.castShadow = true;
+    pedestal.receiveShadow = true;
+    group.add(pedestal);
+
+    // Try loading GLTF
+    gltfLoader.load('AntiqueCamera.glb', (gltf) => {
+        const model = gltf.scene;
+        model.scale.set(2.0, 2.0, 2.0);
+
+        // Center the model
+        const box = new THREE.Box3().setFromObject(model);
+        const center = box.getCenter(new THREE.Vector3());
+        model.position.x -= center.x;
+        model.position.z -= center.z;
+        model.position.y = 0.5;
+
+        model.traverse((child) => {
+            if (child.isMesh) {
+                child.castShadow = true;
+                child.receiveShadow = true;
+            }
+        });
+        group.add(model);
+    }, undefined, () => {
+        // Fallback: create a simple monument shape
+        const obeliskGeo = new THREE.CylinderGeometry(0.3, 0.8, 5, 6);
+        const obeliskMat = new THREE.MeshStandardMaterial({
+            color: 0xccccdd,
+            roughness: 0.3,
+            metalness: 0.6,
+            emissive: 0x222244,
+            emissiveIntensity: 0.2
+        });
+        const obelisk = new THREE.Mesh(obeliskGeo, obeliskMat);
+        obelisk.position.y = 3;
+        obelisk.castShadow = true;
+        group.add(obelisk);
+
+        const sphereGeo = new THREE.SphereGeometry(0.6, 16, 12);
+        const sphereMat = new THREE.MeshStandardMaterial({
+            color: 0xffdd44,
+            emissive: 0xffaa00,
+            emissiveIntensity: 0.5,
+            metalness: 0.8
+        });
+        const sphere = new THREE.Mesh(sphereGeo, sphereMat);
+        sphere.position.y = 5.8;
+        sphere.castShadow = true;
+        group.add(sphere);
+    });
+
+    group.position.set(gx, 0, gz);
+    scene.add(group);
+    return group;
+}
+
+// --- Place Building ---
+function placeBuilding(gx, gz) {
+    const key = gridKey(gx, gz);
+
+    if (state.isDemolishMode) {
+        if (gridData[key]) {
+            const data = gridData[key];
+            scene.remove(data.mesh);
+            const refund = Math.floor(data.cost / 2);
+            state.budget += refund;
+            state.buildingCount[data.type]--;
+            if (data.type === 'monument') {
+                state.monumentExists = false;
+            }
+            delete gridData[key];
+            state.lastAction = 'demolish';
+            recalcPopulation();
+            recalcGridOccupied();
+            updateHUD();
+        }
+        return;
+    }
+
+    if (gridData[key]) return;
+
+    const type = state.selectedType;
+    const cost = costs[type];
+
+    if (state.budget < cost) return;
+
+    if (type === 'monument' && state.monumentExists) {
+        // Remove old monument
+        for (const k in gridData) {
+            if (gridData[k].type === 'monument') {
+                scene.remove(gridData[k].mesh);
+                state.buildingCount.monument--;
+                delete gridData[k];
+                state.monumentExists = false;
+                break;
+            }
+        }
+    }
+
+    let mesh;
+    switch (type) {
+        case 'residential': mesh = createResidential(gx, gz); break;
+        case 'commercial': mesh = createCommercial(gx, gz); break;
+        case 'park': mesh = createPark(gx, gz); break;
+        case 'monument': mesh = createMonument(gx, gz); break;
+    }
+
+    state.budget -= cost;
+    state.buildingCount[type]++;
+    if (type === 'monument') state.monumentExists = true;
+
+    gridData[key] = { type, mesh, cost };
+    state.lastPlacedType = type;
+    state.lastAction = 'place';
+
+    recalcPopulation();
+    recalcGridOccupied();
+    updateHUD();
+}
+
+// --- Click Handler ---
+renderer.domElement.addEventListener('click', (event) => {
+    mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+    mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+    raycaster.setFromCamera(mouse, camera);
+
+    // Check intersection with ground
+    const intersects = raycaster.intersectObject(ground);
+    if (intersects.length > 0) {
+        const point = intersects[0].point;
+        const gx = snapToGrid(point.x);
+        const gz = snapToGrid(point.z);
+
+        // Check bounds
+        if (gx >= GRID_MIN && gx <= GRID_MAX && gz >= GRID_MIN && gz <= GRID_MAX) {
+            placeBuilding(gx, gz);
+        }
+        return;
+    }
+
+    // If demolish mode, check clicking on buildings
+    if (state.isDemolishMode) {
+        const allMeshes = [];
+        for (const key in gridData) {
+            allMeshes.push(gridData[key].mesh);
+        }
+        const buildingIntersects = raycaster.intersectObjects(allMeshes, true);
+        if (buildingIntersects.length > 0) {
+            // Find which grid cell this belongs to
+            let hitObj = buildingIntersects[0].object;
+            while (hitObj.parent && hitObj.parent !== scene) {
+                hitObj = hitObj.parent;
+            }
+            const gx = snapToGrid(hitObj.position.x);
+            const gz = snapToGrid(hitObj.position.z);
+            placeBuilding(gx, gz);
+        }
+    }
+});
+
+// --- UI Buttons ---
+const buildingButtons = document.querySelectorAll('#building-buttons button');
+buildingButtons.forEach(btn => {
+    btn.addEventListener('click', () => {
+        buildingButtons.forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        state.selectedType = btn.dataset.type;
+        state.isDemolishMode = false;
+        document.getElementById('demolishBtn').classList.remove('active');
+    });
+});
+
+document.getElementById('demolishBtn').addEventListener('click', () => {
+    state.isDemolishMode = !state.isDemolishMode;
+    document.getElementById('demolishBtn').classList.toggle('active', state.isDemolishMode);
+    if (state.isDemolishMode) {
+        buildingButtons.forEach(b => b.classList.remove('active'));
+    } else {
+        // Re-select current type
+        const btn = document.querySelector(`#building-buttons button[data-type="${state.selectedType}"]`);
+        if (btn) btn.classList.add('active');
+    }
+});
+
+document.getElementById('dayNightBtn').addEventListener('click', () => {
+    if (state.isNightMode) {
+        applyDayMode();
+    } else {
+        applyNightMode();
+    }
+});
+
+document.getElementById('resetBtn').addEventListener('click', () => {
+    // Remove all buildings
+    for (const key in gridData) {
+        scene.remove(gridData[key].mesh);
+        delete gridData[key];
+    }
+    state.budget = 500;
+    state.buildingCount = { residential: 0, commercial: 0, park: 0, monument: 0 };
+    state.totalBuildings = 0;
+    state.population = 0;
+    state.workers = 0;
+    state.gridOccupied = 0;
+    state.monumentExists = false;
+    state.lastPlacedType = null;
+    state.lastAction = 'reset';
+    updateHUD();
+});
+
+// --- Keyboard ---
+document.addEventListener('keydown', (e) => {
+    const key = e.key.toLowerCase();
+    if (key === 'r') {
+        state.autoRotate = !state.autoRotate;
+        controls.autoRotate = state.autoRotate;
+    }
+    if (key === '1') {
+        state.selectedType = 'residential';
+        state.isDemolishMode = false;
+        document.getElementById('demolishBtn').classList.remove('active');
+        buildingButtons.forEach(b => b.classList.remove('active'));
+        document.querySelector('[data-type="residential"]').classList.add('active');
+    }
+    if (key === '2') {
+        state.selectedType = 'commercial';
+        state.isDemolishMode = false;
+        document.getElementById('demolishBtn').classList.remove('active');
+        buildingButtons.forEach(b => b.classList.remove('active'));
+        document.querySelector('[data-type="commercial"]').classList.add('active');
+    }
+    if (key === '3') {
+        state.selectedType = 'park';
+        state.isDemolishMode = false;
+        document.getElementById('demolishBtn').classList.remove('active');
+        buildingButtons.forEach(b => b.classList.remove('active'));
+        document.querySelector('[data-type="park"]').classList.add('active');
+    }
+    if (key === '4') {
+        state.selectedType = 'monument';
+        state.isDemolishMode = false;
+        document.getElementById('demolishBtn').classList.remove('active');
+        buildingButtons.forEach(b => b.classList.remove('active'));
+        document.querySelector('[data-type="monument"]').classList.add('active');
+    }
+});
+
+// --- Resize ---
+window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// --- Add some ambient fog for atmosphere ---
+scene.fog = new THREE.FogExp2(0x0a0a2e, 0.008);
+
+// --- Stars for night sky ---
+function createStars() {
+    const starsGeo = new THREE.BufferGeometry();
+    const positions = [];
+    for (let i = 0; i < 2000; i++) {
+        const r = 150 + Math.random() * 50;
+        const theta = Math.random() * Math.PI * 2;
+        const phi = Math.random() * Math.PI * 0.5;
+        positions.push(
+            r * Math.sin(phi) * Math.cos(theta),
+            r * Math.cos(phi) + 20,
+            r * Math.sin(phi) * Math.sin(theta)
+        );
+    }
+    starsGeo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+    const starsMat = new THREE.PointsMaterial({ color: 0xffffff, size: 0.5, transparent: true, opacity: 0.8 });
+    const stars = new THREE.Points(starsGeo, starsMat);
+    stars.name = 'stars';
+    scene.add(stars);
+}
+createStars();
+
+// --- Animation Loop ---
+function animate() {
+    requestAnimationFrame(animate);
+    controls.update();
+
+    // Update fog color based on mode
+    if (state.isNightMode) {
+        scene.fog.color.set(0x0a0a2e);
+        const stars = scene.getObjectByName('stars');
+        if (stars) stars.visible = true;
+    } else {
+        scene.fog.color.set(0x87CEEB);
+        const stars = scene.getObjectByName('stars');
+        if (stars) stars.visible = false;
+    }
+
+    renderer.render(scene, camera);
+}
+
+updateHUD();
+animate();
+</script>
+</body>
+</html>

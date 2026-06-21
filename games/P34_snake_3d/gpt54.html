@@ -1,0 +1,454 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Three.js 3D 贪吃蛇</title>
+  <style>
+    html, body {
+      margin: 0;
+      height: 100%;
+      overflow: hidden;
+      background: #0b1020;
+      color: #eaf2ff;
+      font-family: Arial, Helvetica, sans-serif;
+    }
+
+    #ui {
+      position: fixed;
+      top: 12px;
+      left: 12px;
+      z-index: 10;
+      background: rgba(0, 0, 0, 0.45);
+      padding: 10px 14px;
+      border-radius: 10px;
+      line-height: 1.6;
+      backdrop-filter: blur(6px);
+      user-select: none;
+    }
+
+    #ui b {
+      color: #8fd3ff;
+    }
+
+    #help {
+      margin-top: 6px;
+      font-size: 12px;
+      color: #c7d6ee;
+    }
+
+    #gameover {
+      color: #ff7b7b;
+      font-weight: bold;
+    }
+
+    canvas {
+      display: block;
+    }
+  </style>
+
+  <!-- 必须严格遵守的 Three.js 引入方式 -->
+  <script type="importmap">
+  { "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+  } }
+  </script>
+</head>
+<body>
+  <div id="ui">
+    <div>分数: <b id="score">0</b></div>
+    <div>状态: <span id="status">运行中</span></div>
+    <div id="help">
+      WASD：XZ 平面移动<br/>
+      Space：Y+1<br/>
+      Shift：Y-1<br/>
+      鼠标拖拽：旋转视角
+    </div>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+    // =========================
+    // 说明：
+    // 本实现使用固定整数网格坐标范围 0..19（共 20×20×20）。
+    // window.__3D_STATE__ 中的 headPos / foodPos / direction 也统一使用这个坐标系。
+    // 场景中每个网格中心映射为：
+    // world = grid - (GRID_SIZE - 1) / 2
+    // 即 0..19 -> -9.5..9.5
+    // =========================
+
+    const GRID_SIZE = 20;
+    const STEP_INTERVAL = 0.25; // 每 0.25 秒一步
+    const CELL_SIZE = 1;
+
+    const scoreEl = document.getElementById('score');
+    const statusEl = document.getElementById('status');
+
+    // 场景
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0b1020);
+
+    const camera = new THREE.PerspectiveCamera(
+      60,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      1000
+    );
+    camera.position.set(28, 24, 28);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    document.body.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.set(0, 0, 0);
+    controls.enableDamping = true;
+
+    // 光照
+    const ambient = new THREE.AmbientLight(0xffffff, 0.75);
+    scene.add(ambient);
+
+    const dirLight = new THREE.DirectionalLight(0xffffff, 0.9);
+    dirLight.position.set(20, 30, 10);
+    scene.add(dirLight);
+
+    // 边界线框
+    const boundarySize = GRID_SIZE * CELL_SIZE;
+    const boundaryGeom = new THREE.BoxGeometry(boundarySize, boundarySize, boundarySize);
+    const boundaryEdges = new THREE.EdgesGeometry(boundaryGeom);
+    const boundaryLine = new THREE.LineSegments(
+      boundaryEdges,
+      new THREE.LineBasicMaterial({ color: 0x5fa8ff, transparent: true, opacity: 0.65 })
+    );
+    scene.add(boundaryLine);
+
+    // 半透明边界盒
+    const boundaryBox = new THREE.Mesh(
+      boundaryGeom,
+      new THREE.MeshBasicMaterial({
+        color: 0x5fa8ff,
+        transparent: true,
+        opacity: 0.04,
+        side: THREE.BackSide
+      })
+    );
+    scene.add(boundaryBox);
+
+    // 稍微加一点参考网格
+    const gridHelper = new THREE.GridHelper(boundarySize, GRID_SIZE, 0x335577, 0x223344);
+    gridHelper.position.y = -boundarySize / 2;
+    scene.add(gridHelper);
+
+    // 几何与材质
+    const snakeGeom = new THREE.BoxGeometry(0.9, 0.9, 0.9);
+    const headMat = new THREE.MeshStandardMaterial({ color: 0x7CFF6B, emissive: 0x163d12 });
+    const bodyMat = new THREE.MeshStandardMaterial({ color: 0x2fc3ff, emissive: 0x0d2030 });
+    const foodGeom = new THREE.SphereGeometry(0.36, 20, 20);
+
+    // 蛇与食物对象容器
+    const snakeGroup = new THREE.Group();
+    scene.add(snakeGroup);
+
+    let foodMesh = null;
+
+    // 游戏状态
+    let snake = [
+      { x: 10, y: 10, z: 10 },
+      { x: 9, y: 10, z: 10 },
+      { x: 8, y: 10, z: 10 }
+    ];
+
+    let direction = { x: 1, y: 0, z: 0 };
+    let nextDirection = { x: 1, y: 0, z: 0 };
+    let score = 0;
+    let gameOver = false;
+    let foodPos = null;
+
+    let forceEatNextStep = false;
+    let forceSelfCollisionNextStep = false;
+
+    function gridToWorld(v) {
+      const offset = (GRID_SIZE - 1) / 2;
+      return new THREE.Vector3(
+        (v.x - offset) * CELL_SIZE,
+        (v.y - offset) * CELL_SIZE,
+        (v.z - offset) * CELL_SIZE
+      );
+    }
+
+    function wrap(n) {
+      return (n + GRID_SIZE) % GRID_SIZE;
+    }
+
+    function samePos(a, b) {
+      return a.x === b.x && a.y === b.y && a.z === b.z;
+    }
+
+    function posKey(p) {
+      return `${p.x},${p.y},${p.z}`;
+    }
+
+    function randomInt(max) {
+      return Math.floor(Math.random() * max);
+    }
+
+    function randomColor() {
+      return new THREE.Color().setHSL(Math.random(), 0.85, 0.58);
+    }
+
+    function createFoodMesh() {
+      if (foodMesh) scene.remove(foodMesh);
+      foodMesh = new THREE.Mesh(
+        foodGeom,
+        new THREE.MeshStandardMaterial({
+          color: randomColor(),
+          emissive: 0x221100,
+          roughness: 0.35,
+          metalness: 0.15
+        })
+      );
+      scene.add(foodMesh);
+    }
+
+    function placeFood() {
+      const occupied = new Set(snake.map(posKey));
+      const empties = [];
+
+      for (let x = 0; x < GRID_SIZE; x++) {
+        for (let y = 0; y < GRID_SIZE; y++) {
+          for (let z = 0; z < GRID_SIZE; z++) {
+            const p = { x, y, z };
+            if (!occupied.has(posKey(p))) empties.push(p);
+          }
+        }
+      }
+
+      if (empties.length === 0) {
+        foodPos = null;
+        return;
+      }
+
+      foodPos = empties[randomInt(empties.length)];
+      createFoodMesh();
+      const wp = gridToWorld(foodPos);
+      foodMesh.position.copy(wp);
+    }
+
+    function rebuildSnakeMeshes() {
+      while (snakeGroup.children.length < snake.length) {
+        const mesh = new THREE.Mesh(snakeGeom, bodyMat);
+        snakeGroup.add(mesh);
+      }
+      while (snakeGroup.children.length > snake.length) {
+        const child = snakeGroup.children[snakeGroup.children.length - 1];
+        snakeGroup.remove(child);
+      }
+
+      for (let i = 0; i < snake.length; i++) {
+        const seg = snake[i];
+        const mesh = snakeGroup.children[i];
+        mesh.material = i === 0 ? headMat : bodyMat;
+        mesh.position.copy(gridToWorld(seg));
+      }
+    }
+
+    function updateUI() {
+      scoreEl.textContent = String(score);
+      if (gameOver) {
+        statusEl.innerHTML = '<span id="gameover">游戏结束（自撞）</span>';
+      } else {
+        statusEl.textContent = '运行中';
+      }
+    }
+
+    function updateExposedState() {
+      window.__3D_STATE__ = {
+        snakeLength: snake.length,
+        score,
+        direction: { ...direction },
+        headPos: { ...snake[0] },
+        foodPos: foodPos ? { ...foodPos } : null,
+        gameOver
+      };
+    }
+
+    function isOpposite(a, b) {
+      return a.x === -b.x && a.y === -b.y && a.z === -b.z;
+    }
+
+    // WASD 控制 XZ 平面
+    // 这里定义：
+    // W => z - 1
+    // S => z + 1
+    // A => x - 1
+    // D => x + 1
+    // Space => y + 1
+    // Shift => y - 1
+    // 并与 __3D_STATE__.direction 一致
+    function requestDirection(dir) {
+      if (gameOver) return;
+      if (isOpposite(dir, direction)) return;
+      nextDirection = dir;
+    }
+
+    window.addEventListener('keydown', (e) => {
+      const key = e.key;
+
+      if (key === 'w' || key === 'W') requestDirection({ x: 0, y: 0, z: -1 });
+      else if (key === 's' || key === 'S') requestDirection({ x: 0, y: 0, z: 1 });
+      else if (key === 'a' || key === 'A') requestDirection({ x: -1, y: 0, z: 0 });
+      else if (key === 'd' || key === 'D') requestDirection({ x: 1, y: 0, z: 0 });
+      else if (key === ' ') {
+        e.preventDefault();
+        requestDirection({ x: 0, y: 1, z: 0 });
+      } else if (key === 'Shift') {
+        requestDirection({ x: 0, y: -1, z: 0 });
+      } else if (key === 'r' || key === 'R') {
+        resetGame();
+      }
+    });
+
+    function resetGame() {
+      snake = [
+        { x: 10, y: 10, z: 10 },
+        { x: 9, y: 10, z: 10 },
+        { x: 8, y: 10, z: 10 }
+      ];
+      direction = { x: 1, y: 0, z: 0 };
+      nextDirection = { x: 1, y: 0, z: 0 };
+      score = 0;
+      gameOver = false;
+      forceEatNextStep = false;
+      forceSelfCollisionNextStep = false;
+      placeFood();
+      rebuildSnakeMeshes();
+      updateUI();
+      updateExposedState();
+    }
+
+    function stepGame() {
+      if (gameOver) {
+        updateExposedState();
+        return;
+      }
+
+      if (!isOpposite(nextDirection, direction)) {
+        direction = { ...nextDirection };
+      }
+
+      let newHead;
+
+      if (forceSelfCollisionNextStep && snake.length >= 2) {
+        // 让下一步直接把头放到自身某节上，制造自撞
+        newHead = { ...snake[1] };
+        forceSelfCollisionNextStep = false;
+      } else {
+        const head = snake[0];
+        newHead = {
+          x: wrap(head.x + direction.x),
+          y: wrap(head.y + direction.y),
+          z: wrap(head.z + direction.z)
+        };
+      }
+
+      let grow = false;
+
+      if (forceEatNextStep) {
+        // 等价真实吃到食物：把食物设置到新头位置
+        foodPos = { ...newHead };
+        if (foodMesh) {
+          foodMesh.material.color = randomColor();
+          foodMesh.position.copy(gridToWorld(foodPos));
+        }
+        forceEatNextStep = false;
+      }
+
+      if (foodPos && samePos(newHead, foodPos)) {
+        grow = true;
+        score += 10;
+      }
+
+      const newSnake = [newHead, ...snake];
+      if (!grow) {
+        newSnake.pop();
+      }
+
+      // 自撞检测：蛇头与自身任一节同格即失败
+      for (let i = 1; i < newSnake.length; i++) {
+        if (samePos(newSnake[0], newSnake[i])) {
+          snake = newSnake;
+          gameOver = true;
+          rebuildSnakeMeshes();
+          updateUI();
+          updateExposedState();
+          return;
+        }
+      }
+
+      snake = newSnake;
+
+      if (grow) {
+        placeFood();
+      }
+
+      rebuildSnakeMeshes();
+      updateUI();
+      updateExposedState();
+    }
+
+    // 初始化食物
+    placeFood();
+    rebuildSnakeMeshes();
+    updateUI();
+    updateExposedState();
+
+    // 评测辅助接口
+    window.__ICG_simulateEat__ = function() {
+      if (gameOver) return;
+      forceEatNextStep = true;
+    };
+
+    window.__ICG_triggerSelfCollision__ = function() {
+      if (gameOver) return;
+      forceSelfCollisionNextStep = true;
+    };
+
+    // 动画与固定步进
+    const clock = new THREE.Clock();
+    let accumulator = 0;
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      const dt = Math.min(clock.getDelta(), 0.1);
+      accumulator += dt;
+
+      while (accumulator >= STEP_INTERVAL) {
+        stepGame();
+        accumulator -= STEP_INTERVAL;
+      }
+
+      if (foodMesh) {
+        foodMesh.rotation.y += dt * 1.5;
+        foodMesh.rotation.x += dt * 0.8;
+      }
+
+      controls.update();
+      updateExposedState();
+      renderer.render(scene, camera);
+    }
+
+    animate();
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+  </script>
+</body>
+</html>

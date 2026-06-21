@@ -1,0 +1,407 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Three.js Rotational Inertia Demo</title>
+  <style>
+    html, body {
+      margin: 0;
+      height: 100%;
+      overflow: hidden;
+      background: #1a1a2e;
+      font-family: Arial, sans-serif;
+    }
+
+    #app {
+      width: 100%;
+      height: 100%;
+      position: relative;
+    }
+
+    #hud {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      z-index: 100;
+      color: white;
+      background: rgba(0, 0, 0, 0.55);
+      padding: 12px 14px;
+      border-radius: 8px;
+      line-height: 1.45;
+      font-size: 14px;
+      min-width: 260px;
+      white-space: pre-line;
+    }
+
+    #controls {
+      position: absolute;
+      top: 12px;
+      right: 12px;
+      z-index: 100;
+      display: flex;
+      gap: 10px;
+    }
+
+    button {
+      padding: 10px 14px;
+      border: none;
+      border-radius: 8px;
+      background: #3366cc;
+      color: white;
+      font-size: 14px;
+      cursor: pointer;
+    }
+
+    button:hover {
+      background: #4477dd;
+    }
+
+    #info {
+      position: absolute;
+      bottom: 12px;
+      left: 12px;
+      z-index: 100;
+      color: #ddd;
+      background: rgba(0, 0, 0, 0.45);
+      padding: 8px 10px;
+      border-radius: 8px;
+      font-size: 13px;
+    }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <div id="hud"></div>
+    <div id="controls">
+      <button id="toggle-spin">Impulse +3 rad/s</button>
+      <button id="freeze-btn">Freeze</button>
+    </div>
+    <div id="info">
+      A/D: torque &nbsp; B: brake &nbsp; R: reset &nbsp; ↑/↓: move masses &nbsp; C: conservation mode
+    </div>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js';
+    import { GLTFLoader } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/GLTFLoader.js';
+
+    const app = document.getElementById('app');
+    const hud = document.getElementById('hud');
+    const toggleSpinBtn = document.getElementById('toggle-spin');
+    const freezeBtn = document.getElementById('freeze-btn');
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x1a1a2e);
+
+    const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+    camera.position.set(0, 3, 8);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    app.appendChild(renderer.domElement);
+
+    // Lights
+    scene.add(new THREE.AmbientLight(0xffffff, 0.4));
+
+    const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+    dirLight.position.set(5, 10, 5);
+    scene.add(dirLight);
+
+    const hemiLight = new THREE.HemisphereLight(0xaaccff, 0x222233, 0.7);
+    scene.add(hemiLight);
+
+    // Ground
+    const groundMat = new THREE.MeshStandardMaterial({
+      color: 0x444444,
+      roughness: 0.95,
+      metalness: 0.05
+    });
+    const ground = new THREE.Mesh(new THREE.PlaneGeometry(50, 50), groundMat);
+    ground.rotation.x = -Math.PI / 2;
+    ground.position.y = 0;
+    scene.add(ground);
+
+    const grid = new THREE.GridHelper(50, 50, 0x666666, 0x555555);
+    grid.position.y = 0.001;
+    scene.add(grid);
+
+    // Rotating group
+    const rotatingGroup = new THREE.Group();
+    scene.add(rotatingGroup);
+
+    // Platform
+    const platform = new THREE.Mesh(
+      new THREE.CylinderGeometry(2, 2, 0.15, 64),
+      new THREE.MeshStandardMaterial({
+        color: 0x3366cc,
+        roughness: 0.55,
+        metalness: 0.2
+      })
+    );
+    platform.position.y = 0.075;
+    rotatingGroup.add(platform);
+
+    // Shoe container
+    const shoeContainer = new THREE.Group();
+    rotatingGroup.add(shoeContainer);
+
+    // Mass spheres
+    const massCount = 4;
+    const massPerSphere = 0.5;
+    const baseMOI = 1.0;
+    const massSpheres = [];
+
+    const sphereGeom = new THREE.SphereGeometry(0.15, 24, 24);
+    const sphereMat = new THREE.MeshStandardMaterial({
+      color: 0xff4444,
+      roughness: 0.4,
+      metalness: 0.1
+    });
+
+    for (let i = 0; i < massCount; i++) {
+      const sphere = new THREE.Mesh(sphereGeom, sphereMat);
+      sphere.position.y = 0.225;
+      rotatingGroup.add(sphere);
+      massSpheres.push(sphere);
+    }
+
+    // Physics state
+    let angularVelocity = 0.0;
+    let appliedTorque = 0.0;
+    const torqueMagnitude = 5.0;
+    const frictionCoeff = 0.3;
+    let conservationMode = false;
+
+    let massRadius = 0.5;
+    let momentOfInertia = 2.0; // temporary initial per prompt; recalculated immediately below
+    let brakeCount = 0;
+    let resetCount = 0;
+    let shoeLoaded = false;
+
+    const keyState = {
+      a: false,
+      d: false
+    };
+
+    function calculateMOI(radius) {
+      return baseMOI + massCount * massPerSphere * radius * radius;
+    }
+
+    function angularMomentum() {
+      return momentOfInertia * angularVelocity;
+    }
+
+    function kineticEnergy() {
+      return 0.5 * momentOfInertia * angularVelocity * angularVelocity;
+    }
+
+    function updateMassPositions() {
+      for (let i = 0; i < massCount; i++) {
+        const angle = i * Math.PI * 0.5;
+        massSpheres[i].position.set(
+          Math.cos(angle) * massRadius,
+          0.225,
+          Math.sin(angle) * massRadius
+        );
+      }
+    }
+
+    function setMassRadius(newRadius) {
+      const clamped = THREE.MathUtils.clamp(newRadius, 0.2, 1.8);
+      if (clamped === massRadius) return;
+
+      const oldL = angularMomentum();
+      massRadius = clamped;
+      momentOfInertia = calculateMOI(massRadius);
+
+      if (conservationMode) {
+        angularVelocity = momentOfInertia !== 0 ? oldL / momentOfInertia : 0;
+      }
+
+      updateMassPositions();
+    }
+
+    function resetState() {
+      angularVelocity = 0.0;
+      appliedTorque = 0.0;
+      keyState.a = false;
+      keyState.d = false;
+      massRadius = 0.5;
+      momentOfInertia = calculateMOI(massRadius);
+      rotatingGroup.rotation.y = 0;
+      updateMassPositions();
+      resetCount++;
+    }
+
+    // Initialize proper MOI from mass distribution system
+    momentOfInertia = calculateMOI(massRadius);
+    updateMassPositions();
+
+    // Load shoe model
+    const loader = new GLTFLoader();
+    loader.load(
+      'https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/MaterialsVariantsShoe/glTF-Binary/MaterialsVariantsShoe.glb',
+      (gltf) => {
+        const model = gltf.scene;
+
+        const box = new THREE.Box3().setFromObject(model);
+        const size = new THREE.Vector3();
+        const center = new THREE.Vector3();
+        box.getSize(size);
+        box.getCenter(center);
+
+        const targetWidth = 1.5;
+        const currentWidth = Math.max(size.x, size.z, 0.0001);
+        const scale = targetWidth / currentWidth;
+        model.scale.setScalar(scale);
+
+        const scaledBox = new THREE.Box3().setFromObject(model);
+        const scaledCenter = new THREE.Vector3();
+        const scaledSize = new THREE.Vector3();
+        scaledBox.getCenter(scaledCenter);
+        scaledBox.getSize(scaledSize);
+
+        model.position.x -= scaledCenter.x;
+        model.position.z -= scaledCenter.z;
+        model.position.y -= scaledBox.min.y;
+        model.position.y += 0.15;
+
+        shoeContainer.add(model);
+        shoeLoaded = true;
+      },
+      undefined,
+      (err) => {
+        console.error('Failed to load MaterialsVariantsShoe.glb:', err);
+      }
+    );
+
+    // Buttons
+    toggleSpinBtn.addEventListener('click', () => {
+      angularVelocity += 3.0;
+      angularVelocity = THREE.MathUtils.clamp(angularVelocity, -20, 20);
+    });
+
+    freezeBtn.addEventListener('click', () => {
+      angularVelocity = 0;
+    });
+
+    // Keyboard interaction
+    window.addEventListener('keydown', (e) => {
+      const key = e.key;
+
+      if (key === 'a' || key === 'A') {
+        keyState.a = true;
+      } else if (key === 'd' || key === 'D') {
+        keyState.d = true;
+      } else if ((key === 'b' || key === 'B') && !e.repeat) {
+        angularVelocity *= 0.5;
+        brakeCount++;
+      } else if ((key === 'r' || key === 'R') && !e.repeat) {
+        resetState();
+      } else if ((key === 'c' || key === 'C') && !e.repeat) {
+        conservationMode = !conservationMode;
+      } else if (key === 'ArrowUp' && !e.repeat) {
+        e.preventDefault();
+        setMassRadius(massRadius + 0.1);
+      } else if (key === 'ArrowDown' && !e.repeat) {
+        e.preventDefault();
+        setMassRadius(massRadius - 0.1);
+      }
+    });
+
+    window.addEventListener('keyup', (e) => {
+      const key = e.key;
+      if (key === 'a' || key === 'A') {
+        keyState.a = false;
+      } else if (key === 'd' || key === 'D') {
+        keyState.d = false;
+      }
+    });
+
+    function updateAppliedTorque() {
+      if (keyState.a && !keyState.d) {
+        appliedTorque = torqueMagnitude;
+      } else if (keyState.d && !keyState.a) {
+        appliedTorque = -torqueMagnitude;
+      } else {
+        appliedTorque = 0.0;
+      }
+    }
+
+    function updateHUD() {
+      const L = angularMomentum();
+      const KE = kineticEnergy();
+
+      hud.textContent =
+`Angular Velocity: ${angularVelocity.toFixed(2)} rad/s
+Moment of Inertia: ${momentOfInertia.toFixed(3)} kg·m²
+Applied Torque: ${appliedTorque.toFixed(1)} N·m
+Mass Radius: ${massRadius.toFixed(1)} units
+Angular Momentum: ${L.toFixed(3)}
+Conservation Mode: ${conservationMode ? 'ON' : 'OFF'}
+Kinetic Energy: ${KE.toFixed(3)}`;
+    }
+
+    function updateExposedState() {
+      window.__3D_STATE__ = {
+        angularVelocity,
+        momentOfInertia,
+        appliedTorque,
+        massRadius,
+        angularMomentum: angularMomentum(),
+        kineticEnergy: kineticEnergy(),
+        conservationMode,
+        platformRotationY: rotatingGroup.rotation.y,
+        isSpinning: Math.abs(angularVelocity) > 0.01,
+        frictionCoeff,
+        shoeLoaded,
+        massCount,
+        brakeCount,
+        resetCount
+      };
+    }
+
+    const clock = new THREE.Clock();
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      let dt = clock.getDelta();
+      dt = Math.min(dt, 1 / 30);
+
+      updateAppliedTorque();
+
+      const frictionTorque = -frictionCoeff * angularVelocity;
+      const angularAcceleration = (appliedTorque + frictionTorque) / momentOfInertia;
+
+      angularVelocity += angularAcceleration * dt;
+      angularVelocity = THREE.MathUtils.clamp(angularVelocity, -20, 20);
+
+      if (Math.abs(angularVelocity) < 0.01 && appliedTorque === 0) {
+        angularVelocity = 0;
+      }
+
+      rotatingGroup.rotation.y += angularVelocity * dt;
+
+      updateHUD();
+      updateExposedState();
+
+      renderer.render(scene, camera);
+    }
+
+    resetState();
+    updateHUD();
+    updateExposedState();
+    animate();
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+  </script>
+</body>
+</html>

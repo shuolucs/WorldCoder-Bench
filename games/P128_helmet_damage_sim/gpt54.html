@@ -1,0 +1,527 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Three.js 头盔撞击损伤模拟</title>
+  <style>
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #0b0f14;
+      font-family: Arial, Helvetica, sans-serif;
+      color: #fff;
+    }
+
+    #app {
+      width: 100%;
+      height: 100%;
+      position: relative;
+    }
+
+    #hud {
+      position: absolute;
+      top: 16px;
+      left: 16px;
+      z-index: 10;
+      background: rgba(0, 0, 0, 0.45);
+      border: 1px solid rgba(255,255,255,0.15);
+      border-radius: 10px;
+      padding: 12px 14px;
+      min-width: 220px;
+      backdrop-filter: blur(8px);
+      box-shadow: 0 8px 30px rgba(0,0,0,0.25);
+      line-height: 1.8;
+      font-size: 14px;
+    }
+
+    #hud .title {
+      font-weight: bold;
+      margin-bottom: 6px;
+      color: #9fd3ff;
+    }
+
+    #warning {
+      position: absolute;
+      left: 50%;
+      bottom: 28px;
+      transform: translateX(-50%);
+      z-index: 20;
+      padding: 14px 24px;
+      border-radius: 12px;
+      font-size: 28px;
+      font-weight: bold;
+      color: #fff;
+      background: rgba(180, 20, 20, 0.88);
+      border: 2px solid rgba(255,255,255,0.25);
+      box-shadow: 0 0 30px rgba(255, 0, 0, 0.45);
+      display: none;
+      letter-spacing: 2px;
+    }
+
+    #tip {
+      position: absolute;
+      right: 16px;
+      top: 16px;
+      z-index: 10;
+      padding: 10px 12px;
+      background: rgba(0,0,0,0.4);
+      border: 1px solid rgba(255,255,255,0.12);
+      border-radius: 8px;
+      font-size: 13px;
+      color: #d6e7f5;
+    }
+
+    canvas {
+      display: block;
+    }
+  </style>
+
+  <script type="importmap">
+  { "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+  } }
+  </script>
+</head>
+<body>
+  <div id="app">
+    <div id="hud">
+      <div class="title">头盔撞击损伤模拟</div>
+      <div>撞击次数：<span id="impactCount">0</span></div>
+      <div>结构完整性：<span id="integrity">100%</span></div>
+      <div>当前 roughness：<span id="roughness">0.00</span></div>
+    </div>
+    <div id="tip">左键点击头盔表面产生撞击，拖拽可旋转观察</div>
+    <div id="warning">结构失效</div>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+    const app = document.getElementById('app');
+    const impactCountEl = document.getElementById('impactCount');
+    const integrityEl = document.getElementById('integrity');
+    const roughnessEl = document.getElementById('roughness');
+    const warningEl = document.getElementById('warning');
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0b0f14);
+    scene.fog = new THREE.Fog(0x0b0f14, 6, 16);
+
+    const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.01, 100);
+    camera.position.set(1.6, 1.1, 2.4);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.0;
+    app.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.target.set(0, 0.15, 0);
+
+    const ambientLight = new THREE.HemisphereLight(0xbfd8ff, 0x1f1a14, 1.15);
+    scene.add(ambientLight);
+
+    const dirLight1 = new THREE.DirectionalLight(0xffffff, 1.9);
+    dirLight1.position.set(4, 5, 3);
+    scene.add(dirLight1);
+
+    const dirLight2 = new THREE.DirectionalLight(0x88aaff, 0.9);
+    dirLight2.position.set(-3, 2, -4);
+    scene.add(dirLight2);
+
+    const fillLight = new THREE.PointLight(0xffe0c0, 0.8, 20);
+    fillLight.position.set(0, 2, 2);
+    scene.add(fillLight);
+
+    const floor = new THREE.Mesh(
+      new THREE.CircleGeometry(6, 64),
+      new THREE.MeshStandardMaterial({
+        color: 0x161c23,
+        roughness: 0.96,
+        metalness: 0.02
+      })
+    );
+    floor.rotation.x = -Math.PI / 2;
+    floor.position.y = -0.75;
+    scene.add(floor);
+
+    const raycaster = new THREE.Raycaster();
+    const pointer = new THREE.Vector2();
+
+    let helmetRoot = null;
+    let helmetMeshes = [];
+    let modelLoaded = false;
+    let impactCount = 0;
+    let integrity = 100;
+    let lastImpactPos = { x: 0, y: 0, z: 0 };
+    let baseAverageRoughness = 0;
+    let globalRoughnessBoost = 0;
+    let failed = false;
+
+    const impactMarkers = new THREE.Group();
+    scene.add(impactMarkers);
+
+    const dentData = [];
+
+    const dentRadius = 0.3;
+    const markerGeometry = new THREE.SphereGeometry(0.02, 16, 16);
+    const markerMaterial = new THREE.MeshStandardMaterial({
+      color: 0xff2222,
+      emissive: 0x660000,
+      roughness: 0.4,
+      metalness: 0.1
+    });
+
+    const loader = new GLTFLoader();
+    loader.load(
+      'assets/DamagedHelmet.glb',
+      (gltf) => {
+        helmetRoot = gltf.scene;
+
+        const box = new THREE.Box3().setFromObject(helmetRoot);
+        const center = box.getCenter(new THREE.Vector3());
+        helmetRoot.position.sub(center);
+
+        const newBox = new THREE.Box3().setFromObject(helmetRoot);
+        const size = newBox.getSize(new THREE.Vector3());
+        const maxDim = Math.max(size.x, size.y, size.z);
+        const scale = 1.8 / maxDim;
+        helmetRoot.scale.setScalar(scale);
+
+        const finalBox = new THREE.Box3().setFromObject(helmetRoot);
+        const finalCenter = finalBox.getCenter(new THREE.Vector3());
+        const finalSize = finalBox.getSize(new THREE.Vector3());
+        helmetRoot.position.x -= finalCenter.x;
+        helmetRoot.position.y -= finalCenter.y - finalSize.y * 0.1;
+        helmetRoot.position.z -= finalCenter.z;
+
+        helmetRoot.traverse((child) => {
+          if (child.isMesh) {
+            child.castShadow = false;
+            child.receiveShadow = false;
+
+            const originalMaterial = child.material;
+            const material = Array.isArray(originalMaterial)
+              ? originalMaterial.map((m) => prepareMaterial(m))
+              : prepareMaterial(originalMaterial);
+
+            child.material = material;
+
+            if (child.geometry) {
+              if (!child.geometry.attributes.normal) {
+                child.geometry.computeVertexNormals();
+              }
+
+              const posAttr = child.geometry.attributes.position;
+              const basePositions = new Float32Array(posAttr.array);
+              const normalAttr = child.geometry.attributes.normal;
+              const baseNormals = new Float32Array(normalAttr.array);
+
+              child.userData.damage = {
+                basePositions,
+                baseNormals,
+                baseColor: new THREE.Color(1, 1, 1),
+                localImpacts: []
+              };
+            }
+
+            helmetMeshes.push(child);
+          }
+        });
+
+        baseAverageRoughness = computeAverageRoughness();
+        scene.add(helmetRoot);
+        modelLoaded = true;
+        updateHUD();
+      },
+      undefined,
+      (err) => {
+        console.error('模型加载失败:', err);
+      }
+    );
+
+    function prepareMaterial(mat) {
+      const m = mat.clone();
+      if ('roughness' in m && m.roughness === undefined) m.roughness = 0.5;
+      if ('metalness' in m && m.metalness === undefined) m.metalness = 0.5;
+      m.userData.baseRoughness = m.roughness ?? 0.5;
+      m.userData.baseMetalness = m.metalness ?? 0.5;
+      m.userData.damageBoost = 0;
+      m.userData.warningMix = 0;
+      return m;
+    }
+
+    function computeAverageRoughness() {
+      let total = 0;
+      let count = 0;
+      helmetMeshes.forEach((mesh) => {
+        const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+        materials.forEach((m) => {
+          if (typeof m.roughness === 'number') {
+            total += m.roughness;
+            count++;
+          }
+        });
+      });
+      return count ? total / count : 0;
+    }
+
+    function updateHUD() {
+      impactCountEl.textContent = String(impactCount);
+      integrityEl.textContent = `${Math.max(0, integrity).toFixed(1)}%`;
+      roughnessEl.textContent = computeAverageRoughness().toFixed(2);
+    }
+
+    function createImpactMarker(worldPos) {
+      const marker = new THREE.Mesh(markerGeometry, markerMaterial.clone());
+      marker.position.copy(worldPos);
+      scene.add(marker);
+      impactMarkers.add(marker);
+    }
+
+    function addDent(intersection) {
+      const { point, object } = intersection;
+      const localPoint = object.worldToLocal(point.clone());
+
+      dentData.push({
+        mesh: object,
+        localPoint: localPoint.clone(),
+        radius: dentRadius,
+        strength: 0.045 + Math.random() * 0.02,
+        time: performance.now()
+      });
+
+      if (object.userData.damage) {
+        object.userData.damage.localImpacts.push({
+          point: localPoint.clone(),
+          radius: dentRadius,
+          strength: 0.045 + Math.random() * 0.02
+        });
+      }
+
+      applyDentToMesh(object);
+      applyLocalMaterialDamage(point);
+    }
+
+    function applyDentToMesh(mesh) {
+      if (!mesh.geometry || !mesh.userData.damage) return;
+
+      const geometry = mesh.geometry;
+      const posAttr = geometry.attributes.position;
+      const normalAttr = geometry.attributes.normal;
+      const damage = mesh.userData.damage;
+      const localImpacts = damage.localImpacts;
+
+      const posArray = posAttr.array;
+      const basePositions = damage.basePositions;
+      const baseNormals = damage.baseNormals;
+
+      for (let i = 0; i < posAttr.count; i++) {
+        const ix = i * 3;
+        let x = basePositions[ix];
+        let y = basePositions[ix + 1];
+        let z = basePositions[ix + 2];
+
+        const nx = baseNormals[ix];
+        const ny = baseNormals[ix + 1];
+        const nz = baseNormals[ix + 2];
+
+        let offset = 0;
+
+        for (let j = 0; j < localImpacts.length; j++) {
+          const impact = localImpacts[j];
+          const dx = x - impact.point.x;
+          const dy = y - impact.point.y;
+          const dz = z - impact.point.z;
+          const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+
+          if (dist < impact.radius) {
+            const t = 1 - dist / impact.radius;
+            const falloff = t * t * (3 - 2 * t);
+            offset += impact.strength * falloff;
+          }
+        }
+
+        posArray[ix] = x - nx * offset;
+        posArray[ix + 1] = y - ny * offset;
+        posArray[ix + 2] = z - nz * offset;
+      }
+
+      posAttr.needsUpdate = true;
+      geometry.computeVertexNormals();
+      geometry.computeBoundingSphere();
+    }
+
+    function applyLocalMaterialDamage(worldPoint) {
+      helmetMeshes.forEach((mesh) => {
+        if (!mesh.geometry) return;
+
+        const geom = mesh.geometry;
+        geom.computeBoundingSphere();
+        const sphere = geom.boundingSphere.clone();
+        sphere.applyMatrix4(mesh.matrixWorld);
+
+        const distToSphere = sphere.center.distanceTo(worldPoint) - sphere.radius;
+        if (distToSphere > dentRadius) return;
+
+        const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+        materials.forEach((mat) => {
+          const baseMetalness = mat.userData.baseMetalness ?? (mat.metalness ?? 0.5);
+          const baseRoughness = mat.userData.baseRoughness ?? (mat.roughness ?? 0.5);
+
+          mat.userData.damageBoost = Math.min((mat.userData.damageBoost || 0) + 0.08, 0.5);
+          if (typeof mat.metalness === 'number') {
+            mat.metalness = THREE.MathUtils.clamp(baseMetalness + mat.userData.damageBoost * 0.6, 0, 1);
+          }
+          if (typeof mat.roughness === 'number') {
+            mat.roughness = THREE.MathUtils.clamp(baseRoughness + globalRoughnessBoost + mat.userData.damageBoost * 0.2, 0, 1);
+          }
+        });
+      });
+    }
+
+    function applyGlobalRoughnessIncrease() {
+      helmetMeshes.forEach((mesh) => {
+        const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+        materials.forEach((mat) => {
+          const baseRoughness = mat.userData.baseRoughness ?? (mat.roughness ?? 0.5);
+          mat.roughness = THREE.MathUtils.clamp(baseRoughness + globalRoughnessBoost + (mat.userData.damageBoost || 0) * 0.2, 0, 1);
+        });
+      });
+    }
+
+    function updateWarningTint() {
+      const warningMix = integrity <= 30 ? THREE.MathUtils.clamp((30 - Math.max(integrity, 0)) / 30, 0, 1) : 0;
+
+      helmetMeshes.forEach((mesh) => {
+        const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+        materials.forEach((mat) => {
+          if (!mat.color) return;
+          const base = new THREE.Color(1, 1, 1);
+          const warn = new THREE.Color(1.0, 0.25, 0.25);
+          mat.color.copy(base).lerp(warn, warningMix * 0.85);
+          if ('emissive' in mat) {
+            mat.emissive.setRGB(0.18 * warningMix, 0.02, 0.02);
+          }
+        });
+      });
+    }
+
+    function handleImpact(intersection) {
+      if (!intersection || failed) return;
+
+      impactCount++;
+      const damageLoss = 10 + Math.random() * 5;
+      integrity = Math.max(0, integrity - damageLoss);
+
+      lastImpactPos = {
+        x: intersection.point.x,
+        y: intersection.point.y,
+        z: intersection.point.z
+      };
+
+      createImpactMarker(intersection.point);
+      addDent(intersection);
+
+      if (impactCount % 3 === 0) {
+        globalRoughnessBoost = Math.min(globalRoughnessBoost + 0.2, 1.0);
+        applyGlobalRoughnessIncrease();
+      }
+
+      updateWarningTint();
+
+      if (integrity <= 0) {
+        failed = true;
+        warningEl.style.display = 'block';
+      } else if (integrity <= 30) {
+        warningEl.style.display = 'block';
+        warningEl.textContent = '结构临界警告';
+      } else {
+        warningEl.style.display = 'none';
+        warningEl.textContent = '结构失效';
+      }
+
+      if (integrity <= 0) {
+        warningEl.textContent = '结构失效';
+      }
+
+      updateHUD();
+    }
+
+    let downPos = { x: 0, y: 0 };
+    renderer.domElement.addEventListener('pointerdown', (e) => {
+      downPos.x = e.clientX;
+      downPos.y = e.clientY;
+    });
+
+    renderer.domElement.addEventListener('pointerup', (e) => {
+      const dx = e.clientX - downPos.x;
+      const dy = e.clientY - downPos.y;
+      const moved = Math.sqrt(dx * dx + dy * dy);
+      if (moved > 5) return;
+      if (!modelLoaded || !helmetRoot) return;
+
+      const rect = renderer.domElement.getBoundingClientRect();
+      pointer.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+      pointer.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+
+      raycaster.setFromCamera(pointer, camera);
+      const intersections = raycaster.intersectObjects(helmetMeshes, false);
+      if (intersections.length > 0) {
+        handleImpact(intersections[0]);
+      }
+    });
+
+    window.addEventListener('resize', onResize);
+    function onResize() {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    }
+
+    window.__3D_STATE__ = {
+      modelLoaded: false,
+      impactCount: 0,
+      integrity: 100,
+      roughness: 0,
+      lastImpactPos: { x: 0, y: 0, z: 0 }
+    };
+
+    const clock = new THREE.Clock();
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      const elapsed = clock.getElapsedTime();
+
+      impactMarkers.children.forEach((marker, i) => {
+        marker.scale.setScalar(1 + Math.sin(elapsed * 4 + i) * 0.08);
+        marker.material.emissiveIntensity = 0.5 + (Math.sin(elapsed * 6 + i) * 0.5 + 0.5) * 0.8;
+      });
+
+      controls.update();
+      renderer.render(scene, camera);
+
+      window.__3D_STATE__ = {
+        modelLoaded,
+        impactCount,
+        integrity: Number(Math.max(0, integrity).toFixed(2)),
+        roughness: Number(computeAverageRoughness().toFixed(3)),
+        lastImpactPos: { ...lastImpactPos }
+      };
+    }
+
+    animate();
+  </script>
+</body>
+</html>

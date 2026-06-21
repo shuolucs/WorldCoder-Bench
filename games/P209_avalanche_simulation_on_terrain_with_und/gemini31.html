@@ -1,0 +1,515 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Avalanche Simulation</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #87CEEB;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+        }
+        #hud {
+            position: absolute;
+            top: 15px;
+            left: 15px;
+            background: rgba(255, 255, 255, 0.85);
+            padding: 15px;
+            border-radius: 8px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            pointer-events: none;
+            min-width: 200px;
+        }
+        #hud h2 {
+            margin: 0 0 10px 0;
+            font-size: 16px;
+            color: #333;
+        }
+        .stat-row {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 5px;
+            font-size: 14px;
+            color: #555;
+        }
+        .stat-value {
+            font-weight: bold;
+            color: #222;
+        }
+        #controls {
+            position: absolute;
+            top: 15px;
+            right: 15px;
+            display: flex;
+            gap: 10px;
+        }
+        button {
+            padding: 10px 20px;
+            font-size: 14px;
+            font-weight: bold;
+            color: white;
+            background-color: #4CAF50;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+            transition: background-color 0.2s;
+        }
+        button:hover {
+            background-color: #45a049;
+        }
+        #resetBtn {
+            background-color: #f44336;
+        }
+        #resetBtn:hover {
+            background-color: #da190b;
+        }
+        .instructions {
+            margin-top: 10px;
+            font-size: 12px;
+            color: #666;
+            border-top: 1px solid #ccc;
+            padding-top: 5px;
+        }
+    </style>
+    <!-- Import maps polyfill -->
+    <script async src="https://unpkg.com/es-module-shims@1.8.0/dist/es-module-shims.js"></script>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="canvas-container"></div>
+    
+    <div id="hud">
+        <h2>Avalanche Status</h2>
+        <div class="stat-row"><span>Time:</span> <span id="ui-time" class="stat-value">0.0s</span></div>
+        <div class="stat-row"><span>Active Particles:</span> <span id="ui-active" class="stat-value">0 / 200</span></div>
+        <div class="stat-row"><span>Snapshot:</span> <span id="ui-snapshot" class="stat-value">0 / 0</span></div>
+        <div class="stat-row"><span>State:</span> <span id="ui-state" class="stat-value" style="color: #666;">READY</span></div>
+        <div class="instructions">
+            Keys: [P] Pause, [U] Undo, [R] Redo
+        </div>
+    </div>
+
+    <div id="controls">
+        <button id="startBtn">Start Avalanche</button>
+        <button id="resetBtn">Reset</button>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+        // --- State Management ---
+        window.__3D_STATE__ = {
+            simulationStarted: false,
+            simulationTime: 0,
+            activeParticles: 0,
+            totalParticles: 200,
+            paused: false,
+            snapshotIndex: -1,
+            totalSnapshots: 0,
+            horseLoaded: false,
+            horsePosition: { x: 5, y: 0, z: 10 },
+            particlesStopped: 0,
+            undoCount: 0,
+            redoCount: 0,
+            canUndo: false,
+            canRedo: false
+        };
+
+        // --- Scene Setup ---
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        scene.fog = new THREE.FogExp2(0x87CEEB, 0.005);
+
+        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.set(0, 40, 60);
+        camera.lookAt(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        container.appendChild(renderer.domElement);
+
+        // --- Lighting ---
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+        dirLight.position.set(10, 50, 10);
+        dirLight.castShadow = true;
+        dirLight.shadow.mapSize.width = 2048;
+        dirLight.shadow.mapSize.height = 2048;
+        dirLight.shadow.camera.near = 0.5;
+        dirLight.shadow.camera.far = 150;
+        dirLight.shadow.camera.left = -60;
+        dirLight.shadow.camera.right = 60;
+        dirLight.shadow.camera.top = 60;
+        dirLight.shadow.camera.bottom = -60;
+        scene.add(dirLight);
+
+        // --- Terrain Generation ---
+        function getElevation(x, z) {
+            // Base slope: z=-50 (h=0) to z=50 (h=30) -> h = (z+50) * 0.3
+            const baseHeight = (z + 50) * 0.3;
+            // Add some mountainous noise
+            const noise = Math.sin(x * 0.15) * Math.cos(z * 0.15) * 2.0 + Math.sin(x * 0.05) * 3.0;
+            return baseHeight + noise;
+        }
+
+        const terrainGeo = new THREE.PlaneGeometry(100, 100, 64, 64);
+        terrainGeo.rotateX(-Math.PI / 2);
+        const posAttr = terrainGeo.attributes.position;
+        for (let i = 0; i < posAttr.count; i++) {
+            const x = posAttr.getX(i);
+            const z = posAttr.getZ(i);
+            posAttr.setY(i, getElevation(x, z));
+        }
+        terrainGeo.computeVertexNormals();
+
+        const terrainMat = new THREE.MeshStandardMaterial({ 
+            color: 0xeeeeee, 
+            roughness: 0.9, 
+            metalness: 0.1 
+        });
+        const terrain = new THREE.Mesh(terrainGeo, terrainMat);
+        terrain.receiveShadow = true;
+        scene.add(terrain);
+
+        // --- Asset Loading (Horse) ---
+        const horsePos = { x: 5, z: 10 };
+        const horseY = getElevation(horsePos.x, horsePos.z);
+        window.__3D_STATE__.horsePosition = { x: horsePos.x, y: horseY, z: horsePos.z };
+
+        const loader = new GLTFLoader();
+        loader.load('._horse.glb', (gltf) => {
+            const horse = gltf.scene;
+            horse.position.set(horsePos.x, horseY, horsePos.z);
+            horse.scale.set(3, 3, 3);
+            
+            horse.traverse((child) => {
+                if (child.isMesh) {
+                    child.castShadow = true;
+                    child.receiveShadow = true;
+                    // Make it look frozen
+                    child.material = new THREE.MeshStandardMaterial({
+                        color: 0xaaaaaa,
+                        roughness: 0.2,
+                        metalness: 0.8,
+                        envMapIntensity: 1.0
+                    });
+                }
+            });
+            scene.add(horse);
+            window.__3D_STATE__.horseLoaded = true;
+        }, undefined, (error) => {
+            console.warn('Could not load ._horse.glb, continuing simulation without visual model.', error);
+        });
+
+        // --- Particle System ---
+        const particles = [];
+        const particleGeo = new THREE.SphereGeometry(0.3, 8, 8);
+        const particleMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.5 });
+
+        for (let i = 0; i < window.__3D_STATE__.totalParticles; i++) {
+            const mesh = new THREE.Mesh(particleGeo, particleMat);
+            mesh.castShadow = true;
+            mesh.receiveShadow = true;
+            scene.add(mesh);
+            
+            particles.push({
+                mesh: mesh,
+                velocity: new THREE.Vector3(0, 0, 0),
+                active: false,
+                stopped: false
+            });
+        }
+
+        // --- Simulation Variables ---
+        const clock = new THREE.Clock();
+        let snapshotTimer = 0;
+        let history = [];
+        const MAX_SNAPSHOTS = 30;
+        const GRAVITY = -15;
+        
+        // Approximate slope normal for collision response
+        const slopeNormal = new THREE.Vector3(0, 1, -0.3).normalize();
+
+        // --- Core Functions ---
+        function resetParticles() {
+            particles.forEach(p => {
+                // Cluster near (0, 28, 45)
+                const x = (Math.random() - 0.5) * 8;
+                const z = 45 + (Math.random() - 0.5) * 4;
+                const y = getElevation(x, z) + 0.5 + Math.random() * 3;
+                
+                p.mesh.position.set(x, y, z);
+                p.velocity.set(0, 0, 0);
+                p.active = false;
+                p.stopped = false;
+                p.mesh.visible = false;
+            });
+        }
+
+        function resetSimulation() {
+            resetParticles();
+            window.__3D_STATE__.simulationStarted = false;
+            window.__3D_STATE__.paused = false;
+            window.__3D_STATE__.simulationTime = 0;
+            window.__3D_STATE__.activeParticles = 0;
+            window.__3D_STATE__.particlesStopped = 0;
+            
+            history = [];
+            window.__3D_STATE__.snapshotIndex = -1;
+            snapshotTimer = 0;
+            
+            updateUI();
+        }
+
+        function startSimulation() {
+            if (window.__3D_STATE__.simulationStarted) return;
+            
+            window.__3D_STATE__.simulationStarted = true;
+            window.__3D_STATE__.paused = false;
+            
+            particles.forEach(p => {
+                p.active = true;
+                p.mesh.visible = true;
+            });
+            
+            saveSnapshot(); // Save initial state
+            updateUI();
+        }
+
+        // --- Undo/Redo System ---
+        function saveSnapshot() {
+            const state = window.__3D_STATE__;
+            
+            // Truncate future history if we are overwriting from a past state
+            if (state.snapshotIndex < history.length - 1) {
+                history = history.slice(0, state.snapshotIndex + 1);
+            }
+
+            const snapshotData = {
+                time: state.simulationTime,
+                particles: particles.map(p => ({
+                    x: p.mesh.position.x, y: p.mesh.position.y, z: p.mesh.position.z,
+                    vx: p.velocity.x, vy: p.velocity.y, vz: p.velocity.z,
+                    active: p.active, stopped: p.stopped, visible: p.mesh.visible
+                }))
+            };
+
+            history.push(snapshotData);
+            
+            if (history.length > MAX_SNAPSHOTS) {
+                history.shift();
+            } else {
+                state.snapshotIndex++;
+            }
+            
+            state.totalSnapshots = history.length;
+        }
+
+        function applySnapshot(index) {
+            if (index < 0 || index >= history.length) return;
+            
+            const data = history[index];
+            window.__3D_STATE__.simulationTime = data.time;
+            snapshotTimer = 0; // Reset timer relative to this snapshot
+            
+            let activeCount = 0;
+            let stoppedCount = 0;
+
+            data.particles.forEach((sp, i) => {
+                const p = particles[i];
+                p.mesh.position.set(sp.x, sp.y, sp.z);
+                p.velocity.set(sp.vx, sp.vy, sp.vz);
+                p.active = sp.active;
+                p.stopped = sp.stopped;
+                p.mesh.visible = sp.visible;
+                
+                if (p.active) activeCount++;
+                if (p.stopped) stoppedCount++;
+            });
+
+            window.__3D_STATE__.activeParticles = activeCount;
+            window.__3D_STATE__.particlesStopped = stoppedCount;
+        }
+
+        function undo() {
+            const state = window.__3D_STATE__;
+            if (state.snapshotIndex > 0) {
+                state.snapshotIndex--;
+                applySnapshot(state.snapshotIndex);
+                state.undoCount++;
+                updateUI();
+            }
+        }
+
+        function redo() {
+            const state = window.__3D_STATE__;
+            if (state.snapshotIndex < history.length - 1) {
+                state.snapshotIndex++;
+                applySnapshot(state.snapshotIndex);
+                state.redoCount++;
+                updateUI();
+            }
+        }
+
+        // --- Physics Engine ---
+        function updatePhysics(delta) {
+            const state = window.__3D_STATE__;
+            if (!state.simulationStarted || state.paused) return;
+
+            // Cap delta to prevent huge jumps if tab is inactive
+            const dt = Math.min(delta, 0.1);
+            
+            state.simulationTime += dt;
+            snapshotTimer += dt;
+
+            if (snapshotTimer >= 1.0) {
+                saveSnapshot();
+                snapshotTimer -= 1.0;
+            }
+
+            let activeCount = 0;
+            let stoppedCount = 0;
+
+            particles.forEach(p => {
+                if (p.stopped) {
+                    stoppedCount++;
+                    return;
+                }
+                if (!p.active) return;
+                
+                activeCount++;
+
+                // Apply Gravity
+                p.velocity.y += GRAVITY * dt;
+
+                // Apply random X drift
+                p.velocity.x += (Math.random() - 0.5) * 3.0 * dt;
+
+                // Update Position
+                p.mesh.position.addScaledVector(p.velocity, dt);
+                const pos = p.mesh.position;
+
+                // Terrain Collision
+                const groundY = getElevation(pos.x, pos.z);
+                if (pos.y < groundY + 0.3) {
+                    pos.y = groundY + 0.3;
+                    
+                    // Project velocity onto slope plane to slide
+                    const dot = p.velocity.dot(slopeNormal);
+                    if (dot < 0) {
+                        // Remove velocity component along normal (bounce/friction)
+                        p.velocity.sub(slopeNormal.clone().multiplyScalar(dot * 1.2));
+                    }
+                    // Ground friction/drag
+                    p.velocity.multiplyScalar(0.98);
+                }
+
+                // Horse Collision (AABB approx: width 4, depth 4 around x=5, z=10)
+                if (pos.x > 3 && pos.x < 7 && pos.z > 8 && pos.z < 12 && pos.y < horseY + 6) {
+                    // Push away from center
+                    const dx = pos.x - 5;
+                    const dz = pos.z - 10;
+                    p.velocity.x += dx * 2;
+                    p.velocity.z += dz * 2;
+                    // Dampen speed
+                    p.velocity.multiplyScalar(0.8);
+                }
+
+                // Stop Conditions
+                if (pos.z < -40 || pos.y < 0.3) {
+                    p.active = false;
+                    p.stopped = true;
+                    p.velocity.set(0,0,0);
+                }
+            });
+
+            state.activeParticles = activeCount;
+            state.particlesStopped = stoppedCount;
+        }
+
+        // --- UI & Interaction ---
+        function updateUI() {
+            const state = window.__3D_STATE__;
+            state.canUndo = state.snapshotIndex > 0;
+            state.canRedo = state.snapshotIndex < history.length - 1;
+
+            document.getElementById('ui-time').innerText = state.simulationTime.toFixed(1) + 's';
+            document.getElementById('ui-active').innerText = `${state.activeParticles} / ${state.totalParticles}`;
+            
+            const snapDisplay = state.snapshotIndex >= 0 ? state.snapshotIndex + 1 : 0;
+            document.getElementById('ui-snapshot').innerText = `${snapDisplay} / ${state.totalSnapshots}`;
+            
+            const stateEl = document.getElementById('ui-state');
+            if (state.paused) {
+                stateEl.innerText = 'PAUSED';
+                stateEl.style.color = '#f44336';
+            } else if (state.simulationStarted) {
+                stateEl.innerText = 'RUNNING';
+                stateEl.style.color = '#4CAF50';
+            } else {
+                stateEl.innerText = 'READY';
+                stateEl.style.color = '#666';
+            }
+        }
+
+        document.getElementById('startBtn').addEventListener('click', startSimulation);
+        document.getElementById('resetBtn').addEventListener('click', resetSimulation);
+
+        window.addEventListener('keydown', (e) => {
+            const key = e.key.toLowerCase();
+            if (key === 'u') undo();
+            if (key === 'r') redo();
+            if (key === 'p' && window.__3D_STATE__.simulationStarted) {
+                window.__3D_STATE__.paused = !window.__3D_STATE__.paused;
+                updateUI();
+            }
+        });
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // --- Main Loop ---
+        function animate() {
+            requestAnimationFrame(animate);
+            
+            const delta = clock.getDelta();
+            updatePhysics(delta);
+            
+            if (window.__3D_STATE__.simulationStarted) {
+                updateUI();
+            }
+            
+            renderer.render(scene, camera);
+        }
+
+        // Initialize
+        resetSimulation();
+        animate();
+
+    </script>
+</body>
+</html>

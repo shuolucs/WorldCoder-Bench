@@ -1,0 +1,837 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Three.js 3D 国际象棋</title>
+  <style>
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #111;
+      font-family: Arial, Helvetica, sans-serif;
+    }
+    #app {
+      width: 100%;
+      height: 100%;
+      position: relative;
+    }
+    #hud {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      z-index: 10;
+      color: #fff;
+      background: rgba(0,0,0,0.5);
+      padding: 12px 14px;
+      border-radius: 10px;
+      line-height: 1.8;
+      font-size: 14px;
+      min-width: 200px;
+      backdrop-filter: blur(4px);
+      user-select: none;
+    }
+    #hud b {
+      color: #ffd76a;
+      display: inline-block;
+      min-width: 78px;
+    }
+    #tip {
+      position: absolute;
+      right: 12px;
+      bottom: 12px;
+      z-index: 10;
+      color: #ddd;
+      background: rgba(0,0,0,0.45);
+      padding: 10px 12px;
+      border-radius: 10px;
+      font-size: 13px;
+      max-width: 320px;
+      line-height: 1.6;
+      user-select: none;
+    }
+    canvas {
+      display: block;
+    }
+  </style>
+
+  <script type="importmap">
+  { "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+  } }
+  </script>
+</head>
+<body>
+  <div id="app">
+    <div id="hud">
+      <div><b>当前回合</b><span id="currentTurn">白方</span></div>
+      <div><b>移动次数</b><span id="moveCount">0</span></div>
+      <div><b>被吃棋子数</b><span id="capturedCount">0</span></div>
+      <div><b>选中棋子</b><span id="selectedPiece">无</span></div>
+    </div>
+    <div id="tip">
+      操作：点击己方棋子进行选择，再点击绿色高亮格移动。<br />
+      可旋转、缩放查看棋盘。
+    </div>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+    const app = document.getElementById('app');
+    const currentTurnEl = document.getElementById('currentTurn');
+    const moveCountEl = document.getElementById('moveCount');
+    const capturedCountEl = document.getElementById('capturedCount');
+    const selectedPieceEl = document.getElementById('selectedPiece');
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x1c1f26);
+    scene.fog = new THREE.Fog(0x1c1f26, 30, 90);
+
+    const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 300);
+    camera.position.set(10, 12, 14);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    app.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.target.set(0, 0, 0);
+    controls.minDistance = 8;
+    controls.maxDistance = 35;
+    controls.maxPolarAngle = Math.PI * 0.49;
+
+    const ambient = new THREE.HemisphereLight(0xffffff, 0x444466, 1.1);
+    scene.add(ambient);
+
+    const dirLight = new THREE.DirectionalLight(0xffffff, 1.8);
+    dirLight.position.set(12, 18, 10);
+    dirLight.castShadow = true;
+    dirLight.shadow.mapSize.set(2048, 2048);
+    dirLight.shadow.camera.left = -20;
+    dirLight.shadow.camera.right = 20;
+    dirLight.shadow.camera.top = 20;
+    dirLight.shadow.camera.bottom = -20;
+    scene.add(dirLight);
+
+    const fillLight = new THREE.DirectionalLight(0x88aaff, 0.55);
+    fillLight.position.set(-10, 8, -8);
+    scene.add(fillLight);
+
+    const raycaster = new THREE.Raycaster();
+    const mouse = new THREE.Vector2();
+
+    let modelLoaded = false;
+    let boardGroup = null;
+    let boardBounds = null;
+    let boardCenter = new THREE.Vector3();
+    let boardSize = new THREE.Vector3(8, 1, 8);
+
+    let tileSizeX = 1;
+    let tileSizeZ = 1;
+    let boardMinX = -4;
+    let boardMaxX = 4;
+    let boardMinZ = -4;
+    let boardMaxZ = 4;
+    let boardY = 0.02;
+
+    const allClickableMeshes = [];
+    const pieceMeshes = [];
+    const squareMarkers = [];
+
+    const boardMap = Array.from({ length: 8 }, () => Array(8).fill(null));
+
+    let currentTurn = 'white';
+    let moveCount = 0;
+    let capturedCount = 0;
+
+    let selectedPiece = null;
+    let selectedLegalMoves = [];
+    let pendingAnimations = [];
+
+    function createFallbackBoard() {
+      const group = new THREE.Group();
+      group.name = 'FallbackBoard';
+
+      const board = new THREE.Mesh(
+        new THREE.BoxGeometry(8, 0.6, 8),
+        new THREE.MeshStandardMaterial({ color: 0x5d4037, roughness: 0.8, metalness: 0.1 })
+      );
+      board.receiveShadow = true;
+      board.castShadow = true;
+      group.add(board);
+
+      const top = new THREE.Group();
+      const lightMat = new THREE.MeshStandardMaterial({ color: 0xdcc7a1, roughness: 0.9 });
+      const darkMat = new THREE.MeshStandardMaterial({ color: 0x6d4c41, roughness: 0.9 });
+      const squareGeo = new THREE.BoxGeometry(0.98, 0.08, 0.98);
+
+      for (let r = 0; r < 8; r++) {
+        for (let c = 0; c < 8; c++) {
+          const sq = new THREE.Mesh(squareGeo, (r + c) % 2 === 0 ? lightMat : darkMat);
+          sq.position.set(c - 3.5, 0.34, r - 3.5);
+          sq.receiveShadow = true;
+          top.add(sq);
+        }
+      }
+      group.add(top);
+      scene.add(group);
+      return group;
+    }
+
+    function createFallbackPieces() {
+      const whiteMat = new THREE.MeshStandardMaterial({ color: 0xf2f2f2, roughness: 0.5, metalness: 0.15 });
+      const blackMat = new THREE.MeshStandardMaterial({ color: 0x1f1f1f, roughness: 0.5, metalness: 0.2 });
+
+      const pieceDefs = [
+        ['rook','knight','bishop','queen','king','bishop','knight','rook'],
+        ['pawn','pawn','pawn','pawn','pawn','pawn','pawn','pawn']
+      ];
+
+      for (let c = 0; c < 8; c++) {
+        addFallbackPiece(pieceDefs[0][c], 'white', 0, c, whiteMat);
+        addFallbackPiece(pieceDefs[1][c], 'white', 1, c, whiteMat);
+        addFallbackPiece(pieceDefs[1][c], 'black', 6, c, blackMat);
+        addFallbackPiece(pieceDefs[0][c], 'black', 7, c, blackMat);
+      }
+    }
+
+    function addFallbackPiece(type, side, row, col, material) {
+      const g = new THREE.Group();
+      g.name = `${side}_${type}_${String.fromCharCode(97 + col)}${8 - row}`;
+
+      const body = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.22, 0.28, 0.7, 24),
+        material.clone()
+      );
+      body.castShadow = true;
+      body.receiveShadow = true;
+      body.position.y = 0.35;
+      g.add(body);
+
+      const head = new THREE.Mesh(
+        new THREE.SphereGeometry(type === 'pawn' ? 0.16 : 0.2, 24, 24),
+        material.clone()
+      );
+      head.castShadow = true;
+      head.receiveShadow = true;
+      head.position.y = type === 'pawn' ? 0.83 : 0.92;
+      g.add(head);
+
+      if (type === 'king' || type === 'queen') {
+        const crown = new THREE.Mesh(
+          new THREE.CylinderGeometry(0.08, 0.08, type === 'king' ? 0.3 : 0.22, 12),
+          material.clone()
+        );
+        crown.position.y = type === 'king' ? 1.15 : 1.08;
+        crown.castShadow = true;
+        crown.receiveShadow = true;
+        g.add(crown);
+      }
+
+      g.position.copy(squareToWorld(row, col));
+      g.position.y = 0.34;
+      scene.add(g);
+
+      const meshes = [];
+      g.traverse(obj => {
+        if (obj.isMesh) {
+          obj.userData.parentPiece = g;
+          allClickableMeshes.push(obj);
+          meshes.push(obj);
+        }
+      });
+
+      g.userData = {
+        isPiece: true,
+        side,
+        type,
+        row,
+        col,
+        square: [row, col],
+        meshes,
+        captured: false
+      };
+
+      pieceMeshes.push(g);
+      boardMap[row][col] = g;
+    }
+
+    function inferPieceType(name) {
+      const n = name.toLowerCase();
+      if (n.includes('pawn') || n.includes('bauer')) return 'pawn';
+      if (n.includes('rook') || n.includes('castle') || n.includes('tour')) return 'rook';
+      if (n.includes('knight') || n.includes('horse') || n.includes('caval')) return 'knight';
+      if (n.includes('bishop') || n.includes('fou')) return 'bishop';
+      if (n.includes('queen') || n.includes('dame')) return 'queen';
+      if (n.includes('king') || n.includes('roi')) return 'king';
+      return 'pawn';
+    }
+
+    function inferPieceSide(obj) {
+      const n = obj.name.toLowerCase();
+      if (n.includes('white') || n.includes('blanc') || n.includes('light')) return 'white';
+      if (n.includes('black') || n.includes('noir') || n.includes('dark')) return 'black';
+
+      let colorSum = new THREE.Color();
+      let samples = 0;
+
+      obj.traverse(child => {
+        if (child.isMesh && child.material) {
+          const mats = Array.isArray(child.material) ? child.material : [child.material];
+          mats.forEach(mat => {
+            if (mat && mat.color) {
+              colorSum.r += mat.color.r;
+              colorSum.g += mat.color.g;
+              colorSum.b += mat.color.b;
+              samples++;
+            }
+          });
+        }
+      });
+
+      if (samples > 0) {
+        colorSum.multiplyScalar(1 / samples);
+        const luminance = 0.2126 * colorSum.r + 0.7152 * colorSum.g + 0.0722 * colorSum.b;
+        return luminance > 0.45 ? 'white' : 'black';
+      }
+
+      return obj.position.z < boardCenter.z ? 'white' : 'black';
+    }
+
+    function computeBoardMetrics(root) {
+      const box = new THREE.Box3().setFromObject(root);
+      boardBounds = box;
+      box.getCenter(boardCenter);
+      box.getSize(boardSize);
+
+      const horizontal = Math.max(boardSize.x, boardSize.z);
+      tileSizeX = boardSize.x / 8;
+      tileSizeZ = boardSize.z / 8;
+      boardMinX = boardCenter.x - boardSize.x / 2;
+      boardMaxX = boardCenter.x + boardSize.x / 2;
+      boardMinZ = boardCenter.z - boardSize.z / 2;
+      boardMaxZ = boardCenter.z + boardSize.z / 2;
+      boardY = box.min.y + Math.max(0.02, Math.min(0.2, horizontal * 0.01));
+    }
+
+    function worldToSquare(pos) {
+      const localX = pos.x - boardMinX;
+      const localZ = pos.z - boardMinZ;
+      let col = Math.floor(localX / tileSizeX);
+      let row = Math.floor(localZ / tileSizeZ);
+      col = THREE.MathUtils.clamp(col, 0, 7);
+      row = THREE.MathUtils.clamp(row, 0, 7);
+      return { row, col };
+    }
+
+    function squareToWorld(row, col) {
+      return new THREE.Vector3(
+        boardMinX + (col + 0.5) * tileSizeX,
+        boardY,
+        boardMinZ + (row + 0.5) * tileSizeZ
+      );
+    }
+
+    function setupPieceDataFromModel(root) {
+      const candidates = [];
+      root.updateMatrixWorld(true);
+
+      root.traverse(obj => {
+        if (obj.isMesh) {
+          obj.castShadow = true;
+          obj.receiveShadow = true;
+          allClickableMeshes.push(obj);
+        }
+      });
+
+      root.traverse(obj => {
+        if (!obj.isObject3D || obj === root) return;
+        const name = (obj.name || '').toLowerCase();
+        if (
+          name.includes('pawn') || name.includes('rook') || name.includes('knight') ||
+          name.includes('bishop') || name.includes('queen') || name.includes('king') ||
+          name.includes('white') || name.includes('black') || name.includes('piece') ||
+          name.includes('chess')
+        ) {
+          candidates.push(obj);
+        }
+      });
+
+      const filtered = [];
+      const seen = new Set();
+
+      for (const obj of candidates) {
+        let target = obj;
+        while (target.parent && target.parent !== root && target.parent.name && (
+          target.parent.name.toLowerCase().includes('pawn') ||
+          target.parent.name.toLowerCase().includes('rook') ||
+          target.parent.name.toLowerCase().includes('knight') ||
+          target.parent.name.toLowerCase().includes('bishop') ||
+          target.parent.name.toLowerCase().includes('queen') ||
+          target.parent.name.toLowerCase().includes('king') ||
+          target.parent.name.toLowerCase().includes('white') ||
+          target.parent.name.toLowerCase().includes('black') ||
+          target.parent.name.toLowerCase().includes('piece')
+        )) {
+          target = target.parent;
+        }
+        if (!seen.has(target.uuid)) {
+          seen.add(target.uuid);
+          filtered.push(target);
+        }
+      }
+
+      if (filtered.length < 16) {
+        const topLevel = [];
+        root.children.forEach(ch => {
+          const box = new THREE.Box3().setFromObject(ch);
+          const size = new THREE.Vector3();
+          box.getSize(size);
+          if (size.y > boardSize.y * 0.15 && Math.max(size.x, size.z) < Math.max(boardSize.x, boardSize.z) * 0.25) {
+            topLevel.push(ch);
+          }
+        });
+        topLevel.forEach(ch => {
+          if (!seen.has(ch.uuid)) {
+            seen.add(ch.uuid);
+            filtered.push(ch);
+          }
+        });
+      }
+
+      const occupiedTemp = new Map();
+
+      for (const piece of filtered) {
+        const box = new THREE.Box3().setFromObject(piece);
+        const center = new THREE.Vector3();
+        box.getCenter(center);
+        const { row, col } = worldToSquare(center);
+
+        const key = `${row}_${col}`;
+        if (occupiedTemp.has(key)) continue;
+        occupiedTemp.set(key, true);
+
+        const side = inferPieceSide(piece);
+        const type = inferPieceType(piece.name || '');
+        const meshes = [];
+
+        piece.traverse(obj => {
+          if (obj.isMesh) {
+            obj.userData.parentPiece = piece;
+            meshes.push(obj);
+          }
+        });
+
+        piece.userData = {
+          isPiece: true,
+          side,
+          type,
+          row,
+          col,
+          square: [row, col],
+          meshes,
+          captured: false
+        };
+
+        pieceMeshes.push(piece);
+        if (!boardMap[row][col]) boardMap[row][col] = piece;
+      }
+    }
+
+    function clearSelectionHighlight() {
+      if (!selectedPiece) return;
+      const meshes = selectedPiece.userData.meshes || [];
+      meshes.forEach(mesh => {
+        const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+        mats.forEach(mat => {
+          if (mat && 'emissive' in mat) {
+            mat.emissive.setHex(mat.userData.__oldEmissive ?? 0x000000);
+          }
+          if (mat && mat.userData && mat.userData.__oldEmissiveIntensity !== undefined) {
+            mat.emissiveIntensity = mat.userData.__oldEmissiveIntensity;
+          }
+        });
+      });
+    }
+
+    function setSelectionHighlight(piece, enabled) {
+      const meshes = piece.userData.meshes || [];
+      meshes.forEach(mesh => {
+        const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+        mats.forEach(mat => {
+          if (mat && 'emissive' in mat) {
+            if (enabled) {
+              if (mat.userData.__oldEmissive === undefined) {
+                mat.userData.__oldEmissive = mat.emissive.getHex();
+                mat.userData.__oldEmissiveIntensity = mat.emissiveIntensity ?? 1;
+              }
+              mat.emissive.setHex(0xffdd33);
+              mat.emissiveIntensity = 0.9;
+            } else {
+              mat.emissive.setHex(mat.userData.__oldEmissive ?? 0x000000);
+              mat.emissiveIntensity = mat.userData.__oldEmissiveIntensity ?? 1;
+            }
+          }
+        });
+      });
+    }
+
+    function clearMoveMarkers() {
+      while (squareMarkers.length) {
+        const m = squareMarkers.pop();
+        scene.remove(m);
+        if (m.geometry) m.geometry.dispose();
+        if (m.material) m.material.dispose();
+      }
+    }
+
+    function showMoveMarkers(moves) {
+      clearMoveMarkers();
+      const geo = new THREE.BoxGeometry(tileSizeX * 0.85, 0.04, tileSizeZ * 0.85);
+      moves.forEach(move => {
+        const mat = new THREE.MeshStandardMaterial({
+          color: move.capture ? 0xff5555 : 0x33ff66,
+          transparent: true,
+          opacity: 0.55,
+          emissive: move.capture ? 0x440000 : 0x003300
+        });
+        const marker = new THREE.Mesh(geo.clone(), mat);
+        const pos = squareToWorld(move.row, move.col);
+        marker.position.set(pos.x, boardY + 0.08, pos.z);
+        marker.receiveShadow = false;
+        marker.castShadow = false;
+        marker.userData.moveTarget = move;
+        scene.add(marker);
+        squareMarkers.push(marker);
+      });
+    }
+
+    function inBounds(row, col) {
+      return row >= 0 && row < 8 && col >= 0 && col < 8;
+    }
+
+    function getPieceAt(row, col) {
+      if (!inBounds(row, col)) return null;
+      return boardMap[row][col];
+    }
+
+    function pushStepMove(moves, piece, row, col) {
+      if (!inBounds(row, col)) return;
+      const target = getPieceAt(row, col);
+      if (target && target.userData.side === piece.userData.side) return;
+      moves.push({ row, col, capture: !!target });
+    }
+
+    function pushSlidingMoves(moves, piece, directions) {
+      for (const [dr, dc] of directions) {
+        let r = piece.userData.row + dr;
+        let c = piece.userData.col + dc;
+        while (inBounds(r, c)) {
+          const target = getPieceAt(r, c);
+          if (!target) {
+            moves.push({ row: r, col: c, capture: false });
+          } else {
+            if (target.userData.side !== piece.userData.side) {
+              moves.push({ row: r, col: c, capture: true });
+            }
+            break;
+          }
+          r += dr;
+          c += dc;
+        }
+      }
+    }
+
+    function getLegalMoves(piece) {
+      const { type, side, row, col } = piece.userData;
+      const moves = [];
+
+      if (type === 'pawn') {
+        const dir = side === 'white' ? 1 : -1;
+        const startRow = side === 'white' ? 1 : 6;
+
+        const front1 = row + dir;
+        if (inBounds(front1, col) && !getPieceAt(front1, col)) {
+          moves.push({ row: front1, col, capture: false });
+          const front2 = row + dir * 2;
+          if (row === startRow && inBounds(front2, col) && !getPieceAt(front2, col)) {
+            moves.push({ row: front2, col, capture: false });
+          }
+        }
+
+        for (const dc of [-1, 1]) {
+          const rr = row + dir;
+          const cc = col + dc;
+          if (!inBounds(rr, cc)) continue;
+          const target = getPieceAt(rr, cc);
+          if (target && target.userData.side !== side) {
+            moves.push({ row: rr, col: cc, capture: true });
+          }
+        }
+      } else if (type === 'rook') {
+        pushSlidingMoves(moves, piece, [[1,0],[-1,0],[0,1],[0,-1]]);
+      } else if (type === 'bishop') {
+        pushSlidingMoves(moves, piece, [[1,1],[1,-1],[-1,1],[-1,-1]]);
+      } else if (type === 'queen') {
+        pushSlidingMoves(moves, piece, [[1,0],[-1,0],[0,1],[0,-1],[1,1],[1,-1],[-1,1],[-1,-1]]);
+      } else if (type === 'king') {
+        [[1,0],[-1,0],[0,1],[0,-1],[1,1],[1,-1],[-1,1],[-1,-1]].forEach(([dr, dc]) => {
+          pushStepMove(moves, piece, row + dr, col + dc);
+        });
+      } else if (type === 'knight') {
+        [[2,1],[2,-1],[-2,1],[-2,-1],[1,2],[1,-2],[-1,2],[-1,-2]].forEach(([dr, dc]) => {
+          pushStepMove(moves, piece, row + dr, col + dc);
+        });
+      }
+
+      return moves;
+    }
+
+    function selectPiece(piece) {
+      if (piece.userData.side !== currentTurn) return;
+      if (selectedPiece === piece) return;
+
+      clearSelectionHighlight();
+      clearMoveMarkers();
+
+      selectedPiece = piece;
+      selectedLegalMoves = getLegalMoves(piece);
+      setSelectionHighlight(piece, true);
+      showMoveMarkers(selectedLegalMoves);
+      updateHUD();
+    }
+
+    function deselectPiece() {
+      clearSelectionHighlight();
+      clearMoveMarkers();
+      selectedPiece = null;
+      selectedLegalMoves = [];
+      updateHUD();
+    }
+
+    function removeCapturedPiece(piece) {
+      piece.userData.captured = true;
+      scene.remove(piece);
+      if (piece.parent) piece.parent.remove(piece);
+      capturedCount++;
+    }
+
+    function movePiece(piece, targetRow, targetCol) {
+      const fromRow = piece.userData.row;
+      const fromCol = piece.userData.col;
+      const targetPiece = getPieceAt(targetRow, targetCol);
+
+      if (targetPiece && targetPiece.userData.side === piece.userData.side) return false;
+
+      if (targetPiece && targetPiece.userData.side !== piece.userData.side) {
+        removeCapturedPiece(targetPiece);
+      }
+
+      boardMap[fromRow][fromCol] = null;
+      boardMap[targetRow][targetCol] = piece;
+
+      piece.userData.row = targetRow;
+      piece.userData.col = targetCol;
+      piece.userData.square = [targetRow, targetCol];
+
+      const destination = squareToWorld(targetRow, targetCol);
+      const startPos = piece.position.clone();
+      let liftY = Math.max(startPos.y, destination.y) + Math.max(tileSizeX, tileSizeZ) * 0.35;
+
+      pendingAnimations.push({
+        piece,
+        from: startPos,
+        to: new THREE.Vector3(destination.x, startPos.y, destination.z),
+        boardY: destination.y,
+        liftY,
+        t: 0,
+        duration: 0.35
+      });
+
+      moveCount++;
+      currentTurn = currentTurn === 'white' ? 'black' : 'white';
+      deselectPiece();
+      updateHUD();
+      return true;
+    }
+
+    function updateHUD() {
+      currentTurnEl.textContent = currentTurn === 'white' ? '白方' : '黑方';
+      moveCountEl.textContent = String(moveCount);
+      capturedCountEl.textContent = String(capturedCount);
+      selectedPieceEl.textContent = selectedPiece ? `${selectedPiece.userData.side === 'white' ? '白' : '黑'}-${selectedPiece.userData.type}` : '无';
+    }
+
+    function pieceStateString(piece) {
+      if (!piece) return '';
+      const side = piece.userData.side === 'white' ? 'w' : 'b';
+      const map = {
+        pawn: 'P',
+        rook: 'R',
+        knight: 'N',
+        bishop: 'B',
+        queen: 'Q',
+        king: 'K'
+      };
+      return side + (map[piece.userData.type] || 'P');
+    }
+
+    function update3DState() {
+      window.__3D_STATE__ = {
+        modelLoaded,
+        currentTurn,
+        moveCount,
+        capturedCount,
+        selectedPiece: selectedPiece ? selectedPiece.name || `${selectedPiece.userData.side}_${selectedPiece.userData.type}` : '',
+        boardState: boardMap.map(row => row.map(piece => pieceStateString(piece)))
+      };
+    }
+
+    function onPointerDown(event) {
+      const rect = renderer.domElement.getBoundingClientRect();
+      mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+      mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+      raycaster.setFromCamera(mouse, camera);
+
+      const markerHits = raycaster.intersectObjects(squareMarkers, false);
+      if (markerHits.length > 0 && selectedPiece) {
+        const target = markerHits[0].object.userData.moveTarget;
+        if (target) {
+          movePiece(selectedPiece, target.row, target.col);
+          return;
+        }
+      }
+
+      const pieceHits = raycaster.intersectObjects(allClickableMeshes, false);
+      if (pieceHits.length > 0) {
+        let obj = pieceHits[0].object;
+        let piece = obj.userData.parentPiece || obj;
+
+        while (piece && !piece.userData?.isPiece && piece.parent) {
+          piece = piece.parent;
+        }
+
+        if (piece && piece.userData?.isPiece && !piece.userData.captured) {
+          if (selectedPiece && piece === selectedPiece) {
+            deselectPiece();
+            return;
+          }
+
+          if (selectedPiece) {
+            const move = selectedLegalMoves.find(m => m.row === piece.userData.row && m.col === piece.userData.col);
+            if (move && piece.userData.side !== selectedPiece.userData.side) {
+              movePiece(selectedPiece, move.row, move.col);
+              return;
+            }
+          }
+
+          if (piece.userData.side === currentTurn) {
+            selectPiece(piece);
+            return;
+          }
+        }
+      }
+
+      if (selectedPiece) deselectPiece();
+    }
+
+    renderer.domElement.addEventListener('pointerdown', onPointerDown);
+
+    function centerModel(root) {
+      const box = new THREE.Box3().setFromObject(root);
+      const center = new THREE.Vector3();
+      box.getCenter(center);
+      root.position.sub(center);
+
+      const box2 = new THREE.Box3().setFromObject(root);
+      const minY = box2.min.y;
+      root.position.y -= minY;
+
+      computeBoardMetrics(root);
+      controls.target.copy(boardCenter);
+    }
+
+    async function loadGameModel() {
+      const loader = new GLTFLoader();
+      try {
+        const gltf = await loader.loadAsync('assets/ABeautifulGame.glb');
+        boardGroup = gltf.scene;
+        scene.add(boardGroup);
+        centerModel(boardGroup);
+        computeBoardMetrics(boardGroup);
+        setupPieceDataFromModel(boardGroup);
+
+        const totalPieces = pieceMeshes.length;
+        if (totalPieces < 8) {
+          scene.remove(boardGroup);
+          boardGroup = createFallbackBoard();
+          computeBoardMetrics(boardGroup);
+          createFallbackPieces();
+        }
+
+        modelLoaded = true;
+        updateHUD();
+      } catch (e) {
+        boardGroup = createFallbackBoard();
+        computeBoardMetrics(boardGroup);
+        createFallbackPieces();
+        modelLoaded = true;
+        updateHUD();
+      }
+    }
+
+    const clock = new THREE.Clock();
+
+    function updateAnimations() {
+      const dt = clock.getDelta();
+      for (let i = pendingAnimations.length - 1; i >= 0; i--) {
+        const anim = pendingAnimations[i];
+        anim.t += dt / anim.duration;
+        const t = Math.min(anim.t, 1);
+        const p = t < 0.5
+          ? THREE.MathUtils.lerp(anim.from.y, anim.liftY, t / 0.5)
+          : THREE.MathUtils.lerp(anim.liftY, anim.boardY + 0.32, (t - 0.5) / 0.5);
+
+        anim.piece.position.x = THREE.MathUtils.lerp(anim.from.x, anim.to.x, t);
+        anim.piece.position.z = THREE.MathUtils.lerp(anim.from.z, anim.to.z, t);
+        anim.piece.position.y = p;
+
+        if (t >= 1) {
+          anim.piece.position.copy(anim.to);
+          anim.piece.position.y = anim.boardY + 0.32;
+          pendingAnimations.splice(i, 1);
+        }
+      }
+    }
+
+    function animate() {
+      requestAnimationFrame(animate);
+      controls.update();
+      updateAnimations();
+      update3DState();
+      renderer.render(scene, camera);
+    }
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    updateHUD();
+    update3DState();
+    loadGameModel();
+    animate();
+  </script>
+</body>
+</html>

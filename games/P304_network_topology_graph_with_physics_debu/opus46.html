@@ -1,0 +1,695 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3D Network Topology Graph</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { overflow: hidden; background: #0a0a1a; font-family: 'Courier New', monospace; }
+canvas { display: block; }
+
+#ui-controls {
+    position: absolute;
+    top: 10px;
+    left: 10px;
+    z-index: 100;
+    display: flex;
+    gap: 8px;
+}
+
+#ui-controls button {
+    padding: 8px 16px;
+    background: rgba(30, 30, 60, 0.85);
+    color: #aabbff;
+    border: 1px solid #4455aa;
+    border-radius: 4px;
+    cursor: pointer;
+    font-family: 'Courier New', monospace;
+    font-size: 13px;
+    transition: all 0.2s;
+}
+
+#ui-controls button:hover {
+    background: rgba(50, 50, 100, 0.9);
+    border-color: #6677cc;
+    color: #ffffff;
+}
+
+#debug-overlay {
+    position: absolute;
+    top: 60px;
+    left: 10px;
+    z-index: 100;
+    background: rgba(10, 10, 30, 0.9);
+    border: 1px solid #4455aa;
+    border-radius: 6px;
+    padding: 14px 18px;
+    color: #aabbff;
+    font-size: 12px;
+    line-height: 1.8;
+    min-width: 300px;
+    display: none;
+    backdrop-filter: blur(4px);
+}
+
+#debug-overlay .label {
+    color: #667799;
+}
+
+#debug-overlay .value {
+    color: #44ff88;
+    font-weight: bold;
+}
+
+#debug-overlay .warn {
+    color: #ff4444;
+}
+
+#info-bar {
+    position: absolute;
+    bottom: 10px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 100;
+    background: rgba(10, 10, 30, 0.8);
+    border: 1px solid #333366;
+    border-radius: 4px;
+    padding: 8px 20px;
+    color: #667799;
+    font-size: 11px;
+}
+
+#info-bar kbd {
+    background: rgba(60, 60, 120, 0.5);
+    border: 1px solid #4455aa;
+    border-radius: 2px;
+    padding: 1px 5px;
+    color: #aabbff;
+    margin: 0 2px;
+}
+</style>
+</head>
+<body>
+
+<div id="ui-controls">
+    <button id="btn-debug">Toggle Debug</button>
+    <button id="btn-add-node">Add Client Node</button>
+</div>
+
+<div id="debug-overlay">
+    <div><span class="label">Kinetic Energy: </span><span class="value" id="dbg-energy">0</span></div>
+    <div><span class="label">Sim Steps: </span><span class="value" id="dbg-steps">0</span></div>
+    <div><span class="label">Avg Velocity: </span><span class="value" id="dbg-avgvel">0</span></div>
+    <div><span class="label">Min Edge Dist: </span><span class="value" id="dbg-mindist">0</span></div>
+    <div><span class="label">Max Edge Dist: </span><span class="value" id="dbg-maxdist">0</span></div>
+    <div><span class="label">Nodes: </span><span class="value" id="dbg-nodes">0</span></div>
+    <div><span class="label">Edges: </span><span class="value" id="dbg-edges">0</span></div>
+    <div><span class="label">Gravity: </span><span class="value" id="dbg-gravity">ON</span></div>
+    <div><span class="label">Simulation: </span><span class="value" id="dbg-sim">RUNNING</span></div>
+    <div><span class="label">Selected: </span><span class="value" id="dbg-selected">none</span></div>
+</div>
+
+<div id="info-bar">
+    <kbd>P</kbd> Pause/Resume &nbsp;
+    <kbd>R</kbd> Reset &nbsp;
+    <kbd>G</kbd> Toggle Gravity &nbsp;
+    <kbd>Click</kbd> Select Node &nbsp;
+    <kbd>Drag</kbd> Move Selected
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+
+<script>
+(function() {
+    // ========== INITIALIZATION ==========
+    const REST_LENGTH = 20;
+    const REPULSION = 500;
+    const SPRING_K = 0.05;
+    const DAMPING = 0.92;
+    const CENTER_GRAVITY = 0.01;
+
+    // State
+    window.__3D_STATE__ = {
+        nodeCount: 0,
+        edgeCount: 0,
+        selectedNodeId: null,
+        simulationRunning: true,
+        simulationSteps: 0,
+        totalKineticEnergy: 0,
+        averageVelocity: 0,
+        gravityEnabled: true,
+        debugVisible: false,
+        minEdgeDistance: 0,
+        maxEdgeDistance: 0,
+        routerCount: 3,
+        serverCount: 4,
+        clientCount: 5,
+        nodePositions: [],
+        isDragging: false
+    };
+
+    // Scene setup
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0a0a1a);
+
+    const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+    camera.position.set(0, 0, 80);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(window.devicePixelRatio);
+    document.body.appendChild(renderer.domElement);
+
+    // Lights
+    const ambientLight = new THREE.AmbientLight(0x404060, 0.4);
+    scene.add(ambientLight);
+
+    const pointLight = new THREE.PointLight(0xffffff, 1.0);
+    pointLight.position.set(50, 50, 50);
+    scene.add(pointLight);
+
+    // Controls
+    const controls = new THREE.OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.05;
+
+    // ========== GRAPH DATA ==========
+    const nodes = [];
+    const edges = [];
+    const nodeMeshes = {};
+    const nodeLabels = {};
+    const edgeLines = {};
+    const forceArrows = [];
+
+    let nextClientId = 0;
+    let nextServerId = 0;
+    let nextRouterId = 0;
+
+    function createNodeData(type, x, y) {
+        let id, color, radius;
+        if (type === 'router') {
+            id = 'R' + nextRouterId++;
+            color = 0xff4444;
+            radius = 2.0;
+        } else if (type === 'server') {
+            id = 'S' + nextServerId++;
+            color = 0x44ff44;
+            radius = 1.5;
+        } else {
+            id = 'C' + nextClientId++;
+            color = 0x4488ff;
+            radius = 1.5;
+        }
+        return {
+            id, type, color, radius,
+            x: x || (Math.random() - 0.5) * 40,
+            y: y || (Math.random() - 0.5) * 40,
+            z: 0,
+            vx: 0, vy: 0, vz: 0,
+            fx: 0, fy: 0, fz: 0,
+            originalColor: color
+        };
+    }
+
+    function createTextSprite(text) {
+        const canvas = document.createElement('canvas');
+        canvas.width = 128;
+        canvas.height = 64;
+        const ctx = canvas.getContext('2d');
+        ctx.fillStyle = 'transparent';
+        ctx.fillRect(0, 0, 128, 64);
+        ctx.font = 'bold 32px Courier New';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillStyle = '#ffffff';
+        ctx.strokeStyle = '#000000';
+        ctx.lineWidth = 3;
+        ctx.strokeText(text, 64, 32);
+        ctx.fillText(text, 64, 32);
+
+        const texture = new THREE.CanvasTexture(canvas);
+        texture.needsUpdate = true;
+        const material = new THREE.SpriteMaterial({ map: texture, transparent: true, depthTest: false });
+        const sprite = new THREE.Sprite(material);
+        sprite.scale.set(6, 3, 1);
+        return sprite;
+    }
+
+    function addNodeToScene(node) {
+        const geometry = new THREE.SphereGeometry(node.radius, 32, 32);
+        const material = new THREE.MeshPhongMaterial({
+            color: node.color,
+            emissive: node.color,
+            emissiveIntensity: 0.3,
+            shininess: 80
+        });
+        const mesh = new THREE.Mesh(geometry, material);
+        mesh.position.set(node.x, node.y, node.z);
+        mesh.userData = { nodeId: node.id };
+        scene.add(mesh);
+        nodeMeshes[node.id] = mesh;
+
+        const label = createTextSprite(node.id);
+        label.position.set(node.x, node.y + node.radius + 2, node.z);
+        scene.add(label);
+        nodeLabels[node.id] = label;
+    }
+
+    function addEdgeToScene(edge) {
+        const geometry = new THREE.BufferGeometry();
+        const n1 = nodes.find(n => n.id === edge.source);
+        const n2 = nodes.find(n => n.id === edge.target);
+        const positions = new Float32Array([n1.x, n1.y, n1.z, n2.x, n2.y, n2.z]);
+        geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+        const material = new THREE.LineBasicMaterial({ color: 0x666688, transparent: true, opacity: 0.6 });
+        const line = new THREE.Line(geometry, material);
+        line.userData = { edgeKey: edge.source + '-' + edge.target };
+        scene.add(line);
+        edgeLines[edge.source + '-' + edge.target] = line;
+    }
+
+    // Initialize nodes
+    // 3 routers
+    for (let i = 0; i < 3; i++) {
+        const angle = (i / 3) * Math.PI * 2;
+        nodes.push(createNodeData('router', Math.cos(angle) * 8 + (Math.random()-0.5)*5, Math.sin(angle) * 8 + (Math.random()-0.5)*5));
+    }
+    // 4 servers
+    for (let i = 0; i < 4; i++) {
+        const angle = (i / 4) * Math.PI * 2 + 0.3;
+        nodes.push(createNodeData('server', Math.cos(angle) * 18 + (Math.random()-0.5)*5, Math.sin(angle) * 18 + (Math.random()-0.5)*5));
+    }
+    // 5 clients
+    for (let i = 0; i < 5; i++) {
+        const angle = (i / 5) * Math.PI * 2 + 0.7;
+        nodes.push(createNodeData('client', Math.cos(angle) * 28 + (Math.random()-0.5)*5, Math.sin(angle) * 28 + (Math.random()-0.5)*5));
+    }
+
+    // Create edges
+    const routers = nodes.filter(n => n.type === 'router');
+    const servers = nodes.filter(n => n.type === 'server');
+    const clients = nodes.filter(n => n.type === 'client');
+
+    // Routers interconnect
+    for (let i = 0; i < routers.length; i++) {
+        for (let j = i + 1; j < routers.length; j++) {
+            edges.push({ source: routers[i].id, target: routers[j].id });
+        }
+    }
+
+    // Routers connect to all servers
+    for (const r of routers) {
+        for (const s of servers) {
+            edges.push({ source: r.id, target: s.id });
+        }
+    }
+
+    // Servers connect to clients
+    // S0 -> C0, C1
+    // S1 -> C1, C2
+    // S2 -> C2, C3
+    // S3 -> C3, C4
+    edges.push({ source: 'S0', target: 'C0' });
+    edges.push({ source: 'S0', target: 'C1' });
+    edges.push({ source: 'S1', target: 'C1' });
+    edges.push({ source: 'S1', target: 'C2' });
+    edges.push({ source: 'S2', target: 'C2' });
+    edges.push({ source: 'S2', target: 'C3' });
+    edges.push({ source: 'S3', target: 'C3' });
+    edges.push({ source: 'S3', target: 'C4' });
+
+    // Add all to scene
+    nodes.forEach(n => addNodeToScene(n));
+    edges.forEach(e => addEdgeToScene(e));
+
+    // ========== PHYSICS ==========
+    function simulatePhysics() {
+        if (!window.__3D_STATE__.simulationRunning) return;
+
+        // Reset forces
+        nodes.forEach(n => { n.fx = 0; n.fy = 0; n.fz = 0; });
+
+        // Repulsion between all pairs
+        for (let i = 0; i < nodes.length; i++) {
+            for (let j = i + 1; j < nodes.length; j++) {
+                const a = nodes[i], b = nodes[j];
+                let dx = a.x - b.x;
+                let dy = a.y - b.y;
+                let dist = Math.sqrt(dx * dx + dy * dy);
+                if (dist < 0.5) dist = 0.5;
+                const force = REPULSION / (dist * dist);
+                const fx = (dx / dist) * force;
+                const fy = (dy / dist) * force;
+                a.fx += fx; a.fy += fy;
+                b.fx -= fx; b.fy -= fy;
+            }
+        }
+
+        // Spring forces along edges
+        for (const edge of edges) {
+            const a = nodes.find(n => n.id === edge.source);
+            const b = nodes.find(n => n.id === edge.target);
+            if (!a || !b) continue;
+            let dx = b.x - a.x;
+            let dy = b.y - a.y;
+            let dist = Math.sqrt(dx * dx + dy * dy);
+            if (dist < 0.1) dist = 0.1;
+            const force = SPRING_K * (dist - REST_LENGTH);
+            const fx = (dx / dist) * force;
+            const fy = (dy / dist) * force;
+            a.fx += fx; a.fy += fy;
+            b.fx -= fx; b.fy -= fy;
+        }
+
+        // Center gravity
+        if (window.__3D_STATE__.gravityEnabled) {
+            for (const n of nodes) {
+                const dist = Math.sqrt(n.x * n.x + n.y * n.y);
+                if (dist > 0.1) {
+                    n.fx -= CENTER_GRAVITY * n.x;
+                    n.fy -= CENTER_GRAVITY * n.y;
+                }
+            }
+        }
+
+        // Update velocities and positions
+        for (const n of nodes) {
+            if (window.__3D_STATE__.selectedNodeId === n.id && window.__3D_STATE__.isDragging) continue;
+            n.vx = (n.vx + n.fx) * DAMPING;
+            n.vy = (n.vy + n.fy) * DAMPING;
+            n.vz = 0;
+            n.x += n.vx;
+            n.y += n.vy;
+            n.z = 0;
+        }
+
+        window.__3D_STATE__.simulationSteps++;
+    }
+
+    // ========== UPDATE VISUALS ==========
+    function updateVisuals() {
+        // Update node meshes and labels
+        for (const n of nodes) {
+            const mesh = nodeMeshes[n.id];
+            if (mesh) {
+                mesh.position.set(n.x, n.y, n.z);
+            }
+            const label = nodeLabels[n.id];
+            if (label) {
+                label.position.set(n.x, n.y + n.radius + 2, n.z);
+            }
+        }
+
+        // Update edge lines
+        for (const edge of edges) {
+            const key = edge.source + '-' + edge.target;
+            const line = edgeLines[key];
+            if (!line) continue;
+            const a = nodes.find(n => n.id === edge.source);
+            const b = nodes.find(n => n.id === edge.target);
+            if (!a || !b) continue;
+            const positions = line.geometry.attributes.position.array;
+            positions[0] = a.x; positions[1] = a.y; positions[2] = a.z;
+            positions[3] = b.x; positions[4] = b.y; positions[5] = b.z;
+            line.geometry.attributes.position.needsUpdate = true;
+
+            // Color edges based on debug mode
+            if (window.__3D_STATE__.debugVisible) {
+                const dx = b.x - a.x, dy = b.y - a.y;
+                const dist = Math.sqrt(dx * dx + dy * dy);
+                if (dist > REST_LENGTH * 1.2) {
+                    line.material.color.setHex(0xff0000);
+                    line.material.opacity = 0.9;
+                } else if (dist < REST_LENGTH * 0.8) {
+                    line.material.color.setHex(0x00ff00);
+                    line.material.opacity = 0.9;
+                } else {
+                    line.material.color.setHex(0x666688);
+                    line.material.opacity = 0.6;
+                }
+            } else {
+                line.material.color.setHex(0x666688);
+                line.material.opacity = 0.6;
+            }
+        }
+
+        // Highlight selected node
+        for (const n of nodes) {
+            const mesh = nodeMeshes[n.id];
+            if (!mesh) continue;
+            if (window.__3D_STATE__.selectedNodeId === n.id) {
+                mesh.material.color.setHex(0xffffff);
+                mesh.material.emissive.setHex(0xffffff);
+                mesh.material.emissiveIntensity = 0.5;
+            } else {
+                mesh.material.color.setHex(n.originalColor);
+                mesh.material.emissive.setHex(n.originalColor);
+                mesh.material.emissiveIntensity = 0.3;
+            }
+        }
+
+        // Highlight selected node's edges
+        if (window.__3D_STATE__.selectedNodeId) {
+            for (const edge of edges) {
+                const key = edge.source + '-' + edge.target;
+                const line = edgeLines[key];
+                if (!line) continue;
+                if (edge.source === window.__3D_STATE__.selectedNodeId || edge.target === window.__3D_STATE__.selectedNodeId) {
+                    line.material.color.setHex(0xffff00);
+                    line.material.opacity = 1.0;
+                }
+            }
+        }
+
+        // Force arrows in debug mode
+        clearForceArrows();
+        if (window.__3D_STATE__.debugVisible) {
+            for (const n of nodes) {
+                const forceMag = Math.sqrt(n.fx * n.fx + n.fy * n.fy);
+                if (forceMag > 0.01) {
+                    const dir = new THREE.Vector3(n.fx, n.fy, 0).normalize();
+                    const origin = new THREE.Vector3(n.x, n.y, n.z);
+                    const length = Math.min(forceMag * 2, 8);
+                    const arrow = new THREE.ArrowHelper(dir, origin, length, 0xffff00, length * 0.3, length * 0.15);
+                    scene.add(arrow);
+                    forceArrows.push(arrow);
+                }
+            }
+        }
+    }
+
+    function clearForceArrows() {
+        for (const arrow of forceArrows) {
+            scene.remove(arrow);
+            if (arrow.line) { arrow.line.geometry.dispose(); arrow.line.material.dispose(); }
+            if (arrow.cone) { arrow.cone.geometry.dispose(); arrow.cone.material.dispose(); }
+        }
+        forceArrows.length = 0;
+    }
+
+    // ========== STATE UPDATE ==========
+    function updateState() {
+        let totalKE = 0;
+        let totalVel = 0;
+        let minDist = Infinity;
+        let maxDist = -Infinity;
+
+        for (const n of nodes) {
+            const v2 = n.vx * n.vx + n.vy * n.vy + n.vz * n.vz;
+            totalKE += 0.5 * v2;
+            totalVel += Math.sqrt(v2);
+        }
+
+        for (const edge of edges) {
+            const a = nodes.find(n => n.id === edge.source);
+            const b = nodes.find(n => n.id === edge.target);
+            if (!a || !b) continue;
+            const dx = b.x - a.x, dy = b.y - a.y;
+            const dist = Math.sqrt(dx * dx + dy * dy);
+            if (dist < minDist) minDist = dist;
+            if (dist > maxDist) maxDist = dist;
+        }
+
+        if (edges.length === 0) { minDist = 0; maxDist = 0; }
+
+        const state = window.__3D_STATE__;
+        state.nodeCount = nodes.length;
+        state.edgeCount = edges.length;
+        state.totalKineticEnergy = totalKE;
+        state.averageVelocity = nodes.length > 0 ? totalVel / nodes.length : 0;
+        state.minEdgeDistance = minDist === Infinity ? 0 : minDist;
+        state.maxEdgeDistance = maxDist === -Infinity ? 0 : maxDist;
+        state.routerCount = nodes.filter(n => n.type === 'router').length;
+        state.serverCount = nodes.filter(n => n.type === 'server').length;
+        state.clientCount = nodes.filter(n => n.type === 'client').length;
+        state.nodePositions = nodes.map(n => ({ id: n.id, x: n.x, y: n.y, z: n.z }));
+
+        // Update debug overlay
+        if (state.debugVisible) {
+            document.getElementById('dbg-energy').textContent = totalKE.toFixed(4);
+            document.getElementById('dbg-steps').textContent = state.simulationSteps;
+            document.getElementById('dbg-avgvel').textContent = state.averageVelocity.toFixed(4);
+            document.getElementById('dbg-mindist').textContent = state.minEdgeDistance.toFixed(2);
+            document.getElementById('dbg-maxdist').textContent = state.maxEdgeDistance.toFixed(2);
+            document.getElementById('dbg-nodes').textContent = state.nodeCount;
+            document.getElementById('dbg-edges').textContent = state.edgeCount;
+            document.getElementById('dbg-gravity').textContent = state.gravityEnabled ? 'ON' : 'OFF';
+            document.getElementById('dbg-sim').textContent = state.simulationRunning ? 'RUNNING' : 'PAUSED';
+            document.getElementById('dbg-selected').textContent = state.selectedNodeId || 'none';
+        }
+    }
+
+    // ========== INTERACTION ==========
+    const raycaster = new THREE.Raycaster();
+    const mouse = new THREE.Vector2();
+    let isDragging = false;
+    let dragPlane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0);
+    let mouseDownPos = new THREE.Vector2();
+
+    function getIntersectedNode(event) {
+        mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+        mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+        raycaster.setFromCamera(mouse, camera);
+        const meshes = Object.values(nodeMeshes);
+        const intersects = raycaster.intersectObjects(meshes);
+        if (intersects.length > 0) {
+            return intersects[0].object.userData.nodeId;
+        }
+        return null;
+    }
+
+    renderer.domElement.addEventListener('mousedown', (event) => {
+        if (event.button !== 0) return;
+        mouseDownPos.set(event.clientX, event.clientY);
+        const nodeId = getIntersectedNode(event);
+        if (nodeId && window.__3D_STATE__.selectedNodeId === nodeId) {
+            // Start dragging
+            isDragging = true;
+            window.__3D_STATE__.isDragging = true;
+            controls.enabled = false;
+        }
+    });
+
+    renderer.domElement.addEventListener('mousemove', (event) => {
+        if (isDragging && window.__3D_STATE__.selectedNodeId) {
+            mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+            raycaster.setFromCamera(mouse, camera);
+            const intersection = new THREE.Vector3();
+            raycaster.ray.intersectPlane(dragPlane, intersection);
+            if (intersection) {
+                const node = nodes.find(n => n.id === window.__3D_STATE__.selectedNodeId);
+                if (node) {
+                    node.x = intersection.x;
+                    node.y = intersection.y;
+                    node.z = 0;
+                    node.vx = 0;
+                    node.vy = 0;
+                    node.vz = 0;
+                }
+            }
+        }
+    });
+
+    renderer.domElement.addEventListener('mouseup', (event) => {
+        if (event.button !== 0) return;
+        const dx = event.clientX - mouseDownPos.x;
+        const dy = event.clientY - mouseDownPos.y;
+        const moved = Math.sqrt(dx * dx + dy * dy);
+
+        if (isDragging) {
+            isDragging = false;
+            window.__3D_STATE__.isDragging = false;
+            controls.enabled = true;
+            return;
+        }
+
+        if (moved < 5) {
+            // Click - select/deselect
+            const nodeId = getIntersectedNode(event);
+            if (nodeId) {
+                if (window.__3D_STATE__.selectedNodeId === nodeId) {
+                    window.__3D_STATE__.selectedNodeId = null;
+                } else {
+                    window.__3D_STATE__.selectedNodeId = nodeId;
+                }
+            }
+        }
+    });
+
+    // Keyboard
+    document.addEventListener('keydown', (event) => {
+        const key = event.key.toUpperCase();
+        if (key === 'P') {
+            window.__3D_STATE__.simulationRunning = !window.__3D_STATE__.simulationRunning;
+        } else if (key === 'R') {
+            // Reset positions
+            for (const n of nodes) {
+                const theta = Math.random() * Math.PI * 2;
+                const r = Math.random() * 30;
+                n.x = Math.cos(theta) * r;
+                n.y = Math.sin(theta) * r;
+                n.z = 0;
+                n.vx = 0; n.vy = 0; n.vz = 0;
+            }
+            window.__3D_STATE__.simulationRunning = true;
+            window.__3D_STATE__.simulationSteps = 0;
+        } else if (key === 'G') {
+            window.__3D_STATE__.gravityEnabled = !window.__3D_STATE__.gravityEnabled;
+        }
+    });
+
+    // Debug toggle
+    document.getElementById('btn-debug').addEventListener('click', () => {
+        window.__3D_STATE__.debugVisible = !window.__3D_STATE__.debugVisible;
+        document.getElementById('debug-overlay').style.display = window.__3D_STATE__.debugVisible ? 'block' : 'none';
+        if (!window.__3D_STATE__.debugVisible) {
+            clearForceArrows();
+        }
+    });
+
+    // Add node button
+    document.getElementById('btn-add-node').addEventListener('click', () => {
+        const serverNodes = nodes.filter(n => n.type === 'server');
+        if (serverNodes.length === 0) return;
+        const randomServer = serverNodes[Math.floor(Math.random() * serverNodes.length)];
+        const angle = Math.random() * Math.PI * 2;
+        const newNode = createNodeData('client',
+            randomServer.x + Math.cos(angle) * 15 + (Math.random()-0.5)*5,
+            randomServer.y + Math.sin(angle) * 15 + (Math.random()-0.5)*5
+        );
+        nodes.push(newNode);
+        addNodeToScene(newNode);
+
+        const newEdge = { source: randomServer.id, target: newNode.id };
+        edges.push(newEdge);
+        addEdgeToScene(newEdge);
+    });
+
+    // Window resize
+    window.addEventListener('resize', () => {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    // ========== ANIMATION LOOP ==========
+    function animate() {
+        requestAnimationFrame(animate);
+        simulatePhysics();
+        updateVisuals();
+        updateState();
+        controls.update();
+        renderer.render(scene, camera);
+    }
+
+    // Initialize state before first frame
+    updateState();
+    animate();
+})();
+</script>
+</body>
+</html>

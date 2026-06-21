@@ -1,0 +1,478 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Fire Tornado</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #050505;
+            font-family: monospace;
+            color: #fff;
+        }
+        canvas {
+            display: block;
+        }
+        #hud {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 15px;
+            border: 1px solid #333;
+            border-radius: 5px;
+            pointer-events: none;
+            user-select: none;
+            line-height: 1.5;
+            font-size: 14px;
+        }
+        .controls-help {
+            margin-top: 10px;
+            font-size: 12px;
+            color: #aaa;
+            border-top: 1px solid #444;
+            padding-top: 10px;
+        }
+    </style>
+    <!-- Import maps polyfill -->
+    <script async src="https://unpkg.com/es-module-shims@1.8.0/dist/es-module-shims.js"></script>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="hud">
+        <div id="hud-content"></div>
+        <div class="controls-help">
+            W/S: Wind Speed (+/-)<br>
+            E: Toggle Embers<br>
+            T: Toggle Helmet<br>
+            C: Cycle Theme<br>
+            Space: Pause/Resume<br>
+            Click: Burst<br>
+            R: Reset
+        </div>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+        // --- STATE MANAGEMENT ---
+        window.__3D_STATE__ = {
+            windSpeed: 3.0,
+            particleCount: 0,
+            colorTheme: 'fire',
+            emberMode: false,
+            paused: false,
+            helmetVisible: true,
+            helmetRotationY: 0,
+            tornadoBaseRadius: 2.0,
+            tornadoTopRadius: 0.3,
+            tornadoHeight: 10.0,
+            burstCount: 0,
+            elapsedTime: 0,
+            maxParticleY: 0,
+            fps: 0
+        };
+
+        const state = window.__3D_STATE__;
+
+        // --- CONSTANTS & GLOBALS ---
+        const NORMAL_COUNT = 3000;
+        const EMBER_COUNT = 500;
+        const BURST_COUNT = 100;
+        const TOTAL_PARTICLES = NORMAL_COUNT + EMBER_COUNT + BURST_COUNT;
+
+        const THEMES = {
+            fire: [new THREE.Color(0xffff00), new THREE.Color(0xff0000), new THREE.Color(0x330000)],
+            ice: [new THREE.Color(0x00ffff), new THREE.Color(0x0000ff), new THREE.Color(0x000033)],
+            toxic: [new THREE.Color(0x00ff00), new THREE.Color(0x800080), new THREE.Color(0x330033)]
+        };
+        const THEME_KEYS = Object.keys(THEMES);
+
+        let scene, camera, renderer, helmetModel;
+        let particleSystem, positions, colors, particleData;
+        let lastTime = 0;
+        let frames = 0;
+        let prevTime = performance.now();
+        const tempColor = new THREE.Color();
+
+        // --- INITIALIZATION ---
+        function init() {
+            // Scene
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x050505);
+
+            // Camera
+            camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+            camera.position.set(0, 5, 12);
+            camera.lookAt(0, 0, 0);
+
+            // Renderer
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+            document.body.appendChild(renderer.domElement);
+
+            // Lights
+            const ambientLight = new THREE.AmbientLight(0xffffff, 0.2);
+            scene.add(ambientLight);
+
+            const pointLight = new THREE.PointLight(0xff6600, 2.0, 50);
+            pointLight.position.set(0, 3, 0);
+            scene.add(pointLight);
+
+            // Load Model
+            const loader = new GLTFLoader();
+            loader.load('https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Models/master/2.0/DamagedHelmet/glTF-Binary/DamagedHelmet.glb', (gltf) => {
+                helmetModel = gltf.scene;
+                
+                // Scale to roughly 2 units
+                const box = new THREE.Box3().setFromObject(helmetModel);
+                const size = box.getSize(new THREE.Vector3()).length();
+                const scale = 2.0 / size;
+                helmetModel.scale.setScalar(scale);
+                
+                // Center at origin
+                const center = box.getCenter(new THREE.Vector3());
+                helmetModel.position.sub(center.multiplyScalar(scale));
+                helmetModel.position.set(0, 0, 0);
+                
+                scene.add(helmetModel);
+            });
+
+            // Particles
+            initParticles();
+
+            // Events
+            window.addEventListener('resize', onWindowResize);
+            window.addEventListener('keydown', onKeyDown);
+            window.addEventListener('click', onClick);
+
+            // Start Loop
+            requestAnimationFrame(animate);
+        }
+
+        function createCircleTexture() {
+            const canvas = document.createElement('canvas');
+            canvas.width = 32;
+            canvas.height = 32;
+            const ctx = canvas.getContext('2d');
+            ctx.beginPath();
+            ctx.arc(16, 16, 14, 0, Math.PI * 2);
+            ctx.fillStyle = '#ffffff';
+            ctx.fill();
+            return new THREE.CanvasTexture(canvas);
+        }
+
+        function initParticles() {
+            const geometry = new THREE.BufferGeometry();
+            positions = new Float32Array(TOTAL_PARTICLES * 3);
+            colors = new Float32Array(TOTAL_PARTICLES * 3);
+            particleData = new Array(TOTAL_PARTICLES);
+
+            for (let i = 0; i < TOTAL_PARTICLES; i++) {
+                particleData[i] = { active: false };
+                if (i < NORMAL_COUNT) {
+                    resetNormalParticle(i);
+                }
+            }
+
+            geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+            geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+            const material = new THREE.PointsMaterial({
+                size: 0.2,
+                vertexColors: true,
+                blending: THREE.AdditiveBlending,
+                transparent: true,
+                depthWrite: false,
+                map: createCircleTexture()
+            });
+
+            particleSystem = new THREE.Points(geometry, material);
+            scene.add(particleSystem);
+        }
+
+        function resetNormalParticle(i) {
+            const angle = Math.random() * Math.PI * 2;
+            const radius = state.tornadoBaseRadius + (Math.random() * 0.4 - 0.2);
+            
+            particleData[i] = {
+                type: 'normal',
+                active: true,
+                life: Math.random() * 3.0, // Randomize initial life to avoid clumping
+                maxLife: 3.0,
+                angle: angle,
+                radius: radius,
+                vSpeed: 2.0 + Math.random() * 2.0,
+                x: radius * Math.cos(angle),
+                y: 0,
+                z: radius * Math.sin(angle)
+            };
+            
+            updateParticlePositionArray(i);
+        }
+
+        function spawnEmber() {
+            // Find inactive ember slot
+            for (let i = NORMAL_COUNT; i < NORMAL_COUNT + EMBER_COUNT; i++) {
+                if (!particleData[i].active) {
+                    // Pick a random active normal particle to spawn from
+                    const sourceIdx = Math.floor(Math.random() * NORMAL_COUNT);
+                    const source = particleData[sourceIdx];
+                    
+                    if (source.active && source.y > 1.0) {
+                        const angle = Math.random() * Math.PI * 2;
+                        const speed = 1.0 + Math.random() * 2.0;
+                        particleData[i] = {
+                            type: 'ember',
+                            active: true,
+                            life: 0,
+                            maxLife: 1.5 + Math.random(),
+                            x: source.x,
+                            y: source.y,
+                            z: source.z,
+                            vx: Math.cos(angle) * speed,
+                            vy: (Math.random() - 0.2) * speed,
+                            vz: Math.sin(angle) * speed
+                        };
+                        updateParticlePositionArray(i);
+                        break;
+                    }
+                }
+            }
+        }
+
+        function spawnBurst(targetPos) {
+            state.burstCount++;
+            let spawned = 0;
+            for (let i = NORMAL_COUNT + EMBER_COUNT; i < TOTAL_PARTICLES; i++) {
+                if (spawned >= BURST_COUNT) break;
+                
+                const angle = Math.random() * Math.PI * 2;
+                const elevation = Math.random() * Math.PI / 2;
+                const speed = 3.0 + Math.random() * 5.0;
+                
+                particleData[i] = {
+                    type: 'burst',
+                    active: true,
+                    life: 0,
+                    maxLife: 1.0 + Math.random() * 1.0,
+                    x: targetPos.x,
+                    y: targetPos.y,
+                    z: targetPos.z,
+                    vx: Math.cos(angle) * Math.cos(elevation) * speed,
+                    vy: Math.sin(elevation) * speed,
+                    vz: Math.sin(angle) * Math.cos(elevation) * speed
+                };
+                updateParticlePositionArray(i);
+                spawned++;
+            }
+        }
+
+        function updateParticlePositionArray(i) {
+            const p = particleData[i];
+            positions[i * 3] = p.x;
+            positions[i * 3 + 1] = p.y;
+            positions[i * 3 + 2] = p.z;
+        }
+
+        function updateParticleColorArray(i, t) {
+            const theme = THEMES[state.colorTheme];
+            if (t < 0.5) {
+                tempColor.lerpColors(theme[0], theme[1], t * 2.0);
+            } else {
+                tempColor.lerpColors(theme[1], theme[2], (t - 0.5) * 2.0);
+            }
+            colors[i * 3] = tempColor.r;
+            colors[i * 3 + 1] = tempColor.g;
+            colors[i * 3 + 2] = tempColor.b;
+        }
+
+        // --- INTERACTION ---
+        function onKeyDown(e) {
+            switch(e.key.toLowerCase()) {
+                case 'w':
+                    state.windSpeed = Math.min(10.0, state.windSpeed + 1.0);
+                    break;
+                case 's':
+                    state.windSpeed = Math.max(1.0, state.windSpeed - 1.0);
+                    break;
+                case 'e':
+                    state.emberMode = !state.emberMode;
+                    break;
+                case 'r':
+                    state.windSpeed = 3.0;
+                    state.colorTheme = 'fire';
+                    state.emberMode = false;
+                    state.paused = false;
+                    state.helmetVisible = true;
+                    if (helmetModel) helmetModel.visible = true;
+                    break;
+                case ' ':
+                    state.paused = !state.paused;
+                    break;
+                case 't':
+                    state.helmetVisible = !state.helmetVisible;
+                    if (helmetModel) helmetModel.visible = state.helmetVisible;
+                    break;
+                case 'c':
+                    const idx = THEME_KEYS.indexOf(state.colorTheme);
+                    state.colorTheme = THEME_KEYS[(idx + 1) % THEME_KEYS.length];
+                    break;
+            }
+        }
+
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+        const plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+
+        function onClick(e) {
+            mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+            raycaster.setFromCamera(mouse, camera);
+            
+            const target = new THREE.Vector3();
+            raycaster.ray.intersectPlane(plane, target);
+            
+            if (target) {
+                spawnBurst(target);
+            }
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        // --- UPDATE LOOP ---
+        function updateHUD() {
+            const hud = document.getElementById('hud-content');
+            hud.innerHTML = `
+                Wind Speed: ${state.windSpeed.toFixed(1)} rad/s<br>
+                Active Particles: ${state.particleCount}<br>
+                Color Theme: ${state.colorTheme}<br>
+                Ember Mode: ${state.emberMode ? 'ON' : 'OFF'}<br>
+                Paused: ${state.paused ? 'YES' : 'NO'}<br>
+                Helmet Visible: ${state.helmetVisible ? 'YES' : 'NO'}<br>
+                Burst Count: ${state.burstCount}<br>
+                FPS: ${state.fps}
+            `;
+        }
+
+        function animate(time) {
+            requestAnimationFrame(animate);
+
+            const delta = (time - lastTime) / 1000;
+            lastTime = time;
+
+            // FPS Calculation
+            frames++;
+            if (time >= prevTime + 1000) {
+                state.fps = Math.round((frames * 1000) / (time - prevTime));
+                frames = 0;
+                prevTime = time;
+            }
+
+            if (!state.paused) {
+                state.elapsedTime += delta;
+
+                // Rotate Helmet
+                if (helmetModel && state.helmetVisible) {
+                    helmetModel.rotation.y += 0.3 * delta;
+                    state.helmetRotationY = helmetModel.rotation.y;
+                }
+
+                // Update Particles
+                let activeCount = 0;
+                let maxY = 0;
+
+                if (state.emberMode) {
+                    // Spawn a few embers per frame
+                    for(let k=0; k<3; k++) spawnEmber();
+                }
+
+                for (let i = 0; i < TOTAL_PARTICLES; i++) {
+                    const p = particleData[i];
+                    
+                    if (!p.active) {
+                        // Hide inactive particles
+                        positions[i * 3] = 9999;
+                        continue;
+                    }
+
+                    activeCount++;
+                    p.life += delta;
+
+                    if (p.life >= p.maxLife) {
+                        if (p.type === 'normal') {
+                            resetNormalParticle(i);
+                        } else {
+                            p.active = false;
+                            positions[i * 3] = 9999;
+                        }
+                        continue;
+                    }
+
+                    const t = p.life / p.maxLife;
+
+                    if (p.type === 'normal') {
+                        p.y += p.vSpeed * delta;
+                        p.angle += state.windSpeed * delta;
+                        
+                        // Calculate radius based on height (tornado shape)
+                        const heightRatio = Math.min(1.0, p.y / state.tornadoHeight);
+                        const targetRadius = THREE.MathUtils.lerp(state.tornadoBaseRadius, state.tornadoTopRadius, heightRatio);
+                        
+                        // Add some noise
+                        const noise = Math.sin(p.y * 2.0 + state.elapsedTime * 5.0) * 0.1;
+                        const currentRadius = targetRadius + noise;
+
+                        p.x = currentRadius * Math.cos(p.angle);
+                        p.z = currentRadius * Math.sin(p.angle);
+                        
+                        updateParticleColorArray(i, t);
+
+                    } else if (p.type === 'ember' || p.type === 'burst') {
+                        p.x += p.vx * delta;
+                        p.y += p.vy * delta;
+                        p.z += p.vz * delta;
+                        
+                        // Fade out color for embers/bursts
+                        updateParticleColorArray(i, t);
+                        // Make them darker as they die
+                        colors[i*3] *= (1.0 - t);
+                        colors[i*3+1] *= (1.0 - t);
+                        colors[i*3+2] *= (1.0 - t);
+                    }
+
+                    updateParticlePositionArray(i);
+                    if (p.y > maxY) maxY = p.y;
+                }
+
+                state.particleCount = activeCount;
+                state.maxParticleY = maxY;
+
+                particleSystem.geometry.attributes.position.needsUpdate = true;
+                particleSystem.geometry.attributes.color.needsUpdate = true;
+            }
+
+            updateHUD();
+            renderer.render(scene, camera);
+        }
+
+        // Start
+        init();
+    </script>
+</body>
+</html>

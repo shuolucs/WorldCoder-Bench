@@ -1,0 +1,590 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Three.js 3D 弹球碰撞模拟</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      background: #0f172a;
+      font-family: Arial, sans-serif;
+    }
+
+    #hud {
+      position: fixed;
+      top: 12px;
+      left: 12px;
+      z-index: 10;
+      color: #fff;
+      background: rgba(0, 0, 0, 0.45);
+      padding: 10px 14px;
+      border-radius: 8px;
+      line-height: 1.7;
+      font-size: 14px;
+      user-select: none;
+      backdrop-filter: blur(4px);
+    }
+
+    #tip {
+      position: fixed;
+      right: 12px;
+      top: 12px;
+      z-index: 10;
+      color: #e2e8f0;
+      background: rgba(0, 0, 0, 0.35);
+      padding: 8px 12px;
+      border-radius: 8px;
+      font-size: 13px;
+      user-select: none;
+    }
+
+    canvas {
+      display: block;
+    }
+  </style>
+
+  <script type="importmap">
+  { "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+  } }
+  </script>
+</head>
+<body>
+  <div id="hud">
+    <div>当前球数：<span id="ballCount">0</span></div>
+    <div>总碰撞次数：<span id="collisionCount">0</span></div>
+  </div>
+  <div id="tip">鼠标拖拽旋转视角；点击地面/场景生成新球</div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+    // =========================
+    // 基本参数
+    // =========================
+    const BOX_SIZE = 20;
+    const HALF_BOX = BOX_SIZE / 2;
+    const BALL_RADIUS = 0.5;
+    const GRAVITY = 15;
+    const RESTITUTION = 0.75;
+    const MAX_BALLS = 30;
+    const INITIAL_BALLS = 5;
+    const FIXED_DT = 1 / 120;
+    const MAX_FRAME_DT = 1 / 30;
+    const TRAIL_POINTS = 18;
+
+    let collisionCount = 0;
+    const balls = [];
+
+    const ballCountEl = document.getElementById('ballCount');
+    const collisionCountEl = document.getElementById('collisionCount');
+
+    // =========================
+    // 场景 / 相机 / 渲染器
+    // =========================
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0b1020);
+
+    const camera = new THREE.PerspectiveCamera(
+      60,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      200
+    );
+    camera.position.set(18, 16, 18);
+    camera.lookAt(0, 5, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.shadowMap.enabled = true;
+    document.body.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.set(0, 4, 0);
+    controls.enableDamping = true;
+
+    // =========================
+    // 光照
+    // =========================
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.7);
+    scene.add(ambientLight);
+
+    const dirLight = new THREE.DirectionalLight(0xffffff, 1.2);
+    dirLight.position.set(10, 20, 8);
+    dirLight.castShadow = true;
+    dirLight.shadow.mapSize.set(2048, 2048);
+    dirLight.shadow.camera.left = -15;
+    dirLight.shadow.camera.right = 15;
+    dirLight.shadow.camera.top = 15;
+    dirLight.shadow.camera.bottom = -15;
+    dirLight.shadow.camera.near = 1;
+    dirLight.shadow.camera.far = 50;
+    scene.add(dirLight);
+
+    // =========================
+    // 盒子：地面 + 透明围墙
+    // =========================
+    const floorMat = new THREE.MeshStandardMaterial({
+      color: 0x334155,
+      roughness: 0.85,
+      metalness: 0.1
+    });
+    const floor = new THREE.Mesh(
+      new THREE.PlaneGeometry(BOX_SIZE, BOX_SIZE),
+      floorMat
+    );
+    floor.rotation.x = -Math.PI / 2;
+    floor.receiveShadow = true;
+    floor.userData.isFloor = true;
+    scene.add(floor);
+
+    const grid = new THREE.GridHelper(BOX_SIZE, BOX_SIZE, 0x64748b, 0x475569);
+    grid.position.y = 0.002;
+    scene.add(grid);
+
+    const wallMaterial = new THREE.MeshPhysicalMaterial({
+      color: 0x93c5fd,
+      transparent: true,
+      opacity: 0.16,
+      roughness: 0.15,
+      metalness: 0.0,
+      transmission: 0.2,
+      side: THREE.DoubleSide
+    });
+
+    const wallHeight = 10;
+    const wallGeoA = new THREE.PlaneGeometry(BOX_SIZE, wallHeight);
+    const wallGeoB = new THREE.PlaneGeometry(BOX_SIZE, wallHeight);
+
+    const wall1 = new THREE.Mesh(wallGeoA, wallMaterial);
+    wall1.position.set(0, wallHeight / 2, -HALF_BOX);
+    scene.add(wall1);
+
+    const wall2 = new THREE.Mesh(wallGeoA, wallMaterial);
+    wall2.rotation.y = Math.PI;
+    wall2.position.set(0, wallHeight / 2, HALF_BOX);
+    scene.add(wall2);
+
+    const wall3 = new THREE.Mesh(wallGeoB, wallMaterial);
+    wall3.rotation.y = Math.PI / 2;
+    wall3.position.set(-HALF_BOX, wallHeight / 2, 0);
+    scene.add(wall3);
+
+    const wall4 = new THREE.Mesh(wallGeoB, wallMaterial);
+    wall4.rotation.y = -Math.PI / 2;
+    wall4.position.set(HALF_BOX, wallHeight / 2, 0);
+    scene.add(wall4);
+
+    // 边框线
+    const edges = new THREE.EdgesGeometry(new THREE.BoxGeometry(BOX_SIZE, wallHeight, BOX_SIZE));
+    const edgeLines = new THREE.LineSegments(
+      edges,
+      new THREE.LineBasicMaterial({ color: 0x94a3b8, transparent: true, opacity: 0.45 })
+    );
+    edgeLines.position.y = wallHeight / 2;
+    scene.add(edgeLines);
+
+    // =========================
+    // 工具
+    // =========================
+    const raycaster = new THREE.Raycaster();
+    const mouse = new THREE.Vector2();
+    const clock = new THREE.Clock();
+
+    const sphereGeometry = new THREE.SphereGeometry(BALL_RADIUS, 32, 32);
+    const palette = [
+      0xef4444, 0x22c55e, 0x3b82f6, 0xeab308, 0xa855f7,
+      0xf97316, 0x14b8a6, 0xec4899, 0x84cc16, 0x06b6d4
+    ];
+
+    function randomRange(min, max) {
+      return min + Math.random() * (max - min);
+    }
+
+    function randomVelocity() {
+      return new THREE.Vector3(
+        randomRange(-5, 5),
+        randomRange(2, 8),
+        randomRange(-5, 5)
+      );
+    }
+
+    function createTrail(color) {
+      const positions = new Float32Array(TRAIL_POINTS * 3);
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+
+      const material = new THREE.LineBasicMaterial({
+        color,
+        transparent: true,
+        opacity: 0.45
+      });
+
+      const line = new THREE.Line(geometry, material);
+      scene.add(line);
+
+      return {
+        line,
+        positions,
+        points: []
+      };
+    }
+
+    function updateTrail(ball) {
+      ball.trail.points.push(ball.position.clone());
+      if (ball.trail.points.length > TRAIL_POINTS) {
+        ball.trail.points.shift();
+      }
+
+      const arr = ball.trail.positions;
+      for (let i = 0; i < TRAIL_POINTS; i++) {
+        const p = ball.trail.points[i] || ball.position;
+        arr[i * 3] = p.x;
+        arr[i * 3 + 1] = p.y;
+        arr[i * 3 + 2] = p.z;
+      }
+      ball.trail.line.geometry.attributes.position.needsUpdate = true;
+    }
+
+    function makeBall(position, velocity, color = palette[Math.floor(Math.random() * palette.length)]) {
+      if (balls.length >= MAX_BALLS) return;
+
+      const material = new THREE.MeshStandardMaterial({
+        color,
+        roughness: 0.35,
+        metalness: 0.15
+      });
+
+      const mesh = new THREE.Mesh(sphereGeometry, material);
+      mesh.castShadow = true;
+      mesh.receiveShadow = true;
+      mesh.position.copy(position);
+      scene.add(mesh);
+
+      const trail = createTrail(color);
+
+      const ball = {
+        mesh,
+        position: mesh.position,
+        velocity: velocity.clone(),
+        radius: BALL_RADIUS,
+        mass: 1,
+        trail
+      };
+
+      for (let i = 0; i < TRAIL_POINTS; i++) {
+        trail.points.push(position.clone());
+      }
+      updateTrail(ball);
+
+      balls.push(ball);
+      updateHUD();
+    }
+
+    function updateHUD() {
+      ballCountEl.textContent = balls.length;
+      collisionCountEl.textContent = collisionCount;
+    }
+
+    // =========================
+    // 初始球体
+    // =========================
+    function spawnInitialBalls() {
+      let attempts = 0;
+      while (balls.length < INITIAL_BALLS && attempts < 200) {
+        attempts++;
+        const pos = new THREE.Vector3(
+          randomRange(-HALF_BOX + 2, HALF_BOX - 2),
+          randomRange(2, 8),
+          randomRange(-HALF_BOX + 2, HALF_BOX - 2)
+        );
+
+        let valid = true;
+        for (const b of balls) {
+          if (pos.distanceTo(b.position) < BALL_RADIUS * 2.2) {
+            valid = false;
+            break;
+          }
+        }
+        if (!valid) continue;
+
+        makeBall(pos, randomVelocity(), palette[balls.length % palette.length]);
+      }
+    }
+
+    // =========================
+    // 物理：墙壁碰撞
+    // =========================
+    function solveWallCollision(ball) {
+      let collided = false;
+
+      // 地面
+      if (ball.position.y - ball.radius < 0) {
+        ball.position.y = ball.radius;
+        if (ball.velocity.y < 0) {
+          ball.velocity.y = -ball.velocity.y * RESTITUTION;
+          collided = true;
+        }
+      }
+
+      // 顶部限制（防止飞出可视围墙）
+      const topLimit = wallHeight - ball.radius;
+      if (ball.position.y > topLimit) {
+        ball.position.y = topLimit;
+        if (ball.velocity.y > 0) {
+          ball.velocity.y = -ball.velocity.y * RESTITUTION;
+          collided = true;
+        }
+      }
+
+      // X 墙
+      if (ball.position.x - ball.radius < -HALF_BOX) {
+        ball.position.x = -HALF_BOX + ball.radius;
+        if (ball.velocity.x < 0) {
+          ball.velocity.x = -ball.velocity.x * RESTITUTION;
+          collided = true;
+        }
+      } else if (ball.position.x + ball.radius > HALF_BOX) {
+        ball.position.x = HALF_BOX - ball.radius;
+        if (ball.velocity.x > 0) {
+          ball.velocity.x = -ball.velocity.x * RESTITUTION;
+          collided = true;
+        }
+      }
+
+      // Z 墙
+      if (ball.position.z - ball.radius < -HALF_BOX) {
+        ball.position.z = -HALF_BOX + ball.radius;
+        if (ball.velocity.z < 0) {
+          ball.velocity.z = -ball.velocity.z * RESTITUTION;
+          collided = true;
+        }
+      } else if (ball.position.z + ball.radius > HALF_BOX) {
+        ball.position.z = HALF_BOX - ball.radius;
+        if (ball.velocity.z > 0) {
+          ball.velocity.z = -ball.velocity.z * RESTITUTION;
+          collided = true;
+        }
+      }
+
+      if (collided) {
+        collisionCount++;
+      }
+    }
+
+    // =========================
+    // 物理：球-球碰撞
+    // 等质量球体：交换法向分量速度
+    // =========================
+    const normal = new THREE.Vector3();
+    const relative = new THREE.Vector3();
+
+    function solveBallBallCollisions() {
+      for (let i = 0; i < balls.length; i++) {
+        for (let j = i + 1; j < balls.length; j++) {
+          const a = balls[i];
+          const b = balls[j];
+
+          normal.subVectors(b.position, a.position);
+          const distSq = normal.lengthSq();
+          const minDist = a.radius + b.radius;
+
+          if (distSq === 0) {
+            normal.set(1, 0, 0);
+          }
+
+          if (distSq < minDist * minDist) {
+            const dist = Math.sqrt(Math.max(distSq, 1e-8));
+            normal.divideScalar(dist || 1);
+
+            // 位置纠正，消除重叠
+            const overlap = minDist - dist;
+            const correction = overlap / 2;
+            a.position.addScaledVector(normal, -correction);
+            b.position.addScaledVector(normal, correction);
+
+            // 相对速度沿法向分量
+            relative.subVectors(a.velocity, b.velocity);
+            const relNormalSpeed = relative.dot(normal);
+
+            // 只有接近时才交换法向分量
+            if (relNormalSpeed > 0) continue;
+
+            const vaN = normal.clone().multiplyScalar(a.velocity.dot(normal));
+            const vbN = normal.clone().multiplyScalar(b.velocity.dot(normal));
+            const vaT = a.velocity.clone().sub(vaN);
+            const vbT = b.velocity.clone().sub(vbN);
+
+            // 等质量弹性碰撞：交换法向分量
+            a.velocity.copy(vaT.add(vbN));
+            b.velocity.copy(vbT.add(vaN));
+
+            collisionCount++;
+          }
+        }
+      }
+    }
+
+    // =========================
+    // 点击生成新球
+    // 从点击位置上方 5m 处生成
+    // =========================
+    function spawnBallFromClick(event) {
+      if (balls.length >= MAX_BALLS) return;
+
+      const rect = renderer.domElement.getBoundingClientRect();
+      mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+      mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+
+      raycaster.setFromCamera(mouse, camera);
+
+      // 优先与地面相交；若未命中则与 y=0 平面求交
+      const intersects = raycaster.intersectObject(floor);
+      let point = null;
+
+      if (intersects.length > 0) {
+        point = intersects[0].point.clone();
+      } else {
+        const plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+        point = new THREE.Vector3();
+        raycaster.ray.intersectPlane(plane, point);
+      }
+
+      if (!point) return;
+
+      point.x = THREE.MathUtils.clamp(point.x, -HALF_BOX + BALL_RADIUS, HALF_BOX - BALL_RADIUS);
+      point.z = THREE.MathUtils.clamp(point.z, -HALF_BOX + BALL_RADIUS, HALF_BOX - BALL_RADIUS);
+      point.y = Math.min(5 + BALL_RADIUS, wallHeight - BALL_RADIUS);
+
+      // 若与现有球过近，略微抬高
+      let tries = 0;
+      while (tries < 10) {
+        let overlap = false;
+        for (const b of balls) {
+          if (point.distanceTo(b.position) < BALL_RADIUS * 2.05) {
+            overlap = true;
+            point.y += BALL_RADIUS * 1.2;
+            break;
+          }
+        }
+        if (!overlap) break;
+        point.y = Math.min(point.y, wallHeight - BALL_RADIUS);
+        tries++;
+      }
+
+      makeBall(
+        point,
+        new THREE.Vector3(randomRange(-2, 2), 0, randomRange(-2, 2))
+      );
+    }
+
+    renderer.domElement.addEventListener('pointerdown', (event) => {
+      // 避免拖拽旋转时频繁生成球：仅在短按点击时处理
+      const startX = event.clientX;
+      const startY = event.clientY;
+      const startTime = performance.now();
+
+      function onUp(upEvent) {
+        const dx = upEvent.clientX - startX;
+        const dy = upEvent.clientY - startY;
+        const dt = performance.now() - startTime;
+        if (Math.hypot(dx, dy) < 5 && dt < 250) {
+          spawnBallFromClick(upEvent);
+        }
+        window.removeEventListener('pointerup', onUp);
+      }
+
+      window.addEventListener('pointerup', onUp);
+    });
+
+    // =========================
+    // 动画循环
+    // =========================
+    let accumulator = 0;
+
+    function stepPhysics(dt) {
+      // 积分
+      for (const ball of balls) {
+        ball.velocity.y -= GRAVITY * dt;
+        ball.position.addScaledVector(ball.velocity, dt);
+        solveWallCollision(ball);
+      }
+
+      // 球-球碰撞
+      solveBallBallCollisions();
+
+      // 更新拖尾
+      for (const ball of balls) {
+        updateTrail(ball);
+      }
+    }
+
+    function exposeState() {
+      let totalKineticEnergy = 0;
+      const stateBalls = balls.map((b) => {
+        const v2 = b.velocity.lengthSq();
+        totalKineticEnergy += 0.5 * v2;
+        return {
+          x: b.position.x,
+          y: b.position.y,
+          z: b.position.z,
+          vx: b.velocity.x,
+          vy: b.velocity.y,
+          vz: b.velocity.z
+        };
+      });
+
+      window.__3D_STATE__ = {
+        ballCount: balls.length,
+        collisionCount,
+        balls: stateBalls,
+        totalKineticEnergy
+      };
+    }
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      const frameDt = Math.min(clock.getDelta(), MAX_FRAME_DT);
+      accumulator += frameDt;
+
+      while (accumulator >= FIXED_DT) {
+        stepPhysics(FIXED_DT);
+        accumulator -= FIXED_DT;
+      }
+
+      controls.update();
+      updateHUD();
+      exposeState();
+      renderer.render(scene, camera);
+    }
+
+    // =========================
+    // 自适应
+    // =========================
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    // 初始状态暴露
+    window.__3D_STATE__ = {
+      ballCount: 0,
+      collisionCount: 0,
+      balls: [],
+      totalKineticEnergy: 0
+    };
+
+    spawnInitialBalls();
+    updateHUD();
+    animate();
+  </script>
+</body>
+</html>

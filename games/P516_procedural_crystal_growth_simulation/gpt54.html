@@ -1,0 +1,529 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Procedural Crystal Growth Simulation</title>
+  <style>
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #0a0a1a;
+      font-family: Arial, Helvetica, sans-serif;
+    }
+
+    canvas {
+      display: block;
+    }
+
+    #hud {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      z-index: 10;
+      color: #e8e8ff;
+      background: rgba(12, 12, 28, 0.6);
+      border: 1px solid rgba(180, 180, 255, 0.15);
+      border-radius: 8px;
+      padding: 10px 12px;
+      line-height: 1.5;
+      font-size: 14px;
+      min-width: 240px;
+      backdrop-filter: blur(4px);
+      pointer-events: none;
+      box-shadow: 0 0 20px rgba(80, 80, 180, 0.15);
+    }
+
+    #btn-harvest {
+      position: absolute;
+      left: 50%;
+      bottom: 18px;
+      transform: translateX(-50%);
+      z-index: 10;
+      padding: 12px 18px;
+      border: 1px solid rgba(255,255,255,0.15);
+      border-radius: 999px;
+      background: linear-gradient(180deg, #2b2b44, #17172b);
+      color: #f0f0ff;
+      font-size: 14px;
+      cursor: pointer;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.35);
+    }
+
+    #btn-harvest:hover {
+      background: linear-gradient(180deg, #353557, #1c1c33);
+    }
+
+    #hint {
+      position: absolute;
+      right: 12px;
+      top: 12px;
+      z-index: 10;
+      color: #bfc7ff;
+      background: rgba(12, 12, 28, 0.5);
+      border-radius: 8px;
+      padding: 10px 12px;
+      font-size: 12px;
+      line-height: 1.5;
+      max-width: 280px;
+    }
+  </style>
+</head>
+<body>
+  <div id="hud"></div>
+  <div id="hint">
+    Click base: plant seed<br>
+    G: grow pause/resume<br>
+    R: reset<br>
+    C: crystallize burst<br>
+    L: glow mode<br>
+    +/-: speed<br>
+    Shift + Mouse Wheel: rotate formation
+  </div>
+  <button id="btn-harvest">Harvest Crystals</button>
+
+  <script type="module">
+    import * as THREE from "https://unpkg.com/three@0.160.0/build/three.module.js";
+    import { OrbitControls } from "https://unpkg.com/three@0.160.0/examples/jsm/controls/OrbitControls.js";
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color("#0a0a1a");
+    scene.fog = new THREE.Fog("#0a0a1a", 20, 80);
+
+    const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 200);
+    camera.position.set(0, 8, 18);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    document.body.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+
+    const warmLight = new THREE.PointLight("#ffaa44", 1.5, 100);
+    warmLight.position.set(10, 15, 10);
+    scene.add(warmLight);
+
+    const coolLight = new THREE.PointLight("#4488ff", 1.0, 100);
+    coolLight.position.set(-10, 12, -10);
+    scene.add(coolLight);
+
+    const ambientLight = new THREE.AmbientLight("#222244", 0.3);
+    scene.add(ambientLight);
+
+    const formationGroup = new THREE.Group();
+    scene.add(formationGroup);
+
+    const baseGeo = new THREE.BoxGeometry(20, 0.5, 20, 1, 1, 1);
+    const baseMat = new THREE.MeshStandardMaterial({
+      color: "#333340",
+      roughness: 0.9,
+      metalness: 0.05
+    });
+    const base = new THREE.Mesh(baseGeo, baseMat);
+    base.position.y = -0.25;
+    base.receiveShadow = true;
+    formationGroup.add(base);
+
+    // Rocky deformation feel through vertex jitter
+    const posAttr = base.geometry.attributes.position;
+    for (let i = 0; i < posAttr.count; i++) {
+      const y = posAttr.getY(i);
+      if (y > 0) {
+        posAttr.setY(i, y + (Math.random() - 0.5) * 0.08);
+      }
+    }
+    posAttr.needsUpdate = true;
+    base.geometry.computeVertexNormals();
+
+    const palette = [
+      { name: "amethyst", color: new THREE.Color("#9966cc") },
+      { name: "quartz", color: new THREE.Color("#eeddff") },
+      { name: "emerald", color: new THREE.Color("#33cc77") },
+      { name: "ruby", color: new THREE.Color("#cc3355") },
+      { name: "sapphire", color: new THREE.Color("#3366cc") }
+    ];
+
+    let colorCycleIndex = 0;
+    let growthActive = true;
+    let glowMode = false;
+    let speedMultiplier = 1.0;
+    let totalHarvested = 0;
+    let seedsPlanted = 0;
+
+    const crystals = [];
+    const raycaster = new THREE.Raycaster();
+    const pointer = new THREE.Vector2();
+
+    const hud = document.getElementById("hud");
+    const harvestBtn = document.getElementById("btn-harvest");
+
+    const particleCount = 500;
+    const particlePositions = new Float32Array(particleCount * 3);
+    const particleColors = new Float32Array(particleCount * 3);
+    const particleGeo = new THREE.BufferGeometry();
+    particleGeo.setAttribute("position", new THREE.BufferAttribute(particlePositions, 3));
+    particleGeo.setAttribute("color", new THREE.BufferAttribute(particleColors, 3));
+    const particleMat = new THREE.PointsMaterial({
+      size: 0.08,
+      vertexColors: true,
+      transparent: true,
+      opacity: 0.8,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false
+    });
+    const particles = new THREE.Points(particleGeo, particleMat);
+    formationGroup.add(particles);
+
+    window.__3D_STATE__ = {
+      crystalCount: 0,
+      growthActive: true,
+      speedMultiplier: 1,
+      glowMode: false,
+      maxGeneration: 0,
+      totalHarvested: 0,
+      tallestCrystalHeight: 0,
+      averageCrystalHeight: 0,
+      seedsPlanted: 0,
+      crystalColors: {}
+    };
+
+    function rand(min, max) {
+      return min + Math.random() * (max - min);
+    }
+
+    function randomPaletteEntry(indexOverride = null) {
+      if (indexOverride !== null) return palette[indexOverride % palette.length];
+      return palette[Math.floor(Math.random() * palette.length)];
+    }
+
+    function createCrystal({
+      position,
+      direction = new THREE.Vector3(0, 1, 0),
+      generation = 0,
+      paletteEntry = null,
+      parent = null
+    }) {
+      const chosen = paletteEntry || randomPaletteEntry();
+      const baseRadius = rand(0.15, 0.5);
+      const maxHeight = rand(2.0, 5.0);
+      const growthRate = rand(0.01, 0.04);
+
+      const geo = new THREE.CylinderGeometry(baseRadius * 0.7, baseRadius, 1, 6, 1, false);
+      const mat = new THREE.MeshPhysicalMaterial({
+        color: chosen.color.clone(),
+        transmission: 0.6,
+        roughness: 0.1,
+        metalness: 0.1,
+        clearcoat: 1.0,
+        opacity: 0.85,
+        transparent: true,
+        ior: 1.25,
+        thickness: 0.8,
+        emissive: glowMode ? chosen.color.clone() : new THREE.Color(0x000000),
+        emissiveIntensity: glowMode ? 0.4 : 0.0
+      });
+
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.castShadow = false;
+      mesh.receiveShadow = false;
+
+      const up = new THREE.Vector3(0, 1, 0);
+      const dir = direction.clone().normalize();
+      const q = new THREE.Quaternion().setFromUnitVectors(up, dir);
+      mesh.quaternion.copy(q);
+
+      const currentHeight = 0.1;
+      mesh.scale.set(1, currentHeight, 1);
+
+      const centerPos = position.clone().add(dir.clone().multiplyScalar(currentHeight * 0.5));
+      mesh.position.copy(centerPos);
+
+      formationGroup.add(mesh);
+
+      const crystal = {
+        mesh,
+        positionBase: position.clone(),
+        direction: dir,
+        baseRadius,
+        currentHeight,
+        maxHeight,
+        growthRate,
+        generation,
+        paletteName: chosen.name,
+        paletteColor: chosen.color.clone(),
+        branched: false,
+        parent
+      };
+
+      crystals.push(crystal);
+      return crystal;
+    }
+
+    function updateCrystalTransform(crystal) {
+      crystal.mesh.scale.y = crystal.currentHeight;
+      const centerPos = crystal.positionBase.clone().add(
+        crystal.direction.clone().multiplyScalar(crystal.currentHeight * 0.5)
+      );
+      crystal.mesh.position.copy(centerPos);
+    }
+
+    function spawnChildren(crystal) {
+      if (crystal.branched) return;
+      crystal.branched = true;
+
+      const count = Math.random() < 0.5 ? 1 : 2;
+      const tip = crystal.positionBase.clone().add(
+        crystal.direction.clone().multiplyScalar(crystal.currentHeight)
+      );
+
+      for (let i = 0; i < count; i++) {
+        const axis = new THREE.Vector3(rand(-1, 1), 0, rand(-1, 1)).normalize();
+        if (axis.lengthSq() < 0.0001) axis.set(1, 0, 0);
+
+        const angle = THREE.MathUtils.degToRad(rand(15, 30));
+        const dir = crystal.direction.clone().applyAxisAngle(axis, angle).normalize();
+        if (dir.y < 0.35) dir.y = 0.35;
+        dir.normalize();
+
+        const offset = new THREE.Vector3(rand(-0.08, 0.08), 0, rand(-0.08, 0.08));
+        createCrystal({
+          position: tip.clone().add(offset),
+          direction: dir,
+          generation: crystal.generation + 1,
+          paletteEntry: randomPaletteEntry(),
+          parent: crystal
+        });
+      }
+    }
+
+    function plantSeedAt(x, z, manual = false) {
+      const entry = palette[colorCycleIndex % palette.length];
+      colorCycleIndex++;
+      createCrystal({
+        position: new THREE.Vector3(
+          THREE.MathUtils.clamp(x, -9.5, 9.5),
+          0,
+          THREE.MathUtils.clamp(z, -9.5, 9.5)
+        ),
+        direction: new THREE.Vector3(0, 1, 0),
+        generation: 0,
+        paletteEntry: entry
+      });
+      if (manual) seedsPlanted++;
+    }
+
+    function resetSimulation() {
+      for (const crystal of crystals) {
+        formationGroup.remove(crystal.mesh);
+        crystal.mesh.geometry.dispose();
+        crystal.mesh.material.dispose();
+      }
+      crystals.length = 0;
+      totalHarvested = 0;
+      seedsPlanted = 0;
+      colorCycleIndex = 0;
+      formationGroup.rotation.y = 0;
+
+      for (let i = 0; i < 3; i++) {
+        plantSeedAt(rand(-7, 7), rand(-7, 7), false);
+      }
+    }
+
+    function harvestCrystals() {
+      let harvestedNow = 0;
+      for (let i = crystals.length - 1; i >= 0; i--) {
+        const c = crystals[i];
+        if (c.currentHeight >= c.maxHeight * 0.95) {
+          formationGroup.remove(c.mesh);
+          c.mesh.geometry.dispose();
+          c.mesh.material.dispose();
+          crystals.splice(i, 1);
+          harvestedNow++;
+        }
+      }
+      totalHarvested += harvestedNow;
+    }
+
+    function applyGlowMode() {
+      for (const c of crystals) {
+        c.mesh.material.emissive.copy(glowMode ? c.paletteColor : new THREE.Color(0x000000));
+        c.mesh.material.emissiveIntensity = glowMode ? 0.4 : 0.0;
+      }
+      warmLight.intensity = glowMode ? 1.5 * 1.5 : 1.5;
+      coolLight.intensity = glowMode ? 1.0 * 1.5 : 1.0;
+    }
+
+    function crystallizeBurst() {
+      for (const c of crystals) {
+        if (c.currentHeight < c.maxHeight) {
+          c.currentHeight = Math.max(c.currentHeight, c.maxHeight * 0.8);
+          updateCrystalTransform(c);
+          if (!c.branched && c.currentHeight >= c.maxHeight * 0.6) {
+            spawnChildren(c);
+          }
+        }
+      }
+    }
+
+    function updateParticles(time) {
+      for (let i = 0; i < particleCount; i++) {
+        if (crystals.length === 0) {
+          particlePositions[i * 3 + 0] = 9999;
+          particlePositions[i * 3 + 1] = 9999;
+          particlePositions[i * 3 + 2] = 9999;
+          continue;
+        }
+
+        const c = crystals[i % crystals.length];
+        const active = c.currentHeight < c.maxHeight * 0.98;
+        const tip = c.positionBase.clone().add(c.direction.clone().multiplyScalar(c.currentHeight));
+        const spread = active ? 0.5 : 0.2;
+        const t = time * 0.001 + i * 0.17;
+
+        const px = tip.x + Math.sin(t * 1.7) * spread * 0.6 + rand(-0.1, 0.1);
+        const py = tip.y + Math.cos(t * 1.3) * 0.25 + rand(-0.1, 0.1);
+        const pz = tip.z + Math.sin(t * 1.1) * spread * 0.6 + rand(-0.1, 0.1);
+
+        particlePositions[i * 3 + 0] = px;
+        particlePositions[i * 3 + 1] = py;
+        particlePositions[i * 3 + 2] = pz;
+
+        const col = c.paletteColor;
+        particleColors[i * 3 + 0] = col.r;
+        particleColors[i * 3 + 1] = col.g;
+        particleColors[i * 3 + 2] = col.b;
+      }
+
+      particleGeo.attributes.position.needsUpdate = true;
+      particleGeo.attributes.color.needsUpdate = true;
+    }
+
+    function updateStateAndHUD() {
+      let maxGeneration = 0;
+      let tallest = 0;
+      let sum = 0;
+      const colorCounts = {};
+
+      for (const p of palette) colorCounts[p.name] = 0;
+
+      for (const c of crystals) {
+        maxGeneration = Math.max(maxGeneration, c.generation);
+        tallest = Math.max(tallest, c.currentHeight);
+        sum += c.currentHeight;
+        colorCounts[c.paletteName] = (colorCounts[c.paletteName] || 0) + 1;
+      }
+
+      const avg = crystals.length ? sum / crystals.length : 0;
+
+      window.__3D_STATE__.crystalCount = crystals.length;
+      window.__3D_STATE__.growthActive = growthActive;
+      window.__3D_STATE__.speedMultiplier = speedMultiplier;
+      window.__3D_STATE__.glowMode = glowMode;
+      window.__3D_STATE__.maxGeneration = maxGeneration;
+      window.__3D_STATE__.totalHarvested = totalHarvested;
+      window.__3D_STATE__.tallestCrystalHeight = Number(tallest.toFixed(2));
+      window.__3D_STATE__.averageCrystalHeight = Number(avg.toFixed(2));
+      window.__3D_STATE__.seedsPlanted = seedsPlanted;
+      window.__3D_STATE__.crystalColors = colorCounts;
+
+      hud.innerHTML = `
+        <strong>Crystal Growth Simulation</strong><br>
+        Crystal Count: ${crystals.length}<br>
+        Growth Status: ${growthActive ? "Growing" : "Paused"}<br>
+        Speed Multiplier: ${speedMultiplier.toFixed(1)}<br>
+        Glow Mode: ${glowMode ? "ON" : "OFF"}<br>
+        Generation Count: ${maxGeneration}<br>
+        Harvested: ${totalHarvested}<br>
+        Tallest: ${tallest.toFixed(2)}<br>
+        Average Height: ${avg.toFixed(2)}
+      `;
+    }
+
+    renderer.domElement.addEventListener("click", (event) => {
+      const rect = renderer.domElement.getBoundingClientRect();
+      pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+      pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+
+      raycaster.setFromCamera(pointer, camera);
+      const hits = raycaster.intersectObject(base, false);
+      if (hits.length > 0) {
+        const p = hits[0].point;
+        plantSeedAt(p.x, p.z, true);
+      }
+    });
+
+    window.addEventListener("keydown", (e) => {
+      const key = e.key.toLowerCase();
+
+      if (key === "g") {
+        growthActive = !growthActive;
+      } else if (key === "r") {
+        resetSimulation();
+      } else if (key === "c") {
+        crystallizeBurst();
+      } else if (key === "l") {
+        glowMode = !glowMode;
+        applyGlowMode();
+      } else if (e.key === "+" || e.key === "=") {
+        speedMultiplier = Math.min(3.0, speedMultiplier + 0.5);
+      } else if (e.key === "-") {
+        speedMultiplier = Math.max(0.5, speedMultiplier - 0.5);
+      }
+    });
+
+    renderer.domElement.addEventListener("wheel", (e) => {
+      if (e.shiftKey) {
+        e.preventDefault();
+        formationGroup.rotation.y += e.deltaY * 0.002;
+      }
+    }, { passive: false });
+
+    harvestBtn.addEventListener("click", harvestCrystals);
+
+    window.addEventListener("resize", () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    function animate(time) {
+      requestAnimationFrame(animate);
+
+      if (growthActive) {
+        const currentCrystals = [...crystals];
+        for (const c of currentCrystals) {
+          if (c.currentHeight < c.maxHeight) {
+            c.currentHeight = Math.min(c.maxHeight, c.currentHeight + c.growthRate * speedMultiplier);
+            updateCrystalTransform(c);
+
+            if (!c.branched && c.currentHeight >= c.maxHeight * 0.6) {
+              spawnChildren(c);
+            }
+          }
+          c.mesh.rotation.y += 0.001;
+        }
+      } else {
+        for (const c of crystals) {
+          c.mesh.rotation.y += 0.001;
+        }
+      }
+
+      updateParticles(time);
+      updateStateAndHUD();
+      controls.update();
+      renderer.render(scene, camera);
+    }
+
+    resetSimulation();
+    applyGlowMode();
+    updateStateAndHUD();
+    animate();
+  </script>
+</body>
+</html>

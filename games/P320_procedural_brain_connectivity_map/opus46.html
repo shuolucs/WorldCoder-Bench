@@ -1,0 +1,659 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3D Brain Connectivity Map</title>
+<style>
+  body { margin: 0; overflow: hidden; background: #0a0a1a; font-family: 'Segoe UI', Tahoma, sans-serif; }
+  canvas { display: block; }
+  #hud {
+    position: absolute; top: 15px; left: 15px;
+    background: rgba(10, 10, 30, 0.85);
+    border: 1px solid rgba(100, 100, 200, 0.3);
+    border-radius: 8px;
+    padding: 15px 20px;
+    color: #aabbdd;
+    font-size: 13px;
+    line-height: 1.8;
+    backdrop-filter: blur(10px);
+    min-width: 220px;
+    z-index: 10;
+  }
+  #hud .label { color: #667799; }
+  #hud .value { color: #88ccff; font-weight: bold; }
+  #hud h3 { margin: 0 0 8px 0; color: #5588cc; font-size: 14px; border-bottom: 1px solid rgba(100,100,200,0.2); padding-bottom: 6px; }
+  #strengthFilterBtn {
+    position: absolute; top: 15px; right: 15px;
+    background: rgba(30, 30, 60, 0.9);
+    border: 1px solid rgba(100, 100, 200, 0.4);
+    border-radius: 6px;
+    color: #88ccff;
+    padding: 10px 18px;
+    font-size: 13px;
+    cursor: pointer;
+    z-index: 10;
+    transition: all 0.2s;
+  }
+  #strengthFilterBtn:hover { background: rgba(50, 50, 100, 0.9); border-color: rgba(130, 130, 255, 0.6); }
+  #controls-help {
+    position: absolute; bottom: 15px; left: 15px;
+    background: rgba(10, 10, 30, 0.75);
+    border: 1px solid rgba(100, 100, 200, 0.2);
+    border-radius: 8px;
+    padding: 10px 15px;
+    color: #556688;
+    font-size: 11px;
+    line-height: 1.6;
+    z-index: 10;
+  }
+  #controls-help kbd {
+    background: rgba(50,50,100,0.5);
+    border: 1px solid rgba(100,100,200,0.3);
+    border-radius: 3px;
+    padding: 1px 5px;
+    color: #88aacc;
+  }
+</style>
+</head>
+<body>
+
+<div id="hud">
+  <h3>🧠 Brain Connectivity</h3>
+  <div><span class="label">Active Nodes: </span><span class="value" id="activeCount">0</span></div>
+  <div><span class="label">Group Filter: </span><span class="value" id="groupFilter">all</span></div>
+  <div><span class="label">Strength Threshold: </span><span class="value" id="strengthThreshold">0.00</span></div>
+  <div><span class="label">Signal Animation: </span><span class="value" id="signalStatus">ON</span></div>
+  <div><span class="label">Transparency: </span><span class="value" id="transparencyMode">OFF</span></div>
+</div>
+
+<button id="strengthFilterBtn">Strength Filter: 0.00</button>
+
+<div id="controls-help">
+  <kbd>Click</kbd> Activate node &nbsp;
+  <kbd>G</kbd> Group filter &nbsp;
+  <kbd>R</kbd> Reset &nbsp;
+  <kbd>S</kbd> Toggle signals &nbsp;
+  <kbd>T</kbd> Transparency
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<script>
+(function() {
+
+// ============ STATE ============
+window.__3D_STATE__ = {
+  nodeCount: 20,
+  connectionCount: 35,
+  activeNodes: [],
+  activeConnectionCount: 0,
+  groupFilter: 'all',
+  strengthThreshold: 0,
+  signalAnimationOn: true,
+  transparencyMode: false,
+  visibleNodeCount: 20,
+  visibleConnectionCount: 35,
+  cameraDistance: 80,
+  frameCount: 0,
+  lastClickedNodeId: -1,
+  signalParticleCount: 0
+};
+
+// ============ SCENE SETUP ============
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0a0a1a);
+
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 500);
+camera.position.set(0, 0, 80);
+camera.lookAt(0, 0, 0);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(window.devicePixelRatio);
+document.body.appendChild(renderer.domElement);
+
+const controls = new THREE.OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+
+// Lighting
+const ambientLight = new THREE.AmbientLight(0x334466, 0.4);
+scene.add(ambientLight);
+const pointLight = new THREE.PointLight(0xffffff, 1.0);
+pointLight.position.set(30, 30, 30);
+scene.add(pointLight);
+
+// ============ BRAIN REGIONS ============
+const groups = ['frontal', 'temporal', 'parietal', 'occipital'];
+const groupColors = {
+  frontal: 0xff4466,
+  temporal: 0x44ff66,
+  parietal: 0x4466ff,
+  occipital: 0xffaa44
+};
+
+function getGroup(index) {
+  if (index < 5) return 'frontal';
+  if (index < 10) return 'temporal';
+  if (index < 15) return 'parietal';
+  return 'occipital';
+}
+
+// Generate node positions in ellipsoidal brain shape
+function generateNodePositions() {
+  const positions = [];
+  // Left hemisphere (indices 0-9), Right hemisphere (indices 10-19)
+  // But we need groups: frontal 0-4, temporal 5-9, parietal 10-14, occipital 15-19
+  // Left hemisphere = even indices or first half of each group? 
+  // Let's do: for each group of 5, first ~2-3 on left, rest on right
+  // Actually spec says: Left hemisphere: 10 nodes at negative X, Right: 10 at positive X
+
+  const nodePositions = [
+    // Frontal (0-4): front of brain (positive Y)
+    { x: -12, y: 10, z: 3 },    // 0 left
+    { x: -8, y: 13, z: -2 },    // 1 left
+    { x: -15, y: 8, z: 1 },     // 2 left
+    { x: 12, y: 10, z: 3 },     // 3 right
+    { x: 8, y: 13, z: -2 },     // 4 right
+
+    // Temporal (5-9): sides, middle height
+    { x: -20, y: -2, z: -5 },   // 5 left
+    { x: -18, y: 3, z: 4 },     // 6 left
+    { x: -22, y: -5, z: 0 },    // 7 left
+    { x: 20, y: -2, z: -5 },    // 8 right
+    { x: 18, y: 3, z: 4 },      // 9 right
+
+    // Parietal (10-14): top, middle
+    { x: -8, y: 2, z: 8 },      // 10 left
+    { x: -5, y: 5, z: 6 },      // 11 left
+    { x: -10, y: -3, z: 7 },    // 12 left
+    { x: 8, y: 2, z: 8 },       // 13 right
+    { x: 5, y: 5, z: 6 },       // 14 right
+
+    // Occipital (15-19): back of brain (negative Y)
+    { x: -6, y: -12, z: 2 },    // 15 left
+    { x: -10, y: -10, z: -3 },  // 16 left
+    { x: 6, y: -12, z: 2 },     // 17 right
+    { x: 10, y: -10, z: -3 },   // 18 right
+    { x: -3, y: -14, z: -1 },   // 19 left
+  ];
+
+  return nodePositions;
+}
+
+const nodePositions = generateNodePositions();
+const nodes = [];
+const nodeMeshes = [];
+const nodeGeometry = new THREE.IcosahedronGeometry(1.5, 2);
+
+for (let i = 0; i < 20; i++) {
+  const group = getGroup(i);
+  const color = groupColors[group];
+  const material = new THREE.MeshPhongMaterial({
+    color: color,
+    emissive: 0x000000,
+    emissiveIntensity: 0,
+    transparent: true,
+    opacity: 1.0,
+    shininess: 80
+  });
+  const mesh = new THREE.Mesh(nodeGeometry, material);
+  const pos = nodePositions[i];
+  mesh.position.set(pos.x, pos.y, pos.z);
+  mesh.userData = { nodeId: i };
+  scene.add(mesh);
+  nodeMeshes.push(mesh);
+
+  nodes.push({
+    id: i,
+    position: new THREE.Vector3(pos.x, pos.y, pos.z),
+    group: group,
+    active: false,
+    mesh: mesh,
+    baseColor: new THREE.Color(color)
+  });
+}
+
+// ============ CONNECTIONS ============
+const connections = [];
+const connectionLines = [];
+
+function createConnections() {
+  const connSet = new Set();
+  const connList = [];
+
+  function addConn(a, b) {
+    const key = Math.min(a, b) + '-' + Math.max(a, b);
+    if (!connSet.has(key) && a !== b) {
+      connSet.add(key);
+      connList.push([a, b]);
+      return true;
+    }
+    return false;
+  }
+
+  // Intra-group connections (at least 5 per group)
+  // Frontal: 0-4
+  addConn(0, 1); addConn(1, 2); addConn(0, 3); addConn(3, 4); addConn(1, 4);
+  // Temporal: 5-9
+  addConn(5, 6); addConn(6, 7); addConn(5, 8); addConn(8, 9); addConn(6, 9);
+  // Parietal: 10-14
+  addConn(10, 11); addConn(11, 12); addConn(10, 13); addConn(13, 14); addConn(11, 14);
+  // Occipital: 15-19
+  addConn(15, 16); addConn(16, 19); addConn(15, 17); addConn(17, 18); addConn(18, 19);
+
+  // Cross-hemisphere connections (at least 5)
+  addConn(0, 4); addConn(2, 3); addConn(7, 8); addConn(12, 13); addConn(16, 18);
+  addConn(1, 3); addConn(6, 9);
+
+  // Additional cross-group connections to reach 35
+  addConn(0, 6); addConn(1, 11); addConn(2, 10); addConn(3, 9);
+  addConn(4, 14); addConn(5, 15); addConn(7, 16); addConn(8, 17);
+  addConn(9, 13); addConn(10, 15); addConn(12, 16); addConn(14, 13);
+  addConn(11, 6);
+
+  // Fill remaining to reach exactly 35
+  const allPairs = [];
+  for (let i = 0; i < 20; i++) {
+    for (let j = i + 1; j < 20; j++) {
+      allPairs.push([i, j]);
+    }
+  }
+  // Shuffle
+  for (let i = allPairs.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [allPairs[i], allPairs[j]] = [allPairs[j], allPairs[i]];
+  }
+  for (const pair of allPairs) {
+    if (connList.length >= 35) break;
+    addConn(pair[0], pair[1]);
+  }
+
+  return connList.slice(0, 35);
+}
+
+const connPairs = createConnections();
+
+// Seeded random for consistent strengths
+function seededRandom(seed) {
+  let s = seed;
+  return function() {
+    s = (s * 9301 + 49297) % 233280;
+    return s / 233280;
+  };
+}
+const srand = seededRandom(42);
+
+for (let i = 0; i < connPairs.length; i++) {
+  const [srcId, tgtId] = connPairs[i];
+  const strength = 0.1 + srand() * 0.9;
+
+  const positions = new Float32Array(6);
+  const srcPos = nodes[srcId].position;
+  const tgtPos = nodes[tgtId].position;
+  positions[0] = srcPos.x; positions[1] = srcPos.y; positions[2] = srcPos.z;
+  positions[3] = tgtPos.x; positions[4] = tgtPos.y; positions[5] = tgtPos.z;
+
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+
+  const material = new THREE.LineBasicMaterial({
+    color: 0x333355,
+    transparent: true,
+    opacity: 0.3
+  });
+
+  const line = new THREE.Line(geometry, material);
+  scene.add(line);
+  connectionLines.push(line);
+
+  connections.push({
+    id: i,
+    sourceId: srcId,
+    targetId: tgtId,
+    strength: strength,
+    active: false,
+    line: line,
+    baseColor: new THREE.Color(0x333355)
+  });
+}
+
+// ============ SIGNAL PARTICLES ============
+const signalParticles = [];
+const signalGeometry = new THREE.SphereGeometry(0.4, 8, 8);
+const signalMaterial = new THREE.MeshBasicMaterial({ color: 0x00ffff, transparent: true, opacity: 0.9 });
+
+function createSignalParticle(connection) {
+  const mesh = new THREE.Mesh(signalGeometry, signalMaterial.clone());
+  scene.add(mesh);
+  const particle = {
+    mesh: mesh,
+    connectionId: connection.id,
+    progress: 0,
+    speed: 0.3 + connection.strength * 0.7 // proportional to strength
+  };
+  signalParticles.push(particle);
+  return particle;
+}
+
+function removeSignalParticle(particle) {
+  scene.remove(particle.mesh);
+  if (particle.mesh.material) particle.mesh.material.dispose();
+  const idx = signalParticles.indexOf(particle);
+  if (idx !== -1) signalParticles.splice(idx, 1);
+}
+
+function removeSignalsForConnection(connId) {
+  for (let i = signalParticles.length - 1; i >= 0; i--) {
+    if (signalParticles[i].connectionId === connId) {
+      scene.remove(signalParticles[i].mesh);
+      if (signalParticles[i].mesh.material) signalParticles[i].mesh.material.dispose();
+      signalParticles.splice(i, 1);
+    }
+  }
+}
+
+function removeAllSignals() {
+  for (let i = signalParticles.length - 1; i >= 0; i--) {
+    scene.remove(signalParticles[i].mesh);
+    if (signalParticles[i].mesh.material) signalParticles[i].mesh.material.dispose();
+  }
+  signalParticles.length = 0;
+}
+
+// ============ ACTIVATION LOGIC ============
+const activeNodeIds = [];
+
+function activateNode(nodeId) {
+  const node = nodes[nodeId];
+  if (node.active) {
+    deactivateNode(nodeId);
+    return;
+  }
+
+  // Max 3 active nodes
+  if (activeNodeIds.length >= 3) {
+    deactivateNode(activeNodeIds[0]);
+  }
+
+  node.active = true;
+  activeNodeIds.push(nodeId);
+  node.mesh.material.emissive.set(0xffffff);
+  node.mesh.material.emissiveIntensity = 0.6;
+
+  // Activate connections
+  for (const conn of connections) {
+    if (conn.sourceId === nodeId || conn.targetId === nodeId) {
+      if (!conn.active) {
+        conn.active = true;
+        conn.line.material.color.set(0xffffff);
+        conn.line.material.opacity = 0.9;
+        createSignalParticle(conn);
+      }
+    }
+  }
+}
+
+function deactivateNode(nodeId) {
+  const node = nodes[nodeId];
+  node.active = false;
+  const idx = activeNodeIds.indexOf(nodeId);
+  if (idx !== -1) activeNodeIds.splice(idx, 1);
+  node.mesh.material.emissive.set(0x000000);
+  node.mesh.material.emissiveIntensity = 0;
+
+  // Deactivate connections that no longer have any active endpoint
+  for (const conn of connections) {
+    if (conn.sourceId === nodeId || conn.targetId === nodeId) {
+      const otherNodeId = conn.sourceId === nodeId ? conn.targetId : conn.sourceId;
+      if (!nodes[otherNodeId].active) {
+        conn.active = false;
+        conn.line.material.color.set(0x333355);
+        conn.line.material.opacity = 0.3;
+        removeSignalsForConnection(conn.id);
+      }
+    }
+  }
+}
+
+function resetAll() {
+  for (let i = activeNodeIds.length - 1; i >= 0; i--) {
+    const nid = activeNodeIds[i];
+    nodes[nid].active = false;
+    nodes[nid].mesh.material.emissive.set(0x000000);
+    nodes[nid].mesh.material.emissiveIntensity = 0;
+  }
+  activeNodeIds.length = 0;
+
+  for (const conn of connections) {
+    conn.active = false;
+    conn.line.material.color.set(0x333355);
+    conn.line.material.opacity = 0.3;
+  }
+
+  removeAllSignals();
+
+  window.__3D_STATE__.groupFilter = 'all';
+  window.__3D_STATE__.strengthThreshold = 0;
+  window.__3D_STATE__.transparencyMode = false;
+  window.__3D_STATE__.signalAnimationOn = true;
+
+  updateVisibility();
+  updateHUD();
+}
+
+// ============ VISIBILITY ============
+function updateVisibility() {
+  const state = window.__3D_STATE__;
+  let visNodes = 0;
+  let visConns = 0;
+
+  for (const node of nodes) {
+    const groupVisible = state.groupFilter === 'all' || node.group === state.groupFilter;
+    node.mesh.visible = groupVisible;
+    if (groupVisible) visNodes++;
+
+    // Transparency mode
+    if (state.transparencyMode) {
+      node.mesh.material.opacity = node.active ? 1.0 : 0.2;
+    } else {
+      node.mesh.material.opacity = 1.0;
+    }
+  }
+
+  for (const conn of connections) {
+    const srcNode = nodes[conn.sourceId];
+    const tgtNode = nodes[conn.targetId];
+    const srcVisible = state.groupFilter === 'all' || srcNode.group === state.groupFilter;
+    const tgtVisible = state.groupFilter === 'all' || tgtNode.group === state.groupFilter;
+    const strengthOk = conn.strength >= state.strengthThreshold;
+    const visible = (srcVisible || tgtVisible) && strengthOk;
+    // Actually, for group filter, show connection only if both endpoints are visible
+    // or at least one? Let's say both must be visible for the connection to show
+    const bothVisible = srcVisible && tgtVisible;
+    conn.line.visible = bothVisible && strengthOk;
+    if (bothVisible && strengthOk) visConns++;
+
+    // Hide signal particles for hidden connections
+    if (!conn.line.visible) {
+      removeSignalsForConnection(conn.id);
+      if (conn.active && !conn.line.visible) {
+        // Keep active state but hide signals
+      }
+    } else if (conn.active) {
+      // Ensure signal exists
+      const hasSignal = signalParticles.some(p => p.connectionId === conn.id);
+      if (!hasSignal && state.signalAnimationOn) {
+        createSignalParticle(conn);
+      }
+    }
+  }
+
+  state.visibleNodeCount = visNodes;
+  state.visibleConnectionCount = visConns;
+}
+
+// ============ RAYCASTING ============
+const raycaster = new THREE.Raycaster();
+const mouse = new THREE.Vector2();
+
+renderer.domElement.addEventListener('click', (event) => {
+  mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+  mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+  raycaster.setFromCamera(mouse, camera);
+  const intersects = raycaster.intersectObjects(nodeMeshes);
+
+  if (intersects.length > 0) {
+    const nodeId = intersects[0].object.userData.nodeId;
+    if (nodes[nodeId].mesh.visible) {
+      window.__3D_STATE__.lastClickedNodeId = nodeId;
+      activateNode(nodeId);
+      updateVisibility();
+      updateHUD();
+    }
+  }
+});
+
+// ============ KEYBOARD ============
+const groupCycle = ['all', 'frontal', 'temporal', 'parietal', 'occipital'];
+let groupCycleIndex = 0;
+
+const strengthCycle = [0, 0.25, 0.5, 0.75];
+let strengthCycleIndex = 0;
+
+document.addEventListener('keydown', (event) => {
+  const key = event.key.toLowerCase();
+
+  if (key === 'g') {
+    groupCycleIndex = (groupCycleIndex + 1) % groupCycle.length;
+    window.__3D_STATE__.groupFilter = groupCycle[groupCycleIndex];
+    updateVisibility();
+    updateHUD();
+  } else if (key === 'r') {
+    groupCycleIndex = 0;
+    strengthCycleIndex = 0;
+    resetAll();
+  } else if (key === 's') {
+    window.__3D_STATE__.signalAnimationOn = !window.__3D_STATE__.signalAnimationOn;
+    if (!window.__3D_STATE__.signalAnimationOn) {
+      // Hide all signal particles
+      for (const p of signalParticles) {
+        p.mesh.visible = false;
+      }
+    } else {
+      for (const p of signalParticles) {
+        p.mesh.visible = true;
+      }
+    }
+    updateHUD();
+  } else if (key === 't') {
+    window.__3D_STATE__.transparencyMode = !window.__3D_STATE__.transparencyMode;
+    updateVisibility();
+    updateHUD();
+  }
+});
+
+// ============ STRENGTH FILTER BUTTON ============
+document.getElementById('strengthFilterBtn').addEventListener('click', () => {
+  strengthCycleIndex = (strengthCycleIndex + 1) % strengthCycle.length;
+  window.__3D_STATE__.strengthThreshold = strengthCycle[strengthCycleIndex];
+  updateVisibility();
+  updateHUD();
+});
+
+// ============ HUD UPDATE ============
+function updateHUD() {
+  const state = window.__3D_STATE__;
+  document.getElementById('activeCount').textContent = activeNodeIds.length;
+  document.getElementById('groupFilter').textContent = state.groupFilter;
+  document.getElementById('strengthThreshold').textContent = state.strengthThreshold.toFixed(2);
+  document.getElementById('signalStatus').textContent = state.signalAnimationOn ? 'ON' : 'OFF';
+  document.getElementById('transparencyMode').textContent = state.transparencyMode ? 'ON' : 'OFF';
+  document.getElementById('strengthFilterBtn').textContent = 'Strength Filter: ' + state.strengthThreshold.toFixed(2);
+}
+
+// ============ ANIMATION LOOP ============
+const clock = new THREE.Clock();
+
+function animate() {
+  requestAnimationFrame(animate);
+
+  const delta = clock.getDelta();
+  const state = window.__3D_STATE__;
+  state.frameCount++;
+
+  controls.update();
+
+  // Camera distance
+  state.cameraDistance = camera.position.length();
+
+  // Update active nodes array
+  state.activeNodes = [...activeNodeIds];
+
+  // Count active connections
+  state.activeConnectionCount = connections.filter(c => c.active).length;
+
+  // Animate signal particles
+  if (state.signalAnimationOn) {
+    for (const particle of signalParticles) {
+      const conn = connections[particle.connectionId];
+      if (!conn.line.visible) {
+        particle.mesh.visible = false;
+        continue;
+      }
+      particle.mesh.visible = true;
+      particle.progress += delta * particle.speed;
+      if (particle.progress > 1) particle.progress -= 1;
+
+      const srcPos = nodes[conn.sourceId].position;
+      const tgtPos = nodes[conn.targetId].position;
+      const t = particle.progress;
+      particle.mesh.position.lerpVectors(srcPos, tgtPos, t);
+    }
+  }
+
+  // Node pulse animation for active nodes
+  const time = clock.elapsedTime;
+  for (const node of nodes) {
+    if (node.active) {
+      const pulse = 0.4 + 0.2 * Math.sin(time * 3 + node.id);
+      node.mesh.material.emissiveIntensity = pulse;
+      const scale = 1.0 + 0.1 * Math.sin(time * 2 + node.id * 0.5);
+      node.mesh.scale.setScalar(scale);
+    } else {
+      node.mesh.scale.setScalar(1.0);
+    }
+  }
+
+  // Active connection color pulse
+  for (const conn of connections) {
+    if (conn.active && conn.line.visible) {
+      const pulse = 0.7 + 0.3 * Math.sin(time * 4 + conn.id);
+      conn.line.material.opacity = pulse;
+    }
+  }
+
+  // Signal particle count
+  state.signalParticleCount = signalParticles.filter(p => p.mesh.visible).length;
+
+  renderer.render(scene, camera);
+}
+
+// ============ RESIZE ============
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// ============ INIT ============
+updateVisibility();
+updateHUD();
+animate();
+
+})();
+</script>
+</body>
+</html>

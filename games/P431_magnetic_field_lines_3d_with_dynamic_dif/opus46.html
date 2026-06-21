@@ -1,0 +1,820 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3D Magnetic Field Visualization</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { overflow: hidden; background: #0a0a1a; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+canvas { display: block; }
+#hud-top-left {
+    position: absolute; top: 15px; left: 15px;
+    color: #aaccff; font-size: 14px; line-height: 1.6;
+    background: rgba(10, 10, 30, 0.8); padding: 12px 18px;
+    border-radius: 8px; border: 1px solid rgba(100, 150, 255, 0.3);
+    pointer-events: none;
+}
+#hud-top-right {
+    position: absolute; top: 15px; right: 15px;
+    color: #aaccff; font-size: 14px; line-height: 1.6;
+    background: rgba(10, 10, 30, 0.8); padding: 12px 18px;
+    border-radius: 8px; border: 1px solid rgba(100, 150, 255, 0.3);
+    pointer-events: none;
+}
+#button-row {
+    position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%);
+    display: flex; gap: 10px;
+}
+#button-row button {
+    padding: 10px 20px; font-size: 14px; cursor: pointer;
+    background: rgba(30, 40, 80, 0.9); color: #aaccff;
+    border: 1px solid rgba(100, 150, 255, 0.4); border-radius: 6px;
+    transition: all 0.2s;
+}
+#button-row button:hover {
+    background: rgba(50, 70, 140, 0.9); border-color: rgba(100, 150, 255, 0.8);
+}
+#instructions {
+    position: absolute; bottom: 70px; left: 50%; transform: translateX(-50%);
+    color: rgba(170, 200, 255, 0.5); font-size: 11px; text-align: center;
+    pointer-events: none;
+}
+</style>
+</head>
+<body>
+
+<div id="hud-top-left">
+    <div>Difficulty: <span id="hud-difficulty">1</span> / 5</div>
+    <div>Dipoles: <span id="hud-dipoles">2</span></div>
+    <div>Field Lines: <span id="hud-lines">0</span></div>
+    <div>Simulation: <span id="hud-sim">Paused</span></div>
+    <div>Selected: <span id="hud-selected">None</span></div>
+</div>
+
+<div id="hud-top-right">
+    <div>Field at target:</div>
+    <div><span id="hud-field">0.0000</span> T</div>
+</div>
+
+<div id="instructions">
+    Click dipole to select | Arrow keys to move | Shift+Up/Down for Y | R to rotate | Space to toggle sim | N/B for difficulty
+</div>
+
+<div id="button-row">
+    <button id="btn-diff-up">Difficulty +</button>
+    <button id="btn-diff-down">Difficulty -</button>
+    <button id="btn-reset">Reset</button>
+    <button id="btn-toggle-sim">Toggle Sim</button>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<script>
+(function() {
+
+// ============ STATE ============
+window.__3D_STATE__ = {
+    difficultyLevel: 1,
+    numDipoles: 2,
+    numFieldLines: 0,
+    simulationRunning: false,
+    selectedDipoleIndex: -1,
+    dipolePositions: [],
+    dipoleRotations: [],
+    testChargeCount: 0,
+    fieldStrengthAtOrigin: 0,
+    heatmapVisible: false,
+    animatedFlow: false,
+    frameCount: 0,
+    testChargePositions: []
+};
+
+const state = window.__3D_STATE__;
+
+// ============ SCENE SETUP ============
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0a0a1a);
+
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+camera.position.set(0, 8, 15);
+camera.lookAt(0, 0, 0);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+document.body.appendChild(renderer.domElement);
+
+const controls = new THREE.OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+controls.target.set(0, 0, 0);
+
+// Lights
+const ambientLight = new THREE.AmbientLight(0x334455, 0.4);
+scene.add(ambientLight);
+
+const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+dirLight.position.set(5, 10, 5);
+scene.add(dirLight);
+
+// Grid
+const gridHelper = new THREE.GridHelper(20, 20, 0x444466, 0x222244);
+gridHelper.material.opacity = 0.5;
+gridHelper.material.transparent = true;
+scene.add(gridHelper);
+
+// ============ DIPOLE DEFINITIONS ============
+const initialDipoleConfigs = [
+    { pos: new THREE.Vector3(-3, 1, 0), rotZ: 0 },
+    { pos: new THREE.Vector3(3, 1, 0), rotZ: 0 },
+    { pos: new THREE.Vector3(0, 1, 3), rotZ: 0 },
+    { pos: new THREE.Vector3(0, 1, -3), rotZ: 0 }
+];
+
+let dipoles = []; // { mesh, rotZDeg, momentDir }
+let fieldLines = [];
+let testCharges = [];
+let heatmapTiles = [];
+let heatmapGroup = null;
+
+function createDipoleMesh() {
+    const group = new THREE.Group();
+
+    // North pole (top) - red
+    const northGeo = new THREE.CylinderGeometry(0.3, 0.3, 0.7, 16);
+    const northMat = new THREE.MeshPhongMaterial({ color: 0xff3333, emissive: 0x330000 });
+    const northMesh = new THREE.Mesh(northGeo, northMat);
+    northMesh.position.y = 0.65;
+    group.add(northMesh);
+
+    // Middle - gray
+    const midGeo = new THREE.CylinderGeometry(0.3, 0.3, 0.6, 16);
+    const midMat = new THREE.MeshPhongMaterial({ color: 0x888888, emissive: 0x111111 });
+    const midMesh = new THREE.Mesh(midGeo, midMat);
+    midMesh.position.y = 0;
+    group.add(midMesh);
+
+    // South pole (bottom) - blue
+    const southGeo = new THREE.CylinderGeometry(0.3, 0.3, 0.7, 16);
+    const southMat = new THREE.MeshPhongMaterial({ color: 0x3333ff, emissive: 0x000033 });
+    const southMesh = new THREE.Mesh(southGeo, southMat);
+    southMesh.position.y = -0.65;
+    group.add(southMesh);
+
+    // Label N
+    // We'll skip text for performance, the colors are clear
+
+    group.userData.parts = [northMesh, midMesh, southMesh];
+    return group;
+}
+
+function initDipoles(count) {
+    // Remove existing
+    dipoles.forEach(d => scene.remove(d.mesh));
+    dipoles = [];
+
+    for (let i = 0; i < count; i++) {
+        const cfg = initialDipoleConfigs[i];
+        const mesh = createDipoleMesh();
+        mesh.position.copy(cfg.pos);
+        mesh.rotation.z = THREE.MathUtils.degToRad(cfg.rotZ);
+        scene.add(mesh);
+        dipoles.push({
+            mesh: mesh,
+            rotZDeg: cfg.rotZ
+        });
+    }
+    state.selectedDipoleIndex = -1;
+    updateStateArrays();
+}
+
+function updateStateArrays() {
+    state.numDipoles = dipoles.length;
+    state.dipolePositions = dipoles.map(d => ({
+        x: d.mesh.position.x,
+        y: d.mesh.position.y,
+        z: d.mesh.position.z
+    }));
+    state.dipoleRotations = dipoles.map(d => d.rotZDeg);
+}
+
+// ============ MAGNETIC FIELD COMPUTATION ============
+function getMomentDirection(dipole) {
+    // The dipole moment points from south to north, which is local +Y
+    const dir = new THREE.Vector3(0, 1, 0);
+    dir.applyEuler(dipole.mesh.rotation);
+    return dir;
+}
+
+function computeBField(point, dipolesArr) {
+    const B = new THREE.Vector3(0, 0, 0);
+    const mu0_4pi = 1.0; // normalized units
+
+    for (let i = 0; i < dipolesArr.length; i++) {
+        const d = dipolesArr[i];
+        const m = getMomentDirection(d);
+        const r = new THREE.Vector3().subVectors(point, d.mesh.position);
+        const rMag = r.length();
+
+        if (rMag < 0.3) continue; // avoid singularity
+
+        const rHat = r.clone().normalize();
+        const mDotRhat = m.dot(rHat);
+        const r3 = rMag * rMag * rMag;
+
+        // B = (mu0/4pi) * [3(m·r̂)r̂ - m] / |r|³
+        const contrib = new THREE.Vector3();
+        contrib.copy(rHat).multiplyScalar(3 * mDotRhat);
+        contrib.sub(m);
+        contrib.divideScalar(r3);
+        contrib.multiplyScalar(mu0_4pi);
+
+        B.add(contrib);
+    }
+
+    return B;
+}
+
+// ============ FIELD LINE GENERATION ============
+function generateFieldLines() {
+    // Remove old
+    fieldLines.forEach(l => scene.remove(l));
+    fieldLines = [];
+
+    const linesPerDipole = getLinesPerDipole();
+
+    for (let di = 0; di < dipoles.length; di++) {
+        const d = dipoles[di];
+        const momentDir = getMomentDirection(d);
+        const pos = d.mesh.position.clone();
+
+        // Create seed points in a circle around the north pole
+        const northPole = pos.clone().add(momentDir.clone().multiplyScalar(1.0));
+
+        // Find perpendicular vectors
+        let perp1 = new THREE.Vector3(1, 0, 0);
+        if (Math.abs(momentDir.dot(perp1)) > 0.9) {
+            perp1.set(0, 0, 1);
+        }
+        perp1.cross(momentDir).normalize();
+        const perp2 = new THREE.Vector3().crossVectors(momentDir, perp1).normalize();
+
+        for (let li = 0; li < linesPerDipole; li++) {
+            const angle = (li / linesPerDipole) * Math.PI * 2;
+            const seedRadius = 0.4;
+            const seed = northPole.clone()
+                .add(perp1.clone().multiplyScalar(Math.cos(angle) * seedRadius))
+                .add(perp2.clone().multiplyScalar(Math.sin(angle) * seedRadius));
+
+            const points = traceFieldLine(seed, dipoles, 0.1, 500);
+            if (points.length > 2) {
+                const line = createFieldLineObject(points);
+                scene.add(line);
+                fieldLines.push(line);
+            }
+        }
+    }
+
+    state.numFieldLines = fieldLines.length;
+}
+
+function traceFieldLine(startPoint, dipolesArr, stepSize, maxSteps) {
+    const points = [];
+    const p = startPoint.clone();
+    points.push(p.clone());
+
+    for (let i = 0; i < maxSteps; i++) {
+        // RK4
+        const k1 = computeBField(p, dipolesArr);
+        if (k1.length() < 1e-6) break;
+        k1.normalize().multiplyScalar(stepSize);
+
+        const p2 = p.clone().add(k1.clone().multiplyScalar(0.5));
+        const k2 = computeBField(p2, dipolesArr);
+        if (k2.length() < 1e-6) break;
+        k2.normalize().multiplyScalar(stepSize);
+
+        const p3 = p.clone().add(k2.clone().multiplyScalar(0.5));
+        const k3 = computeBField(p3, dipolesArr);
+        if (k3.length() < 1e-6) break;
+        k3.normalize().multiplyScalar(stepSize);
+
+        const p4 = p.clone().add(k3);
+        const k4 = computeBField(p4, dipolesArr);
+        if (k4.length() < 1e-6) break;
+        k4.normalize().multiplyScalar(stepSize);
+
+        const dp = new THREE.Vector3()
+            .add(k1)
+            .add(k2.multiplyScalar(2))
+            .add(k3.multiplyScalar(2))
+            .add(k4)
+            .divideScalar(6);
+
+        p.add(dp);
+        points.push(p.clone());
+
+        // Bounds check
+        if (Math.abs(p.x) > 12 || Math.abs(p.y) > 12 || Math.abs(p.z) > 12) break;
+
+        // Check if too close to any dipole south pole (convergence)
+        let tooClose = false;
+        for (let d of dipolesArr) {
+            const dist = p.distanceTo(d.mesh.position);
+            if (dist < 0.25) { tooClose = true; break; }
+        }
+        if (tooClose) break;
+    }
+
+    return points;
+}
+
+function fieldStrengthColor(strength) {
+    // weak=green(0x00ff88), medium=yellow(0xffff00), strong=red(0xff4400)
+    const t = Math.min(strength * 3.0, 1.0); // normalize
+    const color = new THREE.Color();
+    if (t < 0.5) {
+        const s = t * 2;
+        color.setRGB(s, 1.0, 0.53 * (1 - s));
+    } else {
+        const s = (t - 0.5) * 2;
+        color.setRGB(1.0, 1.0 - s * 0.73, 0);
+    }
+    return color;
+}
+
+function createFieldLineObject(points) {
+    const positions = new Float32Array(points.length * 3);
+    const colors = new Float32Array(points.length * 3);
+
+    for (let i = 0; i < points.length; i++) {
+        positions[i * 3] = points[i].x;
+        positions[i * 3 + 1] = points[i].y;
+        positions[i * 3 + 2] = points[i].z;
+
+        const B = computeBField(points[i], dipoles);
+        const strength = B.length();
+        const col = fieldStrengthColor(strength);
+        colors[i * 3] = col.r;
+        colors[i * 3 + 1] = col.g;
+        colors[i * 3 + 2] = col.b;
+    }
+
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+    const material = new THREE.LineBasicMaterial({
+        vertexColors: true,
+        linewidth: 1,
+        transparent: true,
+        opacity: 0.85
+    });
+
+    return new THREE.Line(geometry, material);
+}
+
+// ============ ANIMATED FLOW (Level 5) ============
+let flowOffset = 0;
+
+function updateFieldLineFlow() {
+    if (!state.animatedFlow) return;
+    flowOffset += 0.02;
+
+    fieldLines.forEach(line => {
+        const colors = line.geometry.attributes.color;
+        const count = colors.count;
+        for (let i = 0; i < count; i++) {
+            const wave = Math.sin((i / count) * Math.PI * 4 + flowOffset * 10) * 0.5 + 0.5;
+            const baseR = colors.array[i * 3];
+            const baseG = colors.array[i * 3 + 1];
+            const baseB = colors.array[i * 3 + 2];
+            // Modulate brightness
+            line.geometry.attributes.color.array[i * 3] = baseR * (0.5 + 0.5 * wave);
+            line.geometry.attributes.color.array[i * 3 + 1] = baseG * (0.5 + 0.5 * wave);
+            line.geometry.attributes.color.array[i * 3 + 2] = baseB * (0.5 + 0.5 * wave);
+        }
+        colors.needsUpdate = true;
+    });
+}
+
+// ============ TEST CHARGES ============
+function spawnTestCharges(count) {
+    // Remove existing
+    testCharges.forEach(tc => scene.remove(tc.mesh));
+    testCharges = [];
+
+    const geo = new THREE.SphereGeometry(0.15, 12, 12);
+    const mat = new THREE.MeshPhongMaterial({ color: 0xff8800, emissive: 0x442200 });
+
+    for (let i = 0; i < count; i++) {
+        const mesh = new THREE.Mesh(geo, mat.clone());
+        mesh.position.set(
+            (Math.random() - 0.5) * 10,
+            1,
+            (Math.random() - 0.5) * 10
+        );
+        scene.add(mesh);
+        testCharges.push({ mesh });
+    }
+    state.testChargeCount = testCharges.length;
+}
+
+function updateTestCharges(dt) {
+    if (!state.simulationRunning) return;
+
+    for (let tc of testCharges) {
+        const B = computeBField(tc.mesh.position, dipoles);
+        const mag = B.length();
+        const speed = Math.min(mag * 2.0, 2.0);
+        if (mag > 1e-6) {
+            const dir = B.clone().normalize();
+            tc.mesh.position.add(dir.multiplyScalar(speed * dt));
+        }
+
+        // Respawn if out of bounds
+        if (Math.abs(tc.mesh.position.x) > 8 || Math.abs(tc.mesh.position.z) > 8 ||
+            tc.mesh.position.y > 8 || tc.mesh.position.y < -1) {
+            tc.mesh.position.set(
+                (Math.random() - 0.5) * 10,
+                1,
+                (Math.random() - 0.5) * 10
+            );
+        }
+    }
+
+    state.testChargePositions = testCharges.map(tc => ({
+        x: tc.mesh.position.x,
+        y: tc.mesh.position.y,
+        z: tc.mesh.position.z
+    }));
+}
+
+// ============ HEATMAP ============
+function createHeatmap() {
+    if (heatmapGroup) {
+        scene.remove(heatmapGroup);
+        heatmapGroup = null;
+        heatmapTiles = [];
+    }
+
+    heatmapGroup = new THREE.Group();
+    const gridSize = 40;
+    const extent = 10;
+    const tileSize = (extent * 2) / gridSize;
+    const geo = new THREE.PlaneGeometry(tileSize * 0.95, tileSize * 0.95);
+
+    for (let ix = 0; ix < gridSize; ix++) {
+        for (let iz = 0; iz < gridSize; iz++) {
+            const x = -extent + (ix + 0.5) * tileSize;
+            const z = -extent + (iz + 0.5) * tileSize;
+            const mat = new THREE.MeshBasicMaterial({
+                color: 0x000000,
+                transparent: true,
+                opacity: 0.6,
+                side: THREE.DoubleSide
+            });
+            const mesh = new THREE.Mesh(geo, mat);
+            mesh.rotation.x = -Math.PI / 2;
+            mesh.position.set(x, 0.01, z);
+            heatmapGroup.add(mesh);
+            heatmapTiles.push({ mesh, x, z });
+        }
+    }
+    scene.add(heatmapGroup);
+}
+
+function updateHeatmap() {
+    if (!heatmapGroup || !state.heatmapVisible) return;
+
+    for (let tile of heatmapTiles) {
+        const point = new THREE.Vector3(tile.x, 0, tile.z);
+        const B = computeBField(point, dipoles);
+        const strength = B.length();
+        const col = heatmapColor(strength);
+        tile.mesh.material.color.copy(col);
+    }
+}
+
+function heatmapColor(strength) {
+    const t = Math.min(strength * 5.0, 1.0);
+    const color = new THREE.Color();
+    if (t < 0.33) {
+        const s = t / 0.33;
+        color.setRGB(0, s, 1.0 - s * 0.5);
+    } else if (t < 0.66) {
+        const s = (t - 0.33) / 0.33;
+        color.setRGB(s, 1.0, 0.5 * (1 - s));
+    } else {
+        const s = (t - 0.66) / 0.34;
+        color.setRGB(1.0, 1.0 - s, 0);
+    }
+    return color;
+}
+
+// ============ DIFFICULTY SYSTEM ============
+function getLinesPerDipole() {
+    const level = state.difficultyLevel;
+    if (level <= 1) return 8;
+    if (level <= 2) return 12;
+    if (level <= 3) return 12;
+    return 16;
+}
+
+function getTestChargeCount() {
+    const level = state.difficultyLevel;
+    if (level <= 1) return 0;
+    if (level <= 2) return 2;
+    if (level <= 3) return 3;
+    if (level <= 4) return 4;
+    return 5;
+}
+
+function getDipoleCount() {
+    const level = state.difficultyLevel;
+    if (level <= 2) return 2;
+    if (level <= 4) return 3;
+    return 4;
+}
+
+function applyDifficulty() {
+    const dipoleCount = getDipoleCount();
+    const tcCount = getTestChargeCount();
+
+    // Adjust dipoles
+    while (dipoles.length < dipoleCount) {
+        const idx = dipoles.length;
+        const cfg = initialDipoleConfigs[idx];
+        const mesh = createDipoleMesh();
+        mesh.position.copy(cfg.pos);
+        mesh.rotation.z = THREE.MathUtils.degToRad(cfg.rotZ);
+        scene.add(mesh);
+        dipoles.push({ mesh, rotZDeg: cfg.rotZ });
+    }
+    while (dipoles.length > dipoleCount) {
+        const d = dipoles.pop();
+        scene.remove(d.mesh);
+        if (state.selectedDipoleIndex >= dipoles.length) {
+            state.selectedDipoleIndex = -1;
+        }
+    }
+
+    // Heatmap
+    if (state.difficultyLevel >= 4) {
+        state.heatmapVisible = true;
+        if (!heatmapGroup) createHeatmap();
+        heatmapGroup.visible = true;
+    } else {
+        state.heatmapVisible = false;
+        if (heatmapGroup) heatmapGroup.visible = false;
+    }
+
+    // Animated flow
+    state.animatedFlow = state.difficultyLevel >= 5;
+
+    // Test charges
+    spawnTestCharges(tcCount);
+
+    updateStateArrays();
+    generateFieldLines();
+    if (state.heatmapVisible) updateHeatmap();
+
+    updateHUD();
+}
+
+// ============ SELECTION & INTERACTION ============
+const raycaster = new THREE.Raycaster();
+const mouse = new THREE.Vector2();
+
+function onMouseClick(event) {
+    mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+    mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+    raycaster.setFromCamera(mouse, camera);
+
+    // Check all dipole meshes
+    let closestIdx = -1;
+    let closestDist = Infinity;
+
+    for (let i = 0; i < dipoles.length; i++) {
+        const parts = dipoles[i].mesh.userData.parts || [];
+        const allChildren = dipoles[i].mesh.children;
+        const intersects = raycaster.intersectObjects(allChildren, true);
+        if (intersects.length > 0 && intersects[0].distance < closestDist) {
+            closestDist = intersects[0].distance;
+            closestIdx = i;
+        }
+    }
+
+    // Deselect all
+    dipoles.forEach(d => {
+        d.mesh.children.forEach(child => {
+            if (child.material) child.material.emissive.set(
+                child.material.color.getHex() === 0xff3333 ? 0x330000 :
+                child.material.color.getHex() === 0x3333ff ? 0x000033 : 0x111111
+            );
+        });
+    });
+
+    state.selectedDipoleIndex = closestIdx;
+
+    if (closestIdx >= 0) {
+        dipoles[closestIdx].mesh.children.forEach(child => {
+            if (child.material) child.material.emissive.set(0xffff00);
+        });
+    }
+
+    updateHUD();
+}
+
+function onKeyDown(event) {
+    const key = event.key;
+
+    if (key === 'n' || key === 'N') {
+        if (state.difficultyLevel < 5) {
+            state.difficultyLevel++;
+            applyDifficulty();
+        }
+        return;
+    }
+    if (key === 'b' || key === 'B') {
+        if (state.difficultyLevel > 1) {
+            state.difficultyLevel--;
+            applyDifficulty();
+        }
+        return;
+    }
+    if (key === ' ') {
+        event.preventDefault();
+        state.simulationRunning = !state.simulationRunning;
+        updateHUD();
+        return;
+    }
+    if (key === 'r' || key === 'R') {
+        if (state.selectedDipoleIndex >= 0) {
+            const d = dipoles[state.selectedDipoleIndex];
+            d.rotZDeg += 45;
+            d.mesh.rotation.z = THREE.MathUtils.degToRad(d.rotZDeg);
+            needsFieldUpdate = true;
+        }
+        return;
+    }
+
+    // Arrow keys for movement
+    if (state.selectedDipoleIndex >= 0) {
+        const d = dipoles[state.selectedDipoleIndex];
+        const step = 0.5;
+
+        if (key === 'ArrowLeft') {
+            d.mesh.position.x -= step;
+            needsFieldUpdate = true;
+            event.preventDefault();
+        } else if (key === 'ArrowRight') {
+            d.mesh.position.x += step;
+            needsFieldUpdate = true;
+            event.preventDefault();
+        } else if (key === 'ArrowUp') {
+            if (event.shiftKey) {
+                d.mesh.position.y += step;
+            } else {
+                d.mesh.position.z -= step;
+            }
+            needsFieldUpdate = true;
+            event.preventDefault();
+        } else if (key === 'ArrowDown') {
+            if (event.shiftKey) {
+                d.mesh.position.y -= step;
+            } else {
+                d.mesh.position.z += step;
+            }
+            needsFieldUpdate = true;
+            event.preventDefault();
+        }
+    }
+}
+
+let needsFieldUpdate = false;
+let fieldUpdateTimer = null;
+
+function scheduleFieldUpdate() {
+    if (fieldUpdateTimer) clearTimeout(fieldUpdateTimer);
+    fieldUpdateTimer = setTimeout(() => {
+        updateStateArrays();
+        generateFieldLines();
+        if (state.heatmapVisible) updateHeatmap();
+    }, 50);
+}
+
+// ============ HUD UPDATE ============
+function updateHUD() {
+    document.getElementById('hud-difficulty').textContent = state.difficultyLevel;
+    document.getElementById('hud-dipoles').textContent = state.numDipoles;
+    document.getElementById('hud-lines').textContent = state.numFieldLines;
+    document.getElementById('hud-sim').textContent = state.simulationRunning ? 'Running' : 'Paused';
+    document.getElementById('hud-selected').textContent = state.selectedDipoleIndex >= 0 ?
+        'Dipole ' + (state.selectedDipoleIndex + 1) : 'None';
+}
+
+// ============ BUTTONS ============
+document.getElementById('btn-diff-up').addEventListener('click', () => {
+    if (state.difficultyLevel < 5) {
+        state.difficultyLevel++;
+        applyDifficulty();
+    }
+});
+
+document.getElementById('btn-diff-down').addEventListener('click', () => {
+    if (state.difficultyLevel > 1) {
+        state.difficultyLevel--;
+        applyDifficulty();
+    }
+});
+
+document.getElementById('btn-reset').addEventListener('click', () => {
+    state.difficultyLevel = 1;
+    state.simulationRunning = false;
+    state.selectedDipoleIndex = -1;
+
+    // Remove everything
+    dipoles.forEach(d => scene.remove(d.mesh));
+    dipoles = [];
+    fieldLines.forEach(l => scene.remove(l));
+    fieldLines = [];
+    testCharges.forEach(tc => scene.remove(tc.mesh));
+    testCharges = [];
+    if (heatmapGroup) { scene.remove(heatmapGroup); heatmapGroup = null; heatmapTiles = []; }
+
+    initDipoles(2);
+    applyDifficulty();
+});
+
+document.getElementById('btn-toggle-sim').addEventListener('click', () => {
+    state.simulationRunning = !state.simulationRunning;
+    updateHUD();
+});
+
+// ============ EVENT LISTENERS ============
+renderer.domElement.addEventListener('click', onMouseClick);
+window.addEventListener('keydown', onKeyDown);
+window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// ============ INIT ============
+initDipoles(2);
+applyDifficulty();
+
+// ============ ANIMATION LOOP ============
+const clock = new THREE.Clock();
+
+function animate() {
+    requestAnimationFrame(animate);
+
+    const dt = Math.min(clock.getDelta(), 0.05);
+    state.frameCount++;
+
+    controls.update();
+
+    // Handle deferred field update
+    if (needsFieldUpdate) {
+        needsFieldUpdate = false;
+        scheduleFieldUpdate();
+    }
+
+    // Update test charges
+    updateTestCharges(dt);
+
+    // Animated flow
+    if (state.animatedFlow) {
+        updateFieldLineFlow();
+    }
+
+    // Compute field at origin
+    const Borigin = computeBField(new THREE.Vector3(0, 0, 0), dipoles);
+    state.fieldStrengthAtOrigin = Borigin.length();
+
+    // Compute field at camera target
+    const Btarget = computeBField(controls.target, dipoles);
+    document.getElementById('hud-field').textContent = Btarget.length().toFixed(4);
+
+    // Update state
+    updateStateArrays();
+    state.testChargePositions = testCharges.map(tc => ({
+        x: tc.mesh.position.x,
+        y: tc.mesh.position.y,
+        z: tc.mesh.position.z
+    }));
+    state.testChargeCount = testCharges.length;
+
+    renderer.render(scene, camera);
+}
+
+animate();
+
+})();
+</script>
+</body>
+</html>

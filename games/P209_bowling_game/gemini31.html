@@ -1,0 +1,498 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Bowling Game</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #000;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            user-select: none;
+        }
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+        }
+        #ui-layer {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+            color: white;
+            text-shadow: 1px 1px 2px black;
+        }
+        #score-display {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            font-size: 28px;
+            font-weight: bold;
+        }
+        #phase-display {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            font-size: 24px;
+            text-transform: uppercase;
+            letter-spacing: 2px;
+        }
+        #power-bar-container {
+            position: absolute;
+            bottom: 80px;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 200px;
+            height: 20px;
+            background: rgba(0, 0, 0, 0.5);
+            border: 2px solid #fff;
+            border-radius: 10px;
+            overflow: hidden;
+        }
+        #power-bar {
+            width: 0%;
+            height: 100%;
+            background: linear-gradient(90deg, #ffeb3b, #f44336);
+            transition: width 0.05s linear;
+        }
+        #instructions {
+            position: absolute;
+            bottom: 20px;
+            width: 100%;
+            text-align: center;
+            font-size: 18px;
+            opacity: 0.8;
+        }
+        #loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            font-size: 24px;
+            color: white;
+            background: rgba(0,0,0,0.7);
+            padding: 20px;
+            border-radius: 10px;
+        }
+    </style>
+    <!-- Import maps polyfill -->
+    <script async src="https://unpkg.com/es-module-shims@1.8.0/dist/es-module-shims.js"></script>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="canvas-container"></div>
+    <div id="ui-layer">
+        <div id="score-display">Score: 0/10</div>
+        <div id="phase-display">Phase: aiming</div>
+        <div id="power-bar-container">
+            <div id="power-bar"></div>
+        </div>
+        <div id="instructions">Press SPACE to bowl | Arrows to aim | R to reset</div>
+        <div id="loading">Loading Models...</div>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+        // --- State Management ---
+        window.__3D_STATE__ = {
+            phase: 'aiming', // 'aiming' | 'rolling' | 'finished'
+            ballPosition: { x: 0, y: 0.5, z: 12 },
+            ballVelocity: { x: 0, y: 0, z: 0 },
+            ballAimX: 0,
+            pinsDown: 0,
+            pinsStatus: Array(10).fill(true),
+            score: 0,
+            power: 0,
+            launched: false,
+            totalPins: 10,
+            resetCount: 0
+        };
+
+        const state = window.__3D_STATE__;
+
+        // --- Scene Setup ---
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x111111);
+        scene.fog = new THREE.Fog(0x111111, 20, 60);
+
+        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+        camera.position.set(0, 8, 18);
+        camera.lookAt(0, 0, -20);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        container.appendChild(renderer.domElement);
+
+        // --- Lighting ---
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+        dirLight.position.set(5, 15, 10);
+        dirLight.castShadow = true;
+        dirLight.shadow.camera.top = 20;
+        dirLight.shadow.camera.bottom = -40;
+        dirLight.shadow.camera.left = -10;
+        dirLight.shadow.camera.right = 10;
+        dirLight.shadow.camera.near = 0.1;
+        dirLight.shadow.camera.far = 50;
+        dirLight.shadow.mapSize.width = 2048;
+        dirLight.shadow.mapSize.height = 2048;
+        scene.add(dirLight);
+
+        // --- Environment (Lane & Gutters) ---
+        const laneGeo = new THREE.BoxGeometry(4, 0.2, 40);
+        const laneMat = new THREE.MeshStandardMaterial({ 
+            color: 0xC4A36E, 
+            roughness: 0.2, 
+            metalness: 0.1 
+        });
+        const lane = new THREE.Mesh(laneGeo, laneMat);
+        lane.position.set(0, -0.1, -10);
+        lane.receiveShadow = true;
+        scene.add(lane);
+
+        const gutterGeo = new THREE.BoxGeometry(0.8, 0.1, 40);
+        const gutterMat = new THREE.MeshStandardMaterial({ color: 0x222222, roughness: 0.8 });
+        
+        const leftGutter = new THREE.Mesh(gutterGeo, gutterMat);
+        leftGutter.position.set(-2.4, -0.15, -10);
+        leftGutter.receiveShadow = true;
+        scene.add(leftGutter);
+
+        const rightGutter = new THREE.Mesh(gutterGeo, gutterMat);
+        rightGutter.position.set(2.4, -0.15, -10);
+        rightGutter.receiveShadow = true;
+        scene.add(rightGutter);
+
+        // --- Ball ---
+        const ballGeo = new THREE.SphereGeometry(0.5, 32, 32);
+        const ballMat = new THREE.MeshStandardMaterial({
+            color: 0x222244,
+            metalness: 0.7,
+            roughness: 0.3
+        });
+        const ball = new THREE.Mesh(ballGeo, ballMat);
+        ball.position.set(state.ballPosition.x, state.ballPosition.y, state.ballPosition.z);
+        ball.castShadow = true;
+        ball.receiveShadow = true;
+        scene.add(ball);
+
+        // --- Aim Line ---
+        const aimPoints = [new THREE.Vector3(0, 0.5, 12), new THREE.Vector3(0, 0.5, -30)];
+        const aimGeo = new THREE.BufferGeometry().setFromPoints(aimPoints);
+        const aimMat = new THREE.LineDashedMaterial({
+            color: 0xffffff,
+            linewidth: 2,
+            scale: 1,
+            dashSize: 0.5,
+            gapSize: 0.5,
+            transparent: true,
+            opacity: 0.5
+        });
+        const aimLine = new THREE.Line(aimGeo, aimMat);
+        aimLine.computeLineDistances();
+        scene.add(aimLine);
+
+        // --- Pins ---
+        const pins = [];
+        const pinPositions = [
+            { x: 0, z: -25 }, // Row 1
+            { x: -0.6, z: -26.5 }, { x: 0.6, z: -26.5 }, // Row 2
+            { x: -1.2, z: -28 }, { x: 0, z: -28 }, { x: 1.2, z: -28 }, // Row 3
+            { x: -1.8, z: -29.5 }, { x: -0.6, z: -29.5 }, { x: 0.6, z: -29.5 }, { x: 1.8, z: -29.5 } // Row 4
+        ];
+
+        function createFallbackPin() {
+            const group = new THREE.Group();
+            const geo = new THREE.CylinderGeometry(0.15, 0.25, 0.8, 16);
+            const mat = new THREE.MeshStandardMaterial({ color: 0xdddddd, roughness: 0.5 });
+            const mesh = new THREE.Mesh(geo, mat);
+            mesh.position.y = 0.4; // Pivot at bottom
+            mesh.castShadow = true;
+            mesh.receiveShadow = true;
+            
+            // Add a red stripe
+            const stripeGeo = new THREE.CylinderGeometry(0.18, 0.18, 0.1, 16);
+            const stripeMat = new THREE.MeshStandardMaterial({ color: 0xff0000 });
+            const stripe = new THREE.Mesh(stripeGeo, stripeMat);
+            stripe.position.y = 0.5;
+            mesh.add(stripe);
+
+            group.add(mesh);
+            return group;
+        }
+
+        function setupPins(model) {
+            pinPositions.forEach((pos, index) => {
+                const pinGroup = new THREE.Group();
+                const pinMesh = model.clone();
+                pinGroup.add(pinMesh);
+                pinGroup.position.set(pos.x, 0, pos.z);
+                scene.add(pinGroup);
+
+                pins.push({
+                    group: pinGroup,
+                    index: index,
+                    standing: true,
+                    falling: false,
+                    fallProgress: 0,
+                    initialPos: new THREE.Vector3(pos.x, 0, pos.z)
+                });
+            });
+            document.getElementById('loading').style.display = 'none';
+        }
+
+        const loader = new GLTFLoader();
+        // Using a known public GLTF sample model (Lantern)
+        loader.load(
+            'https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Models/master/2.0/Lantern/glTF/Lantern.gltf',
+            (gltf) => {
+                const model = gltf.scene;
+                
+                // Calculate bounding box to scale to ~0.8 units tall
+                const box = new THREE.Box3().setFromObject(model);
+                const height = box.max.y - box.min.y;
+                const scale = 0.8 / height;
+                model.scale.set(scale, scale, scale);
+
+                // Center origin to bottom for correct rotation pivot
+                const center = box.getCenter(new THREE.Vector3());
+                model.position.set(-center.x * scale, -box.min.y * scale, -center.z * scale);
+
+                // Enable shadows
+                model.traverse((child) => {
+                    if (child.isMesh) {
+                        child.castShadow = true;
+                        child.receiveShadow = true;
+                    }
+                });
+
+                setupPins(model);
+            },
+            undefined,
+            (error) => {
+                console.warn('Failed to load Lantern model, using fallback geometry.', error);
+                const fallbackModel = createFallbackPin();
+                setupPins(fallbackModel);
+            }
+        );
+
+        // --- Input Handling ---
+        let isCharging = false;
+        const keys = { ArrowLeft: false, ArrowRight: false };
+
+        window.addEventListener('keydown', (e) => {
+            if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+                keys[e.key] = true;
+            }
+            
+            if (e.key === ' ' && state.phase === 'aiming' && !isCharging) {
+                isCharging = true;
+            }
+
+            if (e.key.toLowerCase() === 'r') {
+                resetGame();
+            }
+        });
+
+        window.addEventListener('keyup', (e) => {
+            if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+                keys[e.key] = false;
+            }
+
+            if (e.key === ' ' && state.phase === 'aiming' && isCharging) {
+                isCharging = false;
+                launchBall();
+            }
+        });
+
+        function launchBall() {
+            state.phase = 'rolling';
+            state.launched = true;
+            
+            // Map power (0-1) to velocity Z (0.2 to 0.6)
+            const speed = 0.2 + (state.power * 0.4);
+            state.ballVelocity.z = -speed;
+            
+            aimLine.visible = false;
+        }
+
+        function resetGame() {
+            state.phase = 'aiming';
+            state.ballAimX = 0;
+            state.ballPosition = { x: 0, y: 0.5, z: 12 };
+            state.ballVelocity = { x: 0, y: 0, z: 0 };
+            state.pinsDown = 0;
+            state.score = 0;
+            state.power = 0;
+            state.launched = false;
+            state.pinsStatus.fill(true);
+            state.resetCount++;
+
+            isCharging = false;
+
+            ball.position.set(0, 0.5, 12);
+            ball.rotation.set(0, 0, 0);
+            aimLine.visible = true;
+
+            pins.forEach(pin => {
+                pin.standing = true;
+                pin.falling = false;
+                pin.fallProgress = 0;
+                pin.group.position.copy(pin.initialPos);
+                pin.group.rotation.set(0, 0, 0);
+            });
+        }
+
+        // --- Game Logic ---
+        function knockPin(pin) {
+            pin.standing = false;
+            pin.falling = true;
+            pin.fallProgress = 0;
+            state.pinsStatus[pin.index] = false;
+            state.pinsDown++;
+            state.score = state.pinsDown;
+        }
+
+        function checkCollisions() {
+            // Ball to Pins
+            pins.forEach(pin => {
+                if (pin.standing) {
+                    const dx = ball.position.x - pin.group.position.x;
+                    const dz = ball.position.z - pin.group.position.z;
+                    const dist = Math.sqrt(dx * dx + dz * dz);
+                    if (dist < 1.2) {
+                        knockPin(pin);
+                    }
+                }
+            });
+
+            // Pin to Pin (Chain Reaction)
+            pins.forEach(pin1 => {
+                if (!pin1.standing) {
+                    pins.forEach(pin2 => {
+                        if (pin2.standing && pin1 !== pin2) {
+                            const dx = pin1.group.position.x - pin2.group.position.x;
+                            const dz = pin1.group.position.z - pin2.group.position.z;
+                            const dist = Math.sqrt(dx * dx + dz * dz);
+                            if (dist < 1.5) {
+                                knockPin(pin2);
+                            }
+                        }
+                    });
+                }
+            });
+        }
+
+        // --- UI Update ---
+        const scoreDisplay = document.getElementById('score-display');
+        const phaseDisplay = document.getElementById('phase-display');
+        const powerBar = document.getElementById('power-bar');
+
+        function updateUI() {
+            scoreDisplay.innerText = `Score: ${state.score}/10`;
+            phaseDisplay.innerText = `Phase: ${state.phase}`;
+            powerBar.style.width = `${state.power * 100}%`;
+        }
+
+        // --- Main Loop ---
+        const clock = new THREE.Clock();
+
+        function animate() {
+            requestAnimationFrame(animate);
+            const dt = clock.getDelta();
+
+            if (state.phase === 'aiming') {
+                // Aiming movement
+                if (keys.ArrowLeft) state.ballAimX = Math.max(-1.5, state.ballAimX - 2 * dt);
+                if (keys.ArrowRight) state.ballAimX = Math.min(1.5, state.ballAimX + 2 * dt);
+
+                ball.position.x = state.ballAimX;
+                state.ballPosition.x = state.ballAimX;
+
+                // Update aim line
+                const positions = aimLine.geometry.attributes.position.array;
+                positions[0] = state.ballAimX;
+                positions[3] = state.ballAimX;
+                aimLine.geometry.attributes.position.needsUpdate = true;
+
+                // Charging power
+                if (isCharging) {
+                    state.power = Math.min(1.0, state.power + dt / 2.0); // 2 seconds to full power
+                } else {
+                    state.power = 0;
+                }
+
+            } else if (state.phase === 'rolling') {
+                // Apply velocity
+                ball.position.x += state.ballVelocity.x;
+                ball.position.y += state.ballVelocity.y;
+                ball.position.z += state.ballVelocity.z;
+                
+                // Update state
+                state.ballPosition.x = ball.position.x;
+                state.ballPosition.y = ball.position.y;
+                state.ballPosition.z = ball.position.z;
+
+                // Friction
+                state.ballVelocity.x *= 0.995;
+                state.ballVelocity.z *= 0.995;
+
+                // Visual ball rotation
+                ball.rotation.x -= state.ballVelocity.z / 0.5;
+
+                checkCollisions();
+
+                // End conditions
+                if (ball.position.z < -32 || state.pinsDown === 10) {
+                    state.phase = 'finished';
+                }
+            }
+
+            // Animate falling pins
+            pins.forEach(pin => {
+                if (pin.falling) {
+                    pin.fallProgress += dt / 0.3; // 0.3 seconds to fall
+                    if (pin.fallProgress >= 1) {
+                        pin.fallProgress = 1;
+                        pin.falling = false;
+                    }
+                    // Rotate 90 degrees on X axis
+                    pin.group.rotation.x = pin.fallProgress * (Math.PI / 2);
+                }
+            });
+
+            updateUI();
+            renderer.render(scene, camera);
+        }
+
+        // Handle window resize
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        animate();
+    </script>
+</body>
+</html>

@@ -1,0 +1,610 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GPU Boids Simulation</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { overflow: hidden; background: #000; font-family: 'Segoe UI', sans-serif; }
+  canvas { display: block; }
+  #controls {
+    position: absolute; top: 10px; left: 10px;
+    background: rgba(0,0,0,0.75); color: #eee;
+    padding: 16px; border-radius: 10px;
+    min-width: 260px; backdrop-filter: blur(8px);
+    border: 1px solid rgba(255,255,255,0.1);
+  }
+  #controls h3 { margin-bottom: 12px; font-size: 14px; color: #8cf; }
+  .ctrl-row { margin-bottom: 10px; }
+  .ctrl-row label { display: block; font-size: 12px; margin-bottom: 3px; color: #aaa; }
+  .ctrl-row input[type="range"] { width: 100%; accent-color: #4af; }
+  .ctrl-row .val { float: right; color: #4af; font-weight: bold; }
+  #stats {
+    position: absolute; bottom: 10px; left: 10px;
+    background: rgba(0,0,0,0.75); color: #ccc;
+    padding: 12px; border-radius: 8px; font-size: 11px;
+    border: 1px solid rgba(255,255,255,0.1);
+    backdrop-filter: blur(8px);
+    line-height: 1.6;
+  }
+</style>
+<script type="importmap">
+{ "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+
+<div id="controls">
+  <h3>🐦 Boids GPU Simulation — 500 Agents</h3>
+  <div class="ctrl-row">
+    <label>Separation Radius: <span class="val" id="separationRadiusVal">3</span></label>
+    <input type="range" id="separationRadius" min="1" max="10" step="0.5" value="3">
+  </div>
+  <div class="ctrl-row">
+    <label>Alignment Radius: <span class="val" id="alignmentRadiusVal">10</span></label>
+    <input type="range" id="alignmentRadius" min="5" max="20" step="1" value="10">
+  </div>
+  <div class="ctrl-row">
+    <label>Cohesion Strength: <span class="val" id="cohesionVal">1.0</span></label>
+    <input type="range" id="cohesion" min="0" max="2" step="0.1" value="1.0">
+  </div>
+  <div class="ctrl-row">
+    <label>Speed Limit: <span class="val" id="speedLimitVal">8</span></label>
+    <input type="range" id="speedLimit" min="1" max="20" step="1" value="8">
+  </div>
+</div>
+
+<div id="stats">Loading...</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GPUComputationRenderer } from 'three/addons/misc/GPUComputationRenderer.js';
+
+const BOID_COUNT = 500;
+const TEX_WIDTH = 32;
+const TEX_HEIGHT = 16;
+const BOUNDS = 25.0;
+
+// Renderer
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+document.body.appendChild(renderer.domElement);
+
+// Scene & Camera
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x050510);
+scene.fog = new THREE.FogExp2(0x050510, 0.008);
+
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 200);
+camera.position.set(40, 30, 40);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.05;
+controls.target.set(0, 0, 0);
+
+// Lights
+const ambientLight = new THREE.AmbientLight(0x334466, 0.8);
+scene.add(ambientLight);
+const dirLight = new THREE.DirectionalLight(0xffffff, 1.2);
+dirLight.position.set(20, 40, 30);
+scene.add(dirLight);
+const pointLight = new THREE.PointLight(0x4488ff, 0.5, 80);
+pointLight.position.set(0, 20, 0);
+scene.add(pointLight);
+
+// Boundary box
+const boxGeo = new THREE.BoxGeometry(BOUNDS * 2, BOUNDS * 2, BOUNDS * 2);
+const edges = new THREE.EdgesGeometry(boxGeo);
+const lineMat = new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.15 });
+const boundaryBox = new THREE.LineSegments(edges, lineMat);
+scene.add(boundaryBox);
+
+// Ground grid
+const gridHelper = new THREE.GridHelper(50, 20, 0x222244, 0x111133);
+gridHelper.position.y = -BOUNDS;
+scene.add(gridHelper);
+
+// Parameters
+let params = {
+  separationRadius: 3.0,
+  alignmentRadius: 10.0,
+  cohesion: 1.0,
+  speedLimit: 8.0
+};
+
+// Mouse / Predator
+const mouse = new THREE.Vector2(9999, 9999);
+const predatorPos = new THREE.Vector3(9999, 9999, 9999);
+const raycaster = new THREE.Raycaster();
+const planeY = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+
+window.addEventListener('mousemove', (e) => {
+  mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
+  mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+  raycaster.setFromCamera(mouse, camera);
+  const intersect = new THREE.Vector3();
+  raycaster.ray.intersectPlane(planeY, intersect);
+  if (intersect) {
+    predatorPos.copy(intersect);
+  }
+});
+
+window.addEventListener('mouseleave', () => {
+  predatorPos.set(9999, 9999, 9999);
+});
+
+// ============ GPGPU Setup ============
+
+const gpuCompute = new GPUComputationRenderer(TEX_WIDTH, TEX_HEIGHT, renderer);
+
+// Check float texture support
+if (renderer.capabilities.isWebGL2 === false) {
+  console.warn('WebGL2 not available');
+}
+
+const dtPosition = gpuCompute.createTexture();
+const dtVelocity = gpuCompute.createTexture();
+
+// Initialize position & velocity
+function initTextures() {
+  const posArray = dtPosition.image.data;
+  const velArray = dtVelocity.image.data;
+
+  for (let i = 0; i < TEX_WIDTH * TEX_HEIGHT; i++) {
+    const i4 = i * 4;
+    if (i < BOID_COUNT) {
+      posArray[i4 + 0] = (Math.random() - 0.5) * BOUNDS * 2;
+      posArray[i4 + 1] = (Math.random() - 0.5) * BOUNDS * 2;
+      posArray[i4 + 2] = (Math.random() - 0.5) * BOUNDS * 2;
+      posArray[i4 + 3] = 1.0;
+
+      const theta = Math.random() * Math.PI * 2;
+      const phi = Math.acos(2 * Math.random() - 1);
+      const speed = 1.0 + Math.random() * 2.0;
+      velArray[i4 + 0] = Math.sin(phi) * Math.cos(theta) * speed;
+      velArray[i4 + 1] = Math.sin(phi) * Math.sin(theta) * speed;
+      velArray[i4 + 2] = Math.cos(phi) * speed;
+      velArray[i4 + 3] = speed;
+    } else {
+      posArray[i4 + 0] = 0; posArray[i4 + 1] = 0;
+      posArray[i4 + 2] = 0; posArray[i4 + 3] = 0;
+      velArray[i4 + 0] = 0; velArray[i4 + 1] = 0;
+      velArray[i4 + 2] = 0; velArray[i4 + 3] = 0;
+    }
+  }
+}
+
+initTextures();
+
+// Velocity compute shader
+const velocityShader = `
+uniform float uSeparationRadius;
+uniform float uAlignmentRadius;
+uniform float uCohesion;
+uniform float uSpeedLimit;
+uniform float uDelta;
+uniform vec3 uPredator;
+uniform float uBoidCount;
+uniform float uTexWidth;
+uniform float uTexHeight;
+
+void main() {
+  vec2 uv = gl_FragCoord.xy / resolution.xy;
+  
+  // Check if this texel is a valid boid
+  float index = gl_FragCoord.y * uTexWidth + gl_FragCoord.x;
+  if (index >= uBoidCount) {
+    gl_FragColor = vec4(0.0);
+    return;
+  }
+
+  vec4 selfPos = texture2D(texturePosition, uv);
+  vec4 selfVel = texture2D(textureVelocity, uv);
+  vec3 pos = selfPos.xyz;
+  vec3 vel = selfVel.xyz;
+
+  vec3 separation = vec3(0.0);
+  vec3 alignment = vec3(0.0);
+  vec3 cohesionCenter = vec3(0.0);
+  float sepCount = 0.0;
+  float aliCount = 0.0;
+  float cohCount = 0.0;
+
+  for (float y = 0.0; y < uTexHeight; y++) {
+    for (float x = 0.0; x < uTexWidth; x++) {
+      float idx = y * uTexWidth + x;
+      if (idx >= uBoidCount) continue;
+      
+      vec2 ref = vec2((x + 0.5) / uTexWidth, (y + 0.5) / uTexHeight);
+      
+      // Skip self
+      if (abs(ref.x - uv.x) < 0.001 && abs(ref.y - uv.y) < 0.001) continue;
+
+      vec3 otherPos = texture2D(texturePosition, ref).xyz;
+      vec3 otherVel = texture2D(textureVelocity, ref).xyz;
+      vec3 diff = pos - otherPos;
+      float dist = length(diff);
+
+      // Separation
+      if (dist < uSeparationRadius && dist > 0.001) {
+        separation += normalize(diff) / dist;
+        sepCount += 1.0;
+      }
+
+      // Alignment
+      if (dist < uAlignmentRadius && dist > 0.001) {
+        alignment += otherVel;
+        aliCount += 1.0;
+      }
+
+      // Cohesion
+      if (dist < uAlignmentRadius && dist > 0.001) {
+        cohesionCenter += otherPos;
+        cohCount += 1.0;
+      }
+    }
+  }
+
+  vec3 sepForce = vec3(0.0);
+  vec3 aliForce = vec3(0.0);
+  vec3 cohForce = vec3(0.0);
+
+  if (sepCount > 0.0) {
+    sepForce = separation / sepCount;
+  }
+
+  if (aliCount > 0.0) {
+    alignment = alignment / aliCount;
+    aliForce = (alignment - vel);
+  }
+
+  if (cohCount > 0.0) {
+    cohesionCenter = cohesionCenter / cohCount;
+    cohForce = (cohesionCenter - pos);
+  }
+
+  float separationWeight = 1.5;
+  float alignmentWeight = 1.0;
+  float cohesionWeight = uCohesion * 0.01;
+
+  vec3 accel = sepForce * separationWeight + aliForce * alignmentWeight * 0.1 + cohForce * cohesionWeight;
+
+  // Boundary forces
+  float boundMargin = 5.0;
+  float boundStrength = 0.8;
+  float bounds = 25.0;
+
+  if (pos.x > bounds - boundMargin) accel.x -= boundStrength * (pos.x - (bounds - boundMargin));
+  if (pos.x < -bounds + boundMargin) accel.x -= boundStrength * (pos.x - (-bounds + boundMargin));
+  if (pos.y > bounds - boundMargin) accel.y -= boundStrength * (pos.y - (bounds - boundMargin));
+  if (pos.y < -bounds + boundMargin) accel.y -= boundStrength * (pos.y - (-bounds + boundMargin));
+  if (pos.z > bounds - boundMargin) accel.z -= boundStrength * (pos.z - (bounds - boundMargin));
+  if (pos.z < -bounds + boundMargin) accel.z -= boundStrength * (pos.z - (-bounds + boundMargin));
+
+  // Predator avoidance
+  vec3 predDiff = pos - uPredator;
+  float predDist = length(predDiff);
+  if (predDist < 10.0 && predDist > 0.01) {
+    accel += normalize(predDiff) * (10.0 / predDist) * 2.0;
+  }
+
+  vel += accel * uDelta;
+
+  // Speed limit
+  float speed = length(vel);
+  if (speed > uSpeedLimit) {
+    vel = normalize(vel) * uSpeedLimit;
+  }
+  if (speed < 0.5) {
+    vel = normalize(vel + vec3(0.001)) * 0.5;
+  }
+
+  gl_FragColor = vec4(vel, length(vel));
+}
+`;
+
+// Position compute shader
+const positionShader = `
+uniform float uDelta;
+uniform float uBoidCount;
+uniform float uTexWidth;
+
+void main() {
+  vec2 uv = gl_FragCoord.xy / resolution.xy;
+  
+  float index = gl_FragCoord.y * uTexWidth + gl_FragCoord.x;
+  if (index >= uBoidCount) {
+    gl_FragColor = vec4(0.0);
+    return;
+  }
+
+  vec4 pos = texture2D(texturePosition, uv);
+  vec4 vel = texture2D(textureVelocity, uv);
+
+  pos.xyz += vel.xyz * uDelta;
+
+  // Hard clamp
+  pos.xyz = clamp(pos.xyz, vec3(-25.0), vec3(25.0));
+
+  gl_FragColor = vec4(pos.xyz, 1.0);
+}
+`;
+
+const velocityVariable = gpuCompute.addVariable('textureVelocity', velocityShader, dtVelocity);
+const positionVariable = gpuCompute.addVariable('texturePosition', positionShader, dtPosition);
+
+gpuCompute.setVariableDependencies(velocityVariable, [positionVariable, velocityVariable]);
+gpuCompute.setVariableDependencies(positionVariable, [positionVariable, velocityVariable]);
+
+// Uniforms for velocity shader
+velocityVariable.material.uniforms['uSeparationRadius'] = { value: params.separationRadius };
+velocityVariable.material.uniforms['uAlignmentRadius'] = { value: params.alignmentRadius };
+velocityVariable.material.uniforms['uCohesion'] = { value: params.cohesion };
+velocityVariable.material.uniforms['uSpeedLimit'] = { value: params.speedLimit };
+velocityVariable.material.uniforms['uDelta'] = { value: 0.016 };
+velocityVariable.material.uniforms['uPredator'] = { value: new THREE.Vector3(9999, 9999, 9999) };
+velocityVariable.material.uniforms['uBoidCount'] = { value: BOID_COUNT };
+velocityVariable.material.uniforms['uTexWidth'] = { value: TEX_WIDTH };
+velocityVariable.material.uniforms['uTexHeight'] = { value: TEX_HEIGHT };
+
+// Uniforms for position shader
+positionVariable.material.uniforms['uDelta'] = { value: 0.016 };
+positionVariable.material.uniforms['uBoidCount'] = { value: BOID_COUNT };
+positionVariable.material.uniforms['uTexWidth'] = { value: TEX_WIDTH };
+
+// Wrap mode
+velocityVariable.wrapS = THREE.ClampToEdgeWrapping;
+velocityVariable.wrapT = THREE.ClampToEdgeWrapping;
+positionVariable.wrapS = THREE.ClampToEdgeWrapping;
+positionVariable.wrapT = THREE.ClampToEdgeWrapping;
+
+const error = gpuCompute.init();
+if (error !== null) {
+  console.error('GPUComputationRenderer error:', error);
+}
+
+// ============ Instanced Mesh ============
+
+const coneGeo = new THREE.ConeGeometry(0.15, 0.5, 6);
+coneGeo.rotateX(Math.PI / 2); // Point cone along +Z by default
+
+const coneMat = new THREE.MeshPhongMaterial({
+  color: 0x44aaff,
+  shininess: 80,
+  specular: 0x222244
+});
+
+const boidMesh = new THREE.InstancedMesh(coneGeo, coneMat, BOID_COUNT);
+boidMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+
+// Instance colors
+const colorAttr = new THREE.InstancedBufferAttribute(new Float32Array(BOID_COUNT * 3), 3);
+colorAttr.setUsage(THREE.DynamicDrawUsage);
+boidMesh.instanceColor = colorAttr;
+
+scene.add(boidMesh);
+
+// Temp objects for matrix computation
+const dummy = new THREE.Object3D();
+const forward = new THREE.Vector3(0, 0, 1);
+const tempVel = new THREE.Vector3();
+const tempQuat = new THREE.Quaternion();
+const tempColor = new THREE.Color();
+
+// Read buffer
+const readBuffer = new Float32Array(TEX_WIDTH * TEX_HEIGHT * 4);
+const readBufferVel = new Float32Array(TEX_WIDTH * TEX_HEIGHT * 4);
+
+// ============ Trail System ============
+const TRAIL_COUNT = 50; // trails for first N boids
+const TRAIL_LENGTH = 20;
+const trailPositions = [];
+const trailLines = [];
+
+for (let i = 0; i < TRAIL_COUNT; i++) {
+  const positions = new Float32Array(TRAIL_LENGTH * 3);
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  const material = new THREE.LineBasicMaterial({
+    color: 0x4488ff,
+    transparent: true,
+    opacity: 0.15
+  });
+  const line = new THREE.Line(geometry, material);
+  line.frustumCulled = false;
+  scene.add(line);
+  trailLines.push(line);
+  trailPositions.push(positions);
+}
+
+// ============ UI Controls ============
+
+function setupSlider(id, param) {
+  const slider = document.getElementById(id);
+  const valSpan = document.getElementById(id + 'Val');
+  slider.addEventListener('input', () => {
+    const v = parseFloat(slider.value);
+    params[param] = v;
+    valSpan.textContent = v;
+  });
+}
+
+setupSlider('separationRadius', 'separationRadius');
+setupSlider('alignmentRadius', 'alignmentRadius');
+setupSlider('cohesion', 'cohesion');
+setupSlider('speedLimit', 'speedLimit');
+
+// ============ State ============
+window.__3D_STATE__ = {
+  boidCount: BOID_COUNT,
+  separationRadius: params.separationRadius,
+  alignmentRadius: params.alignmentRadius,
+  cohesion: params.cohesion,
+  speedLimit: params.speedLimit,
+  avgSpeed: 0,
+  avgNeighborDist: 0,
+  centerOfMass: { x: 0, y: 0, z: 0 }
+};
+
+// ============ Animation Loop ============
+
+const clock = new THREE.Clock();
+let frameCount = 0;
+
+function animate() {
+  requestAnimationFrame(animate);
+
+  const delta = Math.min(clock.getDelta(), 0.05);
+  frameCount++;
+
+  // Update uniforms
+  velocityVariable.material.uniforms['uSeparationRadius'].value = params.separationRadius;
+  velocityVariable.material.uniforms['uAlignmentRadius'].value = params.alignmentRadius;
+  velocityVariable.material.uniforms['uCohesion'].value = params.cohesion;
+  velocityVariable.material.uniforms['uSpeedLimit'].value = params.speedLimit;
+  velocityVariable.material.uniforms['uDelta'].value = delta;
+  velocityVariable.material.uniforms['uPredator'].value.copy(predatorPos);
+
+  positionVariable.material.uniforms['uDelta'].value = delta;
+
+  // Compute
+  gpuCompute.compute();
+
+  // Read back position and velocity textures
+  const posTarget = gpuCompute.getCurrentRenderTarget(positionVariable);
+  const velTarget = gpuCompute.getCurrentRenderTarget(velocityVariable);
+
+  renderer.readRenderTargetPixels(posTarget, 0, 0, TEX_WIDTH, TEX_HEIGHT, readBuffer);
+  renderer.readRenderTargetPixels(velTarget, 0, 0, TEX_WIDTH, TEX_HEIGHT, readBufferVel);
+
+  // Update instanced mesh
+  let totalSpeed = 0;
+  let cx = 0, cy = 0, cz = 0;
+
+  for (let i = 0; i < BOID_COUNT; i++) {
+    const i4 = i * 4;
+    const px = readBuffer[i4];
+    const py = readBuffer[i4 + 1];
+    const pz = readBuffer[i4 + 2];
+
+    const vx = readBufferVel[i4];
+    const vy = readBufferVel[i4 + 1];
+    const vz = readBufferVel[i4 + 2];
+
+    const speed = Math.sqrt(vx * vx + vy * vy + vz * vz);
+    totalSpeed += speed;
+    cx += px; cy += py; cz += pz;
+
+    dummy.position.set(px, py, pz);
+
+    // Orient cone to velocity direction
+    if (speed > 0.001) {
+      tempVel.set(vx, vy, vz).normalize();
+      tempQuat.setFromUnitVectors(forward, tempVel);
+      dummy.quaternion.copy(tempQuat);
+    }
+
+    // Scale slightly based on speed
+    const s = 0.8 + speed * 0.05;
+    dummy.scale.set(s, s, s);
+    dummy.updateMatrix();
+    boidMesh.setMatrixAt(i, dummy.matrix);
+
+    // Color based on speed: blue (slow) -> cyan -> yellow -> red (fast)
+    const t = Math.min(speed / params.speedLimit, 1.0);
+    tempColor.setHSL(0.65 - t * 0.65, 0.9, 0.45 + t * 0.2);
+    boidMesh.setColorAt(i, tempColor);
+
+    // Update trails
+    if (i < TRAIL_COUNT) {
+      const tp = trailPositions[i];
+      // Shift positions back
+      for (let j = (TRAIL_LENGTH - 1) * 3; j >= 3; j -= 3) {
+        tp[j] = tp[j - 3];
+        tp[j + 1] = tp[j - 2];
+        tp[j + 2] = tp[j - 1];
+      }
+      tp[0] = px;
+      tp[1] = py;
+      tp[2] = pz;
+      trailLines[i].geometry.attributes.position.needsUpdate = true;
+
+      // Update trail color to match boid
+      const trailT = Math.min(speed / params.speedLimit, 1.0);
+      const trailColor = new THREE.Color().setHSL(0.65 - trailT * 0.65, 0.7, 0.4);
+      trailLines[i].material.color.copy(trailColor);
+    }
+  }
+
+  boidMesh.instanceMatrix.needsUpdate = true;
+  if (boidMesh.instanceColor) boidMesh.instanceColor.needsUpdate = true;
+
+  // Compute stats every 10 frames
+  if (frameCount % 10 === 0) {
+    const avgSpeed = totalSpeed / BOID_COUNT;
+    const comX = cx / BOID_COUNT;
+    const comY = cy / BOID_COUNT;
+    const comZ = cz / BOID_COUNT;
+
+    // Sample 50 random pairs for avg neighbor distance
+    let totalDist = 0;
+    const sampleCount = 50;
+    for (let s = 0; s < sampleCount; s++) {
+      const a = Math.floor(Math.random() * BOID_COUNT);
+      const b = Math.floor(Math.random() * BOID_COUNT);
+      if (a === b) continue;
+      const a4 = a * 4, b4 = b * 4;
+      const dx = readBuffer[a4] - readBuffer[b4];
+      const dy = readBuffer[a4 + 1] - readBuffer[b4 + 1];
+      const dz = readBuffer[a4 + 2] - readBuffer[b4 + 2];
+      totalDist += Math.sqrt(dx * dx + dy * dy + dz * dz);
+    }
+    const avgNeighborDist = totalDist / sampleCount;
+
+    window.__3D_STATE__ = {
+      boidCount: BOID_COUNT,
+      separationRadius: params.separationRadius,
+      alignmentRadius: params.alignmentRadius,
+      cohesion: params.cohesion,
+      speedLimit: params.speedLimit,
+      avgSpeed: parseFloat(avgSpeed.toFixed(2)),
+      avgNeighborDist: parseFloat(avgNeighborDist.toFixed(2)),
+      centerOfMass: {
+        x: parseFloat(comX.toFixed(2)),
+        y: parseFloat(comY.toFixed(2)),
+        z: parseFloat(comZ.toFixed(2))
+      }
+    };
+
+    // Update stats display
+    document.getElementById('stats').innerHTML = `
+      <b>Boids:</b> ${BOID_COUNT} &nbsp;|&nbsp;
+      <b>Avg Speed:</b> ${avgSpeed.toFixed(2)} &nbsp;|&nbsp;
+      <b>Avg Dist:</b> ${avgNeighborDist.toFixed(1)}<br>
+      <b>Center of Mass:</b> (${comX.toFixed(1)}, ${comY.toFixed(1)}, ${comZ.toFixed(1)})
+    `;
+  }
+
+  controls.update();
+  renderer.render(scene, camera);
+}
+
+animate();
+
+// Resize
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+</script>
+</body>
+</html>

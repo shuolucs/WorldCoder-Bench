@@ -1,0 +1,567 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Procedural City Builder</title>
+  <style>
+    html, body {
+      margin: 0;
+      height: 100%;
+      overflow: hidden;
+      font-family: Arial, sans-serif;
+      background: #111;
+    }
+
+    #app {
+      width: 100%;
+      height: 100%;
+      position: relative;
+    }
+
+    canvas {
+      display: block;
+    }
+
+    #hud {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      z-index: 10;
+      background: rgba(0,0,0,0.65);
+      color: white;
+      padding: 12px;
+      border-radius: 10px;
+      min-width: 320px;
+      user-select: none;
+    }
+
+    #toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 10px;
+    }
+
+    #toolbar button, #actions button {
+      padding: 8px 12px;
+      background: #2a2a2a;
+      color: white;
+      border: 2px solid #555;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 14px;
+    }
+
+    #toolbar button.active {
+      border: 3px solid yellow;
+    }
+
+    #actions {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 10px;
+    }
+
+    #info {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      font-size: 14px;
+    }
+
+    #status {
+      margin-top: 8px;
+      font-size: 12px;
+      color: #ccc;
+      min-height: 16px;
+    }
+  </style>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+</head>
+<body>
+  <div id="app">
+    <div id="hud">
+      <div id="toolbar">
+        <button id="btn-house">House</button>
+        <button id="btn-tower">Tower</button>
+        <button id="btn-park">Park</button>
+        <button id="btn-horse">Horse Statue</button>
+      </div>
+
+      <div id="actions">
+        <button id="btn-save">Save</button>
+        <button id="btn-load">Load</button>
+        <button id="btn-clear">Clear</button>
+      </div>
+
+      <div id="info">
+        <div id="building-count">Buildings: 0</div>
+        <div id="selected-type">Selected: house</div>
+      </div>
+
+      <div id="status"></div>
+    </div>
+  </div>
+
+  <script type="module">
+    import * as THREE from "three";
+    import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+    import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+
+    const app = document.getElementById("app");
+    const statusEl = document.getElementById("status");
+    const buildingCountEl = document.getElementById("building-count");
+    const selectedTypeEl = document.getElementById("selected-type");
+
+    const btnHouse = document.getElementById("btn-house");
+    const btnTower = document.getElementById("btn-tower");
+    const btnPark = document.getElementById("btn-park");
+    const btnHorse = document.getElementById("btn-horse");
+    const btnSave = document.getElementById("btn-save");
+    const btnLoad = document.getElementById("btn-load");
+    const btnClear = document.getElementById("btn-clear");
+
+    const STORAGE_KEY = "cityBuilderState";
+    const GRID_SIZE = 10;
+    const CELL_SIZE = 2;
+    const HALF_EXTENT = (GRID_SIZE * CELL_SIZE) / 2; // 10
+    const VALID_COORDS = [-8, -6, -4, -2, 0, 2, 4, 6, 8];
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x87ceeb);
+
+    const camera = new THREE.PerspectiveCamera(
+      60,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      1000
+    );
+    camera.position.set(15, 20, 15);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    app.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.set(0, 0, 0);
+    controls.enableDamping = true;
+
+    const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+    dirLight.position.set(10, 20, 10);
+    scene.add(dirLight);
+
+    const ambLight = new THREE.AmbientLight(0xffffff, 0.4);
+    scene.add(ambLight);
+
+    const groundPlane = new THREE.Mesh(
+      new THREE.PlaneGeometry(GRID_SIZE * CELL_SIZE, GRID_SIZE * CELL_SIZE),
+      new THREE.MeshStandardMaterial({
+        color: 0x999999,
+        transparent: true,
+        opacity: 0.15,
+        side: THREE.DoubleSide
+      })
+    );
+    groundPlane.rotation.x = -Math.PI / 2;
+    groundPlane.position.y = 0;
+    groundPlane.name = "groundPlane";
+    scene.add(groundPlane);
+
+    const gridHelper = new THREE.GridHelper(GRID_SIZE * CELL_SIZE, GRID_SIZE, 0xffffff, 0xffffff);
+    gridHelper.position.y = 0.01;
+    scene.add(gridHelper);
+
+    const raycaster = new THREE.Raycaster();
+    const mouse = new THREE.Vector2();
+
+    let selectedType = "house";
+    let horseTemplate = null;
+    let horseModelLoaded = false;
+    let cleared = false;
+    let lastPlacedType = null;
+    let lastPlacedPosition = null;
+
+    const buildingMap = new Map(); // key => group
+    const occupancy = {}; // key => type
+
+    const loader = new GLTFLoader();
+    loader.load(
+      "._horse.glb",
+      (gltf) => {
+        horseTemplate = gltf.scene;
+        const box = new THREE.Box3().setFromObject(horseTemplate);
+        const size = new THREE.Vector3();
+        box.getSize(size);
+        const currentHeight = size.y || 1;
+        const targetHeight = 1.5;
+        const scale = targetHeight / currentHeight;
+        horseTemplate.scale.setScalar(scale);
+
+        horseTemplate.updateMatrixWorld(true);
+        const box2 = new THREE.Box3().setFromObject(horseTemplate);
+        const center = new THREE.Vector3();
+        box2.getCenter(center);
+        const min = box2.min.clone();
+        horseTemplate.position.x -= center.x;
+        horseTemplate.position.z -= center.z;
+        horseTemplate.position.y -= min.y;
+
+        horseTemplate.traverse((obj) => {
+          if (obj.isMesh) {
+            obj.castShadow = true;
+            obj.receiveShadow = true;
+          }
+        });
+
+        horseModelLoaded = true;
+        setStatus("Horse statue loaded.");
+        updateState();
+      },
+      undefined,
+      (err) => {
+        console.warn("Failed to load horse model:", err);
+        horseModelLoaded = false;
+        setStatus("Horse model failed to load. Horse placement unavailable.");
+        updateState();
+      }
+    );
+
+    function setStatus(msg) {
+      statusEl.textContent = msg || "";
+    }
+
+    function isFiniteCoord(n) {
+      return Number.isFinite(n) && !Number.isNaN(n);
+    }
+
+    function keyFromXZ(x, z) {
+      return `${x}_${z}`;
+    }
+
+    function snapToGrid(value) {
+      const snapped = Math.round(value / CELL_SIZE) * CELL_SIZE;
+      return snapped;
+    }
+
+    function isValidGridCoord(v) {
+      return VALID_COORDS.includes(v);
+    }
+
+    function getSnappedCell(point) {
+      const x = snapToGrid(point.x);
+      const z = snapToGrid(point.z);
+      if (!isFiniteCoord(x) || !isFiniteCoord(z)) return null;
+      if (!isValidGridCoord(x) || !isValidGridCoord(z)) return null;
+      return { x, z };
+    }
+
+    function updateButtonSelection() {
+      [btnHouse, btnTower, btnPark, btnHorse].forEach(btn => btn.classList.remove("active"));
+      if (selectedType === "house") btnHouse.classList.add("active");
+      if (selectedType === "tower") btnTower.classList.add("active");
+      if (selectedType === "park") btnPark.classList.add("active");
+      if (selectedType === "horse") btnHorse.classList.add("active");
+      selectedTypeEl.textContent = `Selected: ${selectedType}`;
+      updateState();
+    }
+
+    function countByType(type) {
+      return Object.values(occupancy).filter(v => v === type).length;
+    }
+
+    function updateBuildingCount() {
+      const count = Object.keys(occupancy).length;
+      buildingCountEl.textContent = `Buildings: ${count}`;
+      updateState();
+    }
+
+    function makeBuilding(type, x, z) {
+      if (!isFiniteCoord(x) || !isFiniteCoord(z)) return null;
+
+      const group = new THREE.Group();
+      group.userData.isBuilding = true;
+      group.userData.type = type;
+      group.userData.gridX = x;
+      group.userData.gridZ = z;
+      group.position.set(x, 0, z);
+
+      if (type === "house") {
+        const base = new THREE.Mesh(
+          new THREE.BoxGeometry(1.5, 2, 1.5),
+          new THREE.MeshStandardMaterial({ color: 0x8B4513 })
+        );
+        base.position.y = 1;
+
+        const roof = new THREE.Mesh(
+          new THREE.ConeGeometry(1.2, 1.0, 4),
+          new THREE.MeshStandardMaterial({ color: 0xCC0000 })
+        );
+        roof.position.y = 2.5;
+        roof.rotation.y = Math.PI / 4;
+
+        group.add(base, roof);
+      } else if (type === "tower") {
+        const tower = new THREE.Mesh(
+          new THREE.BoxGeometry(1.0, 5.0, 1.0),
+          new THREE.MeshStandardMaterial({ color: 0x4169E1 })
+        );
+        tower.position.y = 2.5;
+        group.add(tower);
+      } else if (type === "park") {
+        const ground = new THREE.Mesh(
+          new THREE.PlaneGeometry(1.8, 1.8),
+          new THREE.MeshStandardMaterial({ color: 0x3cb043, side: THREE.DoubleSide })
+        );
+        ground.rotation.x = -Math.PI / 2;
+        ground.position.y = 0.02;
+
+        const tree = new THREE.Mesh(
+          new THREE.SphereGeometry(0.5, 16, 16),
+          new THREE.MeshStandardMaterial({ color: 0x228B22 })
+        );
+        tree.position.y = 0.6;
+
+        group.add(ground, tree);
+      } else if (type === "horse") {
+        if (!horseTemplate) {
+          setStatus("Horse model not loaded yet.");
+          return null;
+        }
+        const horseClone = horseTemplate.clone(true);
+        group.add(horseClone);
+      } else {
+        return null;
+      }
+
+      group.traverse((obj) => {
+        if (obj.isMesh) {
+          obj.castShadow = true;
+          obj.receiveShadow = true;
+          obj.userData.parentBuilding = group;
+        }
+      });
+
+      return group;
+    }
+
+    function placeBuilding(type, x, z) {
+      if (!isFiniteCoord(x) || !isFiniteCoord(z)) return false;
+      if (!isValidGridCoord(x) || !isValidGridCoord(z)) return false;
+
+      const key = keyFromXZ(x, z);
+      if (occupancy[key]) {
+        setStatus("Cell already occupied.");
+        return false;
+      }
+
+      const building = makeBuilding(type, x, z);
+      if (!building) return false;
+
+      scene.add(building);
+      buildingMap.set(key, building);
+      occupancy[key] = type;
+
+      lastPlacedType = type;
+      lastPlacedPosition = { x, z };
+      cleared = false;
+
+      updateBuildingCount();
+      setStatus(`Placed ${type} at (${x}, ${z})`);
+      return true;
+    }
+
+    function removeBuildingAt(x, z) {
+      const key = keyFromXZ(x, z);
+      const obj = buildingMap.get(key);
+      if (!obj) return false;
+
+      scene.remove(obj);
+      buildingMap.delete(key);
+      delete occupancy[key];
+
+      updateBuildingCount();
+      setStatus(`Removed building at (${x}, ${z})`);
+      return true;
+    }
+
+    function clearBuildings() {
+      for (const [, obj] of buildingMap) {
+        scene.remove(obj);
+      }
+      buildingMap.clear();
+
+      for (const key of Object.keys(occupancy)) {
+        delete occupancy[key];
+      }
+
+      cleared = true;
+      lastPlacedType = null;
+      lastPlacedPosition = null;
+      updateBuildingCount();
+      setStatus("Cleared all buildings.");
+    }
+
+    function saveState() {
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(occupancy));
+        setStatus("City saved.");
+      } catch (e) {
+        console.error(e);
+        setStatus("Save failed.");
+      }
+      updateState();
+    }
+
+    function loadState() {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (!raw) {
+        setStatus("No saved city found.");
+        updateState();
+        return;
+      }
+
+      let data;
+      try {
+        data = JSON.parse(raw);
+      } catch (e) {
+        console.error(e);
+        setStatus("Saved data is invalid.");
+        updateState();
+        return;
+      }
+
+      clearBuildings();
+      cleared = true;
+
+      for (const key of Object.keys(data)) {
+        const type = data[key];
+        const parts = key.split("_");
+        if (parts.length !== 2) continue;
+
+        const x = Number(parts[0]);
+        const z = Number(parts[1]);
+
+        if (!isFiniteCoord(x) || !isFiniteCoord(z)) continue;
+        if (!isValidGridCoord(x) || !isValidGridCoord(z)) continue;
+        if (!["house", "tower", "park", "horse"].includes(type)) continue;
+        if (type === "horse" && !horseModelLoaded) continue;
+
+        placeBuilding(type, x, z);
+      }
+
+      setStatus("City loaded.");
+      updateState();
+    }
+
+    function updateState() {
+      window.__3D_STATE__ = {
+        buildingCount: Object.keys(occupancy).length,
+        selectedType,
+        gridOccupancy: { ...occupancy },
+        lastPlacedType,
+        lastPlacedPosition: lastPlacedPosition ? { ...lastPlacedPosition } : null,
+        savedStateExists: localStorage.getItem(STORAGE_KEY) !== null,
+        horseModelLoaded,
+        totalHouses: countByType("house"),
+        totalTowers: countByType("tower"),
+        totalParks: countByType("park"),
+        totalHorses: countByType("horse"),
+        cleared
+      };
+    }
+
+    function setSelectedType(type) {
+      selectedType = type;
+      updateButtonSelection();
+      setStatus(`Selected ${type}`);
+    }
+
+    btnHouse.addEventListener("click", () => setSelectedType("house"));
+    btnTower.addEventListener("click", () => setSelectedType("tower"));
+    btnPark.addEventListener("click", () => setSelectedType("park"));
+    btnHorse.addEventListener("click", () => setSelectedType("horse"));
+
+    btnSave.addEventListener("click", saveState);
+    btnLoad.addEventListener("click", loadState);
+    btnClear.addEventListener("click", clearBuildings);
+
+    renderer.domElement.addEventListener("contextmenu", (e) => e.preventDefault());
+
+    renderer.domElement.addEventListener("pointerdown", (event) => {
+      const rect = renderer.domElement.getBoundingClientRect();
+      mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+      mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+
+      raycaster.setFromCamera(mouse, camera);
+
+      if (event.button === 2) {
+        const intersects = raycaster.intersectObjects(scene.children, true);
+        for (const hit of intersects) {
+          let obj = hit.object;
+          while (obj && !obj.userData.isBuilding && obj.parent) {
+            obj = obj.parent;
+          }
+          if (obj && obj.userData.isBuilding) {
+            removeBuildingAt(obj.userData.gridX, obj.userData.gridZ);
+            return;
+          }
+        }
+      }
+
+      if (event.button === 0) {
+        const hits = raycaster.intersectObject(groundPlane, true);
+        if (!hits.length) return;
+
+        const cell = getSnappedCell(hits[0].point);
+        if (!cell) {
+          setStatus("Clicked outside valid grid.");
+          return;
+        }
+
+        if (selectedType === "horse" && !horseModelLoaded) {
+          setStatus("Horse model not loaded yet.");
+          return;
+        }
+
+        placeBuilding(selectedType, cell.x, cell.z);
+      }
+    });
+
+    window.addEventListener("keydown", (e) => {
+      const key = e.key.toLowerCase();
+      if (key === "s") saveState();
+      if (key === "l") loadState();
+      if (key === "c") clearBuildings();
+    });
+
+    window.addEventListener("resize", () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    updateButtonSelection();
+    updateBuildingCount();
+    updateState();
+
+    function animate() {
+      requestAnimationFrame(animate);
+      controls.update();
+      renderer.render(scene, camera);
+    }
+
+    animate();
+  </script>
+</body>
+</html>

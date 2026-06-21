@@ -1,0 +1,516 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Interactive 3D DNA Unzip Diorama</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #0a0a2e;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            color: white;
+            user-select: none;
+        }
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+        }
+        #ui-layer {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+        }
+        .panel {
+            position: absolute;
+            background: rgba(10, 10, 46, 0.7);
+            border: 1px solid #334466;
+            padding: 15px;
+            border-radius: 8px;
+            pointer-events: auto;
+            backdrop-filter: blur(4px);
+        }
+        #top-left { top: 20px; left: 20px; }
+        #top-right { top: 20px; right: 20px; text-align: right; }
+        #bottom-center {
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            text-align: center;
+            font-size: 14px;
+            color: #aaa;
+        }
+        h2 { margin: 0 0 10px 0; font-size: 18px; color: #4488ff; }
+        .stat { font-size: 24px; font-weight: bold; margin-bottom: 10px; }
+        button {
+            background: #3366ff;
+            color: white;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-weight: bold;
+            margin-top: 10px;
+            transition: background 0.2s;
+        }
+        button:hover { background: #4488ff; }
+        .slider-container { margin-top: 15px; }
+        .slider-container label { display: block; margin-bottom: 5px; font-size: 12px; color: #aaa; }
+        input[type=range] { width: 100%; }
+        
+        .dna-label {
+            position: absolute;
+            color: white;
+            font-size: 12px;
+            font-weight: bold;
+            background: rgba(0,0,0,0.5);
+            padding: 2px 6px;
+            border-radius: 4px;
+            pointer-events: none;
+            transform: translate(-50%, -50%);
+            display: none;
+            border: 1px solid rgba(255,255,255,0.2);
+        }
+        .label-at { color: #33ff66; }
+        .label-gc { color: #ffff33; }
+    </style>
+    <!-- Import maps polyfill -->
+    <script async src="https://unpkg.com/es-module-shims@1.8.0/dist/es-module-shims.js"></script>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.157.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.157.0/examples/jsm/",
+                "@tweenjs/tween.js": "https://unpkg.com/@tweenjs/tween.js@21.0.0/dist/tween.esm.js"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="canvas-container"></div>
+    
+    <div id="labels-container"></div>
+
+    <div id="ui-layer">
+        <div id="top-left" class="panel">
+            <h2>Status</h2>
+            <div class="stat" id="unzip-stat">Unzipped: 0/20</div>
+            <button id="toggleLabelsBtn">Toggle Labels</button>
+            <div class="slider-container">
+                <label for="speedSlider">Animation Speed (<span id="speed-val">1.0</span>x)</label>
+                <input type="range" id="speedSlider" min="0.5" max="3.0" step="0.1" value="1.0">
+            </div>
+        </div>
+
+        <div id="top-right" class="panel">
+            <h2>Orientation</h2>
+            <div class="stat" id="rotation-stat">Helix Rotation: 0&deg;</div>
+        </div>
+
+        <div id="bottom-center" class="panel">
+            <strong>Controls:</strong> [Space] Unzip Next | [R] Rezip All | [L] Toggle Lantern | [Up/Down] Rotate Helix | [Click] Base Pair to Unzip
+        </div>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+        import * as TWEEN from '@tweenjs/tween.js';
+
+        // --- Configuration ---
+        const CONFIG = {
+            numPairs: 20,
+            radius: 1.5,
+            ySpacing: 0.5,
+            twistAngle: Math.PI / 5, // 36 degrees
+            colorA: 0x3366ff,
+            colorB: 0xff3366,
+            colorAT: 0x33ff66,
+            colorGC: 0xffff33,
+            unzipOffset: 1.5
+        };
+
+        // --- Global State ---
+        window.__3D_STATE__ = {
+            unzipLevel: 0,
+            helixRotationDeg: 0,
+            lanternLightOn: true,
+            labelsVisible: false,
+            enzymeMarkerY: 0,
+            animationSpeed: 1.0,
+            basePairsTotal: CONFIG.numPairs,
+            lanternLoaded: false,
+            strandAPositions: [],
+            strandBPositions: [],
+            basePairVisible: []
+        };
+
+        let targetRotationY = 0;
+        let currentRotationY = 0;
+
+        // --- Scene Setup ---
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x0a0a2e);
+
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+        camera.position.set(0, 5, 15);
+        camera.lookAt(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        container.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.05;
+        controls.target.set(0, 0, 0);
+
+        // --- Lighting ---
+        const ambientLight = new THREE.AmbientLight(0x334466, 0.4);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+        dirLight.position.set(5, 10, 5);
+        scene.add(dirLight);
+
+        const lanternLight = new THREE.PointLight(0xffaa33, 1.5, 15);
+        lanternLight.position.set(-6, 0, 0);
+        scene.add(lanternLight);
+
+        // --- Load Model ---
+        const loader = new GLTFLoader();
+        loader.load('https://cdn.jsdelivr.net/npm/three@0.157.0/examples/models/gltf/Lantern/glTF/Lantern.gltf', (gltf) => {
+            const lantern = gltf.scene;
+            lantern.scale.set(0.5, 0.5, 0.5);
+            lantern.position.set(-6, 0, 0);
+            scene.add(lantern);
+            window.__3D_STATE__.lanternLoaded = true;
+        }, undefined, (error) => {
+            console.error('Error loading lantern model:', error);
+        });
+
+        // --- DNA Construction ---
+        const helixGroup = new THREE.Group();
+        scene.add(helixGroup);
+
+        const dnaData = [];
+        const backboneACylinders = [];
+        const backboneBCylinders = [];
+        const labelsElements = [];
+        const labelsContainer = document.getElementById('labels-container');
+
+        const sphereGeo = new THREE.SphereGeometry(0.15, 16, 16);
+        const matA = new THREE.MeshLambertMaterial({ color: CONFIG.colorA });
+        const matB = new THREE.MeshLambertMaterial({ color: CONFIG.colorB });
+        const matAT = new THREE.MeshLambertMaterial({ color: CONFIG.colorAT });
+        const matGC = new THREE.MeshLambertMaterial({ color: CONFIG.colorGC });
+        const backboneGeo = new THREE.CylinderGeometry(0.05, 0.05, 1, 8);
+        backboneGeo.translate(0, 0.5, 0); // Pivot at bottom
+        backboneGeo.rotateX(Math.PI / 2); // Point along Z
+
+        const startY = -4.75;
+
+        for (let i = 0; i < CONFIG.numPairs; i++) {
+            const y = startY + i * CONFIG.ySpacing;
+            const angle = i * CONFIG.twistAngle;
+
+            // Original positions
+            const origPosA = new THREE.Vector3(Math.cos(angle) * CONFIG.radius, y, Math.sin(angle) * CONFIG.radius);
+            const origPosB = new THREE.Vector3(Math.cos(angle + Math.PI) * CONFIG.radius, y, Math.sin(angle + Math.PI) * CONFIG.radius);
+
+            // Spheres
+            const sphereA = new THREE.Mesh(sphereGeo, matA);
+            sphereA.position.copy(origPosA);
+            helixGroup.add(sphereA);
+
+            const sphereB = new THREE.Mesh(sphereGeo, matB);
+            sphereB.position.copy(origPosB);
+            helixGroup.add(sphereB);
+
+            // Base Pair Cylinder
+            const isAT = i % 2 === 0;
+            const bpMat = isAT ? matAT : matGC;
+            const bpGeo = new THREE.CylinderGeometry(0.08, 0.08, 1, 8);
+            bpGeo.translate(0, 0.5, 0);
+            bpGeo.rotateX(Math.PI / 2);
+            
+            const bpMesh = new THREE.Mesh(bpGeo, bpMat);
+            bpMesh.userData = { index: i, isBasePair: true };
+            helixGroup.add(bpMesh);
+
+            // Label
+            const label = document.createElement('div');
+            label.className = `dna-label ${isAT ? 'label-at' : 'label-gc'}`;
+            label.textContent = isAT ? 'A-T' : 'G-C';
+            labelsContainer.appendChild(label);
+            labelsElements.push(label);
+
+            // Calculate unzipped positions (moving outward along their connecting vector)
+            const dir = origPosA.clone().sub(origPosB).normalize();
+            const unzipPosA = origPosA.clone().add(dir.clone().multiplyScalar(CONFIG.unzipOffset));
+            const unzipPosB = origPosB.clone().add(dir.clone().multiplyScalar(-CONFIG.unzipOffset));
+
+            dnaData.push({
+                sphereA, sphereB, bpMesh,
+                origPosA, origPosB,
+                unzipPosA, unzipPosB,
+                currentPosA: origPosA.clone(),
+                currentPosB: origPosB.clone(),
+                isUnzipped: false
+            });
+
+            // Backbone
+            if (i > 0) {
+                const bbA = new THREE.Mesh(backboneGeo, matA);
+                helixGroup.add(bbA);
+                backboneACylinders.push(bbA);
+
+                const bbB = new THREE.Mesh(backboneGeo, matB);
+                helixGroup.add(bbB);
+                backboneBCylinders.push(bbB);
+            }
+        }
+
+        // Enzyme Marker
+        const enzymeGeo = new THREE.SphereGeometry(0.3, 32, 32);
+        const enzymeMat = new THREE.MeshStandardMaterial({ 
+            color: 0xffff00, 
+            emissive: 0xffff00, 
+            emissiveIntensity: 0.5,
+            roughness: 0.2
+        });
+        const enzymeMarker = new THREE.Mesh(enzymeGeo, enzymeMat);
+        enzymeMarker.position.set(0, startY, 0);
+        helixGroup.add(enzymeMarker);
+
+        // --- Helper Functions ---
+        function updateCylinderBetweenPoints(mesh, p1, p2) {
+            const distance = p1.distanceTo(p2);
+            mesh.position.copy(p1);
+            mesh.scale.set(1, 1, distance);
+            mesh.lookAt(p2);
+        }
+
+        function updateDynamicGeometry() {
+            for (let i = 0; i < CONFIG.numPairs; i++) {
+                const data = dnaData[i];
+                
+                // Update Base Pair
+                if (data.bpMesh.visible) {
+                    updateCylinderBetweenPoints(data.bpMesh, data.currentPosA, data.currentPosB);
+                }
+
+                // Update Backbone
+                if (i < CONFIG.numPairs - 1) {
+                    const nextData = dnaData[i + 1];
+                    updateCylinderBetweenPoints(backboneACylinders[i], data.currentPosA, nextData.currentPosA);
+                    updateCylinderBetweenPoints(backboneBCylinders[i], data.currentPosB, nextData.currentPosB);
+                }
+            }
+        }
+
+        // Initial geometry update
+        updateDynamicGeometry();
+
+        // --- Interaction Logic ---
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+
+        function setUnzipLevel(targetLevel, durationMs) {
+            targetLevel = Math.max(0, Math.min(CONFIG.numPairs, targetLevel));
+            if (targetLevel === window.__3D_STATE__.unzipLevel) return;
+
+            window.__3D_STATE__.unzipLevel = targetLevel;
+            document.getElementById('unzip-stat').textContent = `Unzipped: ${targetLevel}/20`;
+
+            const speedMult = window.__3D_STATE__.animationSpeed;
+            const actualDuration = durationMs / speedMult;
+
+            // Animate Enzyme
+            const targetY = targetLevel < CONFIG.numPairs ? startY + targetLevel * CONFIG.ySpacing : startY + CONFIG.numPairs * CONFIG.ySpacing;
+            new TWEEN.Tween(enzymeMarker.position)
+                .to({ y: targetY }, actualDuration)
+                .easing(TWEEN.Easing.Quadratic.InOut)
+                .start();
+
+            // Animate Base Pairs
+            for (let i = 0; i < CONFIG.numPairs; i++) {
+                const data = dnaData[i];
+                const shouldBeUnzipped = i < targetLevel;
+
+                if (data.isUnzipped !== shouldBeUnzipped) {
+                    data.isUnzipped = shouldBeUnzipped;
+                    
+                    const targetA = shouldBeUnzipped ? data.unzipPosA : data.origPosA;
+                    const targetB = shouldBeUnzipped ? data.unzipPosB : data.origPosB;
+
+                    if (shouldBeUnzipped) {
+                        data.bpMesh.visible = false;
+                    } else {
+                        data.bpMesh.visible = true;
+                    }
+
+                    new TWEEN.Tween(data.currentPosA)
+                        .to({ x: targetA.x, y: targetA.y, z: targetA.z }, actualDuration)
+                        .easing(TWEEN.Easing.Cubic.InOut)
+                        .onUpdate(() => { data.sphereA.position.copy(data.currentPosA); })
+                        .start();
+
+                    new TWEEN.Tween(data.currentPosB)
+                        .to({ x: targetB.x, y: targetB.y, z: targetB.z }, actualDuration)
+                        .easing(TWEEN.Easing.Cubic.InOut)
+                        .onUpdate(() => { data.sphereB.position.copy(data.currentPosB); })
+                        .start();
+                }
+            }
+        }
+
+        // Event Listeners
+        window.addEventListener('keydown', (e) => {
+            switch(e.code) {
+                case 'Space':
+                    setUnzipLevel(window.__3D_STATE__.unzipLevel + 1, 500);
+                    break;
+                case 'KeyR':
+                    setUnzipLevel(0, 1000);
+                    break;
+                case 'KeyL':
+                    window.__3D_STATE__.lanternLightOn = !window.__3D_STATE__.lanternLightOn;
+                    lanternLight.visible = window.__3D_STATE__.lanternLightOn;
+                    break;
+                case 'ArrowUp':
+                    targetRotationY += Math.PI / 12; // 15 degrees
+                    break;
+                case 'ArrowDown':
+                    targetRotationY -= Math.PI / 12;
+                    break;
+            }
+        });
+
+        window.addEventListener('click', (e) => {
+            // Ignore clicks on UI
+            if (e.target.tagName === 'BUTTON' || e.target.tagName === 'INPUT') return;
+
+            mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+
+            raycaster.setFromCamera(mouse, camera);
+            const intersects = raycaster.intersectObjects(helixGroup.children);
+
+            for (let i = 0; i < intersects.length; i++) {
+                const obj = intersects[i].object;
+                if (obj.userData && obj.userData.isBasePair) {
+                    const index = obj.userData.index;
+                    if (index >= window.__3D_STATE__.unzipLevel) {
+                        setUnzipLevel(index + 1, 500);
+                    }
+                    break;
+                }
+            }
+        });
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // UI Listeners
+        document.getElementById('toggleLabelsBtn').addEventListener('click', () => {
+            window.__3D_STATE__.labelsVisible = !window.__3D_STATE__.labelsVisible;
+            labelsElements.forEach(el => el.style.display = window.__3D_STATE__.labelsVisible ? 'block' : 'none');
+        });
+
+        const speedSlider = document.getElementById('speedSlider');
+        const speedVal = document.getElementById('speed-val');
+        speedSlider.addEventListener('input', (e) => {
+            const val = parseFloat(e.target.value);
+            window.__3D_STATE__.animationSpeed = val;
+            speedVal.textContent = val.toFixed(1);
+        });
+
+        // --- Render Loop ---
+        const tempV = new THREE.Vector3();
+
+        function animate(time) {
+            requestAnimationFrame(animate);
+
+            TWEEN.update(time);
+            controls.update();
+
+            // Smooth Helix Rotation
+            currentRotationY = THREE.MathUtils.lerp(currentRotationY, targetRotationY, 0.1);
+            helixGroup.rotation.y = currentRotationY;
+
+            // Update Geometry
+            updateDynamicGeometry();
+
+            // Update Labels
+            if (window.__3D_STATE__.labelsVisible) {
+                for (let i = 0; i < CONFIG.numPairs; i++) {
+                    const data = dnaData[i];
+                    if (!data.isUnzipped) {
+                        tempV.copy(data.currentPosA).lerp(data.currentPosB, 0.5);
+                        tempV.applyMatrix4(helixGroup.matrixWorld);
+                        tempV.project(camera);
+
+                        if (tempV.z < 1) { // In front of camera
+                            const x = (tempV.x *  .5 + .5) * window.innerWidth;
+                            const y = (tempV.y * -.5 + .5) * window.innerHeight;
+                            labelsElements[i].style.left = `${x}px`;
+                            labelsElements[i].style.top = `${y}px`;
+                            labelsElements[i].style.display = 'block';
+                        } else {
+                            labelsElements[i].style.display = 'none';
+                        }
+                    } else {
+                        labelsElements[i].style.display = 'none';
+                    }
+                }
+            }
+
+            // Update State Object
+            const state = window.__3D_STATE__;
+            let rotDeg = (currentRotationY * 180 / Math.PI) % 360;
+            if (rotDeg < 0) rotDeg += 360;
+            state.helixRotationDeg = rotDeg;
+            
+            document.getElementById('rotation-stat').innerHTML = `Helix Rotation: ${Math.round(rotDeg)}&deg;`;
+
+            state.enzymeMarkerY = enzymeMarker.position.y;
+            
+            // Clear arrays to avoid memory leaks if we were pushing, but here we overwrite
+            state.strandAPositions.length = 0;
+            state.strandBPositions.length = 0;
+            state.basePairVisible.length = 0;
+
+            for (let i = 0; i < CONFIG.numPairs; i++) {
+                const data = dnaData[i];
+                
+                // Get world positions
+                const wpA = new THREE.Vector3();
+                data.sphereA.getWorldPosition(wpA);
+                state.strandAPositions.push({ x: wpA.x || 0, y: wpA.y || 0, z: wpA.z || 0 });
+
+                const wpB = new THREE.Vector3();
+                data.sphereB.getWorldPosition(wpB);
+                state.strandBPositions.push({ x: wpB.x || 0, y: wpB.y || 0, z: wpB.z || 0 });
+
+                state.basePairVisible.push(data.bpMesh.visible);
+            }
+
+            renderer.render(scene, camera);
+        }
+
+        animate();
+    </script>
+</body>
+</html>

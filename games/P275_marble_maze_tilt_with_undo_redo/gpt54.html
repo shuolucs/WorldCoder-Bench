@@ -1,0 +1,664 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>3D Marble Maze - Three.js</title>
+  <style>
+    html, body {
+      margin: 0;
+      overflow: hidden;
+      background: #1a1a2e;
+      font-family: Arial, sans-serif;
+      color: white;
+    }
+
+    #hud {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      z-index: 10;
+      background: rgba(0, 0, 0, 0.45);
+      padding: 12px 14px;
+      border-radius: 8px;
+      line-height: 1.7;
+      font-size: 14px;
+      min-width: 260px;
+    }
+
+    #hud span {
+      font-weight: bold;
+    }
+
+    #controls {
+      margin-top: 10px;
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    button {
+      padding: 8px 12px;
+      border: none;
+      border-radius: 6px;
+      background: #16213e;
+      color: white;
+      cursor: pointer;
+      font-size: 14px;
+    }
+
+    button:hover {
+      background: #243b67;
+    }
+
+    #info {
+      margin-top: 8px;
+      font-size: 12px;
+      opacity: 0.85;
+    }
+  </style>
+</head>
+<body>
+  <div id="hud">
+    <div>Time: <span id="timer">0s</span></div>
+    <div>Undos: <span id="undo-count">0</span></div>
+    <div>State: <span id="game-state">playing</span></div>
+    <div>History: <span id="history-info">0/0</span></div>
+
+    <div id="controls">
+      <button id="btn-undo">Undo</button>
+      <button id="btn-redo">Redo</button>
+      <button id="btn-reset">Reset</button>
+    </div>
+
+    <div id="info">
+      Arrow keys: tilt board<br/>
+      U: Undo, R: Redo
+    </div>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
+    import { GLTFLoader } from 'https://unpkg.com/three@0.160.0/examples/jsm/loaders/GLTFLoader.js';
+
+    // Scene setup
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color('#1a1a2e');
+
+    const camera = new THREE.PerspectiveCamera(
+      60,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      100
+    );
+    camera.position.set(0, 12, 8);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    document.body.appendChild(renderer.domElement);
+
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+    scene.add(ambientLight);
+
+    const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+    dirLight.position.set(5, 10, 5);
+    dirLight.castShadow = true;
+    dirLight.shadow.mapSize.set(2048, 2048);
+    dirLight.shadow.camera.left = -15;
+    dirLight.shadow.camera.right = 15;
+    dirLight.shadow.camera.top = 15;
+    dirLight.shadow.camera.bottom = -15;
+    dirLight.shadow.camera.near = 0.1;
+    dirLight.shadow.camera.far = 50;
+    scene.add(dirLight);
+
+    // Constants
+    const BOARD_SIZE = 12;
+    const BOARD_HALF = BOARD_SIZE / 2;
+    const BOARD_HEIGHT = 0.3;
+    const BOARD_TOP_Y = BOARD_HEIGHT / 2;
+    const MAX_TILT = 0.15;
+    const TILT_STEP = 0.03;
+    const TILT_RETURN = 0.95;
+    const MARBLE_RADIUS = 0.3;
+    const WALL_HEIGHT = 0.5;
+    const WALL_THICKNESS = 0.2;
+    const MAX_SPEED = 0.15;
+    const FRICTION = 0.98;
+    const RESTITUTION = 0.3;
+    const SNAPSHOT_INTERVAL = 0.5;
+
+    // State
+    let tiltX = 0;
+    let tiltZ = 0;
+    let gameState = 'playing';
+    let startTime = performance.now();
+    let elapsedTime = 0;
+    let undoCount = 0;
+    let redoCount = 0;
+    let holesFallen = 0;
+    let goalReached = false;
+    let snapshotTimer = 0;
+    let history = [];
+    let historyIndex = -1;
+
+    const keys = {
+      ArrowUp: false,
+      ArrowDown: false,
+      ArrowLeft: false,
+      ArrowRight: false
+    };
+
+    // Root board pivot
+    const boardPivot = new THREE.Group();
+    scene.add(boardPivot);
+
+    // Board
+    const boardGeo = new THREE.BoxGeometry(12, 0.3, 12);
+    const boardMat = new THREE.MeshStandardMaterial({ color: '#4a6741' });
+    const boardMesh = new THREE.Mesh(boardGeo, boardMat);
+    boardMesh.receiveShadow = true;
+    boardMesh.castShadow = true;
+    boardPivot.add(boardMesh);
+
+    // Goal
+    const goalGroup = new THREE.Group();
+    goalGroup.position.set(4.8, BOARD_TOP_Y + 0.01, 4.8);
+    boardPivot.add(goalGroup);
+
+    const goalGeo = new THREE.CircleGeometry(0.5, 32);
+    const goalMat = new THREE.MeshBasicMaterial({
+      color: '#00ff66',
+      transparent: true,
+      opacity: 0.9
+    });
+    const goalMesh = new THREE.Mesh(goalGeo, goalMat);
+    goalMesh.rotation.x = -Math.PI / 2;
+    goalGroup.add(goalMesh);
+
+    const goalGlow = new THREE.PointLight('#33ff88', 1.5, 4);
+    goalGlow.position.set(0, 0.4, 0);
+    goalGroup.add(goalGlow);
+
+    // Walls
+    const wallMaterial = new THREE.MeshStandardMaterial({ color: '#8B4513' });
+    const wallSegments = [];
+
+    function addWall(x, z, width, depth) {
+      const geo = new THREE.BoxGeometry(width, WALL_HEIGHT, depth);
+      const mesh = new THREE.Mesh(geo, wallMaterial);
+      mesh.position.set(x, BOARD_TOP_Y + WALL_HEIGHT / 2, z);
+      mesh.castShadow = true;
+      mesh.receiveShadow = true;
+      boardPivot.add(mesh);
+
+      wallSegments.push({
+        mesh,
+        minX: x - width / 2,
+        maxX: x + width / 2,
+        minZ: z - depth / 2,
+        maxZ: z + depth / 2
+      });
+    }
+
+    // Outer maze-like walls / corridors
+    addWall(-2.5, -4.8, 0.2, 3.4);
+    addWall(0.0, -2.8, 4.2, 0.2);
+    addWall(2.2, -0.8, 0.2, 4.0);
+    addWall(-1.8, 0.8, 3.6, 0.2);
+    addWall(-4.0, 2.0, 0.2, 3.5);
+    addWall(0.5, 2.8, 4.0, 0.2);
+    addWall(3.6, 3.2, 0.2, 2.8);
+    addWall(-2.0, -0.2, 0.2, 2.2);
+    addWall(1.0, 1.0, 0.2, 2.0);
+    addWall(-3.5, -1.2, 2.2, 0.2);
+
+    // Holes
+    const holeMaterial = new THREE.MeshStandardMaterial({ color: '#111111' });
+    const holePositions = [
+      new THREE.Vector3(-1.5, BOARD_TOP_Y - 0.12, -3.6),
+      new THREE.Vector3(2.8, BOARD_TOP_Y - 0.12, 0.5),
+      new THREE.Vector3(-2.7, BOARD_TOP_Y - 0.12, 3.2)
+    ];
+    const holeRadius = 0.4;
+    const holes = [];
+
+    holePositions.forEach(pos => {
+      const holeGeo = new THREE.CylinderGeometry(holeRadius, holeRadius, 0.15, 32);
+      const holeMesh = new THREE.Mesh(holeGeo, holeMaterial);
+      holeMesh.position.copy(pos);
+      holeMesh.receiveShadow = true;
+      boardPivot.add(holeMesh);
+      holes.push({ position: pos.clone(), radius: holeRadius });
+    });
+
+    // Marble
+    const marbleGeo = new THREE.SphereGeometry(MARBLE_RADIUS, 32, 32);
+    const marbleMat = new THREE.MeshStandardMaterial({
+      color: '#e74c3c',
+      metalness: 0.7,
+      roughness: 0.3
+    });
+    const marble = new THREE.Mesh(marbleGeo, marbleMat);
+    marble.castShadow = true;
+    marble.receiveShadow = true;
+    scene.add(marble);
+
+    const marbleStart = new THREE.Vector3(-4, 0.5, -4);
+    marble.position.copy(marbleStart);
+    const marbleVel = new THREE.Vector3(0, 0, 0);
+
+    // Decorative animated GLB
+    const loader = new GLTFLoader();
+    let boxAsset = null;
+    let mixer = null;
+    let boxAnimPlaying = false;
+    let boxJumping = false;
+    let boxJumpTime = 0;
+    let boxBaseY = 0.5;
+
+    loader.load(
+      'BoxAnimated.glb',
+      gltf => {
+        boxAsset = gltf.scene;
+        boxAsset.position.set(4, 0.5, 4);
+        boxAsset.scale.set(0.5, 0.5, 0.5);
+        boxAsset.traverse(obj => {
+          if (obj.isMesh) {
+            obj.castShadow = true;
+            obj.receiveShadow = true;
+          }
+        });
+        boardPivot.add(boxAsset);
+
+        if (gltf.animations && gltf.animations.length > 0) {
+          mixer = new THREE.AnimationMixer(boxAsset);
+          const action = mixer.clipAction(gltf.animations[0]);
+          action.play();
+          boxAnimPlaying = true;
+        }
+      },
+      undefined,
+      err => {
+        console.warn('Could not load BoxAnimated.glb:', err);
+      }
+    );
+
+    // Snapshot system
+    function makeSnapshot() {
+      return {
+        marblePos: {
+          x: marble.position.x,
+          y: marble.position.y,
+          z: marble.position.z
+        },
+        marbleVel: {
+          x: marbleVel.x,
+          y: marbleVel.y,
+          z: marbleVel.z
+        },
+        tiltX,
+        tiltZ,
+        timestamp: performance.now()
+      };
+    }
+
+    function pushSnapshot() {
+      if (historyIndex < history.length - 1) {
+        history = history.slice(0, historyIndex + 1);
+      }
+
+      history.push(makeSnapshot());
+
+      if (history.length > 100) {
+        history.shift();
+      }
+
+      historyIndex = history.length - 1;
+      updateHUD();
+    }
+
+    function restoreSnapshot(index) {
+      if (index < 0 || index >= history.length) return;
+      const s = history[index];
+
+      marble.position.set(s.marblePos.x, s.marblePos.y, s.marblePos.z);
+      marbleVel.set(s.marbleVel.x, s.marbleVel.y, s.marbleVel.z);
+
+      tiltX = THREE.MathUtils.clamp(s.tiltX, -MAX_TILT, MAX_TILT);
+      tiltZ = THREE.MathUtils.clamp(s.tiltZ, -MAX_TILT, MAX_TILT);
+      boardPivot.rotation.x = tiltX;
+      boardPivot.rotation.z = tiltZ;
+
+      sanitizeVelocity();
+      updateHUD();
+    }
+
+    function undo() {
+      if (historyIndex > 0) {
+        historyIndex--;
+        restoreSnapshot(historyIndex);
+        undoCount++;
+      }
+    }
+
+    function redo() {
+      if (historyIndex < history.length - 1) {
+        historyIndex++;
+        restoreSnapshot(historyIndex);
+        redoCount++;
+      }
+    }
+
+    function clearHistory() {
+      history = [];
+      historyIndex = -1;
+      snapshotTimer = 0;
+    }
+
+    // Reset
+    function resetGame(markState = true) {
+      marble.position.copy(marbleStart);
+      marbleVel.set(0, 0, 0);
+      tiltX = 0;
+      tiltZ = 0;
+      boardPivot.rotation.set(0, 0, 0);
+      goalReached = false;
+      if (markState) gameState = 'reset';
+      startTime = performance.now();
+      elapsedTime = 0;
+      clearHistory();
+      pushSnapshot();
+      updateHUD();
+    }
+
+    function resetMarbleFromHole() {
+      holesFallen++;
+      marble.position.copy(marbleStart);
+      marbleVel.set(0, 0, 0);
+      gameState = 'reset';
+      updateHUD();
+    }
+
+    // Utility
+    function sanitizeVelocity() {
+      if (!Number.isFinite(marbleVel.x)) marbleVel.x = 0;
+      if (!Number.isFinite(marbleVel.y)) marbleVel.y = 0;
+      if (!Number.isFinite(marbleVel.z)) marbleVel.z = 0;
+    }
+
+    function clampTilt() {
+      tiltX = THREE.MathUtils.clamp(tiltX, -MAX_TILT, MAX_TILT);
+      tiltZ = THREE.MathUtils.clamp(tiltZ, -MAX_TILT, MAX_TILT);
+    }
+
+    function getBoardSurfaceY() {
+      return BOARD_TOP_Y + MARBLE_RADIUS;
+    }
+
+    function triggerGoal() {
+      if (goalReached) return;
+      goalReached = true;
+      gameState = 'won';
+      boxJumping = true;
+      boxJumpTime = 0;
+      updateHUD();
+    }
+
+    // Input
+    window.addEventListener('keydown', e => {
+      if (e.key in keys) keys[e.key] = true;
+      if (e.key === 'u' || e.key === 'U') undo();
+      if (e.key === 'r' || e.key === 'R') redo();
+    });
+
+    window.addEventListener('keyup', e => {
+      if (e.key in keys) keys[e.key] = false;
+    });
+
+    document.getElementById('btn-undo').addEventListener('click', undo);
+    document.getElementById('btn-redo').addEventListener('click', redo);
+    document.getElementById('btn-reset').addEventListener('click', () => resetGame(true));
+
+    // HUD
+    const timerEl = document.getElementById('timer');
+    const undoCountEl = document.getElementById('undo-count');
+    const gameStateEl = document.getElementById('game-state');
+    const historyInfoEl = document.getElementById('history-info');
+
+    function updateHUD() {
+      timerEl.textContent = `${elapsedTime}s`;
+      undoCountEl.textContent = `${undoCount}`;
+      gameStateEl.textContent = gameState;
+      const current = history.length === 0 ? 0 : historyIndex + 1;
+      historyInfoEl.textContent = `${current}/${history.length}`;
+    }
+
+    // Collision helpers
+    function handleBoardEdgeCollision() {
+      const min = -BOARD_HALF + MARBLE_RADIUS;
+      const max = BOARD_HALF - MARBLE_RADIUS;
+
+      if (marble.position.x < min) {
+        marble.position.x = min;
+        marbleVel.x *= -RESTITUTION;
+      } else if (marble.position.x > max) {
+        marble.position.x = max;
+        marbleVel.x *= -RESTITUTION;
+      }
+
+      if (marble.position.z < min) {
+        marble.position.z = min;
+        marbleVel.z *= -RESTITUTION;
+      } else if (marble.position.z > max) {
+        marble.position.z = max;
+        marbleVel.z *= -RESTITUTION;
+      }
+    }
+
+    function handleWallCollisions(prevX, prevZ) {
+      const r = MARBLE_RADIUS;
+
+      for (const wall of wallSegments) {
+        const closestX = THREE.MathUtils.clamp(marble.position.x, wall.minX, wall.maxX);
+        const closestZ = THREE.MathUtils.clamp(marble.position.z, wall.minZ, wall.maxZ);
+
+        const dx = marble.position.x - closestX;
+        const dz = marble.position.z - closestZ;
+        const distSq = dx * dx + dz * dz;
+
+        if (distSq < r * r) {
+          const overlapX1 = Math.abs((wall.maxX + r) - marble.position.x);
+          const overlapX2 = Math.abs(marble.position.x - (wall.minX - r));
+          const overlapZ1 = Math.abs((wall.maxZ + r) - marble.position.z);
+          const overlapZ2 = Math.abs(marble.position.z - (wall.minZ - r));
+          const minOverlap = Math.min(overlapX1, overlapX2, overlapZ1, overlapZ2);
+
+          if (minOverlap === overlapX1) {
+            marble.position.x = wall.maxX + r;
+            marbleVel.x *= -RESTITUTION;
+          } else if (minOverlap === overlapX2) {
+            marble.position.x = wall.minX - r;
+            marbleVel.x *= -RESTITUTION;
+          } else if (minOverlap === overlapZ1) {
+            marble.position.z = wall.maxZ + r;
+            marbleVel.z *= -RESTITUTION;
+          } else {
+            marble.position.z = wall.minZ - r;
+            marbleVel.z *= -RESTITUTION;
+          }
+
+          // fallback stabilize if still inside
+          const retryClosestX = THREE.MathUtils.clamp(marble.position.x, wall.minX, wall.maxX);
+          const retryClosestZ = THREE.MathUtils.clamp(marble.position.z, wall.minZ, wall.maxZ);
+          const rdx = marble.position.x - retryClosestX;
+          const rdz = marble.position.z - retryClosestZ;
+          if (rdx * rdx + rdz * rdz < r * r) {
+            marble.position.x = prevX;
+            marble.position.z = prevZ;
+            marbleVel.x *= -RESTITUTION;
+            marbleVel.z *= -RESTITUTION;
+          }
+        }
+      }
+    }
+
+    function checkHoles() {
+      for (const hole of holes) {
+        const dx = marble.position.x - hole.position.x;
+        const dz = marble.position.z - hole.position.z;
+        const dist = Math.sqrt(dx * dx + dz * dz);
+        if (dist < hole.radius * 0.9) {
+          resetMarbleFromHole();
+          return;
+        }
+      }
+    }
+
+    function checkGoal() {
+      const goalWorld = new THREE.Vector3();
+      goalGroup.getWorldPosition(goalWorld);
+      const dx = marble.position.x - goalWorld.x;
+      const dz = marble.position.z - goalWorld.z;
+      const dist = Math.sqrt(dx * dx + dz * dz);
+      if (dist < 0.65) {
+        triggerGoal();
+      }
+    }
+
+    // Initial state
+    resetGame(false);
+    gameState = 'playing';
+    updateHUD();
+
+    // Exposed state
+    window.__3D_STATE__ = {};
+
+    const clock = new THREE.Clock();
+
+    function animate() {
+      requestAnimationFrame(animate);
+      const dt = Math.min(clock.getDelta(), 0.033);
+
+      elapsedTime = Math.floor((performance.now() - startTime) / 1000);
+
+      // Controls
+      if (keys.ArrowUp) tiltX -= TILT_STEP;
+      if (keys.ArrowDown) tiltX += TILT_STEP;
+      if (keys.ArrowLeft) tiltZ += TILT_STEP;
+      if (keys.ArrowRight) tiltZ -= TILT_STEP;
+
+      if (!keys.ArrowUp && !keys.ArrowDown) tiltX *= TILT_RETURN;
+      if (!keys.ArrowLeft && !keys.ArrowRight) tiltZ *= TILT_RETURN;
+
+      clampTilt();
+
+      boardPivot.rotation.x = tiltX;
+      boardPivot.rotation.z = tiltZ;
+
+      // Physics
+      const accelScale = 0.035;
+      const ax = Math.sin(tiltZ) * 0.6 * accelScale;
+      const az = -Math.sin(tiltX) * 0.6 * accelScale;
+
+      marbleVel.x += ax;
+      marbleVel.z += az;
+
+      marbleVel.x *= FRICTION;
+      marbleVel.z *= FRICTION;
+
+      sanitizeVelocity();
+
+      const speed = Math.sqrt(marbleVel.x * marbleVel.x + marbleVel.z * marbleVel.z);
+      if (speed > MAX_SPEED && speed > 0) {
+        const s = MAX_SPEED / speed;
+        marbleVel.x *= s;
+        marbleVel.z *= s;
+      }
+
+      const prevX = marble.position.x;
+      const prevZ = marble.position.z;
+
+      marble.position.x += marbleVel.x;
+      marble.position.z += marbleVel.z;
+      marble.position.y = getBoardSurfaceY();
+
+      handleWallCollisions(prevX, prevZ);
+      handleBoardEdgeCollision();
+
+      marble.position.y = THREE.MathUtils.clamp(marble.position.y, 0.3, 0.8);
+
+      if (!goalReached) {
+        checkHoles();
+        checkGoal();
+      }
+
+      // Snapshot recording
+      snapshotTimer += dt;
+      if (snapshotTimer >= SNAPSHOT_INTERVAL) {
+        snapshotTimer = 0;
+        pushSnapshot();
+      }
+
+      // GLTF animation
+      if (mixer) mixer.update(dt);
+
+      // Box jump animation on win
+      if (boxAsset && boxJumping) {
+        boxJumpTime += dt;
+        const duration = 1.0;
+        const half = 0.5;
+        if (boxJumpTime <= duration) {
+          let yOffset = 0;
+          if (boxJumpTime <= half) {
+            yOffset = (boxJumpTime / half) * 2.0;
+          } else {
+            yOffset = (1 - (boxJumpTime - half) / half) * 2.0;
+          }
+          boxAsset.position.y = boxBaseY + yOffset;
+        } else {
+          boxAsset.position.y = boxBaseY;
+          boxJumping = false;
+        }
+      }
+
+      updateHUD();
+
+      const marbleSpeed = Math.sqrt(marbleVel.x * marbleVel.x + marbleVel.z * marbleVel.z);
+      window.__3D_STATE__ = {
+        marbleX: Number(marble.position.x.toFixed(3)),
+        marbleY: Number(marble.position.y.toFixed(3)),
+        marbleZ: Number(marble.position.z.toFixed(3)),
+        marbleVelX: marbleVel.x,
+        marbleVelZ: marbleVel.z,
+        tiltX,
+        tiltZ,
+        gameState,
+        elapsedTime,
+        undoCount,
+        redoCount,
+        historyLength: history.length,
+        historyIndex,
+        marbleSpeed,
+        goalReached,
+        holesFallen,
+        boxAnimPlaying,
+        boardTiltMagnitude: Math.sqrt(tiltX * tiltX + tiltZ * tiltZ)
+      };
+
+      renderer.render(scene, camera);
+    }
+
+    animate();
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+  </script>
+</body>
+</html>

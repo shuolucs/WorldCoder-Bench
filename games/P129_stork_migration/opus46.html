@@ -1,0 +1,618 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>候鸟迁徙路径可视化</title>
+<style>
+  body { margin: 0; overflow: hidden; background: #000; font-family: Arial, sans-serif; }
+  canvas { display: block; }
+  #hud {
+    position: absolute; top: 10px; left: 10px;
+    background: rgba(0,0,0,0.7); color: #fff; padding: 15px 20px;
+    border-radius: 8px; font-size: 14px; line-height: 1.8;
+    pointer-events: none; min-width: 220px;
+  }
+  #hud .label { color: #aaa; }
+  #hud .value { color: #4fc3f7; font-weight: bold; }
+  #controls {
+    position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%);
+    background: rgba(0,0,0,0.7); color: #fff; padding: 12px 24px;
+    border-radius: 8px; display: flex; align-items: center; gap: 12px;
+    font-size: 14px;
+  }
+  #timeScale {
+    width: 200px; cursor: pointer;
+    accent-color: #4fc3f7;
+  }
+  #info {
+    position: absolute; top: 10px; right: 10px;
+    background: rgba(0,0,0,0.7); color: #aaa; padding: 10px 15px;
+    border-radius: 8px; font-size: 12px; line-height: 1.6;
+  }
+</style>
+<script type="importmap">
+{ "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="hud">
+  <div><span class="label">已飞行距离: </span><span class="value" id="distance">0%</span></div>
+  <div><span class="label">群体展开度: </span><span class="value" id="spread">0.00</span></div>
+  <div><span class="label">时间倍率: </span><span class="value" id="timeValue">1.00</span></div>
+  <div><span class="label">跟踪鸟编号: </span><span class="value" id="trackedBird">-1</span></div>
+</div>
+<div id="controls">
+  <span>时间倍率:</span>
+  <input type="range" id="timeScale" min="0.5" max="5" step="0.1" value="1">
+  <span id="sliderVal">1.0x</span>
+</div>
+<div id="info">
+  点击鸟 → 跟踪视角<br>
+  点击空白 → 自由视角
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// --- State ---
+window.__3D_STATE__ = {
+  modelLoaded: false,
+  birdCount: 6,
+  leadDistance: 0,
+  spread: 0,
+  timeScale: 1,
+  trackedBird: -1
+};
+
+// --- Scene Setup ---
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x87ceeb);
+scene.fog = new THREE.FogExp2(0x87ceeb, 0.003);
+
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 500);
+camera.position.set(50, 30, 50);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(50, 10, 10);
+controls.enableDamping = true;
+controls.dampingFactor = 0.05;
+controls.maxPolarAngle = Math.PI * 0.48;
+controls.update();
+
+// --- Lights ---
+const ambientLight = new THREE.AmbientLight(0x6688cc, 0.6);
+scene.add(ambientLight);
+
+const dirLight = new THREE.DirectionalLight(0xffffff, 1.5);
+dirLight.position.set(60, 80, 40);
+dirLight.castShadow = true;
+dirLight.shadow.mapSize.set(2048, 2048);
+dirLight.shadow.camera.left = -80;
+dirLight.shadow.camera.right = 80;
+dirLight.shadow.camera.top = 80;
+dirLight.shadow.camera.bottom = -80;
+dirLight.shadow.camera.near = 1;
+dirLight.shadow.camera.far = 200;
+scene.add(dirLight);
+
+const hemiLight = new THREE.HemisphereLight(0x87ceeb, 0x3a7d44, 0.4);
+scene.add(hemiLight);
+
+// --- Ground ---
+const groundGeo = new THREE.PlaneGeometry(300, 300, 64, 64);
+// Add some height variation
+const posAttr = groundGeo.attributes.position;
+for (let i = 0; i < posAttr.count; i++) {
+  const x = posAttr.getX(i);
+  const y = posAttr.getY(i);
+  const z = Math.sin(x * 0.05) * Math.cos(y * 0.05) * 2 + Math.sin(x * 0.02 + y * 0.03) * 1.5;
+  posAttr.setZ(i, z);
+}
+groundGeo.computeVertexNormals();
+
+const groundMat = new THREE.MeshStandardMaterial({
+  color: 0x3a7d44,
+  roughness: 0.9,
+  metalness: 0.0,
+  flatShading: false
+});
+const ground = new THREE.Mesh(groundGeo, groundMat);
+ground.rotation.x = -Math.PI / 2;
+ground.position.set(50, -1, 10);
+ground.receiveShadow = true;
+scene.add(ground);
+
+// Add some simple trees/bushes as decoration
+function createTree(x, z) {
+  const group = new THREE.Group();
+  const trunkGeo = new THREE.CylinderGeometry(0.2, 0.3, 2, 6);
+  const trunkMat = new THREE.MeshStandardMaterial({ color: 0x8B4513 });
+  const trunk = new THREE.Mesh(trunkGeo, trunkMat);
+  trunk.position.y = 1;
+  trunk.castShadow = true;
+  group.add(trunk);
+
+  const foliageGeo = new THREE.SphereGeometry(1.5, 6, 6);
+  const foliageMat = new THREE.MeshStandardMaterial({ color: 0x228B22 + Math.floor(Math.random() * 0x222222) });
+  const foliage = new THREE.Mesh(foliageGeo, foliageMat);
+  foliage.position.y = 3;
+  foliage.castShadow = true;
+  group.add(foliage);
+
+  group.position.set(x, -1, z);
+  group.scale.setScalar(0.8 + Math.random() * 0.8);
+  return group;
+}
+
+for (let i = 0; i < 40; i++) {
+  const x = Math.random() * 200 - 50;
+  const z = Math.random() * 200 - 80;
+  scene.add(createTree(x, z));
+}
+
+// --- Migration Path ---
+const pathPoints = [
+  new THREE.Vector3(0, 10, 0),
+  new THREE.Vector3(20, 12, 20),
+  new THREE.Vector3(40, 8, 40),
+  new THREE.Vector3(60, 15, 20),
+  new THREE.Vector3(80, 10, 0),
+  new THREE.Vector3(100, 12, -20)
+];
+
+const curve = new THREE.CatmullRomCurve3(pathPoints, false, 'catmullrom', 0.5);
+
+// Visualize path with tube
+const tubeGeo = new THREE.TubeGeometry(curve, 200, 0.15, 8, false);
+const tubeMat = new THREE.MeshStandardMaterial({
+  color: 0xff6644,
+  emissive: 0xff3311,
+  emissiveIntensity: 0.3,
+  transparent: true,
+  opacity: 0.6,
+  roughness: 0.3
+});
+const tubeMesh = new THREE.Mesh(tubeGeo, tubeMat);
+scene.add(tubeMesh);
+
+// Path markers at control points
+pathPoints.forEach((pt, i) => {
+  const markerGeo = new THREE.SphereGeometry(0.4, 16, 16);
+  const markerMat = new THREE.MeshStandardMaterial({
+    color: 0xffaa00,
+    emissive: 0xff6600,
+    emissiveIntensity: 0.5
+  });
+  const marker = new THREE.Mesh(markerGeo, markerMat);
+  marker.position.copy(pt);
+  scene.add(marker);
+});
+
+// Dashed line along path for extra visibility
+const linePoints = curve.getPoints(300);
+const lineGeo = new THREE.BufferGeometry().setFromPoints(linePoints);
+const lineMat = new THREE.LineDashedMaterial({
+  color: 0xffcc00,
+  dashSize: 1,
+  gapSize: 0.5,
+  transparent: true,
+  opacity: 0.4
+});
+const line = new THREE.Line(lineGeo, lineMat);
+line.computeLineDistances();
+scene.add(line);
+
+// --- Birds ---
+const birds = [];
+const birdMixers = [];
+const birdMeshes = []; // for raycasting
+const BIRD_COUNT = 6;
+const BASE_SPEED = 5; // m/s conceptual
+const curveLength = curve.getLength();
+
+// Each bird has: { model, mixer, progress (0-1), speed, index }
+const birdData = [];
+for (let i = 0; i < BIRD_COUNT; i++) {
+  birdData.push({
+    model: null,
+    mixer: null,
+    progress: 0,
+    speed: BASE_SPEED * (0.8 + Math.random() * 0.4), // ±20%
+    index: i,
+    initialOffset: i * 0.04 // spacing along path
+  });
+}
+
+// Create simple bird geometry as fallback / placeholder
+function createSimpleBird(index) {
+  const group = new THREE.Group();
+  
+  // Body
+  const bodyGeo = new THREE.ConeGeometry(0.3, 1.5, 6);
+  bodyGeo.rotateX(Math.PI / 2);
+  const bodyMat = new THREE.MeshStandardMaterial({ color: 0xffffff });
+  const body = new THREE.Mesh(bodyGeo, bodyMat);
+  body.castShadow = true;
+  group.add(body);
+
+  // Head
+  const headGeo = new THREE.SphereGeometry(0.25, 8, 8);
+  const headMat = new THREE.MeshStandardMaterial({ color: 0xff0000 });
+  const head = new THREE.Mesh(headGeo, headMat);
+  head.position.z = 0.8;
+  head.castShadow = true;
+  group.add(head);
+
+  // Beak
+  const beakGeo = new THREE.ConeGeometry(0.08, 0.5, 4);
+  beakGeo.rotateX(-Math.PI / 2);
+  const beakMat = new THREE.MeshStandardMaterial({ color: 0xff6600 });
+  const beak = new THREE.Mesh(beakGeo, beakMat);
+  beak.position.z = 1.2;
+  group.add(beak);
+
+  // Wings
+  const wingShape = new THREE.Shape();
+  wingShape.moveTo(0, 0);
+  wingShape.lineTo(2, 0.3);
+  wingShape.lineTo(2, 0);
+  wingShape.lineTo(0, -0.2);
+  const wingGeo = new THREE.ShapeGeometry(wingShape);
+  const wingMat = new THREE.MeshStandardMaterial({ color: 0x111111, side: THREE.DoubleSide });
+
+  const leftWing = new THREE.Mesh(wingGeo, wingMat);
+  leftWing.position.set(0.1, 0, 0);
+  leftWing.rotation.y = Math.PI / 2;
+  leftWing.castShadow = true;
+  leftWing.name = 'leftWing';
+  group.add(leftWing);
+
+  const rightWing = new THREE.Mesh(wingGeo, wingMat);
+  rightWing.position.set(-0.1, 0, 0);
+  rightWing.rotation.y = -Math.PI / 2;
+  rightWing.scale.x = -1;
+  rightWing.castShadow = true;
+  rightWing.name = 'rightWing';
+  group.add(rightWing);
+
+  // Legs (stork-like long legs)
+  const legGeo = new THREE.CylinderGeometry(0.03, 0.03, 1.2, 4);
+  const legMat = new THREE.MeshStandardMaterial({ color: 0xff3333 });
+  const leftLeg = new THREE.Mesh(legGeo, legMat);
+  leftLeg.position.set(0.15, -0.5, -0.3);
+  group.add(leftLeg);
+  const rightLeg = new THREE.Mesh(legGeo, legMat);
+  rightLeg.position.set(-0.15, -0.5, -0.3);
+  group.add(rightLeg);
+
+  // Tail
+  const tailGeo = new THREE.ConeGeometry(0.15, 0.6, 4);
+  tailGeo.rotateX(-Math.PI / 2);
+  const tailMat = new THREE.MeshStandardMaterial({ color: 0x111111 });
+  const tail = new THREE.Mesh(tailGeo, tailMat);
+  tail.position.z = -0.8;
+  group.add(tail);
+
+  group.userData.birdIndex = index;
+  group.userData.isBird = true;
+  group.scale.setScalar(1.2);
+
+  return group;
+}
+
+// Try loading GLTF model
+const loader = new GLTFLoader();
+let gltfModel = null;
+let gltfAnimations = null;
+let modelLoadAttempted = false;
+
+function initBirdsWithModel(gltf) {
+  gltfModel = gltf.scene;
+  gltfAnimations = gltf.animations;
+  window.__3D_STATE__.modelLoaded = true;
+
+  for (let i = 0; i < BIRD_COUNT; i++) {
+    const model = gltfModel.clone();
+    model.scale.setScalar(0.02);
+    model.userData.birdIndex = i;
+    model.userData.isBird = true;
+    model.traverse(child => {
+      if (child.isMesh) {
+        child.castShadow = true;
+        child.userData.birdIndex = i;
+        child.userData.isBird = true;
+      }
+    });
+    scene.add(model);
+
+    let mixer = null;
+    if (gltfAnimations && gltfAnimations.length > 0) {
+      mixer = new THREE.AnimationMixer(model);
+      const clip = gltfAnimations[0];
+      const action = mixer.clipAction(clip);
+      action.play();
+      // Offset animation time so they're not all in sync
+      action.time = i * 0.3;
+    }
+
+    birdData[i].model = model;
+    birdData[i].mixer = mixer;
+    birdMeshes.push(model);
+  }
+}
+
+function initBirdsSimple() {
+  window.__3D_STATE__.modelLoaded = false;
+
+  for (let i = 0; i < BIRD_COUNT; i++) {
+    const model = createSimpleBird(i);
+    scene.add(model);
+
+    birdData[i].model = model;
+    birdData[i].mixer = null;
+    birdMeshes.push(model);
+  }
+}
+
+loader.load(
+  'assets/stork.glb',
+  (gltf) => {
+    modelLoadAttempted = true;
+    initBirdsWithModel(gltf);
+  },
+  undefined,
+  (error) => {
+    console.warn('Could not load stork.glb, using simple bird geometry:', error);
+    modelLoadAttempted = true;
+    initBirdsSimple();
+  }
+);
+
+// Fallback timeout - if model hasn't loaded in 3 seconds, use simple birds
+setTimeout(() => {
+  if (!modelLoadAttempted) {
+    modelLoadAttempted = true;
+    console.warn('Model load timeout, using simple birds');
+    initBirdsSimple();
+  }
+}, 3000);
+
+// --- Raycaster for bird selection ---
+const raycaster = new THREE.Raycaster();
+const mouse = new THREE.Vector2();
+let trackedBirdIndex = -1;
+let isFollowing = false;
+
+renderer.domElement.addEventListener('click', (event) => {
+  mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+  mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+  raycaster.setFromCamera(mouse, camera);
+
+  // Collect all bird meshes for intersection
+  const allBirdObjects = [];
+  birdMeshes.forEach(m => {
+    m.traverse(child => {
+      if (child.isMesh) allBirdObjects.push(child);
+    });
+  });
+
+  const intersects = raycaster.intersectObjects(allBirdObjects, false);
+
+  if (intersects.length > 0) {
+    // Find which bird was clicked
+    let clickedIndex = -1;
+    let obj = intersects[0].object;
+    while (obj) {
+      if (obj.userData && obj.userData.isBird && obj.userData.birdIndex !== undefined) {
+        clickedIndex = obj.userData.birdIndex;
+        break;
+      }
+      obj = obj.parent;
+    }
+
+    if (clickedIndex >= 0) {
+      trackedBirdIndex = clickedIndex;
+      isFollowing = true;
+      controls.enabled = false;
+    }
+  } else {
+    // Clicked empty space - restore free view
+    trackedBirdIndex = -1;
+    isFollowing = false;
+    controls.enabled = true;
+    controls.target.set(50, 10, 10);
+  }
+});
+
+// --- Time Scale ---
+const timeScaleSlider = document.getElementById('timeScale');
+const sliderValEl = document.getElementById('sliderVal');
+let timeScale = 1;
+
+timeScaleSlider.addEventListener('input', () => {
+  timeScale = parseFloat(timeScaleSlider.value);
+  sliderValEl.textContent = timeScale.toFixed(1) + 'x';
+});
+
+// --- HUD Elements ---
+const distanceEl = document.getElementById('distance');
+const spreadEl = document.getElementById('spread');
+const timeValueEl = document.getElementById('timeValue');
+const trackedBirdEl = document.getElementById('trackedBird');
+
+// --- Clouds ---
+function createCloud(x, y, z) {
+  const group = new THREE.Group();
+  const mat = new THREE.MeshStandardMaterial({
+    color: 0xffffff,
+    transparent: true,
+    opacity: 0.8,
+    roughness: 1
+  });
+  for (let i = 0; i < 5; i++) {
+    const geo = new THREE.SphereGeometry(1 + Math.random() * 2, 8, 8);
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.position.set(
+      (Math.random() - 0.5) * 4,
+      (Math.random() - 0.5) * 1,
+      (Math.random() - 0.5) * 3
+    );
+    group.add(mesh);
+  }
+  group.position.set(x, y, z);
+  return group;
+}
+
+for (let i = 0; i < 15; i++) {
+  const cloud = createCloud(
+    Math.random() * 200 - 50,
+    25 + Math.random() * 20,
+    Math.random() * 150 - 60
+  );
+  scene.add(cloud);
+}
+
+// --- Animation Loop ---
+const clock = new THREE.Clock();
+const tempPos = new THREE.Vector3();
+const tempTangent = new THREE.Vector3();
+const lookTarget = new THREE.Vector3();
+
+function animate() {
+  requestAnimationFrame(animate);
+
+  const delta = clock.getDelta();
+  const scaledDelta = delta * timeScale;
+
+  // Update birds
+  let maxProgress = 0;
+  let minProgress = 1;
+  const progresses = [];
+
+  for (let i = 0; i < BIRD_COUNT; i++) {
+    const bd = birdData[i];
+    if (!bd.model) continue;
+
+    // Update progress along curve
+    const speedFraction = (bd.speed * scaledDelta) / curveLength;
+    bd.progress += speedFraction;
+
+    // Loop the path
+    if (bd.progress > 1) bd.progress -= 1;
+
+    // Effective progress with initial offset
+    let effectiveProgress = (bd.progress + bd.initialOffset) % 1;
+    progresses.push(effectiveProgress);
+
+    // Get position and tangent on curve
+    curve.getPointAt(effectiveProgress, tempPos);
+    curve.getTangentAt(effectiveProgress, tempTangent);
+
+    bd.model.position.copy(tempPos);
+
+    // Add slight bobbing
+    bd.model.position.y += Math.sin(Date.now() * 0.003 + i * 1.5) * 0.3;
+
+    // Orient bird along tangent
+    lookTarget.copy(tempPos).add(tempTangent);
+    bd.model.lookAt(lookTarget);
+
+    // Slight banking on turns
+    // Approximate curvature by checking tangent change
+    const nextT = Math.min(effectiveProgress + 0.01, 0.999);
+    const nextTangent = new THREE.Vector3();
+    curve.getTangentAt(nextT, nextTangent);
+    const cross = new THREE.Vector3().crossVectors(tempTangent, nextTangent);
+    const bankAngle = cross.y * 5;
+    bd.model.rotateZ(bankAngle);
+
+    // Update animation mixer
+    if (bd.mixer) {
+      bd.mixer.update(scaledDelta);
+    } else if (bd.model) {
+      // Animate simple bird wings
+      const leftWing = bd.model.getObjectByName('leftWing');
+      const rightWing = bd.model.getObjectByName('rightWing');
+      if (leftWing && rightWing) {
+        const wingAngle = Math.sin(Date.now() * 0.008 * timeScale + i * 0.7) * 0.6;
+        leftWing.rotation.x = wingAngle;
+        rightWing.rotation.x = -wingAngle;
+      }
+    }
+
+    if (effectiveProgress > maxProgress) maxProgress = effectiveProgress;
+    if (effectiveProgress < minProgress) minProgress = effectiveProgress;
+  }
+
+  // Calculate spread (handle wrapping)
+  let spread = 0;
+  if (progresses.length > 1) {
+    progresses.sort((a, b) => a - b);
+    // Simple spread: max - min, but handle wrap-around
+    const directSpread = progresses[progresses.length - 1] - progresses[0];
+    const wrapSpread = (1 - progresses[progresses.length - 1]) + progresses[0];
+    spread = Math.min(directSpread, wrapSpread) * curveLength;
+  }
+
+  // Camera follow
+  if (isFollowing && trackedBirdIndex >= 0 && birdData[trackedBirdIndex].model) {
+    const bd = birdData[trackedBirdIndex];
+    const birdPos = bd.model.position;
+    let effectiveProgress = (bd.progress + bd.initialOffset) % 1;
+    curve.getTangentAt(effectiveProgress, tempTangent);
+
+    // Camera behind and above the bird
+    const camOffset = new THREE.Vector3()
+      .copy(tempTangent)
+      .multiplyScalar(-8)
+      .add(new THREE.Vector3(0, 5, 0));
+
+    const targetCamPos = new THREE.Vector3().copy(birdPos).add(camOffset);
+    camera.position.lerp(targetCamPos, 0.05);
+    camera.lookAt(birdPos);
+  } else {
+    controls.update();
+  }
+
+  // Update HUD
+  const leadDist = maxProgress;
+  distanceEl.textContent = (leadDist * 100).toFixed(1) + '%';
+  spreadEl.textContent = spread.toFixed(2);
+  timeValueEl.textContent = timeScale.toFixed(2);
+  trackedBirdEl.textContent = trackedBirdIndex.toString();
+
+  // Update global state
+  window.__3D_STATE__.leadDistance = leadDist;
+  window.__3D_STATE__.spread = spread;
+  window.__3D_STATE__.timeScale = timeScale;
+  window.__3D_STATE__.trackedBird = trackedBirdIndex;
+  window.__3D_STATE__.birdCount = BIRD_COUNT;
+
+  renderer.render(scene, camera);
+}
+
+animate();
+
+// --- Resize ---
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+</script>
+</body>
+</html>

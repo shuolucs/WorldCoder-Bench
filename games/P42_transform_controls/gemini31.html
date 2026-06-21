@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Three.js TransformControls Scene</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #1e1e1e;
+            color: #fff;
+            font-family: sans-serif;
+        }
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+        }
+        #ui-container {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 15px;
+            border-radius: 8px;
+            pointer-events: auto;
+            user-select: none;
+        }
+        .control-group {
+            margin-bottom: 10px;
+        }
+        button {
+            background: #444;
+            color: white;
+            border: 1px solid #666;
+            padding: 5px 10px;
+            cursor: pointer;
+            border-radius: 4px;
+        }
+        button:hover {
+            background: #555;
+        }
+        button:active {
+            background: #666;
+        }
+        label {
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 5px;
+        }
+        #infoPanel {
+            margin-top: 15px;
+            padding-top: 10px;
+            border-top: 1px solid #555;
+            font-family: monospace;
+            font-size: 12px;
+            white-space: pre-wrap;
+        }
+    </style>
+    <script type="importmap">
+    { "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+    } }
+    </script>
+</head>
+<body>
+    <div id="ui-container">
+        <div class="control-group">
+            <button id="translateBtn">Translate</button>
+            <button id="rotateBtn">Rotate</button>
+            <button id="scaleBtn">Scale</button>
+        </div>
+        <div class="control-group">
+            <label><input type="checkbox" id="snapToggle"> Snap (0.5 / 15°)</label>
+        </div>
+        <div class="control-group">
+            <button id="undoBtn">Undo</button>
+            <button id="redoBtn">Redo</button>
+        </div>
+        <div id="infoPanel">No object selected</div>
+    </div>
+    <div id="canvas-container"></div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { TransformControls } from 'three/addons/controls/TransformControls.js';
+
+        // --- Scene Setup ---
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x222222);
+
+        const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 100);
+        camera.position.set(0, 5, 10);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        container.appendChild(renderer.domElement);
+
+        // Lights
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+        scene.add(ambientLight);
+        const dirLight = new THREE.DirectionalLight(0xffffff, 1.5);
+        dirLight.position.set(5, 10, 5);
+        scene.add(dirLight);
+
+        // Grid
+        const gridHelper = new THREE.GridHelper(20, 40, 0x888888, 0x444444);
+        scene.add(gridHelper);
+
+        // --- Objects ---
+        const interactableObjects = [];
+        
+        const createMesh = (geometry, color, name, position) => {
+            const material = new THREE.MeshStandardMaterial({ color, roughness: 0.4, metalness: 0.1 });
+            const mesh = new THREE.Mesh(geometry, material);
+            mesh.name = name;
+            mesh.position.copy(position);
+            scene.add(mesh);
+            interactableObjects.push(mesh);
+            return mesh;
+        };
+
+        createMesh(new THREE.BoxGeometry(1, 1, 1), 0xff4444, 'box', new THREE.Vector3(-4, 0.5, 0));
+        createMesh(new THREE.SphereGeometry(0.6, 32, 32), 0x44ff44, 'sphere', new THREE.Vector3(-2, 0.6, 0));
+        createMesh(new THREE.CylinderGeometry(0.5, 0.5, 1.5, 32), 0x4444ff, 'cylinder', new THREE.Vector3(0, 0.75, 0));
+        createMesh(new THREE.TorusGeometry(0.5, 0.2, 16, 100), 0xffff44, 'torus', new THREE.Vector3(2, 0.7, 0));
+        createMesh(new THREE.ConeGeometry(0.6, 1.5, 32), 0xff44ff, 'cone', new THREE.Vector3(4, 0.75, 0));
+
+        // --- Controls ---
+        const orbitControls = new OrbitControls(camera, renderer.domElement);
+        orbitControls.enableDamping = true;
+
+        const transformControls = new TransformControls(camera, renderer.domElement);
+        scene.add(transformControls);
+
+        // --- Undo / Redo System ---
+        const undoStack = [];
+        const redoStack = [];
+        let dragStartState = null;
+
+        const cloneState = (obj) => ({
+            position: obj.position.clone(),
+            rotation: obj.rotation.clone(),
+            scale: obj.scale.clone()
+        });
+
+        const applyState = (obj, state) => {
+            obj.position.copy(state.position);
+            obj.rotation.copy(state.rotation);
+            obj.scale.copy(state.scale);
+        };
+
+        const recordStartState = (obj) => {
+            if (obj) dragStartState = cloneState(obj);
+        };
+
+        const recordEndState = (obj) => {
+            if (!obj || !dragStartState) return;
+            const endState = cloneState(obj);
+            
+            // Check if actually changed
+            if (!dragStartState.position.equals(endState.position) ||
+                !dragStartState.rotation.equals(endState.rotation) ||
+                !dragStartState.scale.equals(endState.scale)) {
+                undoStack.push({ object: obj, from: dragStartState, to: endState });
+                redoStack.length = 0; // Clear redo stack
+            }
+            dragStartState = null;
+        };
+
+        // Handle TransformControls events
+        transformControls.addEventListener('dragging-changed', (event) => {
+            orbitControls.enabled = !event.value;
+            if (event.value) {
+                recordStartState(transformControls.object);
+            } else {
+                recordEndState(transformControls.object);
+            }
+        });
+
+        // --- Interaction (Raycasting) ---
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+
+        window.addEventListener('pointerdown', (event) => {
+            // Ignore if clicking on UI
+            if (event.target.closest('#ui-container')) return;
+            
+            // Ignore if hovering over TransformControls gizmo
+            if (transformControls.axis !== null) return;
+
+            mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+            raycaster.setFromCamera(mouse, camera);
+            const intersects = raycaster.intersectObjects(interactableObjects);
+
+            if (intersects.length > 0) {
+                transformControls.attach(intersects[0].object);
+            } else {
+                // Clicked empty space, detach (behavior: click empty to cancel selection)
+                transformControls.detach();
+            }
+        });
+
+        // --- UI Event Listeners ---
+        document.getElementById('translateBtn').addEventListener('click', () => transformControls.setMode('translate'));
+        document.getElementById('rotateBtn').addEventListener('click', () => transformControls.setMode('rotate'));
+        document.getElementById('scaleBtn').addEventListener('click', () => transformControls.setMode('scale'));
+
+        document.getElementById('snapToggle').addEventListener('change', (e) => {
+            if (e.target.checked) {
+                transformControls.setTranslationSnap(0.5);
+                transformControls.setRotationSnap(Math.PI / 12);
+            } else {
+                transformControls.setTranslationSnap(null);
+                transformControls.setRotationSnap(null);
+            }
+        });
+
+        document.getElementById('undoBtn').addEventListener('click', () => {
+            if (undoStack.length === 0) return;
+            const action = undoStack.pop();
+            applyState(action.object, action.from);
+            redoStack.push(action);
+        });
+
+        document.getElementById('redoBtn').addEventListener('click', () => {
+            if (redoStack.length === 0) return;
+            const action = redoStack.pop();
+            applyState(action.object, action.to);
+            undoStack.push(action);
+        });
+
+        // --- State Exposure & Info Panel ---
+        window.__3D_STATE__ = {
+            objectCount: 5,
+            selectedObject: null,
+            mode: 'translate',
+            snapEnabled: false,
+            objects: []
+        };
+
+        const infoPanel = document.getElementById('infoPanel');
+
+        const updateStateAndUI = () => {
+            const obj = transformControls.object;
+            
+            // Update Global State
+            window.__3D_STATE__.selectedObject = obj ? obj.name : null;
+            window.__3D_STATE__.mode = transformControls.getMode();
+            window.__3D_STATE__.snapEnabled = document.getElementById('snapToggle').checked;
+            window.__3D_STATE__.objects = interactableObjects.map(o => ({
+                name: o.name,
+                x: o.position.x, y: o.position.y, z: o.position.z,
+                rx: o.rotation.x, ry: o.rotation.y, rz: o.rotation.z,
+                sx: o.scale.x, sy: o.scale.y, sz: o.scale.z
+            }));
+
+            // Update Info Panel
+            if (obj) {
+                infoPanel.innerHTML = `Selected: <b>${obj.name}</b>\n` +
+                    `Pos: ${obj.position.x.toFixed(2)}, ${obj.position.y.toFixed(2)}, ${obj.position.z.toFixed(2)}\n` +
+                    `Rot: ${obj.rotation.x.toFixed(2)}, ${obj.rotation.y.toFixed(2)}, ${obj.rotation.z.toFixed(2)}\n` +
+                    `Scl: ${obj.scale.x.toFixed(2)}, ${obj.scale.y.toFixed(2)}, ${obj.scale.z.toFixed(2)}`;
+            } else {
+                infoPanel.innerHTML = 'No object selected';
+            }
+        };
+
+        // --- Testing Helpers ---
+        window.__ICG_select__ = (name) => {
+            const obj = interactableObjects.find(o => o.name === name);
+            if (obj) transformControls.attach(obj);
+            else transformControls.detach();
+        };
+
+        window.__ICG_nudge__ = (dx, dy, dz) => {
+            const obj = transformControls.object;
+            if (obj) {
+                recordStartState(obj);
+                obj.position.x += dx;
+                obj.position.y += dy;
+                obj.position.z += dz;
+                recordEndState(obj);
+            }
+        };
+
+        // --- Window Resize ---
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // --- Animation Loop ---
+        function animate() {
+            requestAnimationFrame(animate);
+            orbitControls.update();
+            updateStateAndUI();
+            renderer.render(scene, camera);
+        }
+        animate();
+    </script>
+</body>
+</html>

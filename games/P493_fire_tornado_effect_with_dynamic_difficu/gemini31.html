@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Fire Tornado</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #0a0a0a;
+            font-family: monospace;
+        }
+        canvas {
+            display: block;
+        }
+        #hud {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            color: white;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 15px;
+            border-radius: 5px;
+            pointer-events: none;
+            user-select: none;
+            min-width: 200px;
+        }
+        .hud-line {
+            margin: 5px 0;
+            font-size: 14px;
+        }
+        #controls-info {
+            margin-top: 15px;
+            font-size: 12px;
+            color: #aaa;
+            border-top: 1px solid #444;
+            padding-top: 10px;
+        }
+    </style>
+    <!-- Import Three.js and add-ons -->
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="hud">
+        <div class="hud-line">Difficulty: <span id="difficulty-display">1</span></div>
+        <div class="hud-line">Particles: <span id="particle-count">400</span></div>
+        <div class="hud-line">Height: <span id="tornado-height">10.0</span></div>
+        <div class="hud-line">Status: <span id="pause-indicator">RUNNING</span></div>
+        <div class="hud-line">Color: <span id="color-mode">fire</span></div>
+        <div id="controls-info">
+            Keys 1-5: Set Difficulty<br>
+            U/D: Diff Up/Down<br>
+            P: Pause/Resume<br>
+            R: Reset Particles<br>
+            C: Toggle Color Mode<br>
+            Click: Burst Effect
+        </div>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+        // --- State Management ---
+        window.__3D_STATE__ = {
+            difficulty: 1,
+            particleCount: 400,
+            tornadoHeight: 10,
+            rotationSpeed: 1,
+            isPaused: false,
+            colorMode: 'fire',
+            burstActive: false,
+            modelLoaded: false,
+            modelRotationY: 0,
+            elapsedTime: 0,
+            lightIntensity: 2,
+            particleLifetime: 2.7
+        };
+
+        // --- Scene Setup ---
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x0a0a0a);
+
+        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.set(0, 8, 20);
+        camera.lookAt(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        document.body.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.target.set(0, 5, 0);
+
+        // --- Lights ---
+        const ambientLight = new THREE.AmbientLight(0x331100, 0.3);
+        scene.add(ambientLight);
+
+        const pointLight = new THREE.PointLight(0xff4400, 2, 50);
+        pointLight.position.set(0, 10, 0);
+        scene.add(pointLight);
+
+        // --- Model Loading ---
+        let fuelModel = null;
+        const loader = new GLTFLoader();
+        // Using a reliable Khronos sample model URL for the requested filename
+        const modelUrl = 'https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Models/master/2.0/TextureTransformMultiTest/glTF-Binary/TextureTransformMultiTest.glb';
+        
+        loader.load(modelUrl, (gltf) => {
+            fuelModel = gltf.scene;
+            fuelModel.position.set(0, 0, 0);
+            fuelModel.scale.set(2, 2, 2);
+            
+            // Enhance materials for glowing effect
+            fuelModel.traverse((child) => {
+                if (child.isMesh) {
+                    child.material.emissive = new THREE.Color(0xff4400);
+                    child.material.emissiveIntensity = 0.2;
+                }
+            });
+            
+            scene.add(fuelModel);
+            window.__3D_STATE__.modelLoaded = true;
+        });
+
+        // --- Particle System ---
+        const MAX_PARTICLES = 2000;
+        const geometry = new THREE.BufferGeometry();
+        
+        const positions = new Float32Array(MAX_PARTICLES * 3);
+        const colors = new Float32Array(MAX_PARTICLES * 3);
+        const sizes = new Float32Array(MAX_PARTICLES);
+        const opacities = new Float32Array(MAX_PARTICLES);
+
+        geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+        geometry.setAttribute('customColor', new THREE.BufferAttribute(colors, 3));
+        geometry.setAttribute('size', new THREE.BufferAttribute(sizes, 1));
+        geometry.setAttribute('opacity', new THREE.BufferAttribute(opacities, 1));
+
+        // Custom Shader Material for particles
+        const vertexShader = `
+            attribute float opacity;
+            attribute vec3 customColor;
+            attribute float size;
+            varying vec3 vColor;
+            varying float vOpacity;
+            void main() {
+                vColor = customColor;
+                vOpacity = opacity;
+                vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+                gl_PointSize = size * (300.0 / -mvPosition.z);
+                gl_Position = projectionMatrix * mvPosition;
+            }
+        `;
+
+        const fragmentShader = `
+            varying vec3 vColor;
+            varying float vOpacity;
+            void main() {
+                vec2 xy = gl_PointCoord.xy - vec2(0.5);
+                float ll = length(xy);
+                if(ll > 0.5) discard;
+                // Soft edge
+                float alpha = smoothstep(0.5, 0.1, ll) * vOpacity;
+                gl_FragColor = vec4(vColor, alpha);
+            }
+        `;
+
+        const material = new THREE.ShaderMaterial({
+            vertexShader,
+            fragmentShader,
+            transparent: true,
+            depthWrite: false,
+            blending: THREE.AdditiveBlending
+        });
+
+        const particleSystem = new THREE.Points(geometry, material);
+        scene.add(particleSystem);
+
+        // CPU Particle Data
+        const particlesData = [];
+        for (let i = 0; i < MAX_PARTICLES; i++) {
+            particlesData.push({
+                angle: Math.random() * Math.PI * 2,
+                radius: 0,
+                y: 0,
+                life: 0,
+                maxLife: 1,
+                active: false
+            });
+        }
+
+        // --- Difficulty & Physics Parameters ---
+        let targetDifficulty = 1;
+        let currentDifficulty = 1;
+        
+        const params = {
+            rotationSpeed: 1,
+            maxHeight: 10,
+            radius: 3,
+            activeParticles: 400,
+            buoyancy: 3.5,
+            turbulence: 0.3,
+            lifetime: 2.7
+        };
+
+        const targetParams = { ...params };
+
+        function updateTargetParams(diff) {
+            targetParams.rotationSpeed = diff * 1.0;
+            targetParams.maxHeight = 10 + (diff - 1) * 5;
+            targetParams.radius = 3 + (diff - 1) * 0.75;
+            targetParams.activeParticles = 400 + (diff - 1) * 400;
+            targetParams.buoyancy = 2.0 + diff * 1.5;
+            targetParams.turbulence = 0.3 * diff;
+            targetParams.lifetime = 3.0 - diff * 0.3;
+        }
+
+        // Colors
+        const colorFireBase = new THREE.Color(0xffff00);
+        const colorFireMid = new THREE.Color(0xff4400);
+        const colorFireTop = new THREE.Color(0x880000);
+        
+        const colorIceBase = new THREE.Color(0x00ffff);
+        const colorIceTop = new THREE.Color(0x000088);
+        
+        const tempColor = new THREE.Color();
+
+        function respawnParticle(index) {
+            const p = particlesData[index];
+            p.angle = Math.random() * Math.PI * 2;
+            // Ring radius 2 to max radius
+            p.radius = 2 + Math.random() * (params.radius - 2);
+            p.y = Math.random() * 2; // Start near base
+            p.maxLife = params.lifetime * (0.8 + Math.random() * 0.4);
+            p.life = 0;
+            p.active = true;
+            sizes[index] = 2.0 + Math.random() * 3.0;
+        }
+
+        function resetAllParticles() {
+            for (let i = 0; i < MAX_PARTICLES; i++) {
+                respawnParticle(i);
+            }
+        }
+        resetAllParticles();
+
+        // --- Interactions ---
+        let burstTimer = 0;
+        let burstMultiplier = 1.0;
+
+        window.addEventListener('keydown', (e) => {
+            const key = e.key.toUpperCase();
+            if (key >= '1' && key <= '5') {
+                targetDifficulty = parseInt(key);
+            } else if (key === 'U') {
+                targetDifficulty = Math.min(5, targetDifficulty + 1);
+            } else if (key === 'D') {
+                targetDifficulty = Math.max(1, targetDifficulty - 1);
+            } else if (key === 'P') {
+                window.__3D_STATE__.isPaused = !window.__3D_STATE__.isPaused;
+                document.getElementById('pause-indicator').innerText = window.__3D_STATE__.isPaused ? 'PAUSED' : 'RUNNING';
+            } else if (key === 'R') {
+                resetAllParticles();
+            } else if (key === 'C') {
+                window.__3D_STATE__.colorMode = window.__3D_STATE__.colorMode === 'fire' ? 'ice' : 'fire';
+                document.getElementById('color-mode').innerText = window.__3D_STATE__.colorMode;
+                // Update light color based on mode
+                pointLight.color.setHex(window.__3D_STATE__.colorMode === 'fire' ? 0xff4400 : 0x0088ff);
+            }
+            updateTargetParams(targetDifficulty);
+        });
+
+        window.addEventListener('click', () => {
+            burstTimer = 1.0;
+            window.__3D_STATE__.burstActive = true;
+        });
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // --- Animation Loop ---
+        const clock = new THREE.Clock();
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const dt = clock.getDelta();
+            
+            if (!window.__3D_STATE__.isPaused) {
+                window.__3D_STATE__.elapsedTime += dt;
+
+                // Handle Burst
+                if (burstTimer > 0) {
+                    burstTimer -= dt;
+                    burstMultiplier = 2.0;
+                } else {
+                    burstMultiplier = 1.0;
+                    window.__3D_STATE__.burstActive = false;
+                }
+
+                // Lerp Difficulty Parameters (approx 0.5s transition -> factor of 2.0)
+                const lerpFactor = Math.min(1.0, dt * 2.0);
+                currentDifficulty += (targetDifficulty - currentDifficulty) * lerpFactor;
+                
+                for (const key in params) {
+                    params[key] += (targetParams[key] - params[key]) * lerpFactor;
+                }
+
+                // Update Model
+                if (fuelModel) {
+                    fuelModel.rotation.y += 0.5 * dt;
+                    window.__3D_STATE__.modelRotationY = fuelModel.rotation.y;
+                    
+                    // Glow brighter at higher difficulty
+                    const intensity = 0.2 + (currentDifficulty - 1) * 0.2;
+                    fuelModel.traverse((child) => {
+                        if (child.isMesh && child.material.emissiveIntensity !== undefined) {
+                            child.material.emissiveIntensity = intensity;
+                        }
+                    });
+                }
+
+                // Update Light
+                pointLight.intensity = 2 + (currentDifficulty - 1) * 1.5;
+                window.__3D_STATE__.lightIntensity = pointLight.intensity;
+
+                // Update Particles
+                const activeCount = Math.floor(params.activeParticles);
+                geometry.setDrawRange(0, activeCount);
+
+                const currentRotSpeed = params.rotationSpeed * burstMultiplier;
+                const currentBuoyancy = params.buoyancy * burstMultiplier;
+
+                for (let i = 0; i < activeCount; i++) {
+                    const p = particlesData[i];
+                    
+                    p.life += dt;
+                    if (p.life >= p.maxLife || p.y >= params.maxHeight) {
+                        respawnParticle(i);
+                    }
+
+                    // Physics
+                    p.y += currentBuoyancy * dt;
+                    
+                    // Spiral inward slightly as it goes up
+                    const heightFactor = p.y / params.maxHeight;
+                    const currentRadius = p.radius * (1.0 - heightFactor * 0.5);
+                    
+                    // Angular velocity increases as radius decreases (conservation of angular momentum feel)
+                    p.angle += currentRotSpeed * dt * (1.0 + heightFactor);
+
+                    // Turbulence
+                    const turb = params.turbulence;
+                    const tx = (Math.random() - 0.5) * turb;
+                    const tz = (Math.random() - 0.5) * turb;
+
+                    // Calculate position
+                    const x = Math.cos(p.angle) * currentRadius + tx;
+                    const z = Math.sin(p.angle) * currentRadius + tz;
+
+                    positions[i * 3] = x;
+                    positions[i * 3 + 1] = p.y;
+                    positions[i * 3 + 2] = z;
+
+                    // Color & Opacity
+                    const lifeRatio = p.life / p.maxLife;
+                    opacities[i] = 1.0 - lifeRatio;
+
+                    if (window.__3D_STATE__.colorMode === 'fire') {
+                        if (lifeRatio < 0.5) {
+                            tempColor.lerpColors(colorFireBase, colorFireMid, lifeRatio * 2.0);
+                        } else {
+                            tempColor.lerpColors(colorFireMid, colorFireTop, (lifeRatio - 0.5) * 2.0);
+                        }
+                    } else {
+                        tempColor.lerpColors(colorIceBase, colorIceTop, lifeRatio);
+                    }
+
+                    colors[i * 3] = tempColor.r;
+                    colors[i * 3 + 1] = tempColor.g;
+                    colors[i * 3 + 2] = tempColor.b;
+                }
+
+                geometry.attributes.position.needsUpdate = true;
+                geometry.attributes.customColor.needsUpdate = true;
+                geometry.attributes.opacity.needsUpdate = true;
+
+                // Update State Object
+                window.__3D_STATE__.difficulty = Math.round(currentDifficulty);
+                window.__3D_STATE__.particleCount = activeCount;
+                window.__3D_STATE__.tornadoHeight = params.maxHeight;
+                window.__3D_STATE__.rotationSpeed = currentRotSpeed;
+                window.__3D_STATE__.particleLifetime = params.lifetime;
+
+                // Update HUD DOM
+                document.getElementById('difficulty-display').innerText = window.__3D_STATE__.difficulty;
+                document.getElementById('particle-count').innerText = window.__3D_STATE__.particleCount;
+                document.getElementById('tornado-height').innerText = window.__3D_STATE__.tornadoHeight.toFixed(1);
+            }
+
+            controls.update();
+            renderer.render(scene, camera);
+        }
+
+        animate();
+    </script>
+</body>
+</html>

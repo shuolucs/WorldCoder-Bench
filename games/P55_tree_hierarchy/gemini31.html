@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Radial Tree</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #111;
+            font-family: sans-serif;
+        }
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            position: absolute;
+            top: 0;
+            left: 0;
+            z-index: 1;
+        }
+        #ui-container {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            z-index: 10;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 15px;
+            border-radius: 8px;
+            color: white;
+            pointer-events: auto;
+            border: 1px solid #333;
+        }
+        input[type="text"] {
+            width: 200px;
+            padding: 8px;
+            margin-bottom: 10px;
+            background: #222;
+            border: 1px solid #555;
+            color: white;
+            border-radius: 4px;
+        }
+        .state-display {
+            font-size: 12px;
+            line-height: 1.5;
+            color: #aaa;
+        }
+        .state-val {
+            color: #4caf50;
+            font-weight: bold;
+        }
+        #labels-container {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100vw;
+            height: 100vh;
+            pointer-events: none;
+            z-index: 5;
+        }
+        .node-label {
+            position: absolute;
+            font-size: 10px;
+            color: white;
+            text-shadow: 1px 1px 2px black, -1px -1px 2px black;
+            white-space: nowrap;
+            transform: translate(-50%, 15px);
+            transition: color 0.3s;
+        }
+    </style>
+    <script type="importmap">
+    { "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+    } }
+    </script>
+</head>
+<body>
+    <div id="ui-container">
+        <input type="text" id="searchFilter" placeholder="Search by label...">
+        <div class="state-display" id="stateDisplay"></div>
+    </div>
+    <div id="labels-container"></div>
+    <div id="canvas-container"></div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        // --- State Management ---
+        window.__3D_STATE__ = {
+            nodeCount: 50,
+            visibleNodes: 50,
+            expandedNodes: 0,
+            selectedNode: null,
+            searchFilter: ''
+        };
+
+        // --- Data Generation (Exactly 50 nodes, max depth 4) ---
+        const nodes = [];
+        const root = { id: 1, label: 'Root', children: [], depth: 0, expanded: true, parent: null };
+        nodes.push(root);
+        
+        let idCounter = 2;
+        // Depth 1: 4 nodes
+        for(let i=0; i<4; i++) {
+            let n = { id: idCounter++, label: `Category ${i+1}`, children: [], depth: 1, expanded: true, parent: root };
+            root.children.push(n);
+            nodes.push(n);
+        }
+        // Depth 2: 12 nodes (3 per D1)
+        root.children.forEach((c1, i) => {
+            for(let j=0; j<3; j++) {
+                let n = { id: idCounter++, label: `Group ${i+1}-${j+1}`, children: [], depth: 2, expanded: true, parent: c1 };
+                c1.children.push(n);
+                nodes.push(n);
+            }
+        });
+        // Depth 3: 24 nodes (2 per D2)
+        nodes.filter(n => n.depth === 2).forEach((c2, i) => {
+            for(let j=0; j<2; j++) {
+                let n = { id: idCounter++, label: `Item ${i+1}-${j+1}`, children: [], depth: 3, expanded: true, parent: c2 };
+                c2.children.push(n);
+                nodes.push(n);
+            }
+        });
+        // Depth 4: 9 nodes (1 per first 9 D3)
+        let d3Nodes = nodes.filter(n => n.depth === 3);
+        for(let i=0; i<9; i++) {
+            let c3 = d3Nodes[i];
+            let n = { id: idCounter++, label: `Detail ${i+1}`, children: [], depth: 4, expanded: true, parent: c3 };
+            c3.children.push(n);
+            nodes.push(n);
+        }
+
+        // --- Three.js Setup ---
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        scene.fog = new THREE.FogExp2(0x111111, 0.005);
+
+        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.set(0, 40, 80);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        container.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.05;
+        controls.target.set(0, -20, 0);
+
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+        scene.add(ambientLight);
+        const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+        dirLight.position.set(20, 50, 20);
+        scene.add(dirLight);
+
+        // --- Visual Objects ---
+        const nodeMeshes = new Map();
+        const labelsContainer = document.getElementById('labels-container');
+        
+        const colors = [0xff5252, 0x448aff, 0x69f0ae, 0xffd740, 0xe040fb];
+        const geometryInternal = new THREE.SphereGeometry(1.8, 32, 32);
+        const geometryLeaf = new THREE.SphereGeometry(1.2, 16, 16);
+
+        nodes.forEach(n => {
+            const isLeaf = n.children.length === 0;
+            const geo = isLeaf ? geometryLeaf : geometryInternal;
+            const mat = new THREE.MeshStandardMaterial({ 
+                color: colors[n.depth % colors.length],
+                roughness: 0.4,
+                metalness: 0.1
+            });
+            const mesh = new THREE.Mesh(geo, mat);
+            mesh.userData.node = n;
+            
+            // Initial positions at origin for animation
+            mesh.position.set(0, 0, 0);
+            n.targetPos = new THREE.Vector3(0, 0, 0);
+            
+            scene.add(mesh);
+            nodeMeshes.set(n.id, mesh);
+
+            // HTML Label
+            const el = document.createElement('div');
+            el.className = 'node-label';
+            el.textContent = n.label;
+            el.id = `label-${n.id}`;
+            labelsContainer.appendChild(el);
+            n.labelEl = el;
+        });
+
+        const linesGroup = new THREE.Group();
+        scene.add(linesGroup);
+        const lineMaterial = new THREE.LineBasicMaterial({ color: 0x555555, transparent: true, opacity: 0.6 });
+
+        // --- Logic & Layout ---
+        function updateTreeLogic() {
+            const filterText = window.__3D_STATE__.searchFilter.toLowerCase();
+
+            // 1. Search Matching
+            nodes.forEach(n => {
+                n.isMatched = filterText === '' || n.label.toLowerCase().includes(filterText);
+                n.hasMatchedDescendant = false;
+            });
+
+            for (let i = nodes.length - 1; i >= 0; i--) {
+                const n = nodes[i];
+                if (n.parent && (n.isMatched || n.hasMatchedDescendant)) {
+                    n.parent.hasMatchedDescendant = true;
+                }
+            }
+
+            // 2. Visibility
+            nodes.forEach(n => {
+                if (n.depth === 0) {
+                    n.visible = true;
+                } else {
+                    n.visible = n.parent.visible && n.parent.expanded && 
+                                (filterText === '' || n.isMatched || n.hasMatchedDescendant);
+                }
+            });
+
+            // 3. Weights for Layout
+            function calcWeight(n) {
+                if (!n.visible) return 0;
+                if (!n.expanded || n.children.length === 0) {
+                    n.weight = 1;
+                } else {
+                    n.weight = n.children.reduce((sum, child) => sum + calcWeight(child), 0);
+                    if (n.weight === 0) n.weight = 1;
+                }
+                return n.weight;
+            }
+            calcWeight(root);
+
+            // 4. Radial Layout Calculation
+            const radiusStep = 18;
+            const yStep = -12;
+
+            function doLayout(n, angleStart, angleEnd) {
+                if (!n.visible) return;
+
+                const radius = n.depth * radiusStep;
+                const y = n.depth * yStep;
+                const angleMid = (angleStart + angleEnd) / 2;
+
+                n.targetPos.set(
+                    radius * Math.cos(angleMid),
+                    y,
+                    radius * Math.sin(angleMid)
+                );
+
+                if (n.expanded && n.children.length > 0) {
+                    let currentAngle = angleStart;
+                    const visibleChildren = n.children.filter(c => c.visible);
+                    const totalWeight = visibleChildren.reduce((sum, c) => sum + c.weight, 0);
+
+                    visibleChildren.forEach(c => {
+                        const angleRange = (c.weight / totalWeight) * (angleEnd - angleStart);
+                        doLayout(c, currentAngle, currentAngle + angleRange);
+                        currentAngle += angleRange;
+                    });
+                }
+            }
+            doLayout(root, 0, Math.PI * 2);
+
+            // 5. Update State
+            window.__3D_STATE__.visibleNodes = nodes.filter(n => n.visible).length;
+            window.__3D_STATE__.expandedNodes = nodes.filter(n => n.visible && n.children.length > 0 && n.expanded).length;
+            
+            updateStateDisplay();
+        }
+
+        function updateStateDisplay() {
+            const s = window.__3D_STATE__;
+            document.getElementById('stateDisplay').innerHTML = `
+                Total Nodes: <span class="state-val">${s.nodeCount}</span><br>
+                Visible Nodes: <span class="state-val">${s.visibleNodes}</span><br>
+                Expanded Internal: <span class="state-val">${s.expandedNodes}</span><br>
+                Selected ID: <span class="state-val">${s.selectedNode || 'None'}</span>
+            `;
+        }
+
+        // --- Interaction ---
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+
+        window.addEventListener('pointerdown', (event) => {
+            if(event.target.tagName === 'INPUT') return;
+
+            mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+            raycaster.setFromCamera(mouse, camera);
+            const intersects = raycaster.intersectObjects(Array.from(nodeMeshes.values()));
+
+            if (intersects.length > 0) {
+                const clickedNode = intersects[0].object.userData.node;
+                if (clickedNode.children.length > 0) {
+                    clickedNode.expanded = !clickedNode.expanded;
+                }
+                window.__3D_STATE__.selectedNode = clickedNode.id;
+            } else {
+                window.__3D_STATE__.selectedNode = null;
+            }
+            updateTreeLogic();
+        });
+
+        document.getElementById('searchFilter').addEventListener('input', (e) => {
+            window.__3D_STATE__.searchFilter = e.target.value;
+            updateTreeLogic();
+        });
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // --- Animation Loop ---
+        const tempVec = new THREE.Vector3();
+
+        function animate() {
+            requestAnimationFrame(animate);
+            controls.update();
+
+            linesGroup.clear();
+            const positions = [];
+
+            nodes.forEach(n => {
+                const mesh = nodeMeshes.get(n.id);
+                
+                // Animate position
+                if (n.visible) {
+                    mesh.visible = true;
+                    mesh.position.lerp(n.targetPos, 0.1);
+                    
+                    // Update Colors based on state
+                    if (window.__3D_STATE__.selectedNode === n.id) {
+                        mesh.material.emissive.setHex(0x555500);
+                        mesh.material.color.setHex(0xffff00);
+                    } else if (window.__3D_STATE__.searchFilter !== '' && !n.isMatched) {
+                        mesh.material.emissive.setHex(0x000000);
+                        mesh.material.color.setHex(0x444444);
+                    } else {
+                        mesh.material.emissive.setHex(0x000000);
+                        mesh.material.color.setHex(colors[n.depth % colors.length]);
+                    }
+
+                    // Collect lines
+                    if (n.expanded) {
+                        n.children.forEach(c => {
+                            if (c.visible) {
+                                const childMesh = nodeMeshes.get(c.id);
+                                positions.push(
+                                    mesh.position.x, mesh.position.y, mesh.position.z,
+                                    childMesh.position.x, childMesh.position.y, childMesh.position.z
+                                );
+                            }
+                        });
+                    }
+
+                    // Update HTML Labels
+                    n.labelEl.style.display = 'block';
+                    tempVec.copy(mesh.position).project(camera);
+                    const x = (tempVec.x *  .5 + .5) * window.innerWidth;
+                    const y = (tempVec.y * -.5 + .5) * window.innerHeight;
+                    n.labelEl.style.left = `${x}px`;
+                    n.labelEl.style.top = `${y}px`;
+                    
+                    if (window.__3D_STATE__.selectedNode === n.id) n.labelEl.style.color = '#ffff00';
+                    else if (window.__3D_STATE__.searchFilter !== '' && !n.isMatched) n.labelEl.style.color = '#666';
+                    else n.labelEl.style.color = '#fff';
+
+                } else {
+                    mesh.visible = false;
+                    n.labelEl.style.display = 'none';
+                    // Snap to parent position when hidden so they grow out of parent when expanded
+                    if(n.parent) {
+                        const parentMesh = nodeMeshes.get(n.parent.id);
+                        mesh.position.copy(parentMesh.position);
+                    }
+                }
+            });
+
+            // Batch draw lines
+            if (positions.length > 0) {
+                const geo = new THREE.BufferGeometry();
+                geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+                const lines = new THREE.LineSegments(geo, lineMaterial);
+                linesGroup.add(lines);
+            }
+
+            renderer.render(scene, camera);
+        }
+
+        // Initialize
+        updateTreeLogic();
+        animate();
+
+    </script>
+</body>
+</html>

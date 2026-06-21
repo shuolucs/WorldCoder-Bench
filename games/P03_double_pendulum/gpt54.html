@@ -1,0 +1,772 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Three.js 3D 双摆混沌模拟 + 相空间轨迹</title>
+  <style>
+    html, body {
+      margin: 0;
+      overflow: hidden;
+      background: #0b0f14;
+      color: #e6edf3;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    #app {
+      position: fixed;
+      inset: 0;
+    }
+    #hud {
+      position: fixed;
+      top: 12px;
+      left: 12px;
+      z-index: 20;
+      background: rgba(0,0,0,0.45);
+      border: 1px solid rgba(255,255,255,0.12);
+      border-radius: 10px;
+      padding: 12px 14px;
+      line-height: 1.6;
+      font-size: 14px;
+      min-width: 260px;
+      backdrop-filter: blur(6px);
+    }
+    #hud b {
+      color: #8bd5ff;
+      display: inline-block;
+      min-width: 88px;
+    }
+    #controls {
+      position: fixed;
+      left: 50%;
+      bottom: 14px;
+      transform: translateX(-50%);
+      z-index: 20;
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      flex-wrap: wrap;
+      justify-content: center;
+      background: rgba(0,0,0,0.45);
+      border: 1px solid rgba(255,255,255,0.12);
+      border-radius: 12px;
+      padding: 10px 14px;
+      backdrop-filter: blur(6px);
+    }
+    #controls label {
+      font-size: 14px;
+      color: #dce6f2;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    #controls input[type="range"] {
+      width: 220px;
+    }
+    button {
+      border: none;
+      border-radius: 8px;
+      padding: 8px 12px;
+      background: #1f6feb;
+      color: white;
+      cursor: pointer;
+      font-size: 14px;
+    }
+    button:hover {
+      filter: brightness(1.1);
+    }
+    #hint {
+      position: fixed;
+      top: 12px;
+      right: 12px;
+      z-index: 20;
+      background: rgba(0,0,0,0.45);
+      border: 1px solid rgba(255,255,255,0.12);
+      border-radius: 10px;
+      padding: 10px 12px;
+      font-size: 13px;
+      line-height: 1.5;
+      color: #c9d1d9;
+      max-width: 340px;
+    }
+  </style>
+
+  <script type="importmap">
+  { "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+  } }
+  </script>
+</head>
+<body>
+  <div id="app"></div>
+
+  <div id="hud">
+    <div><b>θ1</b><span id="theta1">0.000</span></div>
+    <div><b>θ2</b><span id="theta2">0.000</span></div>
+    <div><b>ω1</b><span id="omega1">0.000</span></div>
+    <div><b>ω2</b><span id="omega2">0.000</span></div>
+    <div><b>Energy</b><span id="energy">0.000</span></div>
+    <div><b>Sim Time</b><span id="simTime">0.000</span></div>
+  </div>
+
+  <div id="hint">
+    左侧：3D 双摆动画；右侧：θ2-ω2 相空间。<br>
+    可拖拽红球/蓝球设置初始角度；拖拽时暂停，松开后从新状态重新开始。<br>
+    鼠标右键/滚轮可旋转缩放视角。
+  </div>
+
+  <div id="controls">
+    <button id="pauseBtn">暂停</button>
+    <button id="resetBtn">重置</button>
+    <button id="perturbBtn">θ1 + 0.001</button>
+    <label>
+      速度
+      <input id="speedSlider" type="range" min="0.1" max="5.0" step="0.1" value="1.0" />
+      <span id="speedValue">1.0x</span>
+    </label>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+    // =========================
+    // 常量与参数
+    // =========================
+    const L1 = 2.0;
+    const L2 = 1.5;
+    const m1 = 1.0;
+    const m2 = 1.0;
+    const g = 9.81;
+    const dt = 0.005;
+
+    const INITIAL = {
+      theta1: 2 * Math.PI / 3,
+      theta2: Math.PI / 2,
+      omega1: 0,
+      omega2: 0
+    };
+
+    const PIVOT = new THREE.Vector3(0, 5, 0);
+    const PLANE_X = 8;
+    const PHASE_W = 6;
+    const PHASE_H = 6;
+    const THETA2_MIN = -Math.PI;
+    const THETA2_MAX = Math.PI;
+    const OMEGA2_MIN = -10;
+    const OMEGA2_MAX = 10;
+
+    const MASS_TRAIL_MAX = 2000;
+    const PHASE_TRAIL_MAX = 5000;
+
+    // =========================
+    // 场景
+    // =========================
+    const app = document.getElementById('app');
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0b0f14);
+
+    const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 1000);
+    camera.position.set(-6, 6, 12);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    app.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.set(2, 3.5, 0);
+    controls.enableDamping = true;
+
+    scene.add(new THREE.AmbientLight(0xffffff, 0.65));
+    const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+    dirLight.position.set(6, 12, 8);
+    scene.add(dirLight);
+
+    const grid = new THREE.GridHelper(30, 30, 0x2d3a4a, 0x1a2330);
+    grid.position.y = 0;
+    scene.add(grid);
+
+    const axes = new THREE.AxesHelper(2.5);
+    axes.position.copy(PIVOT);
+    scene.add(axes);
+
+    // =========================
+    // 双摆 3D 对象
+    // =========================
+    const pivotMesh = new THREE.Mesh(
+      new THREE.SphereGeometry(0.12, 24, 24),
+      new THREE.MeshStandardMaterial({ color: 0xffffff, emissive: 0x222222 })
+    );
+    pivotMesh.position.copy(PIVOT);
+    scene.add(pivotMesh);
+
+    const rodRadius = 0.05;
+    const rodGeo = new THREE.CylinderGeometry(rodRadius, rodRadius, 1, 24);
+
+    const rod1 = new THREE.Mesh(
+      rodGeo,
+      new THREE.MeshStandardMaterial({ color: 0xffd54a })
+    );
+    const rod2 = new THREE.Mesh(
+      rodGeo,
+      new THREE.MeshStandardMaterial({ color: 0x33d1cc })
+    );
+    scene.add(rod1, rod2);
+
+    const mass1 = new THREE.Mesh(
+      new THREE.SphereGeometry(0.2, 32, 32),
+      new THREE.MeshStandardMaterial({ color: 0xff4444 })
+    );
+    const mass2 = new THREE.Mesh(
+      new THREE.SphereGeometry(0.2, 32, 32),
+      new THREE.MeshStandardMaterial({ color: 0x3b82f6 })
+    );
+    scene.add(mass1, mass2);
+
+    // 拖拽辅助可视面（摆运动平面 z=0）
+    const dragPlane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0);
+    const raycaster = new THREE.Raycaster();
+    const pointer = new THREE.Vector2();
+    let dragging = null;
+    let wasPausedBeforeDrag = false;
+
+    // =========================
+    // mass2 轨迹线（渐变）
+    // =========================
+    const massTrailPositions = [];
+    const massTrailGeometry = new THREE.BufferGeometry();
+    const massTrailMaterial = new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.95 });
+    const massTrail = new THREE.Line(massTrailGeometry, massTrailMaterial);
+    scene.add(massTrail);
+
+    function rebuildMassTrailGeometry() {
+      const n = massTrailPositions.length;
+      const pos = new Float32Array(n * 3);
+      const col = new Float32Array(n * 3);
+
+      for (let i = 0; i < n; i++) {
+        const p = massTrailPositions[i];
+        pos[i * 3] = p.x;
+        pos[i * 3 + 1] = p.y;
+        pos[i * 3 + 2] = p.z;
+
+        const t = n <= 1 ? 1 : i / (n - 1);
+        const c = new THREE.Color().setHSL(0.58, 1.0, 0.18 + 0.45 * t);
+        col[i * 3] = c.r;
+        col[i * 3 + 1] = c.g;
+        col[i * 3 + 2] = c.b;
+      }
+
+      massTrailGeometry.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+      massTrailGeometry.setAttribute('color', new THREE.BufferAttribute(col, 3));
+      massTrailGeometry.computeBoundingSphere();
+    }
+
+    // =========================
+    // 相空间
+    // =========================
+    const phaseGroup = new THREE.Group();
+    scene.add(phaseGroup);
+
+    const phaseBg = new THREE.Mesh(
+      new THREE.PlaneGeometry(PHASE_W, PHASE_H),
+      new THREE.MeshBasicMaterial({
+        color: 0x101820,
+        transparent: true,
+        opacity: 0.95,
+        side: THREE.DoubleSide
+      })
+    );
+    phaseBg.position.set(PLANE_X, 5, 0);
+    phaseBg.rotation.y = -Math.PI / 2;
+    phaseGroup.add(phaseBg);
+
+    const phaseFrame = new THREE.LineSegments(
+      new THREE.EdgesGeometry(new THREE.PlaneGeometry(PHASE_W, PHASE_H)),
+      new THREE.LineBasicMaterial({ color: 0x8aa4bf })
+    );
+    phaseFrame.position.copy(phaseBg.position);
+    phaseFrame.rotation.copy(phaseBg.rotation);
+    phaseGroup.add(phaseFrame);
+
+    function planeLocalToWorld(u, v, zOffset = 0.01) {
+      // 平面局部：x为宽方向(映射 θ2)，y为高方向(映射 ω2)
+      // 世界：x 固定，y=v+5, z=-u
+      return new THREE.Vector3(PLANE_X + zOffset, 5 + v, -u);
+    }
+
+    function mapTheta2ToPlane(theta2) {
+      const t = (theta2 - THETA2_MIN) / (THETA2_MAX - THETA2_MIN);
+      return (t - 0.5) * PHASE_W;
+    }
+
+    function mapOmega2ToPlane(omega2) {
+      const clamped = Math.max(OMEGA2_MIN, Math.min(OMEGA2_MAX, omega2));
+      const t = (clamped - OMEGA2_MIN) / (OMEGA2_MAX - OMEGA2_MIN);
+      return (t - 0.5) * PHASE_H;
+    }
+
+    function createTextSprite(text, color = '#dbeafe', fontSize = 64) {
+      const canvas = document.createElement('canvas');
+      const ctx = canvas.getContext('2d');
+      canvas.width = 256;
+      canvas.height = 128;
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.font = `${fontSize}px sans-serif`;
+      ctx.fillStyle = color;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(text, canvas.width / 2, canvas.height / 2);
+      const tex = new THREE.CanvasTexture(canvas);
+      tex.needsUpdate = true;
+      const mat = new THREE.SpriteMaterial({ map: tex, transparent: true });
+      const sprite = new THREE.Sprite(mat);
+      sprite.scale.set(1.4, 0.7, 1);
+      return sprite;
+    }
+
+    function addPhaseLine(u1, v1, u2, v2, color = 0x5b7088) {
+      const pts = [planeLocalToWorld(u1, v1), planeLocalToWorld(u2, v2)];
+      const geo = new THREE.BufferGeometry().setFromPoints(pts);
+      const line = new THREE.Line(geo, new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.7 }));
+      phaseGroup.add(line);
+      return line;
+    }
+
+    // 坐标轴
+    addPhaseLine(-PHASE_W / 2, 0, PHASE_W / 2, 0, 0xffffff);
+    addPhaseLine(0, -PHASE_H / 2, 0, PHASE_H / 2, 0xffffff);
+
+    // 刻度与标签
+    const thetaTicks = [-Math.PI, -Math.PI / 2, 0, Math.PI / 2, Math.PI];
+    const thetaLabels = ['-π', '-π/2', '0', 'π/2', 'π'];
+    thetaTicks.forEach((val, i) => {
+      const u = mapTheta2ToPlane(val);
+      addPhaseLine(u, -0.08, u, 0.08, 0xcbd5e1);
+      const label = createTextSprite(thetaLabels[i], '#cbd5e1', 42);
+      const p = planeLocalToWorld(u, -PHASE_H / 2 - 0.35, 0.02);
+      label.position.copy(p);
+      phaseGroup.add(label);
+    });
+
+    const omegaTicks = [-10, -5, 0, 5, 10];
+    omegaTicks.forEach((val) => {
+      const v = mapOmega2ToPlane(val);
+      addPhaseLine(-0.08, v, 0.08, v, 0xcbd5e1);
+      const label = createTextSprite(String(val), '#cbd5e1', 42);
+      const p = planeLocalToWorld(-PHASE_W / 2 - 0.45, v, 0.02);
+      label.position.copy(p);
+      phaseGroup.add(label);
+    });
+
+    const xLabel = createTextSprite('θ2', '#8bd5ff', 52);
+    xLabel.position.copy(planeLocalToWorld(0, -PHASE_H / 2 - 0.75, 0.02));
+    phaseGroup.add(xLabel);
+
+    const yLabel = createTextSprite('ω2', '#8bd5ff', 52);
+    yLabel.position.copy(planeLocalToWorld(-PHASE_W / 2 - 0.85, 0, 0.02));
+    phaseGroup.add(yLabel);
+
+    const phasePositions = [];
+    const phaseGeometry = new THREE.BufferGeometry();
+    const phaseMaterial = new THREE.PointsMaterial({
+      size: 0.05,
+      vertexColors: true,
+      transparent: true,
+      opacity: 0.95,
+      sizeAttenuation: true
+    });
+    const phasePoints = new THREE.Points(phaseGeometry, phaseMaterial);
+    phaseGroup.add(phasePoints);
+
+    function rebuildPhaseGeometry() {
+      const n = phasePositions.length;
+      const pos = new Float32Array(n * 3);
+      const col = new Float32Array(n * 3);
+
+      for (let i = 0; i < n; i++) {
+        const p = phasePositions[i];
+        pos[i * 3] = p.x;
+        pos[i * 3 + 1] = p.y;
+        pos[i * 3 + 2] = p.z;
+
+        const t = n <= 1 ? 1 : i / (n - 1);
+        const c = new THREE.Color().setHSL(0.02 + 0.08 * t, 1.0, 0.35 + 0.3 * t);
+        col[i * 3] = c.r;
+        col[i * 3 + 1] = c.g;
+        col[i * 3 + 2] = c.b;
+      }
+
+      phaseGeometry.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+      phaseGeometry.setAttribute('color', new THREE.BufferAttribute(col, 3));
+      phaseGeometry.computeBoundingSphere();
+    }
+
+    // =========================
+    // 物理状态
+    // =========================
+    let state = {
+      theta1: INITIAL.theta1,
+      theta2: INITIAL.theta2,
+      omega1: INITIAL.omega1,
+      omega2: INITIAL.omega2
+    };
+
+    let simTime = 0;
+    let isPaused = false;
+    let speedMultiplier = 1.0;
+    let accumulator = 0;
+    const clock = new THREE.Clock();
+
+    function normalizeAngle(a) {
+      let x = a;
+      while (x > Math.PI) x -= 2 * Math.PI;
+      while (x < -Math.PI) x += 2 * Math.PI;
+      return x;
+    }
+
+    function derivatives(s) {
+      const { theta1, theta2, omega1, omega2 } = s;
+
+      const den = (2 * m1 + m2 - m2 * Math.cos(2 * theta1 - 2 * theta2));
+
+      const alpha1 =
+        (
+          -g * (2 * m1 + m2) * Math.sin(theta1)
+          - m2 * g * Math.sin(theta1 - 2 * theta2)
+          - 2 * Math.sin(theta1 - theta2) * m2 *
+            (omega2 * omega2 * L2 + omega1 * omega1 * L1 * Math.cos(theta1 - theta2))
+        ) / (L1 * den);
+
+      const alpha2 =
+        (
+          2 * Math.sin(theta1 - theta2) *
+          (
+            omega1 * omega1 * L1 * (m1 + m2)
+            + g * (m1 + m2) * Math.cos(theta1)
+            + omega2 * omega2 * L2 * m2 * Math.cos(theta1 - theta2)
+          )
+        ) / (L2 * den);
+
+      return {
+        dtheta1: omega1,
+        dtheta2: omega2,
+        domega1: alpha1,
+        domega2: alpha2
+      };
+    }
+
+    function rk4Step(s, h) {
+      const k1 = derivatives(s);
+
+      const s2 = {
+        theta1: s.theta1 + 0.5 * h * k1.dtheta1,
+        theta2: s.theta2 + 0.5 * h * k1.dtheta2,
+        omega1: s.omega1 + 0.5 * h * k1.domega1,
+        omega2: s.omega2 + 0.5 * h * k1.domega2
+      };
+      const k2 = derivatives(s2);
+
+      const s3 = {
+        theta1: s.theta1 + 0.5 * h * k2.dtheta1,
+        theta2: s.theta2 + 0.5 * h * k2.dtheta2,
+        omega1: s.omega1 + 0.5 * h * k2.domega1,
+        omega2: s.omega2 + 0.5 * h * k2.domega2
+      };
+      const k3 = derivatives(s3);
+
+      const s4 = {
+        theta1: s.theta1 + h * k3.dtheta1,
+        theta2: s.theta2 + h * k3.dtheta2,
+        omega1: s.omega1 + h * k3.domega1,
+        omega2: s.omega2 + h * k3.domega2
+      };
+      const k4 = derivatives(s4);
+
+      return {
+        theta1: s.theta1 + (h / 6) * (k1.dtheta1 + 2 * k2.dtheta1 + 2 * k3.dtheta1 + k4.dtheta1),
+        theta2: s.theta2 + (h / 6) * (k1.dtheta2 + 2 * k2.dtheta2 + 2 * k3.dtheta2 + k4.dtheta2),
+        omega1: s.omega1 + (h / 6) * (k1.domega1 + 2 * k2.domega1 + 2 * k3.domega1 + k4.domega1),
+        omega2: s.omega2 + (h / 6) * (k1.domega2 + 2 * k2.domega2 + 2 * k3.domega2 + k4.domega2)
+      };
+    }
+
+    function getMassPositions(theta1, theta2) {
+      const p1 = new THREE.Vector3(
+        PIVOT.x + L1 * Math.sin(theta1),
+        PIVOT.y - L1 * Math.cos(theta1),
+        0
+      );
+      const p2 = new THREE.Vector3(
+        p1.x + L2 * Math.sin(theta2),
+        p1.y - L2 * Math.cos(theta2),
+        0
+      );
+      return { p1, p2 };
+    }
+
+    function totalEnergy(s) {
+      const { theta1, theta2, omega1, omega2 } = s;
+      const T =
+        0.5 * m1 * Math.pow(L1 * omega1, 2) +
+        0.5 * m2 * (
+          Math.pow(L1 * omega1, 2) +
+          Math.pow(L2 * omega2, 2) +
+          2 * L1 * L2 * omega1 * omega2 * Math.cos(theta1 - theta2)
+        );
+
+      const V =
+        -(m1 + m2) * g * L1 * Math.cos(theta1) -
+        m2 * g * L2 * Math.cos(theta2);
+
+      return T + V;
+    }
+
+    function updateRod(mesh, start, end) {
+      const dir = new THREE.Vector3().subVectors(end, start);
+      const len = dir.length();
+      mesh.position.copy(start).addScaledVector(dir, 0.5);
+      mesh.scale.set(1, len, 1);
+      mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir.clone().normalize());
+    }
+
+    function clearTrails() {
+      massTrailPositions.length = 0;
+      phasePositions.length = 0;
+      rebuildMassTrailGeometry();
+      rebuildPhaseGeometry();
+    }
+
+    function pushTrails() {
+      const { p2 } = getMassPositions(state.theta1, state.theta2);
+      massTrailPositions.push(p2.clone());
+      if (massTrailPositions.length > MASS_TRAIL_MAX) massTrailPositions.shift();
+      rebuildMassTrailGeometry();
+
+      const u = mapTheta2ToPlane(normalizeAngle(state.theta2));
+      const v = mapOmega2ToPlane(state.omega2);
+      phasePositions.push(planeLocalToWorld(u, v, 0.03));
+      if (phasePositions.length > PHASE_TRAIL_MAX) phasePositions.shift();
+      rebuildPhaseGeometry();
+    }
+
+    function syncVisuals() {
+      const { p1, p2 } = getMassPositions(state.theta1, state.theta2);
+
+      mass1.position.copy(p1);
+      mass2.position.copy(p2);
+
+      updateRod(rod1, PIVOT, p1);
+      updateRod(rod2, p1, p2);
+
+      const E = totalEnergy(state);
+
+      document.getElementById('theta1').textContent = state.theta1.toFixed(3);
+      document.getElementById('theta2').textContent = state.theta2.toFixed(3);
+      document.getElementById('omega1').textContent = state.omega1.toFixed(3);
+      document.getElementById('omega2').textContent = state.omega2.toFixed(3);
+      document.getElementById('energy').textContent = E.toFixed(6);
+      document.getElementById('simTime').textContent = simTime.toFixed(3);
+
+      window.__3D_STATE__ = {
+        theta1: state.theta1,
+        theta2: state.theta2,
+        omega1: state.omega1,
+        omega2: state.omega2,
+        mass1Pos: { x: p1.x, y: p1.y, z: p1.z },
+        mass2Pos: { x: p2.x, y: p2.y, z: p2.z },
+        totalEnergy: E,
+        simTime,
+        isPaused,
+        speedMultiplier,
+        trailLength: massTrailPositions.length
+      };
+    }
+
+    function resetSimulation(customState = null) {
+      state = customState ? { ...customState } : { ...INITIAL };
+      simTime = 0;
+      accumulator = 0;
+      clearTrails();
+      pushTrails();
+      syncVisuals();
+    }
+
+    // =========================
+    // 拖拽设置初始角度
+    // =========================
+    function setPointer(event) {
+      const rect = renderer.domElement.getBoundingClientRect();
+      pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+      pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+    }
+
+    function getPointerPlanePoint(event) {
+      setPointer(event);
+      raycaster.setFromCamera(pointer, camera);
+      const out = new THREE.Vector3();
+      const ok = raycaster.ray.intersectPlane(dragPlane, out);
+      return ok ? out : null;
+    }
+
+    function startDrag(event) {
+      setPointer(event);
+      raycaster.setFromCamera(pointer, camera);
+      const intersects = raycaster.intersectObjects([mass1, mass2], false);
+      if (!intersects.length) return;
+
+      dragging = intersects[0].object === mass1 ? 'mass1' : 'mass2';
+      wasPausedBeforeDrag = isPaused;
+      isPaused = true;
+      controls.enabled = false;
+    }
+
+    function moveDrag(event) {
+      if (!dragging) return;
+      const pt = getPointerPlanePoint(event);
+      if (!pt) return;
+
+      const dx1 = pt.x - PIVOT.x;
+      const dy1 = pt.y - PIVOT.y;
+      const newTheta1 = Math.atan2(dx1, -dy1);
+
+      if (dragging === 'mass1') {
+        state.theta1 = newTheta1;
+        state.theta2 = newTheta1;
+        state.omega1 = 0;
+        state.omega2 = 0;
+      } else if (dragging === 'mass2') {
+        const { p1 } = getMassPositions(state.theta1, state.theta2);
+        const dxb = pt.x - p1.x;
+        const dyb = pt.y - p1.y;
+
+        let theta1Candidate = state.theta1;
+        const distToPivot = Math.hypot(pt.x - PIVOT.x, pt.y - PIVOT.y);
+
+        if (distToPivot < (L1 + L2) && distToPivot > Math.abs(L1 - L2)) {
+          const angleToPoint = Math.atan2(pt.x - PIVOT.x, -(pt.y - PIVOT.y));
+          const gamma = Math.acos(
+            THREE.MathUtils.clamp((L1 * L1 + distToPivot * distToPivot - L2 * L2) / (2 * L1 * distToPivot), -1, 1)
+          );
+          const cand1 = angleToPoint + gamma;
+          const cand2 = angleToPoint - gamma;
+          theta1Candidate = Math.abs(cand1 - state.theta1) < Math.abs(cand2 - state.theta1) ? cand1 : cand2;
+        }
+
+        const p1c = new THREE.Vector3(
+          PIVOT.x + L1 * Math.sin(theta1Candidate),
+          PIVOT.y - L1 * Math.cos(theta1Candidate),
+          0
+        );
+        const theta2Candidate = Math.atan2(pt.x - p1c.x, -(pt.y - p1c.y));
+
+        state.theta1 = theta1Candidate;
+        state.theta2 = theta2Candidate;
+        state.omega1 = 0;
+        state.omega2 = 0;
+      }
+
+      simTime = 0;
+      accumulator = 0;
+      clearTrails();
+      pushTrails();
+      syncVisuals();
+    }
+
+    function endDrag() {
+      if (!dragging) return;
+      dragging = null;
+      controls.enabled = true;
+      isPaused = wasPausedBeforeDrag;
+    }
+
+    renderer.domElement.addEventListener('pointerdown', startDrag);
+    window.addEventListener('pointermove', moveDrag);
+    window.addEventListener('pointerup', endDrag);
+    window.addEventListener('pointercancel', endDrag);
+
+    // =========================
+    // UI
+    // =========================
+    const pauseBtn = document.getElementById('pauseBtn');
+    const resetBtn = document.getElementById('resetBtn');
+    const perturbBtn = document.getElementById('perturbBtn');
+    const speedSlider = document.getElementById('speedSlider');
+    const speedValue = document.getElementById('speedValue');
+
+    function refreshButtons() {
+      pauseBtn.textContent = isPaused ? '播放' : '暂停';
+      speedValue.textContent = `${speedMultiplier.toFixed(1)}x`;
+    }
+
+    pauseBtn.addEventListener('click', () => {
+      isPaused = !isPaused;
+      refreshButtons();
+    });
+
+    resetBtn.addEventListener('click', () => {
+      resetSimulation();
+      refreshButtons();
+    });
+
+    perturbBtn.addEventListener('click', () => {
+      resetSimulation({
+        theta1: INITIAL.theta1 + 0.001,
+        theta2: INITIAL.theta2,
+        omega1: INITIAL.omega1,
+        omega2: INITIAL.omega2
+      });
+      refreshButtons();
+    });
+
+    speedSlider.addEventListener('input', () => {
+      speedMultiplier = parseFloat(speedSlider.value);
+      refreshButtons();
+    });
+
+    // =========================
+    // 动画循环
+    // =========================
+    resetSimulation();
+    refreshButtons();
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      const frameDt = Math.min(clock.getDelta(), 0.05);
+
+      if (!isPaused && !dragging) {
+        accumulator += frameDt * speedMultiplier;
+
+        let stepped = false;
+        while (accumulator >= dt) {
+          state = rk4Step(state, dt);
+          simTime += dt;
+          accumulator -= dt;
+          stepped = true;
+        }
+
+        if (stepped) {
+          pushTrails();
+        }
+      }
+
+      syncVisuals();
+      controls.update();
+      renderer.render(scene, camera);
+    }
+
+    animate();
+
+    // =========================
+    // 自适应
+    // =========================
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,459 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>鸭塘水波物理模拟</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #000;
+            font-family: sans-serif;
+        }
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+        }
+        #hud {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(0, 0, 0, 0.6);
+            color: #fff;
+            padding: 15px;
+            border-radius: 8px;
+            pointer-events: none;
+            font-size: 14px;
+            line-height: 1.6;
+            min-width: 200px;
+        }
+        #controls {
+            position: absolute;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: rgba(0, 0, 0, 0.6);
+            color: #fff;
+            padding: 15px 25px;
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            gap: 15px;
+        }
+        input[type=range] {
+            cursor: pointer;
+        }
+        .status-indicator {
+            display: inline-block;
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            margin-right: 5px;
+        }
+        .status-loading { background-color: #ffa500; }
+        .status-loaded { background-color: #00ff00; }
+    </style>
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+            "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+        }
+    }
+    </script>
+</head>
+<body>
+    <div id="canvas-container"></div>
+    
+    <div id="hud">
+        <div style="font-weight: bold; margin-bottom: 10px; font-size: 16px;">鸭塘状态监控</div>
+        <div><span id="loadIndicator" class="status-indicator status-loading"></span><span id="loadStatus">模型加载中...</span></div>
+        <div>平均水面高度: <span id="avgWaterHeight">0.00</span> m</div>
+        <div>鸭子平均速度: <span id="avgDuckVelocity">0.00</span> m/s</div>
+        <div>累计波纹次数: <span id="rippleCount">0</span></div>
+        <div>当前风速: <span id="windDisplay">0.0</span> m/s</div>
+    </div>
+
+    <div id="controls">
+        <label for="windSlider">风力控制 (m/s):</label>
+        <input type="range" id="windSlider" min="0" max="10" step="0.5" value="0">
+        <span id="windSliderValue">0.0</span>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        // 初始化全局状态
+        window.__3D_STATE__ = {
+            modelLoaded: false,
+            duckCount: 0,
+            avgWaterHeight: 0,
+            avgDuckVelocity: 0,
+            rippleCount: 0,
+            windSpeed: 0,
+            duckPositions: []
+        };
+
+        // 场景配置常量
+        const WATER_SIZE = 40;
+        const WATER_SEGMENTS = 128;
+        const DUCK_COUNT = 10;
+        const DUCK_AREA = 20;
+
+        let scene, camera, renderer, controls;
+        let waterMesh, waterGeometry;
+        let h1 = [], h2 = [], h_new = [];
+        let ducks = [];
+        let duckPrevPositions = [];
+        let clock = new THREE.Clock();
+        let raycaster = new THREE.Raycaster();
+        let mouse = new THREE.Vector2();
+
+        // DOM 元素
+        const elAvgWaterHeight = document.getElementById('avgWaterHeight');
+        const elAvgDuckVelocity = document.getElementById('avgDuckVelocity');
+        const elRippleCount = document.getElementById('rippleCount');
+        const elWindDisplay = document.getElementById('windDisplay');
+        const elLoadStatus = document.getElementById('loadStatus');
+        const elLoadIndicator = document.getElementById('loadIndicator');
+        const elWindSlider = document.getElementById('windSlider');
+        const elWindSliderValue = document.getElementById('windSliderValue');
+
+        init();
+        animate();
+
+        function init() {
+            const container = document.getElementById('canvas-container');
+
+            // 1. 场景与相机
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x87ceeb); // 浅蓝色天空
+            scene.fog = new THREE.FogExp2(0x87ceeb, 0.015);
+
+            camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.position.set(0, 20, 30); // 俯视约 45 度
+
+            // 2. 渲染器
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.shadowMap.enabled = true;
+            container.appendChild(renderer.domElement);
+
+            // 3. 控制器
+            controls = new OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+            controls.dampingFactor = 0.05;
+            controls.maxPolarAngle = Math.PI / 2 - 0.05; // 防止视角进入水下
+
+            // 4. 灯光
+            const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+            scene.add(ambientLight);
+
+            const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+            dirLight.position.set(10, 20, 10);
+            dirLight.castShadow = true;
+            dirLight.shadow.camera.top = 25;
+            dirLight.shadow.camera.bottom = -25;
+            dirLight.shadow.camera.left = -25;
+            dirLight.shadow.camera.right = 25;
+            dirLight.shadow.mapSize.width = 2048;
+            dirLight.shadow.mapSize.height = 2048;
+            scene.add(dirLight);
+
+            // 5. 池塘底部 (沙色)
+            const bottomGeo = new THREE.PlaneGeometry(WATER_SIZE, WATER_SIZE);
+            const bottomMat = new THREE.MeshPhongMaterial({ color: 0xd2b48c });
+            const bottomMesh = new THREE.Mesh(bottomGeo, bottomMat);
+            bottomMesh.rotation.x = -Math.PI / 2;
+            bottomMesh.position.y = -2; // 水深 2m
+            bottomMesh.receiveShadow = true;
+            scene.add(bottomMesh);
+
+            // 6. 水面与高度场初始化
+            waterGeometry = new THREE.PlaneGeometry(WATER_SIZE, WATER_SIZE, WATER_SEGMENTS, WATER_SEGMENTS);
+            waterGeometry.rotateX(-Math.PI / 2); // 使 Y 轴成为高度
+
+            const waterMaterial = new THREE.MeshPhongMaterial({
+                color: 0x2288cc,
+                transparent: true,
+                opacity: 0.7,
+                shininess: 100,
+                side: THREE.DoubleSide
+            });
+
+            waterMesh = new THREE.Mesh(waterGeometry, waterMaterial);
+            waterMesh.receiveShadow = true;
+            scene.add(waterMesh);
+
+            // 初始化高度场数组
+            for (let i = 0; i <= WATER_SEGMENTS; i++) {
+                h1[i] = [];
+                h2[i] = [];
+                h_new[i] = [];
+                for (let j = 0; j <= WATER_SEGMENTS; j++) {
+                    h1[i][j] = 0;
+                    h2[i][j] = 0;
+                    h_new[i][j] = 0;
+                }
+            }
+
+            // 7. 加载鸭子模型
+            const loader = new GLTFLoader();
+            loader.load(
+                'assets/Duck.glb',
+                (gltf) => {
+                    const baseDuck = gltf.scene;
+                    baseDuck.traverse((child) => {
+                        if (child.isMesh) {
+                            child.castShadow = true;
+                            child.receiveShadow = true;
+                        }
+                    });
+
+                    for (let i = 0; i < DUCK_COUNT; i++) {
+                        const duck = baseDuck.clone();
+                        // 随机分布在 20x20 区域 (-10 到 10)
+                        const x = (Math.random() - 0.5) * DUCK_AREA;
+                        const z = (Math.random() - 0.5) * DUCK_AREA;
+                        duck.position.set(x, 0, z);
+                        
+                        // 随机初始朝向
+                        const yaw = Math.random() * Math.PI * 2;
+                        duck.userData.yaw = yaw;
+                        duck.rotation.y = yaw;
+                        
+                        // 适当缩放 (假设原始模型可能偏大或偏小，这里给个默认缩放，若模型标准则不影响)
+                        duck.scale.set(0.5, 0.5, 0.5);
+
+                        scene.add(duck);
+                        ducks.push(duck);
+                        duckPrevPositions.push(new THREE.Vector3(x, 0, z));
+                    }
+
+                    // 更新状态
+                    window.__3D_STATE__.modelLoaded = true;
+                    window.__3D_STATE__.duckCount = DUCK_COUNT;
+                    
+                    elLoadStatus.textContent = "模型已加载";
+                    elLoadIndicator.className = "status-indicator status-loaded";
+                },
+                undefined,
+                (error) => {
+                    console.error('加载鸭子模型失败:', error);
+                    elLoadStatus.textContent = "模型加载失败";
+                    elLoadIndicator.style.backgroundColor = "#ff0000";
+                }
+            );
+
+            // 8. 事件监听
+            window.addEventListener('resize', onWindowResize);
+            renderer.domElement.addEventListener('pointerdown', onPointerDown);
+            elWindSlider.addEventListener('input', onWindChange);
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        function onWindChange(e) {
+            const val = parseFloat(e.target.value);
+            window.__3D_STATE__.windSpeed = val;
+            elWindSliderValue.textContent = val.toFixed(1);
+            elWindDisplay.textContent = val.toFixed(1);
+        }
+
+        function onPointerDown(event) {
+            // 计算鼠标在标准化设备坐标中的位置
+            mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+            raycaster.setFromCamera(mouse, camera);
+            const intersects = raycaster.intersectObject(waterMesh);
+
+            if (intersects.length > 0) {
+                const point = intersects[0].point;
+                createRipple(point.x, point.z, 2.0, 4);
+                
+                window.__3D_STATE__.rippleCount++;
+                elRippleCount.textContent = window.__3D_STATE__.rippleCount;
+            }
+        }
+
+        function createRipple(x, z, strength, radius) {
+            // 将世界坐标转换为网格索引
+            const u = (x + WATER_SIZE / 2) / WATER_SIZE * WATER_SEGMENTS;
+            const v = (z + WATER_SIZE / 2) / WATER_SIZE * WATER_SEGMENTS;
+            const cx = Math.round(u);
+            const cz = Math.round(v);
+
+            for (let i = -radius; i <= radius; i++) {
+                for (let j = -radius; j <= radius; j++) {
+                    const ni = cx + i;
+                    const nj = cz + j;
+                    if (ni > 0 && ni < WATER_SEGMENTS && nj > 0 && nj < WATER_SEGMENTS) {
+                        const dist = Math.sqrt(i * i + j * j);
+                        if (dist <= radius) {
+                            h1[ni][nj] += strength * (1 - dist / radius);
+                        }
+                    }
+                }
+            }
+        }
+
+        function getWaterHeight(x, z) {
+            let u = (x + WATER_SIZE / 2) / WATER_SIZE * WATER_SEGMENTS;
+            let v = (z + WATER_SIZE / 2) / WATER_SIZE * WATER_SEGMENTS;
+            
+            u = Math.max(0, Math.min(WATER_SEGMENTS, u));
+            v = Math.max(0, Math.min(WATER_SEGMENTS, v));
+            
+            const i = Math.floor(u);
+            const j = Math.floor(v);
+            const fu = u - i;
+            const fv = v - j;
+            
+            const i1 = Math.min(WATER_SEGMENTS, i + 1);
+            const j1 = Math.min(WATER_SEGMENTS, j + 1);
+
+            const h00 = h1[i][j];
+            const h10 = h1[i1][j];
+            const h01 = h1[i][j1];
+            const h11 = h1[i1][j1];
+
+            const h0 = h00 * (1 - fu) + h10 * fu;
+            const h1_val = h01 * (1 - fu) + h11 * fu;
+            
+            return h0 * (1 - fv) + h1_val * fv;
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const dt = Math.min(clock.getDelta(), 0.1);
+            const windSpeed = window.__3D_STATE__.windSpeed;
+
+            // 1. 更新高度场 (波动方程)
+            const damping = 0.985;
+            
+            // 风力影响权重：风向为 +X，所以左侧(-X)传来的波浪权重增加
+            const weightLeft = 1.0 + windSpeed * 0.08;
+            const weightRight = 1.0 - windSpeed * 0.08;
+            const weightSum = weightLeft + weightRight + 2.0;
+
+            for (let i = 1; i < WATER_SEGMENTS; i++) {
+                for (let j = 1; j < WATER_SEGMENTS; j++) {
+                    const smoothed = (
+                        h1[i - 1][j] * weightLeft + 
+                        h1[i + 1][j] * weightRight + 
+                        h1[i][j - 1] + 
+                        h1[i][j + 1]
+                    ) / weightSum;
+                    
+                    h_new[i][j] = smoothed * 2.0 - h2[i][j];
+                    h_new[i][j] *= damping;
+                }
+            }
+
+            // 风力产生随机微波
+            if (windSpeed > 0 && Math.random() < windSpeed * 0.05) {
+                const rx = (Math.random() - 0.5) * WATER_SIZE;
+                const rz = (Math.random() - 0.5) * WATER_SIZE;
+                createRipple(rx, rz, windSpeed * 0.1, 2);
+            }
+
+            // 交换缓冲区
+            let temp = h2;
+            h2 = h1;
+            h1 = h_new;
+            h_new = temp;
+
+            // 2. 更新水面几何体顶点
+            const positions = waterGeometry.attributes.position.array;
+            let idx = 0;
+            for (let j = 0; j <= WATER_SEGMENTS; j++) {
+                for (let i = 0; i <= WATER_SEGMENTS; i++) {
+                    positions[idx * 3 + 1] = h1[i][j];
+                    idx++;
+                }
+            }
+            waterGeometry.attributes.position.needsUpdate = true;
+            waterGeometry.computeVertexNormals();
+
+            // 3. 更新鸭子
+            let totalHeight = 0;
+            let totalVelocity = 0;
+            const duckPosArray = [];
+
+            for (let i = 0; i < ducks.length; i++) {
+                const duck = ducks[i];
+                const prevPos = duckPrevPositions[i];
+
+                // 风力漂移
+                if (windSpeed > 0) {
+                    duck.position.x += windSpeed * dt * 0.2;
+                    // 边界限制
+                    const limit = WATER_SIZE / 2 - 2;
+                    if (duck.position.x > limit) duck.position.x = limit;
+                }
+
+                // 计算当前位置水面高度
+                const y = getWaterHeight(duck.position.x, duck.position.z);
+                duck.position.y = y;
+
+                // 计算法线以倾斜鸭子
+                const eps = 0.2;
+                const hL = getWaterHeight(duck.position.x - eps, duck.position.z);
+                const hR = getWaterHeight(duck.position.x + eps, duck.position.z);
+                const hU = getWaterHeight(duck.position.x, duck.position.z - eps);
+                const hD = getWaterHeight(duck.position.x, duck.position.z + eps);
+                
+                const normal = new THREE.Vector3(-(hR - hL) / (2 * eps), 1, -(hD - hU) / (2 * eps)).normalize();
+                
+                // 应用法线倾斜并保留偏航角
+                const up = new THREE.Vector3(0, 1, 0);
+                const quaternion = new THREE.Quaternion().setFromUnitVectors(up, normal);
+                duck.quaternion.copy(quaternion);
+                duck.rotateY(duck.userData.yaw);
+
+                // 统计数据
+                totalHeight += y;
+                
+                const dist = duck.position.distanceTo(prevPos);
+                const velocity = dist / dt;
+                totalVelocity += velocity;
+
+                prevPos.copy(duck.position);
+                
+                duckPosArray.push({
+                    x: duck.position.x,
+                    y: duck.position.y,
+                    z: duck.position.z
+                });
+            }
+
+            // 4. 更新状态与 HUD
+            if (ducks.length > 0) {
+                const avgH = totalHeight / ducks.length;
+                const avgV = totalVelocity / ducks.length;
+                
+                window.__3D_STATE__.avgWaterHeight = avgH;
+                window.__3D_STATE__.avgDuckVelocity = avgV;
+                window.__3D_STATE__.duckPositions = duckPosArray;
+
+                elAvgWaterHeight.textContent = avgH.toFixed(3);
+                elAvgDuckVelocity.textContent = avgV.toFixed(3);
+            }
+
+            controls.update();
+            renderer.render(scene, camera);
+        }
+    </script>
+</body>
+</html>

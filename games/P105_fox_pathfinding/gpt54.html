@@ -1,0 +1,718 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Three.js 3D 网格地形 A* 寻路 - Fox</title>
+  <style>
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      font-family: Arial, Helvetica, sans-serif;
+      background: #f0f0f0;
+    }
+
+    #app {
+      width: 100%;
+      height: 100%;
+      position: relative;
+    }
+
+    #hud {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      z-index: 10;
+      background: rgba(255,255,255,0.92);
+      padding: 12px 14px;
+      border-radius: 8px;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.12);
+      min-width: 220px;
+      line-height: 1.7;
+      font-size: 14px;
+      color: #222;
+      user-select: none;
+    }
+
+    #hud b {
+      display: inline-block;
+      width: 90px;
+    }
+
+    #message {
+      position: absolute;
+      top: 12px;
+      right: 12px;
+      z-index: 10;
+      background: rgba(244,67,54,0.92);
+      color: #fff;
+      padding: 10px 14px;
+      border-radius: 8px;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+      font-size: 14px;
+      opacity: 0;
+      transform: translateY(-8px);
+      transition: all 0.25s ease;
+      pointer-events: none;
+    }
+
+    #message.show {
+      opacity: 1;
+      transform: translateY(0);
+    }
+
+    #tips {
+      position: absolute;
+      bottom: 12px;
+      left: 12px;
+      z-index: 10;
+      background: rgba(255,255,255,0.9);
+      padding: 8px 12px;
+      border-radius: 8px;
+      font-size: 13px;
+      color: #333;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.12);
+    }
+
+    canvas {
+      display: block;
+    }
+  </style>
+
+  <script type="importmap">
+  { "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+  } }
+  </script>
+</head>
+<body>
+  <div id="app">
+    <div id="hud">
+      <div><b>狐狸坐标:</b> <span id="foxPos">(0, 0)</span></div>
+      <div><b>目标坐标:</b> <span id="targetPos">-</span></div>
+      <div><b>路径长度:</b> <span id="pathLength">0</span></div>
+      <div><b>动画状态:</b> <span id="animState">idle</span></div>
+      <div><b>障碍物数量:</b> <span id="obstacleCount">0</span></div>
+    </div>
+    <div id="message"></div>
+    <div id="tips">点击地面格子设置目标，狐狸会自动 A* 寻路前往</div>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+    const app = document.getElementById('app');
+    const foxPosEl = document.getElementById('foxPos');
+    const targetPosEl = document.getElementById('targetPos');
+    const pathLengthEl = document.getElementById('pathLength');
+    const animStateEl = document.getElementById('animState');
+    const obstacleCountEl = document.getElementById('obstacleCount');
+    const messageEl = document.getElementById('message');
+
+    const GRID_SIZE = 10;
+    const TILE_SIZE = 1;
+    const TILE_GAP = 0.05;
+    const TILE_STEP = TILE_SIZE + TILE_GAP;
+    const TILE_HEIGHT = 0.1;
+    const OBSTACLE_COUNT = 15;
+    const MOVE_DURATION_PER_TILE = 0.5;
+
+    const COLORS = {
+      tile: 0x4CAF50,
+      path: 0x2196F3,
+      target: 0xFFEB3B,
+      obstacle: 0xf44336,
+      sceneBg: 0xf0f0f0
+    };
+
+    window.__3D_STATE__ = {
+      modelLoaded: false,
+      foxPosition: { col: 0, row: 0 },
+      targetPosition: null,
+      pathLength: 0,
+      animState: 'idle',
+      obstacleCount: 0,
+      isMoving: false,
+      gridSize: GRID_SIZE
+    };
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(COLORS.sceneBg);
+
+    const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 1000);
+    camera.position.set(6, 11, 10);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    app.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.set(0, 0, 0);
+    controls.enableDamping = true;
+    controls.maxPolarAngle = Math.PI / 2.05;
+    controls.minDistance = 5;
+    controls.maxDistance = 30;
+    controls.update();
+
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.55);
+    scene.add(ambientLight);
+
+    const dirLight = new THREE.DirectionalLight(0xffffff, 1.2);
+    dirLight.position.set(8, 14, 8);
+    dirLight.castShadow = true;
+    dirLight.shadow.mapSize.set(2048, 2048);
+    dirLight.shadow.camera.left = -15;
+    dirLight.shadow.camera.right = 15;
+    dirLight.shadow.camera.top = 15;
+    dirLight.shadow.camera.bottom = -15;
+    dirLight.shadow.camera.near = 0.1;
+    dirLight.shadow.camera.far = 50;
+    scene.add(dirLight);
+
+    const groundBase = new THREE.Mesh(
+      new THREE.BoxGeometry(14, 0.05, 14),
+      new THREE.MeshStandardMaterial({ color: 0xdcdcdc })
+    );
+    groundBase.position.y = -0.08;
+    groundBase.receiveShadow = true;
+    scene.add(groundBase);
+
+    const raycaster = new THREE.Raycaster();
+    const mouse = new THREE.Vector2();
+    const clock = new THREE.Clock();
+
+    const gridGroup = new THREE.Group();
+    scene.add(gridGroup);
+
+    const tileGeometry = new THREE.BoxGeometry(TILE_SIZE, TILE_HEIGHT, TILE_SIZE);
+    const tileMaterials = {
+      normal: new THREE.MeshStandardMaterial({ color: COLORS.tile }),
+      path: new THREE.MeshStandardMaterial({ color: COLORS.path }),
+      target: new THREE.MeshStandardMaterial({ color: COLORS.target })
+    };
+
+    const obstacleGeometry = new THREE.BoxGeometry(0.8, 0.8, 0.8);
+    const obstacleMaterial = new THREE.MeshStandardMaterial({ color: COLORS.obstacle });
+
+    const tiles = [];
+    const tileMap = [];
+    const blocked = Array.from({ length: GRID_SIZE }, () => Array(GRID_SIZE).fill(false));
+    const obstacles = [];
+
+    let fox = null;
+    let mixer = null;
+    let idleAction = null;
+    let walkAction = null;
+    let runAction = null;
+    let activeAction = null;
+
+    let foxGridPos = { col: 0, row: 0 };
+    let targetGridPos = null;
+
+    let currentPath = [];
+    let highlightedPathTiles = [];
+    let currentTargetTile = null;
+
+    let isMoving = false;
+    let movementQueue = [];
+    let currentMove = null;
+    let currentAnimState = 'idle';
+
+    function showMessage(text, duration = 1800) {
+      messageEl.textContent = text;
+      messageEl.classList.add('show');
+      clearTimeout(showMessage._timer);
+      showMessage._timer = setTimeout(() => {
+        messageEl.classList.remove('show');
+      }, duration);
+    }
+
+    function gridToWorld(col, row) {
+      const originOffset = ((GRID_SIZE - 1) * TILE_STEP) / 2;
+      return new THREE.Vector3(
+        col * TILE_STEP - originOffset,
+        TILE_HEIGHT / 2,
+        row * TILE_STEP - originOffset
+      );
+    }
+
+    function worldToGridPosition(vec3) {
+      const originOffset = ((GRID_SIZE - 1) * TILE_STEP) / 2;
+      const col = Math.round((vec3.x + originOffset) / TILE_STEP);
+      const row = Math.round((vec3.z + originOffset) / TILE_STEP);
+      return { col, row };
+    }
+
+    function isInsideGrid(col, row) {
+      return col >= 0 && col < GRID_SIZE && row >= 0 && row < GRID_SIZE;
+    }
+
+    function tileKey(col, row) {
+      return `${col},${row}`;
+    }
+
+    function setAnimState(nextState) {
+      if (currentAnimState === nextState) return;
+
+      let nextAction = null;
+      if (nextState === 'walk') {
+        nextAction = walkAction || runAction || idleAction;
+      } else {
+        nextAction = idleAction || walkAction || runAction;
+      }
+
+      if (!nextAction) {
+        currentAnimState = nextState;
+        return;
+      }
+
+      if (activeAction !== nextAction) {
+        nextAction.reset().play();
+        if (activeAction) {
+          activeAction.crossFadeTo(nextAction, 0.25, false);
+        }
+        activeAction = nextAction;
+      }
+
+      currentAnimState = nextState;
+    }
+
+    function updateHUD() {
+      foxPosEl.textContent = `(${foxGridPos.col}, ${foxGridPos.row})`;
+      targetPosEl.textContent = targetGridPos ? `(${targetGridPos.col}, ${targetGridPos.row})` : '-';
+      pathLengthEl.textContent = currentPath.length;
+      animStateEl.textContent = currentAnimState;
+      obstacleCountEl.textContent = `${obstacles.length}`;
+    }
+
+    function update3DState() {
+      window.__3D_STATE__.modelLoaded = !!fox;
+      window.__3D_STATE__.foxPosition = { col: foxGridPos.col, row: foxGridPos.row };
+      window.__3D_STATE__.targetPosition = targetGridPos ? { col: targetGridPos.col, row: targetGridPos.row } : null;
+      window.__3D_STATE__.pathLength = currentPath.length;
+      window.__3D_STATE__.animState = currentAnimState;
+      window.__3D_STATE__.obstacleCount = obstacles.length;
+      window.__3D_STATE__.isMoving = isMoving;
+      window.__3D_STATE__.gridSize = GRID_SIZE;
+    }
+
+    function clearPathHighlight() {
+      for (const tile of highlightedPathTiles) {
+        if (tile !== currentTargetTile) {
+          tile.material = tileMaterials.normal;
+        }
+      }
+      highlightedPathTiles = [];
+    }
+
+    function clearTargetHighlight() {
+      if (currentTargetTile) {
+        currentTargetTile.material = tileMaterials.normal;
+        currentTargetTile = null;
+      }
+    }
+
+    function applyHighlights(path, target) {
+      clearPathHighlight();
+      clearTargetHighlight();
+
+      for (let i = 0; i < path.length; i++) {
+        const node = path[i];
+        if (target && node.col === target.col && node.row === target.row) continue;
+        const tile = tileMap[node.row][node.col];
+        tile.material = tileMaterials.path;
+        highlightedPathTiles.push(tile);
+      }
+
+      if (target) {
+        currentTargetTile = tileMap[target.row][target.col];
+        currentTargetTile.material = tileMaterials.target;
+      }
+    }
+
+    function createGrid() {
+      for (let row = 0; row < GRID_SIZE; row++) {
+        const rowTiles = [];
+        for (let col = 0; col < GRID_SIZE; col++) {
+          const tile = new THREE.Mesh(tileGeometry, tileMaterials.normal);
+          const pos = gridToWorld(col, row);
+          tile.position.copy(pos);
+          tile.userData = { col, row, isTile: true };
+          tile.receiveShadow = true;
+          tile.castShadow = false;
+          gridGroup.add(tile);
+          rowTiles.push(tile);
+          tiles.push(tile);
+        }
+        tileMap.push(rowTiles);
+      }
+    }
+
+    function placeObstacles() {
+      const forbidden = new Set([tileKey(0, 0), tileKey(9, 9)]);
+      let count = 0;
+
+      while (count < OBSTACLE_COUNT) {
+        const col = Math.floor(Math.random() * GRID_SIZE);
+        const row = Math.floor(Math.random() * GRID_SIZE);
+        const key = tileKey(col, row);
+
+        if (forbidden.has(key) || blocked[row][col]) continue;
+
+        blocked[row][col] = true;
+
+        const obstacle = new THREE.Mesh(obstacleGeometry, obstacleMaterial);
+        const pos = gridToWorld(col, row);
+        obstacle.position.set(pos.x, TILE_HEIGHT / 2 + 0.4, pos.z);
+        obstacle.castShadow = true;
+        obstacle.receiveShadow = true;
+        obstacle.userData = { col, row, isObstacle: true };
+        scene.add(obstacle);
+        obstacles.push(obstacle);
+
+        count++;
+      }
+
+      window.__3D_STATE__.obstacleCount = obstacles.length;
+      obstacleCountEl.textContent = `${obstacles.length}`;
+    }
+
+    function heuristic(a, b) {
+      return Math.abs(a.col - b.col) + Math.abs(a.row - b.row);
+    }
+
+    function reconstructPath(cameFrom, current) {
+      const path = [current];
+      let key = tileKey(current.col, current.row);
+
+      while (cameFrom.has(key)) {
+        const prev = cameFrom.get(key);
+        path.push(prev);
+        key = tileKey(prev.col, prev.row);
+      }
+
+      path.reverse();
+      return path;
+    }
+
+    function findPath(start, goal) {
+      if (!isInsideGrid(goal.col, goal.row)) return null;
+      if (blocked[goal.row][goal.col]) return null;
+
+      const openSet = [start];
+      const openKeys = new Set([tileKey(start.col, start.row)]);
+      const cameFrom = new Map();
+
+      const gScore = new Map();
+      const fScore = new Map();
+
+      const startKey = tileKey(start.col, start.row);
+      gScore.set(startKey, 0);
+      fScore.set(startKey, heuristic(start, goal));
+
+      while (openSet.length > 0) {
+        let currentIndex = 0;
+        let current = openSet[0];
+        let currentKey = tileKey(current.col, current.row);
+        let lowestF = fScore.get(currentKey) ?? Infinity;
+
+        for (let i = 1; i < openSet.length; i++) {
+          const node = openSet[i];
+          const key = tileKey(node.col, node.row);
+          const score = fScore.get(key) ?? Infinity;
+          if (score < lowestF) {
+            lowestF = score;
+            current = node;
+            currentKey = key;
+            currentIndex = i;
+          }
+        }
+
+        if (current.col === goal.col && current.row === goal.row) {
+          return reconstructPath(cameFrom, current);
+        }
+
+        openSet.splice(currentIndex, 1);
+        openKeys.delete(currentKey);
+
+        const neighbors = [
+          { col: current.col + 1, row: current.row },
+          { col: current.col - 1, row: current.row },
+          { col: current.col, row: current.row + 1 },
+          { col: current.col, row: current.row - 1 }
+        ];
+
+        for (const neighbor of neighbors) {
+          if (!isInsideGrid(neighbor.col, neighbor.row)) continue;
+          if (blocked[neighbor.row][neighbor.col]) continue;
+
+          const neighborKey = tileKey(neighbor.col, neighbor.row);
+          const tentativeG = (gScore.get(currentKey) ?? Infinity) + 1;
+
+          if (tentativeG < (gScore.get(neighborKey) ?? Infinity)) {
+            cameFrom.set(neighborKey, current);
+            gScore.set(neighborKey, tentativeG);
+            fScore.set(neighborKey, tentativeG + heuristic(neighbor, goal));
+
+            if (!openKeys.has(neighborKey)) {
+              openSet.push(neighbor);
+              openKeys.add(neighborKey);
+            }
+          }
+        }
+      }
+
+      return null;
+    }
+
+    function rotateFoxToward(direction) {
+      if (!fox) return;
+      const angle = Math.atan2(direction.x, direction.z);
+      fox.rotation.y = angle;
+    }
+
+    function startMovement(path) {
+      if (!fox || !path || path.length <= 1) {
+        isMoving = false;
+        movementQueue = [];
+        currentMove = null;
+        setAnimState('idle');
+        return;
+      }
+
+      movementQueue = path.slice(1);
+      currentMove = null;
+      isMoving = true;
+      setAnimState('walk');
+    }
+
+    function cancelCurrentMovement() {
+      isMoving = false;
+      movementQueue = [];
+      currentMove = null;
+    }
+
+    function setTarget(col, row) {
+      if (!isInsideGrid(col, row)) return;
+      if (blocked[row][col]) {
+        showMessage('目标格子被障碍物阻挡');
+        return;
+      }
+
+      targetGridPos = { col, row };
+
+      cancelCurrentMovement();
+
+      const path = findPath({ ...foxGridPos }, { col, row });
+      if (!path) {
+        currentPath = [];
+        applyHighlights([], targetGridPos);
+        setAnimState('idle');
+        showMessage('无法到达');
+        updateHUD();
+        update3DState();
+        return;
+      }
+
+      currentPath = path.slice(1);
+      applyHighlights(path.slice(1), targetGridPos);
+
+      if (path.length <= 1) {
+        setAnimState('idle');
+        updateHUD();
+        update3DState();
+        return;
+      }
+
+      startMovement(path);
+      updateHUD();
+      update3DState();
+    }
+
+    function updateMovement(delta) {
+      if (!fox || !isMoving) return;
+
+      if (!currentMove && movementQueue.length > 0) {
+        const nextNode = movementQueue.shift();
+        const startPos = fox.position.clone();
+        const targetWorld = gridToWorld(nextNode.col, nextNode.row);
+        targetWorld.y = fox.position.y;
+
+        const dir = new THREE.Vector3().subVectors(targetWorld, startPos).normalize();
+        rotateFoxToward(dir);
+
+        currentMove = {
+          from: startPos,
+          to: targetWorld,
+          toGrid: nextNode,
+          elapsed: 0
+        };
+      }
+
+      if (!currentMove) {
+        isMoving = false;
+        currentPath = [];
+        clearPathHighlight();
+        clearTargetHighlight();
+        targetGridPos = null;
+        setAnimState('idle');
+        updateHUD();
+        update3DState();
+        return;
+      }
+
+      currentMove.elapsed += delta;
+      const t = Math.min(currentMove.elapsed / MOVE_DURATION_PER_TILE, 1);
+      fox.position.lerpVectors(currentMove.from, currentMove.to, t);
+
+      if (t >= 1) {
+        fox.position.copy(currentMove.to);
+        foxGridPos = { col: currentMove.toGrid.col, row: currentMove.toGrid.row };
+
+        currentPath = currentPath.filter(
+          node => !(node.col === foxGridPos.col && node.row === foxGridPos.row)
+        );
+
+        if (currentTargetTile && currentTargetTile.userData.col === foxGridPos.col && currentTargetTile.userData.row === foxGridPos.row) {
+          clearPathHighlight();
+          clearTargetHighlight();
+          targetGridPos = null;
+        } else {
+          const passedTile = tileMap[foxGridPos.row][foxGridPos.col];
+          if (passedTile && passedTile !== currentTargetTile) {
+            passedTile.material = tileMaterials.normal;
+            highlightedPathTiles = highlightedPathTiles.filter(tile => tile !== passedTile);
+          }
+        }
+
+        currentMove = null;
+
+        if (movementQueue.length === 0) {
+          isMoving = false;
+          currentPath = [];
+          clearPathHighlight();
+          clearTargetHighlight();
+          targetGridPos = null;
+          setAnimState('idle');
+        }
+      }
+    }
+
+    function loadFox() {
+      const loader = new GLTFLoader();
+      loader.load(
+        'assets/Fox.glb',
+        (gltf) => {
+          fox = gltf.scene;
+          fox.scale.setScalar(0.02);
+
+          const startPos = gridToWorld(0, 0);
+          fox.position.set(startPos.x, TILE_HEIGHT / 2, startPos.z);
+          fox.traverse((obj) => {
+            if (obj.isMesh) {
+              obj.castShadow = true;
+              obj.receiveShadow = true;
+            }
+          });
+          scene.add(fox);
+
+          mixer = new THREE.AnimationMixer(fox);
+
+          for (const clip of gltf.animations) {
+            const name = clip.name.toLowerCase();
+            if (!idleAction && (name.includes('survey') || name.includes('idle'))) {
+              idleAction = mixer.clipAction(clip);
+            }
+            if (!walkAction && name.includes('walk')) {
+              walkAction = mixer.clipAction(clip);
+            }
+            if (!runAction && name.includes('run')) {
+              runAction = mixer.clipAction(clip);
+            }
+          }
+
+          if (!idleAction && gltf.animations[0]) idleAction = mixer.clipAction(gltf.animations[0]);
+          if (!walkAction && gltf.animations[1]) walkAction = mixer.clipAction(gltf.animations[1]);
+          if (!runAction && gltf.animations[2]) runAction = mixer.clipAction(gltf.animations[2]);
+
+          [idleAction, walkAction, runAction].forEach(action => {
+            if (action) {
+              action.enabled = true;
+              action.setLoop(THREE.LoopRepeat);
+            }
+          });
+
+          activeAction = idleAction || walkAction || runAction || null;
+          if (activeAction) activeAction.play();
+          currentAnimState = 'idle';
+
+          foxGridPos = { col: 0, row: 0 };
+          window.__3D_STATE__.modelLoaded = true;
+          updateHUD();
+          update3DState();
+        },
+        undefined,
+        (err) => {
+          console.error('Fox.glb 加载失败:', err);
+          showMessage('Fox.glb 加载失败，请检查 assets/Fox.glb');
+        }
+      );
+    }
+
+    function onPointerClick(event) {
+      const rect = renderer.domElement.getBoundingClientRect();
+      mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+      mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+
+      raycaster.setFromCamera(mouse, camera);
+      const intersects = raycaster.intersectObjects(tiles, false);
+
+      if (intersects.length > 0) {
+        const tile = intersects[0].object;
+        const { col, row } = tile.userData;
+        setTarget(col, row);
+      }
+    }
+
+    function onResize() {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    }
+
+    createGrid();
+    placeObstacles();
+    loadFox();
+    updateHUD();
+    update3DState();
+
+    renderer.domElement.addEventListener('click', onPointerClick);
+    window.addEventListener('resize', onResize);
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      const delta = clock.getDelta();
+
+      if (mixer) mixer.update(delta);
+      updateMovement(delta);
+      controls.update();
+
+      updateHUD();
+      update3DState();
+
+      renderer.render(scene, camera);
+    }
+
+    animate();
+  </script>
+</body>
+</html>

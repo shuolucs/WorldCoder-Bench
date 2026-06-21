@@ -1,0 +1,502 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Double Spring Physics Simulation</title>
+<style>
+  body { margin: 0; overflow: hidden; font-family: Arial, sans-serif; }
+  canvas { display: block; }
+  #controls {
+    position: absolute;
+    top: 10px;
+    left: 10px;
+    z-index: 10;
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  #controls button {
+    padding: 8px 16px;
+    font-size: 14px;
+    cursor: pointer;
+    border: none;
+    border-radius: 4px;
+    background: #333;
+    color: #fff;
+    transition: background 0.2s;
+  }
+  #controls button:hover {
+    background: #555;
+  }
+  #hud {
+    position: absolute;
+    top: 10px;
+    right: 10px;
+    z-index: 10;
+    background: rgba(0,0,0,0.7);
+    color: #fff;
+    padding: 12px 16px;
+    border-radius: 8px;
+    font-size: 13px;
+    line-height: 1.6;
+    min-width: 220px;
+  }
+  #hud .label {
+    color: #aaa;
+  }
+  #hud .value {
+    color: #0f0;
+    font-weight: bold;
+  }
+</style>
+</head>
+<body>
+
+<div id="controls">
+  <button id="btn-pause">Pause/Resume</button>
+  <button id="btn-slow">Slow Motion</button>
+  <button id="btn-normal">Normal Speed</button>
+  <button id="btn-reset">Reset</button>
+</div>
+
+<div id="hud">
+  <div><span class="label">Time Scale:</span> <span class="value" id="hud-timescale">1.00</span></div>
+  <div><span class="label">Mass A Y:</span> <span class="value" id="hud-massA">4.00</span></div>
+  <div><span class="label">Mass B Y:</span> <span class="value" id="hud-massB">2.00</span></div>
+  <div><span class="label">Total Energy:</span> <span class="value" id="hud-energy">0.00</span> J</div>
+  <div><span class="label">Sim Time:</span> <span class="value" id="hud-simtime">0.00</span> s</div>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.163.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.163.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+// --- State ---
+const state = {
+  paused: false,
+  timeScale: 1.0,
+  massA_y: 4.0,
+  massB_y: 2.0,
+  massA_vy: 0.0,
+  massB_vy: 0.0,
+  totalEnergy: 0.0,
+  simTime: 0.0,
+  modelLoaded: false,
+  impulseAppliedA: 0,
+  impulseAppliedB: 0,
+  resetCount: 0
+};
+window.__3D_STATE__ = state;
+
+// --- Constants ---
+const GRAVITY = 9.81;
+const ANCHOR_POS = new THREE.Vector3(-4, 6, 0);
+const INITIAL_A_Y = 4.0;
+const INITIAL_B_Y = 2.0;
+const MASS_A = 2.0;
+const MASS_B = 1.5;
+const K1 = 30.0;
+const K2 = 20.0;
+const DAMP1 = 0.3;
+const DAMP2 = 0.2;
+const REST1 = 1.5;
+const REST2 = 1.5;
+const MIN_Y = -5.0;
+
+// --- Physics state ---
+let massA_y = INITIAL_A_Y;
+let massA_vy = 0.0;
+let massB_y = INITIAL_B_Y;
+let massB_vy = 0.0;
+let simTime = 0.0;
+
+// --- Scene setup ---
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x87CEEB);
+
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+camera.position.set(0, 3, 10);
+camera.lookAt(0, 0, 0);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.shadowMap.enabled = true;
+document.body.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 3, 0);
+controls.update();
+
+// --- Lights ---
+const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
+scene.add(ambientLight);
+
+const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+dirLight.position.set(5, 10, 5);
+dirLight.castShadow = true;
+scene.add(dirLight);
+
+// --- Ground ---
+const groundGeo = new THREE.PlaneGeometry(50, 50);
+const groundMat = new THREE.MeshStandardMaterial({ color: 0x888888 });
+const ground = new THREE.Mesh(groundGeo, groundMat);
+ground.rotation.x = -Math.PI / 2;
+ground.position.y = 0;
+ground.receiveShadow = true;
+scene.add(ground);
+
+const gridHelper = new THREE.GridHelper(50, 50, 0x444444, 0x666666);
+gridHelper.position.y = 0.01;
+scene.add(gridHelper);
+
+// --- Anchor ---
+const anchorGeo = new THREE.SphereGeometry(0.2, 16, 16);
+const anchorMat = new THREE.MeshStandardMaterial({ color: 0xff0000 });
+const anchorMesh = new THREE.Mesh(anchorGeo, anchorMat);
+anchorMesh.position.copy(ANCHOR_POS);
+scene.add(anchorMesh);
+
+// --- Mass A ---
+const massAGeo = new THREE.SphereGeometry(0.4, 24, 24);
+const massAMat = new THREE.MeshStandardMaterial({ color: 0x3366ff });
+const massAMesh = new THREE.Mesh(massAGeo, massAMat);
+massAMesh.position.set(ANCHOR_POS.x, massA_y, ANCHOR_POS.z);
+massAMesh.castShadow = true;
+scene.add(massAMesh);
+
+// --- Mass B ---
+const massBGeo = new THREE.SphereGeometry(0.4, 24, 24);
+const massBMat = new THREE.MeshStandardMaterial({ color: 0x33cc33 });
+const massBMesh = new THREE.Mesh(massBGeo, massBMat);
+massBMesh.position.set(ANCHOR_POS.x, massB_y, ANCHOR_POS.z);
+massBMesh.castShadow = true;
+scene.add(massBMesh);
+
+// --- Spring visuals (coil-like) ---
+function createSpringLine() {
+  const material = new THREE.LineBasicMaterial({ color: 0xffffff, linewidth: 2 });
+  const geometry = new THREE.BufferGeometry();
+  const points = [];
+  const coils = 10;
+  const segments = coils * 8;
+  for (let i = 0; i <= segments; i++) {
+    points.push(0, 0, 0);
+  }
+  geometry.setAttribute('position', new THREE.Float32BufferAttribute(points, 3));
+  const line = new THREE.Line(geometry, material);
+  return line;
+}
+
+function updateSpringGeometry(line, startPos, endPos) {
+  const positions = line.geometry.attributes.position;
+  const count = positions.count;
+  const coils = 10;
+  const amplitude = 0.15;
+  const dx = endPos.x - startPos.x;
+  const dy = endPos.y - startPos.y;
+  const dz = endPos.z - startPos.z;
+
+  for (let i = 0; i < count; i++) {
+    const t = i / (count - 1);
+    const x = startPos.x + dx * t;
+    const y = startPos.y + dy * t;
+    const z = startPos.z + dz * t;
+
+    // Add zigzag perpendicular to the spring direction
+    if (i > 0 && i < count - 1) {
+      const angle = t * coils * Math.PI * 2;
+      const offset = Math.sin(angle) * amplitude;
+      positions.setXYZ(i, x + offset, y, z);
+    } else {
+      positions.setXYZ(i, x, y, z);
+    }
+  }
+  positions.needsUpdate = true;
+}
+
+const spring1Line = createSpringLine();
+scene.add(spring1Line);
+
+const spring2Line = createSpringLine();
+scene.add(spring2Line);
+
+// --- Load Michelle.glb ---
+let mixer = null;
+const loader = new GLTFLoader();
+loader.load(
+  'Michelle.glb',
+  (gltf) => {
+    const model = gltf.scene;
+    model.scale.set(0.015, 0.015, 0.015);
+    model.position.set(0, 0, -3);
+    model.traverse((child) => {
+      if (child.isMesh) {
+        child.castShadow = true;
+        child.receiveShadow = true;
+      }
+    });
+    scene.add(model);
+
+    if (gltf.animations && gltf.animations.length > 0) {
+      mixer = new THREE.AnimationMixer(model);
+      const action = mixer.clipAction(gltf.animations[0]);
+      action.play();
+    }
+
+    state.modelLoaded = true;
+  },
+  undefined,
+  (error) => {
+    console.warn('Could not load Michelle.glb:', error);
+  }
+);
+
+// --- Labels for masses ---
+function createLabel(text, color) {
+  const canvas = document.createElement('canvas');
+  canvas.width = 128;
+  canvas.height = 64;
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = color;
+  ctx.font = 'bold 28px Arial';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(text, 64, 32);
+  const texture = new THREE.CanvasTexture(canvas);
+  const spriteMat = new THREE.SpriteMaterial({ map: texture });
+  const sprite = new THREE.Sprite(spriteMat);
+  sprite.scale.set(1.2, 0.6, 1);
+  return sprite;
+}
+
+const labelA = createLabel('Mass A', '#3366ff');
+scene.add(labelA);
+
+const labelB = createLabel('Mass B', '#33cc33');
+scene.add(labelB);
+
+// --- Physics ---
+function resetSystem() {
+  massA_y = INITIAL_A_Y;
+  massA_vy = 0.0;
+  massB_y = INITIAL_B_Y;
+  massB_vy = 0.0;
+  simTime = 0.0;
+  state.resetCount++;
+}
+
+function stepPhysics(dt) {
+  if (dt <= 0) return;
+
+  // Spring 1: anchor to mass A
+  const stretch1 = ANCHOR_POS.y - massA_y;
+  const displacement1 = stretch1 - REST1; // positive when compressed (A too close to anchor)
+  // If stretch1 > REST1, spring is compressed, push A down (negative force on A? No...)
+  // Actually: if distance < restLength, spring pushes apart; if distance > restLength, spring pulls together
+  // Force on A from spring 1: directed toward anchor if stretched, away if compressed
+  // stretch1 = anchorY - Ay. If Ay < anchorY - restLength, spring is stretched beyond rest, pull A up
+  // F_spring1_on_A = k1 * (stretch1 - REST1) = k1 * (anchorY - Ay - REST1)
+  // When Ay = anchorY - REST1, force = 0 (at rest)
+  // When Ay < anchorY - REST1, stretch1 > REST1, force > 0 (upward, pulling A toward anchor) ✓
+  // When Ay > anchorY - REST1, stretch1 < REST1, force < 0 (downward, pushing A away) ✓
+  const F_spring1_on_A = K1 * (stretch1 - REST1) - DAMP1 * massA_vy;
+
+  // Spring 2: mass A to mass B
+  const stretch2 = massA_y - massB_y;
+  const F_spring2_on_B = K2 * (stretch2 - REST2) - DAMP2 * massB_vy;
+  const F_spring2_on_A = -K2 * (stretch2 - REST2) + DAMP2 * massA_vy; // reaction on A
+  // Actually damping on spring 2 should use relative velocity
+  const relVel2 = massA_vy - massB_vy; // positive when A moves up relative to B... hmm
+  // Let me redo spring 2 properly:
+  // F_spring2_on_B (upward positive) = K2 * (stretch2 - REST2) - DAMP2 * (massB_vy - massA_vy)
+  // Actually let's think carefully:
+  // stretch2 = Ay - By (distance from B to A along y, assuming A is above B)
+  // If stretch2 > REST2, spring is stretched, pull B up and A down
+  // F on B from spring2 = +K2*(stretch2 - REST2) (upward)
+  // F on A from spring2 = -K2*(stretch2 - REST2) (downward)
+  // Damping: relative velocity of B w.r.t. A = massB_vy - massA_vy
+  // Damping force on B = -DAMP2 * (massB_vy - massA_vy)
+  // Damping force on A = +DAMP2 * (massB_vy - massA_vy)
+
+  const relVelBA = massB_vy - massA_vy;
+  const springForce2 = K2 * (stretch2 - REST2);
+
+  const F_on_B = springForce2 - DAMP2 * relVelBA - MASS_B * GRAVITY;
+  const F_on_A = F_spring1_on_A - springForce2 + DAMP2 * relVelBA - MASS_A * GRAVITY;
+
+  // Wait, let me redo damping on spring 1 too with relative velocity
+  // Spring 1 damping: relative velocity of A w.r.t. anchor (anchor is fixed, vel=0)
+  // So damping force on A from spring 1 = -DAMP1 * massA_vy (already included above)
+
+  // Semi-implicit Euler: update velocity first, then position
+  const accA = F_on_A / MASS_A;
+  const accB = F_on_B / MASS_B;
+
+  massA_vy += accA * dt;
+  massB_vy += accB * dt;
+
+  massA_y += massA_vy * dt;
+  massB_y += massB_vy * dt;
+
+  // Clamp
+  if (massA_y > ANCHOR_POS.y) {
+    massA_y = ANCHOR_POS.y;
+    massA_vy = 0;
+  }
+  if (massA_y < MIN_Y) {
+    massA_y = MIN_Y;
+    massA_vy = 0;
+  }
+  if (massB_y > ANCHOR_POS.y) {
+    massB_y = ANCHOR_POS.y;
+    massB_vy = 0;
+  }
+  if (massB_y < MIN_Y) {
+    massB_y = MIN_Y;
+    massB_vy = 0;
+  }
+
+  simTime += dt;
+}
+
+function computeTotalEnergy() {
+  // KE
+  const KE_A = 0.5 * MASS_A * massA_vy * massA_vy;
+  const KE_B = 0.5 * MASS_B * massB_vy * massB_vy;
+
+  // Gravitational PE (reference at y=0)
+  const PE_grav_A = MASS_A * GRAVITY * massA_y;
+  const PE_grav_B = MASS_B * GRAVITY * massB_y;
+
+  // Spring PE
+  const stretch1 = ANCHOR_POS.y - massA_y;
+  const ext1 = stretch1 - REST1;
+  const PE_spring1 = 0.5 * K1 * ext1 * ext1;
+
+  const stretch2 = massA_y - massB_y;
+  const ext2 = stretch2 - REST2;
+  const PE_spring2 = 0.5 * K2 * ext2 * ext2;
+
+  return KE_A + KE_B + PE_grav_A + PE_grav_B + PE_spring1 + PE_spring2;
+}
+
+// --- Controls ---
+let paused = false;
+let timeScale = 1.0;
+
+document.getElementById('btn-pause').addEventListener('click', () => {
+  paused = !paused;
+  state.paused = paused;
+});
+
+document.getElementById('btn-slow').addEventListener('click', () => {
+  timeScale = 0.25;
+  state.timeScale = timeScale;
+});
+
+document.getElementById('btn-normal').addEventListener('click', () => {
+  timeScale = 1.0;
+  state.timeScale = timeScale;
+});
+
+document.getElementById('btn-reset').addEventListener('click', () => {
+  resetSystem();
+});
+
+// --- Keyboard ---
+document.addEventListener('keydown', (e) => {
+  const key = e.key.toLowerCase();
+  if (key === 'd') {
+    massA_vy -= 5.0;
+    state.impulseAppliedA++;
+  } else if (key === 'u') {
+    massB_vy += 5.0;
+    state.impulseAppliedB++;
+  } else if (key === 'r') {
+    resetSystem();
+  }
+});
+
+// --- HUD elements ---
+const hudTimescale = document.getElementById('hud-timescale');
+const hudMassA = document.getElementById('hud-massA');
+const hudMassB = document.getElementById('hud-massB');
+const hudEnergy = document.getElementById('hud-energy');
+const hudSimtime = document.getElementById('hud-simtime');
+
+// --- Animation loop ---
+const clock = new THREE.Clock();
+
+function animate() {
+  requestAnimationFrame(animate);
+
+  const delta = clock.getDelta();
+
+  if (mixer) {
+    mixer.update(delta);
+  }
+
+  if (!paused) {
+    const dt = (1 / 60) * timeScale;
+    stepPhysics(dt);
+  }
+
+  // Update mesh positions
+  massAMesh.position.set(ANCHOR_POS.x, massA_y, ANCHOR_POS.z);
+  massBMesh.position.set(ANCHOR_POS.x, massB_y, ANCHOR_POS.z);
+
+  // Update labels
+  labelA.position.set(ANCHOR_POS.x + 1.0, massA_y, ANCHOR_POS.z);
+  labelB.position.set(ANCHOR_POS.x + 1.0, massB_y, ANCHOR_POS.z);
+
+  // Update spring visuals
+  updateSpringGeometry(spring1Line, ANCHOR_POS, massAMesh.position);
+  updateSpringGeometry(spring2Line, massAMesh.position, massBMesh.position);
+
+  // Compute energy
+  const totalEnergy = computeTotalEnergy();
+
+  // Update state
+  state.paused = paused;
+  state.timeScale = timeScale;
+  state.massA_y = massA_y;
+  state.massB_y = massB_y;
+  state.massA_vy = massA_vy;
+  state.massB_vy = massB_vy;
+  state.totalEnergy = totalEnergy;
+  state.simTime = simTime;
+
+  // Update HUD
+  hudTimescale.textContent = timeScale.toFixed(2);
+  hudMassA.textContent = massA_y.toFixed(2);
+  hudMassB.textContent = massB_y.toFixed(2);
+  hudEnergy.textContent = totalEnergy.toFixed(2);
+  hudSimtime.textContent = simTime.toFixed(2);
+
+  controls.update();
+  renderer.render(scene, camera);
+}
+
+animate();
+
+// --- Resize ---
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+</script>
+</body>
+</html>

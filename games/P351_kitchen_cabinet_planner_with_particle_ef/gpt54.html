@@ -1,0 +1,624 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>3D Kitchen Cabinet Planner</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      font-family: Arial, sans-serif;
+      background: #1a1a1a;
+    }
+
+    canvas {
+      display: block;
+    }
+
+    .hud {
+      position: absolute;
+      left: 0;
+      right: 0;
+      z-index: 10;
+      pointer-events: none;
+    }
+
+    .topbar {
+      top: 0;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 10px 14px;
+      background: rgba(20, 20, 20, 0.72);
+      color: #fff;
+      box-sizing: border-box;
+    }
+
+    .controls, .stats {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      pointer-events: auto;
+      flex-wrap: wrap;
+    }
+
+    button {
+      background: #2f2f2f;
+      color: white;
+      border: 1px solid #555;
+      padding: 8px 12px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 14px;
+    }
+
+    button:hover {
+      background: #454545;
+    }
+
+    button.active {
+      background: #8b5a2b;
+      border-color: #d8b07a;
+    }
+
+    .danger {
+      background: #7a1f1f;
+      border-color: #c55;
+    }
+
+    .danger:hover {
+      background: #a32929;
+    }
+
+    .bottombar {
+      bottom: 0;
+      padding: 10px 14px;
+      background: rgba(20, 20, 20, 0.72);
+      color: #fff;
+      font-size: 14px;
+      box-sizing: border-box;
+      text-align: center;
+      pointer-events: none;
+    }
+
+    .hint {
+      opacity: 0.9;
+      margin-left: 12px;
+      font-size: 13px;
+    }
+  </style>
+</head>
+<body>
+  <div class="hud topbar">
+    <div class="controls">
+      <button id="addBase">Add Base Cabinet</button>
+      <button id="addWall">Add Wall Cabinet</button>
+      <button id="addTall">Add Tall Cabinet</button>
+      <button id="removeLast" class="danger">Remove Last</button>
+      <button id="clearAll" class="danger">Clear All</button>
+      <span class="hint">Use ←/→ to move preview, Enter to place, D to toggle last door</span>
+    </div>
+    <div class="stats">
+      <span id="statsText">Cabinets: 0 | Total Cost: $0</span>
+    </div>
+  </div>
+
+  <div class="hud bottombar">
+    <span id="placementInfo">Selected X: 0</span>
+  </div>
+
+  <script type="module">
+    import * as THREE from "https://unpkg.com/three@0.160.0/build/three.module.js";
+    import { OrbitControls } from "https://unpkg.com/three@0.160.0/examples/jsm/controls/OrbitControls.js";
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0xd9d4cc);
+
+    const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+    camera.position.set(0, 3, 8);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    document.body.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.set(0, 1.2, 0);
+    controls.minPolarAngle = 0.2;
+    controls.maxPolarAngle = 1.4;
+    controls.enableDamping = true;
+
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+    scene.add(ambientLight);
+
+    const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+    dirLight.position.set(5, 10, 5);
+    dirLight.castShadow = true;
+    dirLight.shadow.mapSize.set(2048, 2048);
+    dirLight.shadow.camera.left = -10;
+    dirLight.shadow.camera.right = 10;
+    dirLight.shadow.camera.top = 10;
+    dirLight.shadow.camera.bottom = -10;
+    dirLight.shadow.camera.near = 0.5;
+    dirLight.shadow.camera.far = 30;
+    scene.add(dirLight);
+
+    const wall = new THREE.Mesh(
+      new THREE.BoxGeometry(10, 4, 0.2),
+      new THREE.MeshStandardMaterial({ color: "#e8e0d4" })
+    );
+    wall.position.set(0, 2, -2);
+    wall.receiveShadow = true;
+    scene.add(wall);
+
+    const floor = new THREE.Mesh(
+      new THREE.PlaneGeometry(10, 10),
+      new THREE.MeshStandardMaterial({ color: "#b5a48a" })
+    );
+    floor.rotation.x = -Math.PI / 2;
+    floor.position.y = 0;
+    floor.receiveShadow = true;
+    scene.add(floor);
+
+    const cabinetDefs = {
+      base: { size: [1, 1, 0.6], color: "#8B4513", y: 0, cost: 150 },
+      wall: { size: [1, 0.8, 0.4], color: "#654321", y: 2.2, cost: 120 },
+      tall: { size: [1, 2.2, 0.6], color: "#5C4033", y: 0, cost: 280 }
+    };
+
+    const cabinets = [];
+    const occupied = new Map();
+    const particles = [];
+    const clock = new THREE.Clock();
+
+    let selectedType = null;
+    let ghost = null;
+    let ghostGridX = 0;
+    let lastPlacedDoor = null;
+    let lastPlacedCabinet = null;
+    let particlesEmitted = 0;
+
+    const raycaster = new THREE.Raycaster();
+    const mouse = new THREE.Vector2();
+
+    const statsText = document.getElementById("statsText");
+    const placementInfo = document.getElementById("placementInfo");
+    const buttons = {
+      base: document.getElementById("addBase"),
+      wall: document.getElementById("addWall"),
+      tall: document.getElementById("addTall")
+    };
+
+    window.__3D_STATE__ = {
+      cabinetCount: 0,
+      totalCost: 0,
+      selectedType: null,
+      lastPlacedX: null,
+      lastPlacedType: null,
+      ghostVisible: false,
+      doorOpen: false,
+      particlesEmitted: 0,
+      cameraDistance: camera.position.length(),
+      cabinetTypes: { base: 0, wall: 0, tall: 0 }
+    };
+
+    function clampGridX(x) {
+      return Math.max(-4, Math.min(4, Math.round(x)));
+    }
+
+    function getCabinetY(type) {
+      const def = cabinetDefs[type];
+      return def.y + def.size[1] / 2;
+    }
+
+    function keyFor(type, x) {
+      return `${type}:${x}`;
+    }
+
+    function createCabinet(type, x) {
+      const def = cabinetDefs[type];
+      const [w, h, d] = def.size;
+
+      const group = new THREE.Group();
+      group.userData.type = type;
+      group.userData.gridX = x;
+      group.userData.cost = def.cost;
+      group.userData.doorOpen = false;
+      group.userData.doorAnimating = false;
+      group.userData.doorAnimTime = 0;
+      group.userData.doorStart = 0;
+      group.userData.doorTarget = 0;
+
+      const body = new THREE.Mesh(
+        new THREE.BoxGeometry(w, h, d),
+        new THREE.MeshStandardMaterial({ color: def.color, roughness: 0.7, metalness: 0.1 })
+      );
+      body.castShadow = true;
+      body.receiveShadow = true;
+      group.add(body);
+
+      const doorPivot = new THREE.Group();
+      const hingeX = -w / 2;
+      doorPivot.position.set(hingeX, 0, d / 2 + 0.002);
+      group.add(doorPivot);
+
+      const door = new THREE.Mesh(
+        new THREE.BoxGeometry(w * 0.98, h * 0.96, 0.03),
+        new THREE.MeshStandardMaterial({ color: new THREE.Color(def.color).offsetHSL(0, 0, 0.08), roughness: 0.6 })
+      );
+      door.position.set(w / 2, 0, 0.02);
+      door.castShadow = true;
+      door.receiveShadow = true;
+      doorPivot.add(door);
+
+      const handle = new THREE.Mesh(
+        new THREE.SphereGeometry(0.04, 12, 12),
+        new THREE.MeshStandardMaterial({ color: "#d4af37", metalness: 0.7, roughness: 0.3 })
+      );
+      handle.position.set(w * 0.85, 0, 0.04);
+      handle.castShadow = true;
+      doorPivot.add(handle);
+
+      group.userData.doorPivot = doorPivot;
+      group.position.set(x, getCabinetY(type), 0);
+
+      return group;
+    }
+
+    function createGhost(type) {
+      if (ghost) {
+        scene.remove(ghost);
+        disposeHierarchy(ghost);
+      }
+
+      const def = cabinetDefs[type];
+      const [w, h, d] = def.size;
+
+      ghost = new THREE.Group();
+
+      const body = new THREE.Mesh(
+        new THREE.BoxGeometry(w, h, d),
+        new THREE.MeshStandardMaterial({
+          color: def.color,
+          transparent: true,
+          opacity: 0.35,
+          depthWrite: false
+        })
+      );
+      ghost.add(body);
+
+      const outline = new THREE.LineSegments(
+        new THREE.EdgesGeometry(new THREE.BoxGeometry(w, h, d)),
+        new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.9 })
+      );
+      ghost.add(outline);
+
+      ghost.position.set(ghostGridX, getCabinetY(type), 0);
+      scene.add(ghost);
+    }
+
+    function setSelectedType(type) {
+      selectedType = type;
+      Object.entries(buttons).forEach(([k, btn]) => btn.classList.toggle("active", k === type));
+      if (selectedType) {
+        createGhost(selectedType);
+      } else if (ghost) {
+        scene.remove(ghost);
+        disposeHierarchy(ghost);
+        ghost = null;
+      }
+    }
+
+    function updateGhost() {
+      if (!ghost || !selectedType) return;
+      ghost.position.set(ghostGridX, getCabinetY(selectedType), 0);
+
+      const isOccupied = occupied.has(keyFor(selectedType, ghostGridX));
+      ghost.traverse(obj => {
+        if (obj.material && obj.material.color) {
+          if (obj.type === "Mesh") {
+            obj.material.color.set(isOccupied ? "#aa3333" : cabinetDefs[selectedType].color);
+          }
+        }
+      });
+    }
+
+    function placeCabinet(type, x) {
+      x = clampGridX(x);
+      const slotKey = keyFor(type, x);
+      if (occupied.has(slotKey)) return false;
+
+      const cabinet = createCabinet(type, x);
+      scene.add(cabinet);
+      cabinets.push(cabinet);
+      occupied.set(slotKey, cabinet);
+      lastPlacedCabinet = cabinet;
+      lastPlacedDoor = cabinet.userData.doorPivot;
+
+      emitParticles(cabinet.position.clone(), 30, new THREE.Color("#FFD700"));
+      particlesEmitted += 30;
+
+      window.__3D_STATE__.lastPlacedX = x;
+      window.__3D_STATE__.lastPlacedType = type;
+      updateStats();
+      return true;
+    }
+
+    function removeLastCabinet() {
+      if (!cabinets.length) return;
+      const cabinet = cabinets.pop();
+      const pos = cabinet.position.clone();
+      occupied.delete(keyFor(cabinet.userData.type, cabinet.userData.gridX));
+      scene.remove(cabinet);
+      disposeHierarchy(cabinet);
+
+      emitParticles(pos, 20, new THREE.Color("#FF4444"));
+      particlesEmitted += 20;
+
+      lastPlacedCabinet = cabinets[cabinets.length - 1] || null;
+      lastPlacedDoor = lastPlacedCabinet ? lastPlacedCabinet.userData.doorPivot : null;
+      updateStats();
+    }
+
+    function clearAllCabinets() {
+      while (cabinets.length) {
+        const cabinet = cabinets.pop();
+        scene.remove(cabinet);
+        disposeHierarchy(cabinet);
+      }
+      occupied.clear();
+      lastPlacedCabinet = null;
+      lastPlacedDoor = null;
+      updateStats();
+    }
+
+    function toggleLastDoor() {
+      if (!lastPlacedCabinet) return;
+      const data = lastPlacedCabinet.userData;
+      data.doorAnimating = true;
+      data.doorAnimTime = 0;
+      data.doorStart = data.doorPivot.rotation.y;
+      data.doorOpen = !data.doorOpen;
+      data.doorTarget = data.doorOpen ? -Math.PI / 2 : 0;
+    }
+
+    function emitParticles(position, count, color) {
+      const geometry = new THREE.BufferGeometry();
+      const positions = new Float32Array(count * 3);
+      const velocities = [];
+      const alphas = new Float32Array(count);
+      const sizes = new Float32Array(count);
+
+      for (let i = 0; i < count; i++) {
+        positions[i * 3 + 0] = position.x;
+        positions[i * 3 + 1] = position.y;
+        positions[i * 3 + 2] = position.z + 0.1;
+
+        velocities.push(new THREE.Vector3(
+          (Math.random() - 0.5) * 2.5,
+          Math.random() * 2.0,
+          (Math.random() - 0.5) * 2.5
+        ));
+
+        alphas[i] = 1;
+        sizes[i] = 24 + Math.random() * 10;
+      }
+
+      geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+      geometry.setAttribute("alpha", new THREE.BufferAttribute(alphas, 1));
+      geometry.setAttribute("size", new THREE.BufferAttribute(sizes, 1));
+
+      const material = new THREE.ShaderMaterial({
+        transparent: true,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+        uniforms: {
+          uColor: { value: color }
+        },
+        vertexShader: `
+          attribute float alpha;
+          attribute float size;
+          varying float vAlpha;
+          void main() {
+            vAlpha = alpha;
+            vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+            gl_PointSize = size * (300.0 / -mvPosition.z);
+            gl_Position = projectionMatrix * mvPosition;
+          }
+        `,
+        fragmentShader: `
+          uniform vec3 uColor;
+          varying float vAlpha;
+          void main() {
+            vec2 c = gl_PointCoord - vec2(0.5);
+            float d = length(c);
+            float a = smoothstep(0.5, 0.0, d) * vAlpha;
+            gl_FragColor = vec4(uColor, a);
+          }
+        `
+      });
+
+      const points = new THREE.Points(geometry, material);
+      scene.add(points);
+
+      particles.push({
+        points,
+        velocities,
+        age: 0,
+        lifetime: 1.5,
+        count
+      });
+    }
+
+    function updateParticles(dt) {
+      for (let i = particles.length - 1; i >= 0; i--) {
+        const p = particles[i];
+        p.age += dt;
+        const t = Math.min(p.age / p.lifetime, 1);
+
+        const posAttr = p.points.geometry.getAttribute("position");
+        const alphaAttr = p.points.geometry.getAttribute("alpha");
+
+        for (let j = 0; j < p.count; j++) {
+          const v = p.velocities[j];
+          v.y -= 2.2 * dt;
+
+          posAttr.array[j * 3 + 0] += v.x * dt;
+          posAttr.array[j * 3 + 1] += v.y * dt;
+          posAttr.array[j * 3 + 2] += v.z * dt;
+
+          alphaAttr.array[j] = 1 - t;
+        }
+
+        posAttr.needsUpdate = true;
+        alphaAttr.needsUpdate = true;
+
+        if (p.age >= p.lifetime) {
+          scene.remove(p.points);
+          p.points.geometry.dispose();
+          p.points.material.dispose();
+          particles.splice(i, 1);
+        }
+      }
+    }
+
+    function updateDoors(dt) {
+      cabinets.forEach(cabinet => {
+        const data = cabinet.userData;
+        if (!data.doorAnimating) return;
+
+        data.doorAnimTime += dt;
+        const duration = 0.3;
+        const t = Math.min(data.doorAnimTime / duration, 1);
+        const eased = 1 - Math.pow(1 - t, 3);
+        data.doorPivot.rotation.y = THREE.MathUtils.lerp(data.doorStart, data.doorTarget, eased);
+
+        if (t >= 1) {
+          data.doorAnimating = false;
+        }
+      });
+    }
+
+    function updateStats() {
+      let totalCost = 0;
+      const counts = { base: 0, wall: 0, tall: 0 };
+
+      cabinets.forEach(c => {
+        totalCost += c.userData.cost;
+        counts[c.userData.type]++;
+      });
+
+      statsText.textContent = `Cabinets: ${cabinets.length} | Total Cost: $${totalCost}`;
+      placementInfo.textContent = `Selected X: ${ghostGridX}`;
+    }
+
+    function disposeHierarchy(obj) {
+      obj.traverse(child => {
+        if (child.geometry) child.geometry.dispose();
+        if (child.material) {
+          if (Array.isArray(child.material)) child.material.forEach(m => m.dispose());
+          else child.material.dispose();
+        }
+      });
+    }
+
+    function screenToFloorX(clientX, clientY) {
+      mouse.x = (clientX / window.innerWidth) * 2 - 1;
+      mouse.y = -(clientY / window.innerHeight) * 2 + 1;
+      raycaster.setFromCamera(mouse, camera);
+      const hits = raycaster.intersectObject(floor, false);
+      if (hits.length) {
+        return clampGridX(hits[0].point.x);
+      }
+      return null;
+    }
+
+    renderer.domElement.addEventListener("pointerdown", (e) => {
+      if (!selectedType) return;
+      const x = screenToFloorX(e.clientX, e.clientY);
+      if (x === null) return;
+      ghostGridX = x;
+      updateGhost();
+      if (placeCabinet(selectedType, ghostGridX)) {
+        setSelectedType(null);
+      }
+    });
+
+    window.addEventListener("keydown", (e) => {
+      if (e.key === "ArrowLeft") {
+        if (selectedType) {
+          ghostGridX = clampGridX(ghostGridX - 1);
+          updateGhost();
+          updateStats();
+        }
+      } else if (e.key === "ArrowRight") {
+        if (selectedType) {
+          ghostGridX = clampGridX(ghostGridX + 1);
+          updateGhost();
+          updateStats();
+        }
+      } else if (e.key === "Enter") {
+        if (selectedType) {
+          if (placeCabinet(selectedType, ghostGridX)) {
+            setSelectedType(null);
+          }
+        }
+      } else if (e.key.toLowerCase() === "d") {
+        toggleLastDoor();
+      }
+    });
+
+    buttons.base.addEventListener("click", () => setSelectedType("base"));
+    buttons.wall.addEventListener("click", () => setSelectedType("wall"));
+    buttons.tall.addEventListener("click", () => setSelectedType("tall"));
+
+    document.getElementById("removeLast").addEventListener("click", removeLastCabinet);
+    document.getElementById("clearAll").addEventListener("click", clearAllCabinets);
+
+    window.addEventListener("resize", () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    updateStats();
+
+    function animate() {
+      requestAnimationFrame(animate);
+      const dt = Math.min(clock.getDelta(), 0.033);
+
+      controls.update();
+      updateParticles(dt);
+      updateDoors(dt);
+      updateGhost();
+
+      let totalCost = 0;
+      const cabinetTypes = { base: 0, wall: 0, tall: 0 };
+      cabinets.forEach(c => {
+        totalCost += c.userData.cost;
+        cabinetTypes[c.userData.type]++;
+      });
+
+      window.__3D_STATE__.cabinetCount = cabinets.length;
+      window.__3D_STATE__.totalCost = totalCost;
+      window.__3D_STATE__.selectedType = selectedType;
+      window.__3D_STATE__.lastPlacedX = lastPlacedCabinet ? lastPlacedCabinet.userData.gridX : null;
+      window.__3D_STATE__.lastPlacedType = lastPlacedCabinet ? lastPlacedCabinet.userData.type : null;
+      window.__3D_STATE__.ghostVisible = !!(ghost && selectedType);
+      window.__3D_STATE__.doorOpen = lastPlacedCabinet ? !!lastPlacedCabinet.userData.doorOpen : false;
+      window.__3D_STATE__.particlesEmitted = particlesEmitted;
+      window.__3D_STATE__.cameraDistance = camera.position.distanceTo(new THREE.Vector3(0, 0, 0));
+      window.__3D_STATE__.cabinetTypes = cabinetTypes;
+
+      renderer.render(scene, camera);
+    }
+
+    animate();
+  </script>
+</body>
+</html>

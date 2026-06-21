@@ -1,0 +1,769 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>3D Wildfire Spread Simulation</title>
+
+  <script type="importmap">
+  { "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+  } }
+  </script>
+
+  <style>
+    html, body {
+      margin: 0;
+      height: 100%;
+      overflow: hidden;
+      font-family: Arial, sans-serif;
+      background: #111;
+      color: #fff;
+    }
+
+    #app {
+      position: relative;
+      width: 100vw;
+      height: 100vh;
+      background: linear-gradient(to bottom, #001122 0%, #334466 100%);
+    }
+
+    canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+    }
+
+    #hud {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      z-index: 10;
+      background: rgba(0,0,0,0.45);
+      padding: 10px 12px;
+      border-radius: 8px;
+      line-height: 1.45;
+      font-size: 14px;
+      min-width: 210px;
+      backdrop-filter: blur(4px);
+    }
+
+    #controls-panel {
+      position: absolute;
+      top: 12px;
+      right: 12px;
+      z-index: 10;
+      background: rgba(0,0,0,0.45);
+      padding: 10px 12px;
+      border-radius: 8px;
+      font-size: 14px;
+      min-width: 260px;
+      backdrop-filter: blur(4px);
+    }
+
+    #controls-panel label {
+      display: block;
+      margin-top: 8px;
+      margin-bottom: 4px;
+    }
+
+    #controls-panel input[type="range"] {
+      width: 100%;
+    }
+
+    .hint {
+      opacity: 0.85;
+      margin-top: 8px;
+      font-size: 12px;
+    }
+
+    .value {
+      color: #ffd27f;
+      font-weight: bold;
+    }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <div id="hud">
+      <div>Vegetation: <span id="hud-veg">0</span></div>
+      <div>Burning: <span id="hud-burning">0</span></div>
+      <div>Burnt: <span id="hud-burnt">0</span></div>
+      <div>Burn %: <span id="hud-percent">0.0</span></div>
+      <div>Wind: <span id="hud-wind">N</span></div>
+      <div>Status: <span id="hud-paused">Playing</span></div>
+    </div>
+
+    <div id="controls-panel">
+      <label for="slider-speed">Simulation Speed: <span id="speed-value" class="value">4</span> steps/sec</label>
+      <input id="slider-speed" type="range" min="1" max="20" step="1" value="4" />
+
+      <label for="slider-wind-strength">Wind Strength: <span id="wind-strength-value" class="value">0.20</span></label>
+      <input id="slider-wind-strength" type="range" min="0" max="1" step="0.05" value="0.2" />
+
+      <div class="hint">
+        Click terrain to ignite.<br/>
+        Space = Pause/Play<br/>
+        R = Reset<br/>
+        W = Cycle Wind Direction
+      </div>
+    </div>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+    const app = document.getElementById('app');
+
+    const hudVeg = document.getElementById('hud-veg');
+    const hudBurning = document.getElementById('hud-burning');
+    const hudBurnt = document.getElementById('hud-burnt');
+    const hudPercent = document.getElementById('hud-percent');
+    const hudWind = document.getElementById('hud-wind');
+    const hudPaused = document.getElementById('hud-paused');
+
+    const speedSlider = document.getElementById('slider-speed');
+    const windStrengthSlider = document.getElementById('slider-wind-strength');
+    const speedValue = document.getElementById('speed-value');
+    const windStrengthValue = document.getElementById('wind-strength-value');
+
+    const scene = new THREE.Scene();
+
+    const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 500);
+    camera.position.set(25, 20, 25);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    app.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.set(0, 0, 0);
+    controls.enableDamping = true;
+
+    const ambient = new THREE.AmbientLight(0x556644, 0.4);
+    scene.add(ambient);
+
+    const dirLight = new THREE.DirectionalLight(0xffaa66, 0.8);
+    dirLight.position.set(10, 15, 10);
+    scene.add(dirLight);
+
+    const GRID_SIZE = 80;
+    const TERRAIN_SIZE = 40;
+    const HALF_SIZE = TERRAIN_SIZE / 2;
+    const CELL_SIZE = TERRAIN_SIZE / GRID_SIZE;
+
+    const CELL = {
+      VEGETATION: 'vegetation',
+      BURNING: 'burning',
+      BURNT: 'burnt',
+      FIREBREAK: 'firebreak'
+    };
+
+    const VALID_STATES = new Set(Object.values(CELL));
+
+    const WIND_DIRS = [
+      { name: 'N',  angle: -Math.PI / 2, vec: new THREE.Vector2(0, -1) },
+      { name: 'NE', angle: -Math.PI / 4, vec: new THREE.Vector2(1, -1).normalize() },
+      { name: 'E',  angle: 0,            vec: new THREE.Vector2(1, 0) },
+      { name: 'SE', angle: Math.PI / 4,  vec: new THREE.Vector2(1, 1).normalize() },
+      { name: 'S',  angle: Math.PI / 2,  vec: new THREE.Vector2(0, 1) },
+      { name: 'SW', angle: 3 * Math.PI / 4, vec: new THREE.Vector2(-1, 1).normalize() },
+      { name: 'W',  angle: Math.PI,      vec: new THREE.Vector2(-1, 0) },
+      { name: 'NW', angle: -3 * Math.PI / 4, vec: new THREE.Vector2(-1, -1).normalize() }
+    ];
+
+    let windIndex = 0;
+    let simSpeed = parseInt(speedSlider.value, 10);
+    let windStrength = parseFloat(windStrengthSlider.value);
+    let isPaused = false;
+    let stepCount = 0;
+    let frameCount = 0;
+    let simAccumulator = 0;
+
+    const raycaster = new THREE.Raycaster();
+    const pointer = new THREE.Vector2();
+
+    const grid = [];
+    const heights = [];
+    const moistureMap = [];
+
+    function mulberry32(seed) {
+      return function() {
+        let t = seed += 0x6D2B79F5;
+        t = Math.imul(t ^ t >>> 15, t | 1);
+        t ^= t + Math.imul(t ^ t >>> 7, t | 61);
+        return ((t ^ t >>> 14) >>> 0) / 4294967296;
+      };
+    }
+    const rng = mulberry32(123456);
+
+    class Perlin2D {
+      constructor(seed = 1337) {
+        this.perm = new Uint8Array(512);
+        const p = new Uint8Array(256);
+        for (let i = 0; i < 256; i++) p[i] = i;
+
+        const rand = mulberry32(seed);
+        for (let i = 255; i > 0; i--) {
+          const j = Math.floor(rand() * (i + 1));
+          [p[i], p[j]] = [p[j], p[i]];
+        }
+        for (let i = 0; i < 512; i++) this.perm[i] = p[i & 255];
+      }
+
+      fade(t) {
+        return t * t * t * (t * (t * 6 - 15) + 10);
+      }
+
+      lerp(a, b, t) {
+        return a + t * (b - a);
+      }
+
+      grad(hash, x, y) {
+        const h = hash & 7;
+        const u = h < 4 ? x : y;
+        const v = h < 4 ? y : x;
+        return ((h & 1) ? -u : u) + ((h & 2) ? -v : v);
+      }
+
+      noise(x, y) {
+        const X = Math.floor(x) & 255;
+        const Y = Math.floor(y) & 255;
+
+        x -= Math.floor(x);
+        y -= Math.floor(y);
+
+        const u = this.fade(x);
+        const v = this.fade(y);
+
+        const A = this.perm[X] + Y;
+        const B = this.perm[X + 1] + Y;
+
+        return this.lerp(
+          this.lerp(this.grad(this.perm[A], x, y), this.grad(this.perm[B], x - 1, y), u),
+          this.lerp(this.grad(this.perm[A + 1], x, y - 1), this.grad(this.perm[B + 1], x - 1, y - 1), u),
+          v
+        );
+      }
+    }
+
+    const perlinHeight = new Perlin2D(1111);
+    const perlinMoisture = new Perlin2D(2222);
+
+    function octaveNoise(noiseObj, x, y, octaves = 2) {
+      let total = 0;
+      let freq = 1;
+      let amp = 1;
+      let maxAmp = 0;
+
+      for (let i = 0; i < octaves; i++) {
+        total += noiseObj.noise(x * freq, y * freq) * amp;
+        maxAmp += amp;
+        amp *= 0.5;
+        freq *= 2;
+      }
+
+      return total / maxAmp;
+    }
+
+    function buildMaps() {
+      for (let z = 0; z < GRID_SIZE; z++) {
+        heights[z] = [];
+        moistureMap[z] = [];
+        grid[z] = [];
+
+        for (let x = 0; x < GRID_SIZE; x++) {
+          const nx = x / GRID_SIZE;
+          const nz = z / GRID_SIZE;
+
+          let h = octaveNoise(perlinHeight, nx * 4, nz * 4, 2);
+          h = (h * 0.5 + 0.5) * 5.0;
+          heights[z][x] = h;
+
+          let m = octaveNoise(perlinMoisture, nx * 5 + 20, nz * 5 + 40, 2);
+          m = THREE.MathUtils.clamp(m * 0.5 + 0.5, 0, 1);
+          moistureMap[z][x] = m;
+
+          let state = CELL.VEGETATION;
+          if (rng() < 0.03) {
+            state = CELL.FIREBREAK;
+          }
+
+          grid[z][x] = {
+            state,
+            burnTimeLeft: 0,
+            burnDuration: 0,
+            moisture: m
+          };
+        }
+      }
+
+      for (let k = 0; k < 6; k++) {
+        const cx = Math.floor(rng() * GRID_SIZE);
+        const cz = Math.floor(rng() * GRID_SIZE);
+        const radius = 1 + Math.floor(rng() * 3);
+        for (let dz = -radius; dz <= radius; dz++) {
+          for (let dx = -radius; dx <= radius; dx++) {
+            const x = cx + dx;
+            const z = cz + dz;
+            if (x < 0 || z < 0 || x >= GRID_SIZE || z >= GRID_SIZE) continue;
+            if (dx * dx + dz * dz <= radius * radius) {
+              grid[z][x].state = CELL.FIREBREAK;
+            }
+          }
+        }
+      }
+    }
+
+    buildMaps();
+
+    const planeGeo = new THREE.PlaneGeometry(TERRAIN_SIZE, TERRAIN_SIZE, GRID_SIZE - 1, GRID_SIZE - 1);
+    planeGeo.rotateX(-Math.PI / 2);
+
+    const posAttr = planeGeo.attributes.position;
+    const colorArray = new Float32Array(GRID_SIZE * GRID_SIZE * 3);
+    const uvAttr = planeGeo.attributes.uv;
+
+    for (let z = 0; z < GRID_SIZE; z++) {
+      for (let x = 0; x < GRID_SIZE; x++) {
+        const i = z * GRID_SIZE + x;
+        posAttr.setY(i, heights[z][x]);
+        uvAttr.setXY(i, (x / (GRID_SIZE - 1)) * 4, (z / (GRID_SIZE - 1)) * 4);
+      }
+    }
+
+    planeGeo.setAttribute('color', new THREE.BufferAttribute(colorArray, 3));
+    posAttr.needsUpdate = true;
+    uvAttr.needsUpdate = true;
+    planeGeo.computeVertexNormals();
+
+    const textureLoader = new THREE.TextureLoader();
+    const groundTexture = textureLoader.load(
+      'brick_diffuse.jpg',
+      tex => {
+        tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+        tex.repeat.set(4, 4);
+        tex.colorSpace = THREE.SRGBColorSpace;
+      },
+      undefined,
+      () => {
+        console.warn('Could not load brick_diffuse.jpg, using vertex colors only.');
+      }
+    );
+
+    const terrainMat = new THREE.MeshStandardMaterial({
+      map: groundTexture,
+      vertexColors: true,
+      roughness: 1.0,
+      metalness: 0.0
+    });
+
+    const terrainMesh = new THREE.Mesh(planeGeo, terrainMat);
+    scene.add(terrainMesh);
+
+    function stateColor(state, pulse = 0) {
+      switch (state) {
+        case CELL.VEGETATION: return new THREE.Color(0x338833);
+        case CELL.BURNING: {
+          const c1 = new THREE.Color(0xff6600);
+          const c2 = new THREE.Color(0xff0000);
+          return c1.lerp(c2, pulse);
+        }
+        case CELL.BURNT: return new THREE.Color(0x222222);
+        case CELL.FIREBREAK: return new THREE.Color(0x665533);
+        default: return new THREE.Color(0xff00ff);
+      }
+    }
+
+    function updateTerrainColors(time = 0) {
+      const colorAttr = planeGeo.attributes.color;
+      for (let z = 0; z < GRID_SIZE; z++) {
+        for (let x = 0; x < GRID_SIZE; x++) {
+          const i = z * GRID_SIZE + x;
+          const cell = grid[z][x];
+          const pulse = cell.state === CELL.BURNING ? (Math.sin(time * 10 + x * 0.2 + z * 0.3) * 0.5 + 0.5) : 0;
+          const color = stateColor(cell.state, pulse);
+          colorAttr.setXYZ(i, color.r, color.g, color.b);
+        }
+      }
+      colorAttr.needsUpdate = true;
+    }
+
+    const fireParticleTexture = textureLoader.load(
+      'cloud10.png',
+      tex => {
+        tex.colorSpace = THREE.SRGBColorSpace;
+      },
+      undefined,
+      () => {
+        console.warn('Could not load cloud10.png, particle sprites may be invisible.');
+      }
+    );
+
+    const MAX_PARTICLES = GRID_SIZE * GRID_SIZE;
+    const particlePositions = new Float32Array(MAX_PARTICLES * 3);
+    const particleColors = new Float32Array(MAX_PARTICLES * 3);
+    const particleSizes = new Float32Array(MAX_PARTICLES);
+
+    const particleGeo = new THREE.BufferGeometry();
+    particleGeo.setAttribute('position', new THREE.BufferAttribute(particlePositions, 3));
+    particleGeo.setAttribute('color', new THREE.BufferAttribute(particleColors, 3));
+    particleGeo.setAttribute('size', new THREE.BufferAttribute(particleSizes, 1));
+    particleGeo.setDrawRange(0, 0);
+
+    const particleMat = new THREE.ShaderMaterial({
+      transparent: true,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      uniforms: {
+        pointTexture: { value: fireParticleTexture }
+      },
+      vertexShader: `
+        attribute float size;
+        attribute vec3 color;
+        varying vec3 vColor;
+        void main() {
+          vColor = color;
+          vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+          gl_PointSize = size * (300.0 / -mvPosition.z);
+          gl_Position = projectionMatrix * mvPosition;
+        }
+      `,
+      fragmentShader: `
+        uniform sampler2D pointTexture;
+        varying vec3 vColor;
+        void main() {
+          vec4 tex = texture2D(pointTexture, gl_PointCoord);
+          gl_FragColor = vec4(vColor, tex.a) * tex;
+        }
+      `
+    });
+
+    const particlePoints = new THREE.Points(particleGeo, particleMat);
+    scene.add(particlePoints);
+
+    function cellToWorld(x, z) {
+      const wx = -HALF_SIZE + (x + 0.5) * CELL_SIZE;
+      const wz = -HALF_SIZE + (z + 0.5) * CELL_SIZE;
+      return new THREE.Vector3(wx, heights[z][x], wz);
+    }
+
+    function updateParticles(time = 0) {
+      let count = 0;
+      for (let z = 0; z < GRID_SIZE; z++) {
+        for (let x = 0; x < GRID_SIZE; x++) {
+          const cell = grid[z][x];
+          if (cell.state !== CELL.BURNING) continue;
+          if (count >= MAX_PARTICLES) break;
+
+          const p = cellToWorld(x, z);
+          const jx = (rng() - 0.5) * CELL_SIZE * 0.4;
+          const jz = (rng() - 0.5) * CELL_SIZE * 0.4;
+          const jy = 0.4 + (Math.sin(time * 12 + x + z) * 0.1 + 0.15);
+
+          particlePositions[count * 3 + 0] = p.x + jx;
+          particlePositions[count * 3 + 1] = p.y + jy;
+          particlePositions[count * 3 + 2] = p.z + jz;
+
+          const t = Math.sin(time * 15 + x * 0.6 + z * 0.7) * 0.5 + 0.5;
+          const c = new THREE.Color(0xff6600).lerp(new THREE.Color(0xff2200), t);
+          particleColors[count * 3 + 0] = c.r;
+          particleColors[count * 3 + 1] = c.g;
+          particleColors[count * 3 + 2] = c.b;
+          particleSizes[count] = 12 + 10 * t;
+
+          count++;
+        }
+      }
+
+      particleGeo.attributes.position.needsUpdate = true;
+      particleGeo.attributes.color.needsUpdate = true;
+      particleGeo.attributes.size.needsUpdate = true;
+      particleGeo.setDrawRange(0, count);
+    }
+
+    const arrowGroup = new THREE.Group();
+    scene.add(arrowGroup);
+
+    const arrowHelper = new THREE.ArrowHelper(
+      new THREE.Vector3(0, 0, -1),
+      new THREE.Vector3(0, 0.2, 0),
+      6,
+      0xffff66,
+      1.2,
+      0.7
+    );
+    arrowGroup.add(arrowHelper);
+
+    function updateWindArrow() {
+      const dir2 = WIND_DIRS[windIndex].vec.clone().normalize();
+      const dir3 = new THREE.Vector3(dir2.x, 0, dir2.y).normalize();
+      arrowHelper.setDirection(dir3);
+      arrowHelper.setLength(5 + windStrength * 5, 1.2, 0.7);
+      arrowGroup.position.set(0, 0.1, 0);
+    }
+
+    function igniteCell(x, z) {
+      if (x < 0 || z < 0 || x >= GRID_SIZE || z >= GRID_SIZE) return;
+      const cell = grid[z][x];
+      if (cell.state === CELL.VEGETATION) {
+        cell.state = CELL.BURNING;
+        cell.burnDuration = 3 + Math.floor(rng() * 3);
+        cell.burnTimeLeft = cell.burnDuration;
+      }
+    }
+
+    function spreadProbability(fromX, fromZ, toX, toZ) {
+      let p = 0.3;
+
+      const windVec = WIND_DIRS[windIndex].vec.clone().normalize();
+      const spreadDir = new THREE.Vector2(toX - fromX, toZ - fromZ).normalize();
+      const dot = windVec.dot(spreadDir);
+
+      if (dot > 0.5) p += windStrength;
+      else if (dot < -0.5) p -= 0.1 * (windStrength / 0.2 || 0);
+
+      const dh = heights[toZ][toX] - heights[fromZ][fromX];
+      if (dh > 0.05) p += 0.15;
+      else if (dh < -0.05) p -= 0.1;
+
+      p -= grid[toZ][toX].moisture * 0.3;
+
+      return THREE.MathUtils.clamp(p, 0, 1);
+    }
+
+    const neighborOffsets = [
+      [-1, -1], [0, -1], [1, -1],
+      [-1,  0],          [1,  0],
+      [-1,  1], [0,  1], [1,  1]
+    ];
+
+    function simulationStep() {
+      const next = new Array(GRID_SIZE);
+      for (let z = 0; z < GRID_SIZE; z++) {
+        next[z] = new Array(GRID_SIZE);
+        for (let x = 0; x < GRID_SIZE; x++) {
+          const c = grid[z][x];
+          next[z][x] = {
+            state: c.state,
+            burnTimeLeft: c.burnTimeLeft,
+            burnDuration: c.burnDuration,
+            moisture: c.moisture
+          };
+        }
+      }
+
+      for (let z = 0; z < GRID_SIZE; z++) {
+        for (let x = 0; x < GRID_SIZE; x++) {
+          const cell = grid[z][x];
+
+          if (cell.state === CELL.FIREBREAK || cell.state === CELL.BURNT) continue;
+
+          if (cell.state === CELL.BURNING) {
+            next[z][x].burnTimeLeft -= 1;
+            if (next[z][x].burnTimeLeft <= 0) {
+              next[z][x].state = CELL.BURNT;
+              next[z][x].burnTimeLeft = 0;
+            }
+            continue;
+          }
+
+          if (cell.state === CELL.VEGETATION) {
+            let shouldIgnite = false;
+
+            for (const [dx, dz] of neighborOffsets) {
+              const nx = x + dx;
+              const nz = z + dz;
+              if (nx < 0 || nz < 0 || nx >= GRID_SIZE || nz >= GRID_SIZE) continue;
+
+              if (grid[nz][nx].state === CELL.BURNING) {
+                const prob = spreadProbability(nx, nz, x, z);
+                if (rng() < prob) {
+                  shouldIgnite = true;
+                  break;
+                }
+              }
+            }
+
+            if (shouldIgnite) {
+              next[z][x].state = CELL.BURNING;
+              next[z][x].burnDuration = 3 + Math.floor(rng() * 3);
+              next[z][x].burnTimeLeft = next[z][x].burnDuration;
+            }
+          }
+        }
+      }
+
+      for (let z = 0; z < GRID_SIZE; z++) {
+        for (let x = 0; x < GRID_SIZE; x++) {
+          grid[z][x] = next[z][x];
+        }
+      }
+
+      stepCount++;
+    }
+
+    function resetSimulation() {
+      for (let z = 0; z < GRID_SIZE; z++) {
+        for (let x = 0; x < GRID_SIZE; x++) {
+          grid[z][x].state = CELL.VEGETATION;
+          grid[z][x].burnDuration = 0;
+          grid[z][x].burnTimeLeft = 0;
+        }
+      }
+
+      for (let k = 0; k < 6; k++) {
+        const cx = Math.floor(rng() * GRID_SIZE);
+        const cz = Math.floor(rng() * GRID_SIZE);
+        const radius = 1 + Math.floor(rng() * 3);
+        for (let dz = -radius; dz <= radius; dz++) {
+          for (let dx = -radius; dx <= radius; dx++) {
+            const x = cx + dx;
+            const z = cz + dz;
+            if (x < 0 || z < 0 || x >= GRID_SIZE || z >= GRID_SIZE) continue;
+            if (dx * dx + dz * dz <= radius * radius) {
+              grid[z][x].state = CELL.FIREBREAK;
+            }
+          }
+        }
+      }
+
+      stepCount = 0;
+    }
+
+    function getCounts() {
+      let vegetationCount = 0;
+      let burningCount = 0;
+      let burntCount = 0;
+      let valid = true;
+
+      for (let z = 0; z < GRID_SIZE; z++) {
+        for (let x = 0; x < GRID_SIZE; x++) {
+          const state = grid[z][x].state;
+          if (!VALID_STATES.has(state)) valid = false;
+          if (state === CELL.VEGETATION) vegetationCount++;
+          else if (state === CELL.BURNING) burningCount++;
+          else if (state === CELL.BURNT) burntCount++;
+        }
+      }
+
+      const total = GRID_SIZE * GRID_SIZE;
+      const burnPercent = Math.round((burntCount / total) * 1000) / 10;
+
+      return { vegetationCount, burningCount, burntCount, burnPercent, valid };
+    }
+
+    function updateHUDAndState() {
+      const counts = getCounts();
+
+      hudVeg.textContent = counts.vegetationCount;
+      hudBurning.textContent = counts.burningCount;
+      hudBurnt.textContent = counts.burntCount;
+      hudPercent.textContent = counts.burnPercent.toFixed(1);
+      hudWind.textContent = WIND_DIRS[windIndex].name;
+      hudPaused.textContent = isPaused ? 'Paused' : 'Playing';
+
+      window.__3D_STATE__ = {
+        vegetationCount: counts.vegetationCount,
+        burningCount: counts.burningCount,
+        burntCount: counts.burntCount,
+        burnPercent: counts.burnPercent,
+        windDirection: WIND_DIRS[windIndex].name,
+        windStrength: windStrength,
+        simSpeed: simSpeed,
+        stepCount: stepCount,
+        isPaused: isPaused,
+        frameCount: frameCount,
+        gridValid: counts.valid
+      };
+    }
+
+    function onPointerDown(event) {
+      const rect = renderer.domElement.getBoundingClientRect();
+      pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+      pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+
+      raycaster.setFromCamera(pointer, camera);
+      const intersects = raycaster.intersectObject(terrainMesh);
+
+      if (intersects.length > 0) {
+        const p = intersects[0].point;
+        let gx = Math.floor(((p.x + HALF_SIZE) / TERRAIN_SIZE) * GRID_SIZE);
+        let gz = Math.floor(((p.z + HALF_SIZE) / TERRAIN_SIZE) * GRID_SIZE);
+        gx = THREE.MathUtils.clamp(gx, 0, GRID_SIZE - 1);
+        gz = THREE.MathUtils.clamp(gz, 0, GRID_SIZE - 1);
+        igniteCell(gx, gz);
+      }
+    }
+
+    renderer.domElement.addEventListener('pointerdown', onPointerDown);
+
+    window.addEventListener('keydown', (e) => {
+      if (e.code === 'Space') {
+        e.preventDefault();
+        isPaused = !isPaused;
+      } else if (e.code === 'KeyR') {
+        resetSimulation();
+      } else if (e.code === 'KeyW') {
+        windIndex = (windIndex + 1) % WIND_DIRS.length;
+        updateWindArrow();
+      }
+    });
+
+    speedSlider.addEventListener('input', () => {
+      simSpeed = parseInt(speedSlider.value, 10);
+      speedValue.textContent = simSpeed;
+    });
+
+    windStrengthSlider.addEventListener('input', () => {
+      windStrength = parseFloat(windStrengthSlider.value);
+      windStrengthValue.textContent = windStrength.toFixed(2);
+      updateWindArrow();
+    });
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    updateWindArrow();
+    updateTerrainColors(0);
+    updateParticles(0);
+
+    const clock = new THREE.Clock();
+
+    function animate() {
+      requestAnimationFrame(animate);
+      frameCount++;
+
+      const dt = clock.getDelta();
+
+      if (!isPaused) {
+        simAccumulator += dt;
+        const stepInterval = 1 / Math.max(1, simSpeed);
+        while (simAccumulator >= stepInterval) {
+          simulationStep();
+          simAccumulator -= stepInterval;
+        }
+      }
+
+      const elapsed = clock.elapsedTime;
+
+      updateTerrainColors(elapsed);
+      updateParticles(elapsed);
+      controls.update();
+
+      updateHUDAndState(); // update every frame before rendering
+      renderer.render(scene, camera);
+    }
+
+    resetSimulation();
+    animate();
+  </script>
+</body>
+</html>

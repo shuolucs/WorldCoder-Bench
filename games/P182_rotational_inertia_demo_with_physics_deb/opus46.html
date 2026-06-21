@@ -1,0 +1,518 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Rotational Inertia Physics Demo</title>
+<style>
+    body {
+        margin: 0;
+        overflow: hidden;
+        background: #1a1a2e;
+    }
+    canvas {
+        display: block;
+    }
+    #debug-overlay {
+        position: absolute;
+        top: 10px;
+        left: 10px;
+        background: rgba(0, 0, 0, 0.7);
+        color: #ffffff;
+        font-family: 'Courier New', monospace;
+        font-size: 14px;
+        padding: 15px;
+        border-radius: 8px;
+        line-height: 1.6;
+        min-width: 320px;
+        pointer-events: none;
+        border: 1px solid rgba(255, 255, 255, 0.1);
+    }
+    #debug-overlay .title {
+        font-size: 16px;
+        font-weight: bold;
+        color: #4a90d9;
+        margin-bottom: 8px;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.2);
+        padding-bottom: 5px;
+    }
+    #debug-overlay .label {
+        color: #aaaacc;
+    }
+    #debug-overlay .value {
+        color: #ffffff;
+        font-weight: bold;
+    }
+    #debug-overlay .brake-on {
+        color: #e74c3c;
+        font-weight: bold;
+    }
+    #debug-overlay .brake-off {
+        color: #2ecc71;
+    }
+    #controls-help {
+        position: absolute;
+        bottom: 10px;
+        left: 10px;
+        background: rgba(0, 0, 0, 0.7);
+        color: #aaaacc;
+        font-family: 'Courier New', monospace;
+        font-size: 12px;
+        padding: 12px;
+        border-radius: 8px;
+        line-height: 1.5;
+        border: 1px solid rgba(255, 255, 255, 0.1);
+    }
+    #controls-help span {
+        color: #4a90d9;
+        font-weight: bold;
+    }
+</style>
+</head>
+<body>
+
+<div id="debug-overlay">
+    <div class="title">⚙ Rotational Inertia Debug</div>
+    <div id="debug-content"></div>
+</div>
+
+<div id="controls-help">
+    <span>R/F</span> Red mass In/Out &nbsp;
+    <span>U/J</span> Blue mass In/Out<br>
+    <span>T</span> Torque impulse &nbsp;
+    <span>B</span> Toggle brake &nbsp;
+    <span>Space</span> Reset &nbsp;
+    <span>D</span> Debug
+</div>
+
+<script type="importmap">
+{
+    "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+    }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// --- Constants ---
+const I_PLATFORM = 5.0;
+const I_MICHELLE = 3.0;
+const MASS_RED = 2.0;
+const MASS_BLUE = 2.0;
+const INITIAL_OMEGA = 2.0;
+const INITIAL_RED_RADIUS = 1.5;
+const INITIAL_BLUE_RADIUS = 1.5;
+const FRICTION_NORMAL = 0.02;
+const FRICTION_BRAKE = 0.5;
+const MIN_RADIUS = 0.3;
+const MAX_RADIUS = 2.8;
+const RADIUS_STEP = 0.3;
+const TORQUE_IMPULSE = 5.0;
+const MAX_DT = 0.05;
+
+// --- State ---
+let redMassRadius = INITIAL_RED_RADIUS;
+let blueMassRadius = INITIAL_BLUE_RADIUS;
+let brakeActive = false;
+let debugVisible = true;
+let turntableAngle = 0;
+let frictionLoss = 0;
+let torqueImpulseCount = 0;
+let resetCount = 0;
+let modelLoaded = false;
+let simRunning = false;
+
+function calcI() {
+    return I_PLATFORM + I_MICHELLE + MASS_RED * redMassRadius * redMassRadius + MASS_BLUE * blueMassRadius * blueMassRadius;
+}
+
+let I = calcI();
+let omega = INITIAL_OMEGA;
+let L = I * omega;
+
+// FPS tracking
+let fpsFrames = 0;
+let fpsTime = 0;
+let currentFPS = 0;
+
+// --- Three.js Setup ---
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x1a1a2e);
+
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+camera.position.set(0, 5, 10);
+camera.lookAt(0, 0, 0);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 1, 0);
+controls.update();
+
+// --- Lights ---
+const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+scene.add(ambientLight);
+
+const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+dirLight.position.set(5, 10, 5);
+dirLight.castShadow = true;
+dirLight.shadow.mapSize.width = 2048;
+dirLight.shadow.mapSize.height = 2048;
+dirLight.shadow.camera.near = 0.5;
+dirLight.shadow.camera.far = 50;
+dirLight.shadow.camera.left = -10;
+dirLight.shadow.camera.right = 10;
+dirLight.shadow.camera.top = 10;
+dirLight.shadow.camera.bottom = -10;
+scene.add(dirLight);
+
+// --- Ground Plane ---
+const groundGeom = new THREE.PlaneGeometry(20, 20);
+const groundMat = new THREE.MeshStandardMaterial({ color: 0x2d2d44, roughness: 0.8 });
+const ground = new THREE.Mesh(groundGeom, groundMat);
+ground.rotation.x = -Math.PI / 2;
+ground.position.y = 0;
+ground.receiveShadow = true;
+scene.add(ground);
+
+// --- Turntable Group (everything that rotates) ---
+const turntableGroup = new THREE.Group();
+scene.add(turntableGroup);
+
+// Platform
+const platformGeom = new THREE.CylinderGeometry(3, 3, 0.3, 64);
+const platformMat = new THREE.MeshStandardMaterial({ color: 0x4a90d9, roughness: 0.4, metalness: 0.3 });
+const platform = new THREE.Mesh(platformGeom, platformMat);
+platform.position.y = 0.15;
+platform.castShadow = true;
+platform.receiveShadow = true;
+turntableGroup.add(platform);
+
+// Edge ring for visual flair
+const ringGeom = new THREE.TorusGeometry(3, 0.05, 8, 64);
+const ringMat = new THREE.MeshStandardMaterial({ color: 0x6ab0f9, emissive: 0x2a5080, emissiveIntensity: 0.3 });
+const ring = new THREE.Mesh(ringGeom, ringMat);
+ring.rotation.x = -Math.PI / 2;
+ring.position.y = 0.3;
+turntableGroup.add(ring);
+
+// --- Red Mass ---
+const redGeom = new THREE.BoxGeometry(0.5, 0.5, 0.5);
+const redMat = new THREE.MeshStandardMaterial({ color: 0xe74c3c, roughness: 0.3, metalness: 0.2 });
+const redMass = new THREE.Mesh(redGeom, redMat);
+redMass.position.set(INITIAL_RED_RADIUS, 0.55, 0);
+redMass.castShadow = true;
+turntableGroup.add(redMass);
+
+// --- Blue Mass ---
+const blueGeom = new THREE.BoxGeometry(0.5, 0.5, 0.5);
+const blueMat = new THREE.MeshStandardMaterial({ color: 0x3498db, roughness: 0.3, metalness: 0.2 });
+const blueMass = new THREE.Mesh(blueGeom, blueMat);
+blueMass.position.set(-INITIAL_BLUE_RADIUS, 0.55, 0);
+blueMass.castShadow = true;
+turntableGroup.add(blueMass);
+
+// --- Load Michelle Model ---
+let michelleModel = null;
+const loader = new GLTFLoader();
+loader.load(
+    'Michelle.glb',
+    (gltf) => {
+        michelleModel = gltf.scene;
+        michelleModel.scale.set(2, 2, 2);
+        michelleModel.position.set(0, 0.3, 0);
+        michelleModel.traverse((child) => {
+            if (child.isMesh) {
+                child.castShadow = true;
+                child.receiveShadow = true;
+            }
+        });
+        turntableGroup.add(michelleModel);
+        modelLoaded = true;
+        updateState();
+    },
+    (progress) => {
+        // Loading progress
+    },
+    (error) => {
+        console.warn('Could not load Michelle.glb:', error);
+        // Create a placeholder figure
+        const bodyGroup = new THREE.Group();
+        
+        // Body
+        const bodyGeom = new THREE.CylinderGeometry(0.3, 0.25, 1.2, 16);
+        const bodyMat = new THREE.MeshStandardMaterial({ color: 0x8e44ad, roughness: 0.5 });
+        const body = new THREE.Mesh(bodyGeom, bodyMat);
+        body.position.y = 1.3;
+        body.castShadow = true;
+        bodyGroup.add(body);
+        
+        // Head
+        const headGeom = new THREE.SphereGeometry(0.25, 16, 16);
+        const headMat = new THREE.MeshStandardMaterial({ color: 0xf0c0a0, roughness: 0.6 });
+        const head = new THREE.Mesh(headGeom, headMat);
+        head.position.y = 2.15;
+        head.castShadow = true;
+        bodyGroup.add(head);
+        
+        // Legs
+        const legGeom = new THREE.CylinderGeometry(0.1, 0.1, 0.8, 8);
+        const legMat = new THREE.MeshStandardMaterial({ color: 0x2c3e50, roughness: 0.5 });
+        const leftLeg = new THREE.Mesh(legGeom, legMat);
+        leftLeg.position.set(-0.15, 0.5, 0);
+        leftLeg.castShadow = true;
+        bodyGroup.add(leftLeg);
+        const rightLeg = new THREE.Mesh(legGeom, legMat);
+        rightLeg.position.set(0.15, 0.5, 0);
+        rightLeg.castShadow = true;
+        bodyGroup.add(rightLeg);
+        
+        // Arms
+        const armGeom = new THREE.CylinderGeometry(0.07, 0.07, 0.9, 8);
+        const armMat = new THREE.MeshStandardMaterial({ color: 0xf0c0a0, roughness: 0.6 });
+        const leftArm = new THREE.Mesh(armGeom, armMat);
+        leftArm.position.set(-0.4, 1.3, 0);
+        leftArm.rotation.z = 0.2;
+        leftArm.castShadow = true;
+        bodyGroup.add(leftArm);
+        const rightArm = new THREE.Mesh(armGeom, armMat);
+        rightArm.position.set(0.4, 1.3, 0);
+        rightArm.rotation.z = -0.2;
+        rightArm.castShadow = true;
+        bodyGroup.add(rightArm);
+        
+        bodyGroup.position.set(0, 0.3, 0);
+        turntableGroup.add(bodyGroup);
+        michelleModel = bodyGroup;
+        modelLoaded = true;
+        updateState();
+    }
+);
+
+// --- State Management ---
+function safeNum(val, fallback = 0) {
+    if (isNaN(val) || !isFinite(val)) return fallback;
+    return val;
+}
+
+function updateState() {
+    const totalEnergy = 0.5 * I * omega * omega;
+    window.__3D_STATE__ = {
+        omega: safeNum(omega),
+        momentOfInertia: safeNum(I),
+        angularMomentum: safeNum(L),
+        redMassRadius: safeNum(redMassRadius),
+        blueMassRadius: safeNum(blueMassRadius),
+        turntableAngle: safeNum(turntableAngle),
+        brakeActive: brakeActive,
+        debugVisible: debugVisible,
+        modelLoaded: modelLoaded,
+        simRunning: simRunning,
+        totalEnergy: safeNum(totalEnergy),
+        frictionLoss: safeNum(frictionLoss),
+        torqueImpulseCount: torqueImpulseCount,
+        resetCount: resetCount
+    };
+}
+
+function resetSimulation() {
+    redMassRadius = INITIAL_RED_RADIUS;
+    blueMassRadius = INITIAL_BLUE_RADIUS;
+    brakeActive = false;
+    turntableAngle = 0;
+    frictionLoss = 0;
+    torqueImpulseCount = 0;
+    I = calcI();
+    omega = INITIAL_OMEGA;
+    L = I * omega;
+    
+    // Reset positions
+    redMass.position.set(INITIAL_RED_RADIUS, 0.55, 0);
+    blueMass.position.set(-INITIAL_BLUE_RADIUS, 0.55, 0);
+    turntableGroup.rotation.y = 0;
+    
+    resetCount++;
+    updateState();
+}
+
+// --- Keyboard Input ---
+document.addEventListener('keydown', (e) => {
+    const key = e.key.toLowerCase();
+    
+    if (key === 'r') {
+        // Red mass inward
+        redMassRadius = Math.max(MIN_RADIUS, redMassRadius - RADIUS_STEP);
+        updateMassPositions();
+        recalcOmega();
+    } else if (key === 'f') {
+        // Red mass outward
+        redMassRadius = Math.min(MAX_RADIUS, redMassRadius + RADIUS_STEP);
+        updateMassPositions();
+        recalcOmega();
+    } else if (key === 'u') {
+        // Blue mass inward
+        blueMassRadius = Math.max(MIN_RADIUS, blueMassRadius - RADIUS_STEP);
+        updateMassPositions();
+        recalcOmega();
+    } else if (key === 'j') {
+        // Blue mass outward
+        blueMassRadius = Math.min(MAX_RADIUS, blueMassRadius + RADIUS_STEP);
+        updateMassPositions();
+        recalcOmega();
+    } else if (key === 't') {
+        // Torque impulse
+        L += TORQUE_IMPULSE;
+        L = safeNum(L);
+        I = calcI();
+        omega = L / I;
+        omega = safeNum(omega);
+        torqueImpulseCount++;
+    } else if (key === 'b') {
+        // Toggle brake
+        brakeActive = !brakeActive;
+    } else if (key === ' ') {
+        e.preventDefault();
+        resetSimulation();
+    } else if (key === 'd') {
+        debugVisible = !debugVisible;
+        document.getElementById('debug-overlay').style.display = debugVisible ? 'block' : 'none';
+    }
+    
+    updateState();
+});
+
+function updateMassPositions() {
+    // Red mass stays along its local direction (positive X in turntable local space)
+    redMass.position.set(redMassRadius, 0.55, 0);
+    // Blue mass stays along its local direction (negative X in turntable local space)
+    blueMass.position.set(-blueMassRadius, 0.55, 0);
+}
+
+function recalcOmega() {
+    I = calcI();
+    I = safeNum(I, 1);
+    omega = L / I;
+    omega = safeNum(omega);
+}
+
+// --- Debug Overlay ---
+const debugContent = document.getElementById('debug-content');
+
+function updateDebugOverlay() {
+    if (!debugVisible) return;
+    
+    const brakeStr = brakeActive 
+        ? '<span class="brake-on">ON 🔴</span>' 
+        : '<span class="brake-off">OFF</span>';
+    
+    const totalEnergy = 0.5 * I * omega * omega;
+    
+    debugContent.innerHTML = `
+<span class="label">Angular Velocity ω:</span> <span class="value">${safeNum(omega).toFixed(3)}</span> rad/s
+<span class="label">Moment of Inertia I:</span> <span class="value">${safeNum(I).toFixed(3)}</span>
+<span class="label">Angular Momentum L:</span> <span class="value">${safeNum(L).toFixed(3)}</span>
+<span class="label">Red Mass Radius:   </span> <span class="value" style="color:#e74c3c">${safeNum(redMassRadius).toFixed(3)}</span>
+<span class="label">Blue Mass Radius:  </span> <span class="value" style="color:#3498db">${safeNum(blueMassRadius).toFixed(3)}</span>
+<span class="label">Kinetic Energy:    </span> <span class="value">${safeNum(totalEnergy).toFixed(3)}</span>
+<span class="label">Friction Loss:     </span> <span class="value">${safeNum(frictionLoss).toFixed(3)}</span>
+<span class="label">Torque Impulses:   </span> <span class="value">${torqueImpulseCount}</span>
+<span class="label">Resets:            </span> <span class="value">${resetCount}</span>
+<span class="label">Brake:             </span> ${brakeStr}
+<span class="label">FPS:               </span> <span class="value">${currentFPS}</span>
+<span class="label">Model Loaded:      </span> <span class="value">${modelLoaded ? '✓' : '...'}</span>
+    `.trim();
+}
+
+// --- Animation Loop ---
+let lastTime = performance.now() / 1000;
+
+function animate() {
+    requestAnimationFrame(animate);
+    simRunning = true;
+    
+    const now = performance.now() / 1000;
+    let dt = now - lastTime;
+    lastTime = now;
+    
+    // Cap delta time
+    if (dt > MAX_DT) dt = MAX_DT;
+    if (dt < 0) dt = 0;
+    
+    // FPS calculation
+    fpsFrames++;
+    fpsTime += dt;
+    if (fpsTime >= 1.0) {
+        currentFPS = Math.round(fpsFrames / fpsTime);
+        fpsFrames = 0;
+        fpsTime = 0;
+    }
+    
+    // --- Physics ---
+    // Apply friction
+    const friction = brakeActive ? FRICTION_BRAKE : FRICTION_NORMAL;
+    const energyBefore = 0.5 * I * omega * omega;
+    
+    L = L * (1 - friction * dt);
+    L = safeNum(L);
+    if (L < 0) L = 0;
+    
+    // Recalculate omega from conserved (or friction-reduced) L
+    I = calcI();
+    I = safeNum(I, 1);
+    omega = I > 0 ? L / I : 0;
+    omega = safeNum(omega);
+    if (omega < 0) omega = 0;
+    
+    const energyAfter = 0.5 * I * omega * omega;
+    const lostEnergy = energyBefore - energyAfter;
+    if (lostEnergy > 0) {
+        frictionLoss += lostEnergy;
+    }
+    frictionLoss = safeNum(frictionLoss);
+    
+    // Update rotation
+    turntableAngle += omega * dt;
+    turntableAngle = safeNum(turntableAngle);
+    turntableGroup.rotation.y = turntableAngle;
+    
+    // Small visual spin on mass cubes
+    redMass.rotation.y = turntableAngle * 0.5;
+    blueMass.rotation.y = -turntableAngle * 0.5;
+    
+    // Update state
+    updateState();
+    
+    // Update debug
+    updateDebugOverlay();
+    
+    // Update controls
+    controls.update();
+    
+    // Render
+    renderer.render(scene, camera);
+}
+
+// --- Window Resize ---
+window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// --- Initialize ---
+updateState();
+animate();
+
+</script>
+</body>
+</html>

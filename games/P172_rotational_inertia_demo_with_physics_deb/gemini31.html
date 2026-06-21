@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Rotational Inertia Demonstration</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #000;
+            font-family: monospace;
+        }
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+        }
+        #ui-container {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            z-index: 10;
+            pointer-events: none;
+        }
+        #toggleDebugBtn {
+            pointer-events: auto;
+            padding: 8px 16px;
+            background-color: #333;
+            color: #fff;
+            border: 1px solid #555;
+            cursor: pointer;
+            font-family: inherit;
+            font-size: 14px;
+        }
+        #toggleDebugBtn:hover {
+            background-color: #444;
+        }
+        #debugOverlay {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            width: 300px;
+            background-color: rgba(0, 0, 0, 0.7);
+            color: #0f0;
+            padding: 15px;
+            border: 1px solid #333;
+            border-radius: 5px;
+            box-sizing: border-box;
+            z-index: 10;
+            pointer-events: none;
+            line-height: 1.5;
+        }
+        .controls-help {
+            position: absolute;
+            bottom: 10px;
+            left: 10px;
+            color: #ccc;
+            background-color: rgba(0, 0, 0, 0.5);
+            padding: 10px;
+            border-radius: 5px;
+            pointer-events: none;
+        }
+    </style>
+    <!-- Import maps polyfill -->
+    <script async src="https://unpkg.com/es-module-shims@1.8.0/dist/es-module-shims.js"></script>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="ui-container">
+        <button id="toggleDebugBtn">Toggle Debug Overlay</button>
+    </div>
+    <div id="debugOverlay"></div>
+    <div class="controls-help">
+        <b>Controls:</b><br>
+        [A] Apply +Torque | [D] Apply -Torque<br>
+        [1] Compact Mass (I=2) | [2] Spread Mass (I=6)<br>
+        [B] Toggle Brake | [R] Reset
+    </div>
+    <div id="canvas-container"></div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+        // --- State Management ---
+        window.__3D_STATE__ = {
+            modelLoaded: false,
+            omega: 0,
+            alpha: 0,
+            theta: 0,
+            torque: 0,
+            momentOfInertia: 2.0,
+            frictionCoeff: 0.05,
+            kineticEnergy: 0,
+            angularMomentum: 0,
+            massConfig: 'compact',
+            brakeActive: false,
+            debugOverlayVisible: true,
+            turntableColorHex: '#4444ff',
+            frameCount: 0,
+            omegaClamped: false
+        };
+
+        // --- Physics Variables ---
+        let omega = 0;
+        let alpha = 0;
+        let theta = 0;
+        let I = 2.0;
+        let massConfig = 'compact';
+        let brakeActive = false;
+        const keys = { a: false, d: false };
+
+        // --- Scene Setup ---
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+        camera.position.set(0, 5, 10);
+        camera.lookAt(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        container.appendChild(renderer.domElement);
+
+        // Lights
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+        dirLight.position.set(5, 10, 5);
+        scene.add(dirLight);
+
+        // Ground
+        const groundGeo = new THREE.PlaneGeometry(20, 20);
+        const groundMat = new THREE.MeshStandardMaterial({ color: 0x888888 });
+        const ground = new THREE.Mesh(groundGeo, groundMat);
+        ground.rotation.x = -Math.PI / 2;
+        ground.position.y = 0;
+        scene.add(ground);
+
+        // Turntable Group
+        const turntableGroup = new THREE.Group();
+        scene.add(turntableGroup);
+
+        // Turntable Disc
+        const discGeo = new THREE.CylinderGeometry(2, 2, 0.1, 32);
+        const discMat = new THREE.MeshStandardMaterial({ color: 0x4444ff });
+        const disc = new THREE.Mesh(discGeo, discMat);
+        disc.position.y = 0.05;
+        turntableGroup.add(disc);
+
+        // Model Container (for scaling without affecting position)
+        const modelContainer = new THREE.Group();
+        modelContainer.position.y = 0.1; // Sits on top of the disc
+        turntableGroup.add(modelContainer);
+
+        // Load Model
+        const loader = new GLTFLoader();
+        loader.load('https://raw.githubusercontent.com/mrdoob/three.js/master/examples/models/gltf/coffeemat.glb', (gltf) => {
+            const model = gltf.scene;
+            
+            // Calculate bounding box to scale and center
+            const box = new THREE.Box3().setFromObject(model);
+            const size = box.getSize(new THREE.Vector3());
+            const maxDim = Math.max(size.x, size.y, size.z);
+            
+            // Scale to fit roughly 2-unit box
+            const baseScale = 2.0 / maxDim;
+            model.scale.setScalar(baseScale);
+
+            // Recompute box after scaling to center it properly
+            const scaledBox = new THREE.Box3().setFromObject(model);
+            const center = scaledBox.getCenter(new THREE.Vector3());
+            
+            // Center XZ, set bottom to Y=0 relative to container
+            model.position.x = -center.x;
+            model.position.z = -center.z;
+            model.position.y = -scaledBox.min.y;
+
+            modelContainer.add(model);
+            window.__3D_STATE__.modelLoaded = true;
+        });
+
+        // --- Input Handling ---
+        window.addEventListener('keydown', (e) => {
+            const k = e.key.toLowerCase();
+            if (k === 'a') keys.a = true;
+            if (k === 'd') keys.d = true;
+
+            if (e.repeat) return;
+
+            if (k === 'r') {
+                omega = 0;
+                theta = 0;
+                I = 2.0;
+                massConfig = 'compact';
+                brakeActive = false;
+                modelContainer.scale.set(1, 1, 1);
+                discMat.color.setHex(0x4444ff);
+            }
+            if (k === '1') setMassConfig('compact');
+            if (k === '2') setMassConfig('spread');
+            if (k === 'b') {
+                brakeActive = !brakeActive;
+                discMat.color.setHex(brakeActive ? 0xff0000 : 0x4444ff);
+            }
+        });
+
+        window.addEventListener('keyup', (e) => {
+            const k = e.key.toLowerCase();
+            if (k === 'a') keys.a = false;
+            if (k === 'd') keys.d = false;
+        });
+
+        function setMassConfig(config) {
+            if (massConfig === config) return;
+            
+            const oldI = I;
+            const L = oldI * omega; // Conserve angular momentum
+
+            if (config === 'compact') {
+                I = 2.0;
+                massConfig = 'compact';
+                modelContainer.scale.set(1, 1, 1);
+            } else if (config === 'spread') {
+                I = 6.0;
+                massConfig = 'spread';
+                modelContainer.scale.set(1.8, 0.6, 1.8);
+            }
+
+            omega = L / I; // New angular velocity
+        }
+
+        // --- UI Handling ---
+        const debugOverlay = document.getElementById('debugOverlay');
+        const toggleDebugBtn = document.getElementById('toggleDebugBtn');
+        
+        toggleDebugBtn.addEventListener('click', () => {
+            window.__3D_STATE__.debugOverlayVisible = !window.__3D_STATE__.debugOverlayVisible;
+            debugOverlay.style.display = window.__3D_STATE__.debugOverlayVisible ? 'block' : 'none';
+        });
+
+        // --- Resize Handling ---
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // --- Animation Loop ---
+        const clock = new THREE.Clock();
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            let dt = clock.getDelta();
+            dt = Math.min(dt, 0.1); // Prevent huge jumps
+
+            // Physics Update
+            let torque = 0;
+            if (keys.a) torque += 3.0;
+            if (keys.d) torque -= 3.0;
+
+            const friction = brakeActive ? 0.5 : 0.05;
+
+            // Equation of motion: alpha = tau / I - friction * omega
+            alpha = (torque / I) - (friction * omega);
+            omega += alpha * dt;
+
+            // Clamp omega
+            window.__3D_STATE__.omegaClamped = false;
+            if (omega > 20) { omega = 20; window.__3D_STATE__.omegaClamped = true; }
+            if (omega < -20) { omega = -20; window.__3D_STATE__.omegaClamped = true; }
+
+            theta += omega * dt;
+            turntableGroup.rotation.y = theta;
+
+            // Calculations for state/UI
+            const ke = 0.5 * I * omega * omega;
+            const L = I * omega;
+
+            // Update State
+            window.__3D_STATE__.omega = omega || 0;
+            window.__3D_STATE__.alpha = alpha || 0;
+            window.__3D_STATE__.theta = theta || 0;
+            window.__3D_STATE__.torque = torque || 0;
+            window.__3D_STATE__.momentOfInertia = I || 0;
+            window.__3D_STATE__.frictionCoeff = friction || 0;
+            window.__3D_STATE__.kineticEnergy = ke || 0;
+            window.__3D_STATE__.angularMomentum = L || 0;
+            window.__3D_STATE__.massConfig = massConfig;
+            window.__3D_STATE__.brakeActive = brakeActive;
+            window.__3D_STATE__.turntableColorHex = brakeActive ? '#ff0000' : '#4444ff';
+            window.__3D_STATE__.frameCount++;
+
+            // Update UI
+            if (window.__3D_STATE__.debugOverlayVisible) {
+                debugOverlay.innerHTML = `
+                    <b>Physics Debug</b><br>
+                    &omega; (rad/s): ${omega.toFixed(3)}<br>
+                    &alpha; (rad/s²): ${alpha.toFixed(3)}<br>
+                    &theta; (rad): ${theta.toFixed(2)}<br>
+                    Torque (N·m): ${torque.toFixed(1)}<br>
+                    I (kg·m²): ${I.toFixed(1)}<br>
+                    Friction: ${friction.toFixed(2)}<br>
+                    KE (J): ${ke.toFixed(2)}<br>
+                    L (kg·m²/s): ${L.toFixed(2)}<br>
+                    Config: ${massConfig}<br>
+                    Brake: ${brakeActive ? '<span style="color:#f55">ON</span>' : 'OFF'}
+                `;
+            }
+
+            renderer.render(scene, camera);
+        }
+
+        animate();
+    </script>
+</body>
+</html>

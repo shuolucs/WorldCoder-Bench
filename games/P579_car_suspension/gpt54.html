@@ -1,0 +1,591 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>3D Car Suspension Spring-Damper Simulation</title>
+  <style>
+    html, body {
+      margin: 0;
+      overflow: hidden;
+      font-family: Arial, sans-serif;
+      background: #000;
+    }
+
+    #ui {
+      position: absolute;
+      top: 12px;
+      right: 12px;
+      z-index: 20;
+      background: rgba(255,255,255,0.9);
+      padding: 12px;
+      border-radius: 8px;
+      width: 270px;
+      box-shadow: 0 4px 16px rgba(0,0,0,0.25);
+      font-size: 14px;
+    }
+
+    #ui label {
+      display: block;
+      margin-top: 8px;
+      margin-bottom: 4px;
+      font-weight: 600;
+    }
+
+    #ui input, #ui select, #ui button {
+      width: 100%;
+      box-sizing: border-box;
+      margin-bottom: 6px;
+    }
+
+    #hud {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      z-index: 20;
+      background: rgba(0,0,0,0.6);
+      padding: 12px;
+      font: 14px monospace;
+      color: white;
+      border-radius: 6px;
+      line-height: 1.5;
+      min-width: 220px;
+    }
+
+    .row {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+    }
+
+    .small {
+      font-size: 12px;
+      color: #333;
+    }
+  </style>
+
+  <script type="importmap">
+  { "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+  } }
+  </script>
+</head>
+<body>
+  <div id="hud">
+    <div>Speed: <span id="hud-speed">0.0</span></div>
+    <div>FL compression: <span id="hud-fl">0.0</span></div>
+    <div>FR compression: <span id="hud-fr">0.0</span></div>
+    <div>RL compression: <span id="hud-rl">0.0</span></div>
+    <div>RR compression: <span id="hud-rr">0.0</span></div>
+    <div>Pitch: <span id="hud-pitch">0.0</span></div>
+    <div>Roll: <span id="hud-roll">0.0</span></div>
+  </div>
+
+  <div id="ui">
+    <label for="slider-speed">Speed (m/s)</label>
+    <input id="slider-speed" type="range" min="0" max="20" step="0.5" value="5" />
+    <div class="small"><span id="speed-value">5.0</span></div>
+
+    <label for="slider-stiffness">Stiffness k (N/m)</label>
+    <input id="slider-stiffness" type="range" min="5000" max="100000" step="1000" value="30000" />
+    <div class="small"><span id="stiffness-value">30000</span></div>
+
+    <label for="slider-damping">Damping c (Ns/m)</label>
+    <input id="slider-damping" type="range" min="500" max="10000" step="100" value="3000" />
+    <div class="small"><span id="damping-value">3000</span></div>
+
+    <label for="select-terrain">Terrain</label>
+    <select id="select-terrain">
+      <option value="sine">sine</option>
+      <option value="step">step</option>
+      <option value="random">random</option>
+    </select>
+
+    <button id="btn-reset">Reset</button>
+    <div class="small">Press <b>p</b> to pause</div>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+    import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x87CEEB);
+
+    const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 500);
+    camera.position.set(8, 6, 12);
+    camera.lookAt(0, 1, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    document.body.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.set(0, 1, 0);
+    controls.enableDamping = true;
+
+    const dirLight = new THREE.DirectionalLight(0xffffff, 1.5);
+    dirLight.position.set(5, 10, 5);
+    dirLight.castShadow = true;
+    dirLight.shadow.mapSize.set(2048, 2048);
+    dirLight.shadow.camera.left = -30;
+    dirLight.shadow.camera.right = 30;
+    dirLight.shadow.camera.top = 30;
+    dirLight.shadow.camera.bottom = -30;
+    dirLight.shadow.camera.near = 0.5;
+    dirLight.shadow.camera.far = 60;
+    scene.add(dirLight);
+
+    const ambient = new THREE.AmbientLight(0xffffff, 0.4);
+    scene.add(ambient);
+
+    const ground = new THREE.Mesh(
+      new THREE.PlaneGeometry(100, 100),
+      new THREE.MeshStandardMaterial({ color: 0x556B2F })
+    );
+    ground.rotation.x = -Math.PI / 2;
+    ground.position.y = 0;
+    ground.receiveShadow = true;
+    scene.add(ground);
+
+    const grid = new THREE.GridHelper(100, 100, 0x333333, 0x333333);
+    grid.position.y = 0.002;
+    scene.add(grid);
+
+    let terrainMesh = null;
+    let terrainType = 'sine';
+    const randomProfile = [];
+    const randomStep = 0.5;
+    const randomMinZ = -60;
+    const randomMaxZ = 60;
+    const randomCount = Math.floor((randomMaxZ - randomMinZ) / randomStep) + 1;
+
+    function generateRandomProfile() {
+      randomProfile.length = 0;
+      let value = 0;
+      for (let i = 0; i < randomCount; i++) {
+        const target = (Math.random() - 0.5) * 0.7;
+        value = value * 0.75 + target * 0.25;
+        value = THREE.MathUtils.clamp(value, -0.35, 0.35);
+        randomProfile.push(value);
+      }
+      for (let pass = 0; pass < 3; pass++) {
+        for (let i = 1; i < randomProfile.length - 1; i++) {
+          randomProfile[i] = (randomProfile[i - 1] + randomProfile[i] + randomProfile[i + 1]) / 3;
+        }
+      }
+    }
+    generateRandomProfile();
+
+    function terrainHeight(z) {
+      if (terrainType === 'sine') {
+        const amp = 0.3;
+        const wavelength = 4;
+        return amp * Math.sin((Math.PI * 2 * z) / wavelength);
+      }
+      if (terrainType === 'step') {
+        return (z >= 0 && z <= 2) ? 0.4 : 0.0;
+      }
+      if (terrainType === 'random') {
+        const t = (z - randomMinZ) / randomStep;
+        const i0 = Math.floor(t);
+        const i1 = i0 + 1;
+        const a = t - i0;
+        const v0 = randomProfile[THREE.MathUtils.clamp(i0, 0, randomProfile.length - 1)] || 0;
+        const v1 = randomProfile[THREE.MathUtils.clamp(i1, 0, randomProfile.length - 1)] || 0;
+        return THREE.MathUtils.lerp(v0, v1, a);
+      }
+      return 0;
+    }
+
+    function buildTerrainStrip() {
+      if (terrainMesh) {
+        scene.remove(terrainMesh);
+        terrainMesh.geometry.dispose();
+        terrainMesh.material.dispose();
+      }
+
+      const width = 4;
+      const zMin = -60;
+      const zMax = 60;
+      const segZ = 240;
+      const segX = 8;
+
+      const geometry = new THREE.PlaneGeometry(width, zMax - zMin, segX, segZ);
+      geometry.rotateX(-Math.PI / 2);
+
+      const pos = geometry.attributes.position;
+      for (let i = 0; i < pos.count; i++) {
+        const x = pos.getX(i);
+        const z = pos.getZ(i);
+        const y = terrainHeight(z);
+        pos.setY(i, y + 0.01);
+      }
+      pos.needsUpdate = true;
+      geometry.computeVertexNormals();
+
+      const material = new THREE.MeshStandardMaterial({
+        color: 0x8B6F47,
+        roughness: 0.95,
+        metalness: 0.0
+      });
+
+      terrainMesh = new THREE.Mesh(geometry, material);
+      terrainMesh.position.set(0, 0, 0);
+      terrainMesh.receiveShadow = true;
+      terrainMesh.castShadow = false;
+      scene.add(terrainMesh);
+    }
+    buildTerrainStrip();
+
+    const carRoot = new THREE.Group();
+    scene.add(carRoot);
+
+    const bodyGroup = new THREE.Group();
+    carRoot.add(bodyGroup);
+
+    const fallbackBody = new THREE.Mesh(
+      new THREE.BoxGeometry(1.8, 0.6, 4.0),
+      new THREE.MeshStandardMaterial({ color: 0xcc0000, metalness: 0.3, roughness: 0.5 })
+    );
+    fallbackBody.position.y = 0;
+    fallbackBody.castShadow = true;
+    fallbackBody.receiveShadow = true;
+    bodyGroup.add(fallbackBody);
+
+    let loadedCarModel = null;
+    const gltfLoader = new GLTFLoader();
+    gltfLoader.load(
+      './ferrari.glb',
+      (gltf) => {
+        loadedCarModel = gltf.scene;
+        const box = new THREE.Box3().setFromObject(loadedCarModel);
+        const size = new THREE.Vector3();
+        box.getSize(size);
+        const scale = 4 / Math.max(size.x, size.y, size.z, 0.0001);
+        loadedCarModel.scale.setScalar(scale);
+
+        const box2 = new THREE.Box3().setFromObject(loadedCarModel);
+        const center = new THREE.Vector3();
+        box2.getCenter(center);
+        loadedCarModel.position.sub(center);
+
+        loadedCarModel.traverse((obj) => {
+          if (obj.isMesh) {
+            obj.castShadow = true;
+            obj.receiveShadow = true;
+          }
+        });
+
+        fallbackBody.visible = false;
+        bodyGroup.add(loadedCarModel);
+      },
+      undefined,
+      (err) => {
+        console.warn('Failed to load ferrari.glb, using fallback body.', err);
+      }
+    );
+
+    const wheelRadius = 0.25;
+    const wheelWidth = 0.2;
+    const L0 = 0.5;
+    const mass = 1200;
+    const gravity = 9.81;
+    const pitchInertia = 2200;
+    const rollInertia = 1800;
+    const wheelRel = [
+      new THREE.Vector3(-0.8, 0,  1.4), // FL
+      new THREE.Vector3( 0.8, 0,  1.4), // FR
+      new THREE.Vector3(-0.8, 0, -1.4), // RL
+      new THREE.Vector3( 0.8, 0, -1.4)  // RR
+    ];
+    const wheelNames = ['FL', 'FR', 'RL', 'RR'];
+
+    const suspensions = wheelRel.map((p, i) => ({
+      name: wheelNames[i],
+      rel: p.clone(),
+      x: 0,
+      v: 0,
+      force: 0,
+      terrainH: 0
+    }));
+
+    const wheelGeometry = new THREE.CylinderGeometry(wheelRadius, wheelRadius, wheelWidth, 24);
+    wheelGeometry.rotateZ(Math.PI / 2);
+    const wheelMaterial = new THREE.MeshStandardMaterial({ color: 0x222222 });
+
+    const wheelMeshes = suspensions.map(() => {
+      const mesh = new THREE.Mesh(wheelGeometry, wheelMaterial);
+      mesh.castShadow = true;
+      mesh.receiveShadow = true;
+      scene.add(mesh);
+      return mesh;
+    });
+
+    function createSpringLine() {
+      const points = new Array(16).fill(0).map(() => new THREE.Vector3());
+      const geometry = new THREE.BufferGeometry().setFromPoints(points);
+      const material = new THREE.LineBasicMaterial({ color: 0xffff00 });
+      const line = new THREE.Line(geometry, material);
+      scene.add(line);
+      return line;
+    }
+
+    const springLines = suspensions.map(() => createSpringLine());
+
+    const state = {
+      carZ: -20,
+      bodyY: 0.8 + L0 + wheelRadius,
+      bodyVY: 0,
+      pitch: 0,
+      pitchV: 0,
+      roll: 0,
+      rollV: 0,
+      speed: 5,
+      stiffness: 30000,
+      damping: 3000,
+      isPaused: false,
+      frameCount: 0
+    };
+
+    function resetCar() {
+      state.carZ = -20;
+      state.bodyY = 0.8 + L0 + wheelRadius;
+      state.bodyVY = 0;
+      state.pitch = 0;
+      state.pitchV = 0;
+      state.roll = 0;
+      state.rollV = 0;
+      suspensions.forEach(s => {
+        s.x = 0;
+        s.v = 0;
+        s.force = 0;
+        s.terrainH = 0;
+      });
+    }
+    resetCar();
+
+    const sliderSpeed = document.getElementById('slider-speed');
+    const sliderStiffness = document.getElementById('slider-stiffness');
+    const sliderDamping = document.getElementById('slider-damping');
+    const selectTerrain = document.getElementById('select-terrain');
+    const btnReset = document.getElementById('btn-reset');
+
+    const speedValue = document.getElementById('speed-value');
+    const stiffnessValue = document.getElementById('stiffness-value');
+    const dampingValue = document.getElementById('damping-value');
+
+    sliderSpeed.addEventListener('input', () => {
+      state.speed = parseFloat(sliderSpeed.value);
+      speedValue.textContent = state.speed.toFixed(1);
+    });
+
+    sliderStiffness.addEventListener('input', () => {
+      state.stiffness = parseFloat(sliderStiffness.value);
+      stiffnessValue.textContent = state.stiffness.toFixed(0);
+    });
+
+    sliderDamping.addEventListener('input', () => {
+      state.damping = parseFloat(sliderDamping.value);
+      dampingValue.textContent = state.damping.toFixed(0);
+    });
+
+    selectTerrain.addEventListener('change', () => {
+      terrainType = selectTerrain.value;
+      if (terrainType === 'random') generateRandomProfile();
+      buildTerrainStrip();
+    });
+
+    btnReset.addEventListener('click', resetCar);
+
+    window.addEventListener('keydown', (e) => {
+      if (e.key.toLowerCase() === 'p') {
+        state.isPaused = !state.isPaused;
+      }
+    });
+
+    speedValue.textContent = parseFloat(sliderSpeed.value).toFixed(1);
+    stiffnessValue.textContent = parseFloat(sliderStiffness.value).toFixed(0);
+    dampingValue.textContent = parseFloat(sliderDamping.value).toFixed(0);
+
+    const hudSpeed = document.getElementById('hud-speed');
+    const hudFL = document.getElementById('hud-fl');
+    const hudFR = document.getElementById('hud-fr');
+    const hudRL = document.getElementById('hud-rl');
+    const hudRR = document.getElementById('hud-rr');
+    const hudPitch = document.getElementById('hud-pitch');
+    const hudRoll = document.getElementById('hud-roll');
+
+    function updateSpringLine(line, top, bottom) {
+      const segments = 15;
+      const positions = new Float32Array((segments + 1) * 3);
+      const dir = new THREE.Vector3().subVectors(bottom, top);
+      const up = dir.clone().normalize();
+
+      let side = new THREE.Vector3(1, 0, 0);
+      if (Math.abs(up.dot(side)) > 0.9) side.set(0, 0, 1);
+
+      const n = new THREE.Vector3().crossVectors(up, side).normalize();
+      const amplitude = 0.06;
+
+      for (let i = 0; i <= segments; i++) {
+        const t = i / segments;
+        const p = new THREE.Vector3().lerpVectors(top, bottom, t);
+
+        if (i !== 0 && i !== segments) {
+          const s = (i % 2 === 0 ? -1 : 1);
+          p.addScaledVector(n, amplitude * s);
+        }
+
+        positions[i * 3 + 0] = p.x;
+        positions[i * 3 + 1] = p.y;
+        positions[i * 3 + 2] = p.z;
+      }
+
+      line.geometry.dispose();
+      line.geometry = new THREE.BufferGeometry();
+      line.geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    }
+
+    function getWheelWorld(relX, relZ) {
+      const cp = Math.cos(state.pitch), sp = Math.sin(state.pitch);
+      const cr = Math.cos(state.roll), sr = Math.sin(state.roll);
+
+      let x = relX;
+      let y = 0;
+      let z = relZ;
+
+      const x1 = x * cr - y * sr;
+      const y1 = x * sr + y * cr;
+      const z1 = z;
+
+      const x2 = x1;
+      const y2 = y1 * cp - z1 * sp;
+      const z2 = y1 * sp + z1 * cp;
+
+      return new THREE.Vector3(x2, y2 + state.bodyY, z2 + state.carZ);
+    }
+
+    function animate() {
+      requestAnimationFrame(animate);
+      controls.update();
+
+      const dt = 1 / 60;
+
+      if (!state.isPaused) {
+        state.carZ += state.speed * dt;
+        if (state.carZ > 50) state.carZ = -50;
+
+        let totalForceY = -mass * gravity;
+        let pitchTorque = 0;
+        let rollTorque = 0;
+
+        suspensions.forEach((s, i) => {
+          const mount = getWheelWorld(s.rel.x, s.rel.z);
+          const wheelZ = mount.z;
+          const hTerrain = terrainHeight(wheelZ);
+          s.terrainH = hTerrain;
+
+          const distance = state.bodyY - hTerrain - wheelRadius + s.rel.x * Math.sin(state.roll) + s.rel.z * (-Math.sin(state.pitch));
+          const compression = L0 - distance;
+          const prevX = s.x;
+          s.x = THREE.MathUtils.clamp(compression, -0.5, 0.5);
+          s.v = (s.x - prevX) / dt;
+
+          let Fspring = state.stiffness * s.x;
+          let Fdamper = -state.damping * s.v;
+          let F = Fspring + Fdamper;
+
+          if (s.x <= 0 && F < 0) F = 0;
+
+          s.force = F;
+          totalForceY += F;
+
+          pitchTorque += s.rel.z * F;
+          rollTorque += -s.rel.x * F;
+        });
+
+        const ay = totalForceY / mass;
+        state.bodyVY += ay * dt;
+        state.bodyY += state.bodyVY * dt;
+
+        const pitchA = pitchTorque / pitchInertia;
+        state.pitchV += pitchA * dt;
+        state.pitch += state.pitchV * dt;
+
+        const rollA = rollTorque / rollInertia;
+        state.rollV += rollA * dt;
+        state.roll += state.rollV * dt;
+
+        state.pitchV *= 0.995;
+        state.rollV *= 0.995;
+
+        if (state.bodyY < 0.65) {
+          state.bodyY = 0.65;
+          if (state.bodyVY < 0) state.bodyVY = 0;
+        }
+
+        state.pitch = THREE.MathUtils.clamp(state.pitch, -0.4, 0.4);
+        state.roll = THREE.MathUtils.clamp(state.roll, -0.4, 0.4);
+      }
+
+      carRoot.position.set(0, 0, 0);
+      bodyGroup.position.set(0, state.bodyY, state.carZ);
+      bodyGroup.rotation.set(state.pitch, 0, state.roll, 'XYZ');
+
+      suspensions.forEach((s, i) => {
+        const mountWorld = getWheelWorld(s.rel.x, s.rel.z);
+        const wheelCenter = new THREE.Vector3(s.rel.x, s.terrainH + wheelRadius, mountWorld.z);
+
+        wheelMeshes[i].position.copy(wheelCenter);
+        wheelMeshes[i].rotation.y = 0;
+
+        updateSpringLine(springLines[i], mountWorld, wheelCenter);
+      });
+
+      hudSpeed.textContent = `${state.speed.toFixed(2)} m/s`;
+      hudFL.textContent = `${(suspensions[0].x * 100).toFixed(1)} cm`;
+      hudFR.textContent = `${(suspensions[1].x * 100).toFixed(1)} cm`;
+      hudRL.textContent = `${(suspensions[2].x * 100).toFixed(1)} cm`;
+      hudRR.textContent = `${(suspensions[3].x * 100).toFixed(1)} cm`;
+      hudPitch.textContent = `${THREE.MathUtils.radToDeg(state.pitch).toFixed(2)}°`;
+      hudRoll.textContent = `${THREE.MathUtils.radToDeg(state.roll).toFixed(2)}°`;
+
+      state.frameCount += 1;
+      const suspensionValid = suspensions.every(s => Number.isFinite(s.x) && s.x >= -0.5 && s.x <= 0.5);
+
+      window.__3D_STATE__ = {
+        frameCount: state.frameCount,
+        carZ: state.carZ,
+        carBodyY: state.bodyY,
+        speed: state.speed,
+        stiffness: state.stiffness,
+        damping: state.damping,
+        compressionFL: suspensions[0].x,
+        compressionFR: suspensions[1].x,
+        compressionRL: suspensions[2].x,
+        compressionRR: suspensions[3].x,
+        pitchAngle: state.pitch,
+        rollAngle: state.roll,
+        terrainType,
+        suspensionValid,
+        isPaused: state.isPaused
+      };
+
+      renderer.render(scene, camera);
+    }
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    animate();
+  </script>
+</body>
+</html>

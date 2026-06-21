@@ -1,0 +1,745 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Magnetic Field Visualizer</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #0a0a1a;
+            font-family: monospace;
+            color: white;
+            user-select: none;
+        }
+        canvas {
+            display: block;
+        }
+        .hud-panel {
+            position: absolute;
+            background: rgba(10, 10, 26, 0.8);
+            border: 1px solid #334466;
+            padding: 10px;
+            border-radius: 5px;
+            pointer-events: none;
+        }
+        #hud-top-left {
+            top: 10px;
+            left: 10px;
+        }
+        #hud-top-right {
+            top: 10px;
+            right: 10px;
+            text-align: right;
+        }
+        #hud-bottom {
+            bottom: 10px;
+            left: 50%;
+            transform: translateX(-50%);
+            text-align: center;
+            width: 80%;
+            pointer-events: auto;
+        }
+        #hover-label {
+            position: absolute;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 5px;
+            border-radius: 3px;
+            font-size: 12px;
+            pointer-events: none;
+            display: none;
+            transform: translate(10px, 10px);
+            border: 1px solid #555;
+        }
+        button {
+            background: #222244;
+            color: white;
+            border: 1px solid #555588;
+            padding: 8px 16px;
+            font-family: monospace;
+            cursor: pointer;
+            border-radius: 4px;
+            margin-top: 5px;
+            pointer-events: auto;
+        }
+        button:hover {
+            background: #333366;
+        }
+        .highlight {
+            color: #ffff55;
+        }
+    </style>
+    <!-- Import maps polyfill -->
+    <script async src="https://unpkg.com/es-module-shims@1.8.0/dist/es-module-shims.js"></script>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+
+    <div id="hud-top-left" class="hud-panel">
+        <div>Difficulty: <span id="ui-diff" class="highlight">1</span></div>
+        <div>Dipoles: <span id="ui-dipoles">2</span></div>
+        <div>Field Lines: <span id="ui-lines">16</span></div>
+    </div>
+
+    <div id="hud-top-right" class="hud-panel" style="display: none;">
+        <div>Quiz Score: <span id="ui-score" class="highlight">0/0</span></div>
+        <div id="ui-quiz-result"></div>
+    </div>
+
+    <div id="hud-bottom" class="hud-panel">
+        <div id="ui-instructions">
+            Drag dipoles to move. Select & press R/T to rotate. Keys 1-5 change difficulty.
+        </div>
+        <button id="btn-quiz">Start Quiz</button>
+    </div>
+
+    <div id="hover-label">|B|: 0.00</div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        // --- State Management ---
+        window.__3D_STATE__ = {
+            difficultyLevel: 1,
+            dipoleCount: 2,
+            fieldLineCount: 0,
+            dipolePositions: [],
+            dipoleRotations: [],
+            selectedDipoleIndex: -1,
+            quizActive: false,
+            quizzesTaken: 0,
+            quizCorrectCount: 0,
+            lastQuizAngularError: NaN,
+            fieldMagnitudeAtOrigin: 0,
+            isDragging: false,
+            cameraDistance: 15
+        };
+
+        // --- Scene Setup ---
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x0a0a1a);
+
+        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+        camera.position.set(0, 8, 15);
+        camera.lookAt(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        document.body.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.05;
+
+        // Lights
+        scene.add(new THREE.AmbientLight(0x334466, 0.4));
+        const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+        dirLight.position.set(5, 10, 5);
+        scene.add(dirLight);
+
+        // Grid
+        const gridHelper = new THREE.GridHelper(20, 20, 0x222244, 0x222244);
+        gridHelper.position.y = 0;
+        scene.add(gridHelper);
+
+        // --- Global Variables ---
+        const dipoles = [];
+        let fieldLinesGroup = new THREE.Group();
+        scene.add(fieldLinesGroup);
+        let vectorGridGroup = new THREE.Group();
+        scene.add(vectorGridGroup);
+
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+        const dragPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -0.75);
+        const quizPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -0.5);
+        
+        let selectedDipole = null;
+        let dragOffset = new THREE.Vector3();
+
+        // Quiz variables
+        let quizTargetMesh = null;
+        let quizActualArrow = null;
+        let quizGuessArrow = null;
+        let quizTargetPos = new THREE.Vector3();
+        let quizState = 'idle'; // idle, waiting_click, showing_result
+
+        // Difficulty Config
+        const levelConfig = {
+            1: { count: 2, lines: 8, pos: [[-3, 0], [3, 0]] },
+            2: { count: 2, lines: 12, pos: [[-3, 0], [3, 0]] },
+            3: { count: 3, lines: 10, pos: [[-3, 0], [3, 0], [0, 3]] },
+            4: { count: 4, lines: 10, pos: [[-3, 0], [3, 0], [0, 3], [0, -3]] },
+            5: { count: 4, lines: 14, pos: [[-3, 0], [3, 0], [0, 3], [0, -3]], showGrid: true }
+        };
+
+        // --- Dipole Class ---
+        class Dipole {
+            constructor(x, z) {
+                this.group = new THREE.Group();
+                this.group.position.set(x, 0.75, z);
+
+                const radius = 0.3;
+                const height = 1.5;
+                const segHeight = height / 3;
+
+                const geo = new THREE.CylinderGeometry(radius, radius, segHeight, 16);
+                
+                const matN = new THREE.MeshPhongMaterial({ color: 0xff3333 });
+                this.meshN = new THREE.Mesh(geo, matN);
+                this.meshN.position.y = segHeight;
+
+                const matMid = new THREE.MeshPhongMaterial({ color: 0x888888 });
+                this.meshMid = new THREE.Mesh(geo, matMid);
+
+                const matS = new THREE.MeshPhongMaterial({ color: 0x3333ff });
+                this.meshS = new THREE.Mesh(geo, matS);
+                this.meshS.position.y = -segHeight;
+
+                this.group.add(this.meshN, this.meshMid, this.meshS);
+                
+                // Selection highlight
+                const outlineGeo = new THREE.CylinderGeometry(radius + 0.05, radius + 0.05, height + 0.1, 16);
+                const outlineMat = new THREE.MeshBasicMaterial({ color: 0xffff00, side: THREE.BackSide, transparent: true, opacity: 0.5 });
+                this.outline = new THREE.Mesh(outlineGeo, outlineMat);
+                this.outline.visible = false;
+                this.group.add(this.outline);
+
+                scene.add(this.group);
+            }
+
+            getMoment() {
+                // Magnetic moment points from S to N (local +Y)
+                const m = new THREE.Vector3(0, 1, 0);
+                m.applyEuler(this.group.rotation);
+                return m;
+            }
+
+            getNPolePos() {
+                const pos = new THREE.Vector3(0, 0.75, 0);
+                pos.applyMatrix4(this.group.matrixWorld);
+                return pos;
+            }
+
+            getSPolePos() {
+                const pos = new THREE.Vector3(0, -0.75, 0);
+                pos.applyMatrix4(this.group.matrixWorld);
+                return pos;
+            }
+
+            dispose() {
+                scene.remove(this.group);
+                this.meshN.geometry.dispose();
+                this.meshN.material.dispose();
+                this.meshMid.material.dispose();
+                this.meshS.material.dispose();
+                this.outline.geometry.dispose();
+                this.outline.material.dispose();
+            }
+        }
+
+        // --- Physics Math ---
+        const MU_4PI = 1.0; // Simplified constant
+
+        function calculateBField(pos) {
+            const B = new THREE.Vector3(0, 0, 0);
+            for (const dipole of dipoles) {
+                const rVec = new THREE.Vector3().subVectors(pos, dipole.group.position);
+                const rMag = rVec.length();
+                
+                if (rMag < 0.1) continue; // Prevent singularity
+
+                const rHat = rVec.clone().normalize();
+                const m = dipole.getMoment();
+                
+                const mDotRhat = m.dot(rHat);
+                const term1 = rHat.clone().multiplyScalar(3 * mDotRhat);
+                const bContrib = term1.sub(m).multiplyScalar(MU_4PI / Math.pow(rMag, 3));
+                
+                B.add(bContrib);
+            }
+            return B;
+        }
+
+        function rk4Step(pos, stepSize) {
+            const k1 = calculateBField(pos);
+            if (k1.lengthSq() === 0) return pos;
+            k1.normalize();
+
+            const p2 = pos.clone().add(k1.clone().multiplyScalar(stepSize / 2));
+            const k2 = calculateBField(p2);
+            if (k2.lengthSq() > 0) k2.normalize(); else k2.copy(k1);
+
+            const p3 = pos.clone().add(k2.clone().multiplyScalar(stepSize / 2));
+            const k3 = calculateBField(p3);
+            if (k3.lengthSq() > 0) k3.normalize(); else k3.copy(k2);
+
+            const p4 = pos.clone().add(k3.clone().multiplyScalar(stepSize));
+            const k4 = calculateBField(p4);
+            if (k4.lengthSq() > 0) k4.normalize(); else k4.copy(k3);
+
+            const move = k1.add(k2.multiplyScalar(2)).add(k3.multiplyScalar(2)).add(k4).multiplyScalar(stepSize / 6);
+            return pos.clone().add(move);
+        }
+
+        function getMagnitudeColor(mag) {
+            // Map magnitude to color (Cyan -> Blue -> Yellow -> Orange -> Red)
+            // Typical mag range: 0.01 (far) to 2.0+ (near pole)
+            const minMag = 0.01;
+            const maxMag = 1.5;
+            let t = (mag - minMag) / (maxMag - minMag);
+            t = Math.max(0, Math.min(1, t)); // Clamp [0,1]
+            
+            // HSL: 240 (Blue) to 0 (Red)
+            const h = 0.66 * (1 - t);
+            const color = new THREE.Color();
+            color.setHSL(h, 1.0, 0.5);
+            return color;
+        }
+
+        // --- Field Line Generation ---
+        function updateFieldLines() {
+            if (window.__3D_STATE__.quizActive) return;
+
+            // Clear old lines
+            while (fieldLinesGroup.children.length > 0) {
+                const child = fieldLinesGroup.children[0];
+                child.geometry.dispose();
+                child.material.dispose();
+                fieldLinesGroup.remove(child);
+            }
+
+            const config = levelConfig[window.__3D_STATE__.difficultyLevel];
+            const numLines = config.lines;
+            const stepSize = 0.15;
+            const maxSteps = 200;
+            let totalLinesRendered = 0;
+
+            const sPolePositions = dipoles.map(d => d.getSPolePos());
+
+            for (const dipole of dipoles) {
+                const nPoleWorld = dipole.getNPolePos();
+                const m = dipole.getMoment();
+                
+                // Create a basis orthogonal to m for seed circle
+                const up = Math.abs(m.y) > 0.9 ? new THREE.Vector3(1,0,0) : new THREE.Vector3(0,1,0);
+                const right = new THREE.Vector3().crossVectors(m, up).normalize();
+                const forward = new THREE.Vector3().crossVectors(right, m).normalize();
+
+                for (let i = 0; i < numLines; i++) {
+                    const angle = (i / numLines) * Math.PI * 2;
+                    const radius = 0.15; // Seed circle radius
+                    
+                    // Seed point slightly above N pole surface
+                    const offset = new THREE.Vector3()
+                        .addScaledVector(right, Math.cos(angle) * radius)
+                        .addScaledVector(forward, Math.sin(angle) * radius)
+                        .addScaledVector(m, 0.1); // push out along moment
+                    
+                    let currentPos = nPoleWorld.clone().add(offset);
+                    const points = [currentPos.clone()];
+                    const colors = [];
+
+                    let stopped = false;
+                    for (let step = 0; step < maxSteps; step++) {
+                        const B = calculateBField(currentPos);
+                        const mag = B.length();
+                        
+                        const color = getMagnitudeColor(mag);
+                        colors.push(color.r, color.g, color.b);
+
+                        currentPos = rk4Step(currentPos, stepSize);
+                        points.push(currentPos.clone());
+
+                        // Stop conditions
+                        if (currentPos.length() > 12) { stopped = true; break; }
+                        
+                        let nearSPole = false;
+                        for (const sPos of sPolePositions) {
+                            if (currentPos.distanceTo(sPos) < 0.4) {
+                                nearSPole = true;
+                                break;
+                            }
+                        }
+                        if (nearSPole) { stopped = true; break; }
+                    }
+
+                    // Add final color
+                    const finalB = calculateBField(currentPos);
+                    const finalColor = getMagnitudeColor(finalB.length());
+                    colors.push(finalColor.r, finalColor.g, finalColor.b);
+
+                    if (points.length > 1) {
+                        const geometry = new THREE.BufferGeometry().setFromPoints(points);
+                        geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+                        const material = new THREE.LineBasicMaterial({ vertexColors: true, linewidth: 2 });
+                        const line = new THREE.Line(geometry, material);
+                        fieldLinesGroup.add(line);
+                        totalLinesRendered++;
+                    }
+                }
+            }
+            window.__3D_STATE__.fieldLineCount = totalLinesRendered;
+            document.getElementById('ui-lines').innerText = totalLinesRendered;
+
+            updateVectorGrid();
+        }
+
+        function updateVectorGrid() {
+            while (vectorGridGroup.children.length > 0) {
+                const child = vectorGridGroup.children[0];
+                if(child.line) child.line.geometry.dispose();
+                if(child.cone) child.cone.geometry.dispose();
+                vectorGridGroup.remove(child);
+            }
+
+            if (window.__3D_STATE__.difficultyLevel !== 5 || window.__3D_STATE__.quizActive) return;
+
+            const gridSize = 5;
+            const spacing = 2;
+            const offset = (gridSize - 1) * spacing / 2;
+
+            for (let i = 0; i < gridSize; i++) {
+                for (let j = 0; j < gridSize; j++) {
+                    const x = i * spacing - offset;
+                    const z = j * spacing - offset;
+                    const pos = new THREE.Vector3(x, 0.5, z);
+                    
+                    const B = calculateBField(pos);
+                    const mag = B.length();
+                    if (mag < 0.01) continue;
+
+                    const dir = B.clone().normalize();
+                    const length = Math.min(mag * 2, 1.5); // Scale arrow length
+                    const color = getMagnitudeColor(mag);
+
+                    const arrow = new THREE.ArrowHelper(dir, pos, length, color.getHex(), 0.2, 0.1);
+                    vectorGridGroup.add(arrow);
+                }
+            }
+        }
+
+        // --- Level Management ---
+        function setDifficulty(level) {
+            if (level < 1 || level > 5 || window.__3D_STATE__.quizActive) return;
+            
+            window.__3D_STATE__.difficultyLevel = level;
+            document.getElementById('ui-diff').innerText = level;
+            
+            const config = levelConfig[level];
+            
+            // Adjust dipoles
+            while (dipoles.length > config.count) {
+                const d = dipoles.pop();
+                d.dispose();
+            }
+            while (dipoles.length < config.count) {
+                const pos = config.pos[dipoles.length];
+                dipoles.push(new Dipole(pos[0], pos[1]));
+            }
+
+            window.__3D_STATE__.dipoleCount = dipoles.length;
+            document.getElementById('ui-dipoles').innerText = dipoles.length;
+
+            if (selectedDipole && !dipoles.includes(selectedDipole)) {
+                selectedDipole = null;
+                window.__3D_STATE__.selectedDipoleIndex = -1;
+            }
+
+            updateFieldLines();
+        }
+
+        // --- Quiz Mode ---
+        function toggleQuiz() {
+            const state = window.__3D_STATE__;
+            state.quizActive = !state.quizActive;
+            
+            const btn = document.getElementById('btn-quiz');
+            const hudRight = document.getElementById('hud-top-right');
+            const instructions = document.getElementById('ui-instructions');
+
+            if (state.quizActive) {
+                btn.innerText = 'End Quiz';
+                hudRight.style.display = 'block';
+                fieldLinesGroup.visible = false;
+                vectorGridGroup.visible = false;
+                
+                if (selectedDipole) {
+                    selectedDipole.outline.visible = false;
+                    selectedDipole = null;
+                    state.selectedDipoleIndex = -1;
+                }
+
+                startQuizQuestion();
+            } else {
+                btn.innerText = 'Start Quiz';
+                hudRight.style.display = 'none';
+                fieldLinesGroup.visible = true;
+                vectorGridGroup.visible = true;
+                instructions.innerText = "Drag dipoles to move. Select & press R/T to rotate. Keys 1-5 change difficulty.";
+                
+                cleanupQuizElements();
+                updateFieldLines();
+            }
+        }
+
+        function startQuizQuestion() {
+            cleanupQuizElements();
+            
+            // Random target point on XZ plane within [-6, 6], y=0.5
+            const rx = (Math.random() - 0.5) * 12;
+            const rz = (Math.random() - 0.5) * 12;
+            quizTargetPos.set(rx, 0.5, rz);
+
+            const geo = new THREE.SphereGeometry(0.2, 16, 16);
+            const mat = new THREE.MeshBasicMaterial({ color: 0x00ff00 });
+            quizTargetMesh = new THREE.Mesh(geo, mat);
+            quizTargetMesh.position.copy(quizTargetPos);
+            scene.add(quizTargetMesh);
+
+            document.getElementById('ui-instructions').innerText = "Click on the grid to indicate the magnetic field direction at the green point.";
+            quizState = 'waiting_click';
+            
+            // Change button to skip
+            const btn = document.getElementById('btn-quiz');
+            btn.innerText = 'End Quiz';
+            
+            // Add next button if not exists
+            if (!document.getElementById('btn-next-quiz')) {
+                const nextBtn = document.createElement('button');
+                nextBtn.id = 'btn-next-quiz';
+                nextBtn.innerText = 'Skip Question';
+                nextBtn.onclick = startQuizQuestion;
+                document.getElementById('hud-bottom').appendChild(nextBtn);
+            } else {
+                document.getElementById('btn-next-quiz').innerText = 'Skip Question';
+                document.getElementById('btn-next-quiz').style.display = 'inline-block';
+            }
+        }
+
+        function handleQuizClick(intersectPoint) {
+            if (quizState !== 'waiting_click') return;
+
+            const guessVec = new THREE.Vector3().subVectors(intersectPoint, quizTargetPos);
+            guessVec.y = 0; // Project to XZ
+            if (guessVec.lengthSq() < 0.01) return;
+            guessVec.normalize();
+
+            const actualB = calculateBField(quizTargetPos);
+            const actualVec = actualB.clone();
+            actualVec.y = 0; // Compare projected directions
+            if (actualVec.lengthSq() > 0) actualVec.normalize();
+
+            // Calculate error
+            let angleRad = guessVec.angleTo(actualVec);
+            let angleDeg = THREE.MathUtils.radToDeg(angleRad);
+            if (isNaN(angleDeg)) angleDeg = 0;
+
+            window.__3D_STATE__.lastQuizAngularError = angleDeg;
+            window.__3D_STATE__.quizzesTaken++;
+
+            let scoreText = "";
+            let isCorrect = false;
+            if (angleDeg <= 15) { scoreText = "Excellent"; isCorrect = true; }
+            else if (angleDeg <= 45) { scoreText = "Good"; isCorrect = true; }
+            else if (angleDeg <= 90) { scoreText = "Fair"; }
+            else { scoreText = "Poor"; }
+
+            if (isCorrect) window.__3D_STATE__.quizCorrectCount++;
+
+            // Visuals
+            quizGuessArrow = new THREE.ArrowHelper(guessVec, quizTargetPos, 2, 0xffffff, 0.4, 0.2);
+            scene.add(quizGuessArrow);
+
+            quizActualArrow = new THREE.ArrowHelper(actualVec, quizTargetPos, 2, 0xffff00, 0.4, 0.2);
+            scene.add(quizActualArrow);
+
+            // UI Update
+            document.getElementById('ui-score').innerText = `${window.__3D_STATE__.quizCorrectCount}/${window.__3D_STATE__.quizzesTaken}`;
+            document.getElementById('ui-quiz-result').innerHTML = `Error: ${angleDeg.toFixed(1)}°<br><span class="highlight">${scoreText}</span>`;
+            document.getElementById('ui-instructions').innerText = "Yellow = Actual, White = Your Guess.";
+            
+            document.getElementById('btn-next-quiz').innerText = 'Next Question';
+            quizState = 'showing_result';
+        }
+
+        function cleanupQuizElements() {
+            if (quizTargetMesh) { scene.remove(quizTargetMesh); quizTargetMesh.geometry.dispose(); quizTargetMesh.material.dispose(); quizTargetMesh = null; }
+            if (quizGuessArrow) { scene.remove(quizGuessArrow); quizGuessArrow.line.geometry.dispose(); quizGuessArrow.cone.geometry.dispose(); quizGuessArrow = null; }
+            if (quizActualArrow) { scene.remove(quizActualArrow); quizActualArrow.line.geometry.dispose(); quizActualArrow.cone.geometry.dispose(); quizActualArrow = null; }
+            document.getElementById('ui-quiz-result').innerHTML = "";
+            
+            const nextBtn = document.getElementById('btn-next-quiz');
+            if (nextBtn && !window.__3D_STATE__.quizActive) {
+                nextBtn.style.display = 'none';
+            }
+        }
+
+        document.getElementById('btn-quiz').addEventListener('click', toggleQuiz);
+
+        // --- Interaction ---
+        function getIntersects(event, objects) {
+            mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+            raycaster.setFromCamera(mouse, camera);
+            return raycaster.intersectObjects(objects, true);
+        }
+
+        window.addEventListener('pointerdown', (event) => {
+            if (event.button !== 0) return; // Only left click
+
+            if (window.__3D_STATE__.quizActive) {
+                if (quizState === 'waiting_click') {
+                    mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+                    mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+                    raycaster.setFromCamera(mouse, camera);
+                    raycaster.ray.intersectPlane(quizPlane, dragOffset);
+                    if (dragOffset) handleQuizClick(dragOffset.clone());
+                }
+                return;
+            }
+
+            const dipoleMeshes = dipoles.map(d => d.group);
+            const intersects = getIntersects(event, dipoleMeshes);
+
+            if (intersects.length > 0) {
+                controls.enabled = false;
+                window.__3D_STATE__.isDragging = true;
+                
+                // Find which dipole was clicked
+                let clickedGroup = intersects[0].object.parent;
+                if (clickedGroup.parent && clickedGroup.parent.type === 'Group') {
+                    clickedGroup = clickedGroup.parent; // Handle nested outline
+                }
+
+                if (selectedDipole) selectedDipole.outline.visible = false;
+                
+                selectedDipole = dipoles.find(d => d.group === clickedGroup);
+                if (selectedDipole) {
+                    selectedDipole.outline.visible = true;
+                    window.__3D_STATE__.selectedDipoleIndex = dipoles.indexOf(selectedDipole);
+                    
+                    raycaster.ray.intersectPlane(dragPlane, dragOffset);
+                    dragOffset.sub(selectedDipole.group.position);
+                }
+            } else {
+                if (selectedDipole) {
+                    selectedDipole.outline.visible = false;
+                    selectedDipole = null;
+                    window.__3D_STATE__.selectedDipoleIndex = -1;
+                }
+            }
+        });
+
+        window.addEventListener('pointermove', (event) => {
+            // Hover label logic
+            const hoverLabel = document.getElementById('hover-label');
+            if (!window.__3D_STATE__.isDragging && !window.__3D_STATE__.quizActive) {
+                mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+                mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+                raycaster.setFromCamera(mouse, camera);
+                
+                const intersectPoint = new THREE.Vector3();
+                raycaster.ray.intersectPlane(quizPlane, intersectPoint); // y=0.5 plane
+                
+                if (intersectPoint) {
+                    const B = calculateBField(intersectPoint);
+                    hoverLabel.style.display = 'block';
+                    hoverLabel.style.left = event.clientX + 'px';
+                    hoverLabel.style.top = event.clientY + 'px';
+                    hoverLabel.innerText = `|B|: ${B.length().toFixed(2)}`;
+                } else {
+                    hoverLabel.style.display = 'none';
+                }
+            } else {
+                hoverLabel.style.display = 'none';
+            }
+
+            // Drag logic
+            if (!window.__3D_STATE__.isDragging || !selectedDipole || window.__3D_STATE__.quizActive) return;
+
+            mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+            raycaster.setFromCamera(mouse, camera);
+
+            const intersectPoint = new THREE.Vector3();
+            raycaster.ray.intersectPlane(dragPlane, intersectPoint);
+
+            if (intersectPoint) {
+                let newX = intersectPoint.x - dragOffset.x;
+                let newZ = intersectPoint.z - dragOffset.z;
+                
+                // Constrain
+                newX = Math.max(-8, Math.min(8, newX));
+                newZ = Math.max(-8, Math.min(8, newZ));
+
+                selectedDipole.group.position.set(newX, 0.75, newZ);
+                updateFieldLines();
+            }
+        });
+
+        window.addEventListener('pointerup', () => {
+            controls.enabled = true;
+            window.__3D_STATE__.isDragging = false;
+        });
+
+        window.addEventListener('keydown', (event) => {
+            if (window.__3D_STATE__.quizActive) return;
+
+            const key = event.key.toLowerCase();
+            
+            // Difficulty
+            if (['1', '2', '3', '4', '5'].includes(key)) {
+                setDifficulty(parseInt(key));
+            }
+
+            // Rotation
+            if (selectedDipole && (key === 'r' || key === 't')) {
+                const angle = THREE.MathUtils.degToRad(15);
+                if (key === 'r') {
+                    selectedDipole.group.rotation.y += angle;
+                } else {
+                    selectedDipole.group.rotation.y -= angle;
+                }
+                updateFieldLines();
+            }
+        });
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // --- Initialization ---
+        setDifficulty(1);
+
+        // --- Animation Loop ---
+        function animate() {
+            requestAnimationFrame(animate);
+            controls.update();
+
+            // Update State Object
+            const state = window.__3D_STATE__;
+            state.dipolePositions = dipoles.map(d => ({ x: d.group.position.x, y: d.group.position.y, z: d.group.position.z }));
+            state.dipoleRotations = dipoles.map(d => THREE.MathUtils.radToDeg(d.group.rotation.y));
+            state.cameraDistance = camera.position.distanceTo(new THREE.Vector3(0,0,0));
+            state.fieldMagnitudeAtOrigin = calculateBField(new THREE.Vector3(0, 0.5, 0)).length();
+
+            renderer.render(scene, camera);
+        }
+
+        animate();
+    </script>
+</body>
+</html>

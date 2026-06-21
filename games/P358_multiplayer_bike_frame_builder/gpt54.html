@@ -1,0 +1,499 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>3D Multiplayer Bike Frame Builder</title>
+  <style>
+    html, body {
+      margin: 0;
+      overflow: hidden;
+      font-family: Arial, sans-serif;
+      background: #111;
+    }
+
+    #playerDisplay, #tubeCount, #scaleDisplay {
+      position: absolute;
+      color: white;
+      background: rgba(0,0,0,0.55);
+      padding: 10px 14px;
+      border-radius: 8px;
+      font-size: 16px;
+      z-index: 10;
+      user-select: none;
+    }
+
+    #playerDisplay { top: 12px; left: 12px; }
+    #tubeCount { top: 12px; right: 12px; }
+    #scaleDisplay {
+      bottom: 18px;
+      left: 50%;
+      transform: translateX(-50%);
+    }
+
+    #exportBtn {
+      position: absolute;
+      bottom: 16px;
+      right: 16px;
+      z-index: 10;
+      padding: 10px 14px;
+      border: none;
+      border-radius: 8px;
+      background: #2d8cff;
+      color: white;
+      font-size: 15px;
+      cursor: pointer;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+    }
+
+    #exportBtn:hover {
+      background: #1c74dd;
+    }
+
+    #hint {
+      position: absolute;
+      left: 12px;
+      bottom: 12px;
+      color: #ddd;
+      background: rgba(0,0,0,0.45);
+      padding: 10px 12px;
+      border-radius: 8px;
+      z-index: 10;
+      font-size: 13px;
+      line-height: 1.5;
+      max-width: 420px;
+    }
+  </style>
+</head>
+<body>
+  <div id="playerDisplay">Active Player: Player1</div>
+  <div id="tubeCount">Tubes: 0/6</div>
+  <div id="scaleDisplay">Frame Scale: 1.0x</div>
+  <button id="exportBtn">Export Frame</button>
+  <div id="hint">
+    Tab: switch player<br>
+    1-6: add tube<br>
+    R: reset frame<br>
+    C: cycle frame color<br>
+    S: cycle frame scale<br>
+    Click tube: select/deselect<br>
+    Delete: remove selected tube
+  </div>
+
+  <script type="module">
+    import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
+    import { OrbitControls } from 'https://unpkg.com/three@0.160.0/examples/jsm/controls/OrbitControls.js';
+    import { GLTFLoader } from 'https://unpkg.com/three@0.160.0/examples/jsm/loaders/GLTFLoader.js';
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x20242a);
+
+    const camera = new THREE.PerspectiveCamera(
+      60,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      100
+    );
+    camera.position.set(0, 3, 8);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    document.body.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.set(0, 1, 0);
+    controls.enableDamping = true;
+
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
+    scene.add(ambientLight);
+
+    const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+    dirLight.position.set(5, 10, 7);
+    dirLight.castShadow = true;
+    dirLight.shadow.mapSize.width = 2048;
+    dirLight.shadow.mapSize.height = 2048;
+    dirLight.shadow.camera.near = 0.5;
+    dirLight.shadow.camera.far = 50;
+    dirLight.shadow.camera.left = -15;
+    dirLight.shadow.camera.right = 15;
+    dirLight.shadow.camera.top = 15;
+    dirLight.shadow.camera.bottom = -15;
+    scene.add(dirLight);
+
+    const ground = new THREE.Mesh(
+      new THREE.PlaneGeometry(20, 20),
+      new THREE.MeshStandardMaterial({ color: '#888888' })
+    );
+    ground.rotation.x = -Math.PI / 2;
+    ground.position.y = 0;
+    ground.receiveShadow = true;
+    scene.add(ground);
+
+    const grid = new THREE.GridHelper(20, 20, 0x444444, 0x555555);
+    grid.position.y = 0.001;
+    scene.add(grid);
+
+    const playerColors = {
+      Player1: '#3366FF',
+      Player2: '#FF6633'
+    };
+
+    const colorPresets = ['#CC0000', '#0066CC', '#00CC66', '#222222'];
+    const scalePresets = [1.0, 1.2, 0.8];
+
+    const ui = {
+      playerDisplay: document.getElementById('playerDisplay'),
+      tubeCount: document.getElementById('tubeCount'),
+      scaleDisplay: document.getElementById('scaleDisplay'),
+      exportBtn: document.getElementById('exportBtn')
+    };
+
+    window.__3D_STATE__ = {
+      tubesPlaced: 0,
+      activePlayer: 'Player1',
+      selectedTube: null,
+      frameScale: 1.0,
+      frameColor: '#CC0000',
+      player1Position: { x: -2, y: 1, z: 2 },
+      player2Position: { x: 2, y: 1, z: -2 },
+      robotLoaded: false,
+      exported: false,
+      tubeOwners: {},
+      colorCycleIndex: 0,
+      scaleCycleIndex: 0
+    };
+
+    function sanitizeNumber(n, fallback = 0) {
+      return Number.isFinite(n) ? n : fallback;
+    }
+
+    function setVecState(target, vec) {
+      target.x = sanitizeNumber(vec.x);
+      target.y = sanitizeNumber(vec.y);
+      target.z = sanitizeNumber(vec.z);
+    }
+
+    const frameGroup = new THREE.Group();
+    scene.add(frameGroup);
+
+    const tubeDefinitions = {
+      1: {
+        name: 'Seat Tube',
+        start: new THREE.Vector3(0, 0.3, 0),
+        end: new THREE.Vector3(0, 1.5, 0),
+        radius: 0.04,
+        color: '#CC0000'
+      },
+      2: {
+        name: 'Top Tube',
+        start: new THREE.Vector3(0, 1.5, 0),
+        end: new THREE.Vector3(-1.2, 1.4, 0),
+        radius: 0.035,
+        color: '#CC0000'
+      },
+      3: {
+        name: 'Down Tube',
+        start: new THREE.Vector3(0, 0.3, 0),
+        end: new THREE.Vector3(-1.2, 0.8, 0),
+        radius: 0.04,
+        color: '#CC0000'
+      },
+      4: {
+        name: 'Head Tube',
+        start: new THREE.Vector3(-1.2, 0.8, 0),
+        end: new THREE.Vector3(-1.2, 1.4, 0),
+        radius: 0.045,
+        color: '#CC0000'
+      },
+      5: {
+        name: 'Chain Stay',
+        start: new THREE.Vector3(0, 0.3, 0),
+        end: new THREE.Vector3(1.0, 0.3, 0),
+        radius: 0.03,
+        color: '#CC0000'
+      },
+      6: {
+        name: 'Seat Stay',
+        start: new THREE.Vector3(0, 1.5, 0),
+        end: new THREE.Vector3(1.0, 0.3, 0),
+        radius: 0.03,
+        color: '#CC0000'
+      }
+    };
+
+    const tubeMeshes = {};
+    let selectedMesh = null;
+
+    function createTube(start, end, radius, color, tubeIndex) {
+      const s = start.clone();
+      const e = end.clone();
+      const dir = new THREE.Vector3().subVectors(e, s);
+      const length = sanitizeNumber(dir.length(), 0.001);
+      const midpoint = new THREE.Vector3().addVectors(s, e).multiplyScalar(0.5);
+
+      const geometry = new THREE.CylinderGeometry(radius, radius, length, 24);
+      const material = new THREE.MeshStandardMaterial({
+        color: color,
+        emissive: 0x000000,
+        emissiveIntensity: 0
+      });
+
+      const mesh = new THREE.Mesh(geometry, material);
+      mesh.castShadow = true;
+      mesh.receiveShadow = true;
+      mesh.position.copy(midpoint);
+
+      const yAxis = new THREE.Vector3(0, 1, 0);
+      const direction = dir.clone().normalize();
+      const quaternion = new THREE.Quaternion().setFromUnitVectors(yAxis, direction);
+      mesh.quaternion.copy(quaternion);
+
+      mesh.userData.tubeIndex = tubeIndex;
+      mesh.userData.baseColor = color;
+      return mesh;
+    }
+
+    function updateHUD() {
+      ui.playerDisplay.textContent = `Active Player: ${window.__3D_STATE__.activePlayer}`;
+      ui.tubeCount.textContent = `Tubes: ${window.__3D_STATE__.tubesPlaced}/6`;
+      ui.scaleDisplay.textContent = `Frame Scale: ${window.__3D_STATE__.frameScale.toFixed(1)}x`;
+    }
+
+    function updateState() {
+      const placedCount = Object.keys(tubeMeshes).length;
+      window.__3D_STATE__.tubesPlaced = sanitizeNumber(placedCount);
+
+      setVecState(window.__3D_STATE__.player1Position, player1Cursor.position);
+      setVecState(window.__3D_STATE__.player2Position, player2Cursor.position);
+
+      window.__3D_STATE__.selectedTube = selectedMesh ? sanitizeNumber(selectedMesh.userData.tubeIndex, null) : null;
+      window.__3D_STATE__.frameScale = sanitizeNumber(frameGroup.scale.x, 1.0);
+      updateHUD();
+    }
+
+    function clearSelection() {
+      if (selectedMesh && selectedMesh.material) {
+        selectedMesh.material.emissive.set(0x000000);
+        selectedMesh.material.emissiveIntensity = 0;
+      }
+      selectedMesh = null;
+      window.__3D_STATE__.selectedTube = null;
+      updateHUD();
+    }
+
+    function selectTube(mesh) {
+      if (selectedMesh === mesh) {
+        clearSelection();
+        return;
+      }
+
+      clearSelection();
+      selectedMesh = mesh;
+      if (selectedMesh.material) {
+        selectedMesh.material.emissive.set(0xFFFF00);
+        selectedMesh.material.emissiveIntensity = 0.3;
+      }
+      window.__3D_STATE__.selectedTube = sanitizeNumber(mesh.userData.tubeIndex, null);
+      updateHUD();
+    }
+
+    function addTube(index) {
+      const def = tubeDefinitions[index];
+      if (!def || tubeMeshes[index]) return;
+
+      const activePlayer = window.__3D_STATE__.activePlayer;
+      const playerColor = playerColors[activePlayer];
+
+      const mesh = createTube(def.start, def.end, def.radius, playerColor, index);
+      frameGroup.add(mesh);
+      tubeMeshes[index] = mesh;
+      window.__3D_STATE__.tubeOwners[index] = activePlayer;
+
+      updateState();
+    }
+
+    function removeTube(index) {
+      if (!tubeMeshes[index]) return;
+
+      if (selectedMesh === tubeMeshes[index]) {
+        clearSelection();
+      }
+
+      frameGroup.remove(tubeMeshes[index]);
+      tubeMeshes[index].geometry.dispose();
+      tubeMeshes[index].material.dispose();
+      delete tubeMeshes[index];
+      delete window.__3D_STATE__.tubeOwners[index];
+
+      updateState();
+    }
+
+    function resetTubes() {
+      Object.keys(tubeMeshes).forEach(key => {
+        const idx = parseInt(key, 10);
+        removeTube(idx);
+      });
+      clearSelection();
+      updateState();
+    }
+
+    function applyFrameColor(hexColor) {
+      window.__3D_STATE__.frameColor = hexColor;
+      Object.values(tubeMeshes).forEach(mesh => {
+        mesh.material.color.set(hexColor);
+        mesh.userData.baseColor = hexColor;
+      });
+      if (selectedMesh) {
+        selectedMesh.material.emissive.set(0xFFFF00);
+        selectedMesh.material.emissiveIntensity = 0.3;
+      }
+      updateState();
+    }
+
+    function cycleFrameColor() {
+      const nextIndex = (window.__3D_STATE__.colorCycleIndex + 1) % colorPresets.length;
+      window.__3D_STATE__.colorCycleIndex = nextIndex;
+      applyFrameColor(colorPresets[nextIndex]);
+    }
+
+    function cycleFrameScale() {
+      const nextIndex = (window.__3D_STATE__.scaleCycleIndex + 1) % scalePresets.length;
+      window.__3D_STATE__.scaleCycleIndex = nextIndex;
+      const s = sanitizeNumber(scalePresets[nextIndex], 1.0);
+      frameGroup.scale.setScalar(s);
+      window.__3D_STATE__.frameScale = s;
+      updateHUD();
+    }
+
+    function toggleActivePlayer() {
+      window.__3D_STATE__.activePlayer =
+        window.__3D_STATE__.activePlayer === 'Player1' ? 'Player2' : 'Player1';
+      updateHUD();
+    }
+
+    const cursorGeometry = new THREE.SphereGeometry(0.1, 24, 24);
+
+    const player1Cursor = new THREE.Mesh(
+      cursorGeometry,
+      new THREE.MeshStandardMaterial({ color: playerColors.Player1 })
+    );
+    player1Cursor.position.set(-2, 1, 2);
+    player1Cursor.castShadow = true;
+    scene.add(player1Cursor);
+
+    const player2Cursor = new THREE.Mesh(
+      cursorGeometry,
+      new THREE.MeshStandardMaterial({ color: playerColors.Player2 })
+    );
+    player2Cursor.position.set(2, 1, -2);
+    player2Cursor.castShadow = true;
+    scene.add(player2Cursor);
+
+    const robotLoader = new GLTFLoader();
+    robotLoader.load(
+      'robot.glb',
+      (gltf) => {
+        const robot = gltf.scene;
+        robot.scale.setScalar(0.5);
+        robot.position.set(4, 0, 0);
+        robot.traverse((obj) => {
+          if (obj.isMesh) {
+            obj.castShadow = true;
+            obj.receiveShadow = true;
+          }
+        });
+        scene.add(robot);
+        window.__3D_STATE__.robotLoaded = true;
+      },
+      undefined,
+      (err) => {
+        console.warn('Failed to load robot.glb', err);
+        window.__3D_STATE__.robotLoaded = false;
+      }
+    );
+
+    const raycaster = new THREE.Raycaster();
+    const mouse = new THREE.Vector2();
+
+    function onPointerDown(event) {
+      mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+      mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+      raycaster.setFromCamera(mouse, camera);
+      const intersects = raycaster.intersectObjects(Object.values(tubeMeshes), false);
+
+      if (intersects.length > 0) {
+        selectTube(intersects[0].object);
+      } else {
+        clearSelection();
+      }
+    }
+
+    window.addEventListener('pointerdown', onPointerDown);
+
+    window.addEventListener('keydown', (event) => {
+      if (event.key === 'Tab') {
+        event.preventDefault();
+        toggleActivePlayer();
+        return;
+      }
+
+      if (/^[1-6]$/.test(event.key)) {
+        addTube(parseInt(event.key, 10));
+        return;
+      }
+
+      switch (event.key.toLowerCase()) {
+        case 'r':
+          resetTubes();
+          break;
+        case 'c':
+          cycleFrameColor();
+          break;
+        case 's':
+          cycleFrameScale();
+          break;
+      }
+
+      if (event.key === 'Delete' && selectedMesh) {
+        const idx = selectedMesh.userData.tubeIndex;
+        removeTube(idx);
+      }
+    });
+
+    ui.exportBtn.addEventListener('click', () => {
+      window.__3D_STATE__.exported = true;
+      const msg = `Export Frame: ${window.__3D_STATE__.tubesPlaced} tube(s) currently in scene.`;
+      console.log(msg);
+      alert(msg);
+    });
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    let t = 0;
+    function animate() {
+      requestAnimationFrame(animate);
+      t += 0.01;
+
+      // simple multiplayer cursor idle movement while keeping valid state
+      player1Cursor.position.y = 1 + Math.sin(t) * 0.08;
+      player2Cursor.position.y = 1 + Math.cos(t * 1.1) * 0.08;
+
+      controls.update();
+      updateState();
+      renderer.render(scene, camera);
+    }
+
+    updateHUD();
+    updateState();
+    animate();
+  </script>
+</body>
+</html>

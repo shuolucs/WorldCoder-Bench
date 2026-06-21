@@ -1,0 +1,512 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Soft Body Simulation</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #111;
+            font-family: monospace;
+            color: #fff;
+        }
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+        }
+        #hud {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 15px;
+            border-radius: 8px;
+            pointer-events: none;
+            border: 1px solid #444;
+        }
+        .hud-item {
+            margin-bottom: 5px;
+        }
+        #controls {
+            position: absolute;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            gap: 10px;
+        }
+        button {
+            background: #333;
+            color: #fff;
+            border: 1px solid #666;
+            padding: 10px 20px;
+            cursor: pointer;
+            border-radius: 4px;
+            font-family: monospace;
+            font-size: 14px;
+            transition: background 0.2s;
+        }
+        button:hover {
+            background: #555;
+        }
+    </style>
+    <script type="importmap">
+    { "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+    } }
+    </script>
+</head>
+<body>
+    <div id="canvas-container"></div>
+    
+    <div id="hud">
+        <div class="hud-item">Sim Time: <span id="simTime">0.000</span> s</div>
+        <div class="hud-item" style="color: #ff6666;">Ball A Pos: <span id="posA">0.00, 0.00, 0.00</span></div>
+        <div class="hud-item" style="color: #ff6666;">Ball A Vol Ratio: <span id="volRatioA">1.00</span></div>
+        <div class="hud-item" style="color: #6666ff; margin-top: 10px;">Ball B Pos: <span id="posB">0.00, 0.00, 0.00</span></div>
+        <div class="hud-item" style="color: #6666ff;">Ball B Vol Ratio: <span id="volRatioB">1.00</span></div>
+    </div>
+
+    <div id="controls">
+        <button id="resetBtn">Reset Simulation</button>
+        <button id="pushBtn">Push Ball A (Impulse)</button>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        // --- Physics Classes ---
+
+        class Node {
+            constructor(x, y, z, mass) {
+                this.x = x; this.y = y; this.z = z;
+                this.px = x; this.py = y; this.pz = z;
+                this.ax = 0; this.ay = 0; this.az = 0;
+                this.mass = mass;
+            }
+        }
+
+        class Spring {
+            constructor(n1, n2, k, d) {
+                this.n1 = n1;
+                this.n2 = n2;
+                this.k = k;
+                this.d = d;
+                let dx = n2.x - n1.x;
+                let dy = n2.y - n1.y;
+                let dz = n2.z - n1.z;
+                this.rest = Math.sqrt(dx*dx + dy*dy + dz*dz);
+            }
+        }
+
+        class SoftBody {
+            constructor(scene, cx, cy, cz, color) {
+                this.scene = scene;
+                this.nodes = [];
+                this.surfaceNodes = [];
+                this.springs = [];
+                this.color = color;
+                
+                const massPerNode = 0.01;
+                const kRadial = 500;
+                const kSurface = 300;
+                const damping = 5.0;
+
+                // Geometry
+                this.geometry = new THREE.IcosahedronGeometry(1.0, 2);
+                const posAttr = this.geometry.attributes.position;
+                const index = this.geometry.index.array;
+
+                // Create surface nodes
+                for (let i = 0; i < posAttr.count; i++) {
+                    let x = posAttr.getX(i) + cx;
+                    let y = posAttr.getY(i) + cy;
+                    let z = posAttr.getZ(i) + cz;
+                    let node = new Node(x, y, z, massPerNode);
+                    this.nodes.push(node);
+                    this.surfaceNodes.push(node);
+                }
+
+                // Create center node
+                this.centerNode = new Node(cx, cy, cz, massPerNode);
+                this.nodes.push(this.centerNode);
+
+                // Create surface springs (unique edges)
+                let edges = new Set();
+                for (let i = 0; i < index.length; i += 3) {
+                    let a = index[i], b = index[i+1], c = index[i+2];
+                    edges.add(`${Math.min(a,b)}_${Math.max(a,b)}`);
+                    edges.add(`${Math.min(b,c)}_${Math.max(b,c)}`);
+                    edges.add(`${Math.min(c,a)}_${Math.max(c,a)}`);
+                }
+
+                edges.forEach(e => {
+                    let parts = e.split('_');
+                    let n1 = this.surfaceNodes[parseInt(parts[0])];
+                    let n2 = this.surfaceNodes[parseInt(parts[1])];
+                    this.springs.push(new Spring(n1, n2, kSurface, damping));
+                });
+
+                // Create radial springs
+                for (let n of this.surfaceNodes) {
+                    this.springs.push(new Spring(this.centerNode, n, kRadial, damping));
+                }
+
+                // Calculate initial volume
+                this.V0 = this.calculateVolume();
+                this.currentVolume = this.V0;
+                this.avgRadius = 1.0;
+
+                // Visuals
+                this.material = new THREE.MeshStandardMaterial({
+                    color: color,
+                    transparent: true,
+                    opacity: 0.7,
+                    roughness: 0.2,
+                    metalness: 0.1,
+                    side: THREE.DoubleSide
+                });
+                this.mesh = new THREE.Mesh(this.geometry, this.material);
+                this.mesh.castShadow = true;
+                this.mesh.receiveShadow = true;
+                this.scene.add(this.mesh);
+
+                // Internal springs visualization (Radial only)
+                const lineGeo = new THREE.BufferGeometry();
+                const linePos = new Float32Array(this.surfaceNodes.length * 6);
+                lineGeo.setAttribute('position', new THREE.BufferAttribute(linePos, 3));
+                const lineMat = new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.3 });
+                this.lines = new THREE.LineSegments(lineGeo, lineMat);
+                this.scene.add(this.lines);
+
+                // Center marker
+                const markerGeo = new THREE.SphereGeometry(0.05, 8, 8);
+                const markerMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
+                this.marker = new THREE.Mesh(markerGeo, markerMat);
+                this.scene.add(this.marker);
+            }
+
+            calculateVolume() {
+                let cx = this.centerNode.x, cy = this.centerNode.y, cz = this.centerNode.z;
+                let sumR = 0;
+                for (let n of this.surfaceNodes) {
+                    let dx = n.x - cx, dy = n.y - cy, dz = n.z - cz;
+                    sumR += Math.sqrt(dx*dx + dy*dy + dz*dz);
+                }
+                this.avgRadius = sumR / this.surfaceNodes.length;
+                return (4/3) * Math.PI * Math.pow(this.avgRadius, 3);
+            }
+
+            applyForces(dt) {
+                // Gravity
+                for (let n of this.nodes) {
+                    n.ax = 0; n.ay = -9.8; n.az = 0;
+                }
+
+                // Springs
+                for (let s of this.springs) {
+                    let dx = s.n2.x - s.n1.x;
+                    let dy = s.n2.y - s.n1.y;
+                    let dz = s.n2.z - s.n1.z;
+                    let dist = Math.sqrt(dx*dx + dy*dy + dz*dz);
+                    if (dist === 0) continue;
+                    
+                    let nx = dx / dist, ny = dy / dist, nz = dz / dist;
+
+                    let v1x = (s.n1.x - s.n1.px) / dt;
+                    let v1y = (s.n1.y - s.n1.py) / dt;
+                    let v1z = (s.n1.z - s.n1.pz) / dt;
+                    let v2x = (s.n2.x - s.n2.px) / dt;
+                    let v2y = (s.n2.y - s.n2.py) / dt;
+                    let v2z = (s.n2.z - s.n2.pz) / dt;
+
+                    let vrx = v2x - v1x, vry = v2y - v1y, vrz = v2z - v1z;
+                    let v_dot_n = vrx*nx + vry*ny + vrz*nz;
+
+                    let f_spring = s.k * (dist - s.rest);
+                    let f_damp = s.d * v_dot_n;
+                    let f_total = f_spring + f_damp;
+
+                    let fx = f_total * nx, fy = f_total * ny, fz = f_total * nz;
+
+                    s.n1.ax += fx / s.n1.mass; s.n1.ay += fy / s.n1.mass; s.n1.az += fz / s.n1.mass;
+                    s.n2.ax -= fx / s.n2.mass; s.n2.ay -= fy / s.n2.mass; s.n2.az -= fz / s.n2.mass;
+                }
+
+                // Pressure
+                this.currentVolume = this.calculateVolume();
+                if (this.currentVolume < this.V0 * 0.7) {
+                    let pressure_coeff = 200;
+                    let forceMag = pressure_coeff * (this.V0 - this.currentVolume) / this.V0;
+                    let cx = this.centerNode.x, cy = this.centerNode.y, cz = this.centerNode.z;
+                    
+                    for (let n of this.surfaceNodes) {
+                        let dx = n.x - cx, dy = n.y - cy, dz = n.z - cz;
+                        let dist = Math.sqrt(dx*dx + dy*dy + dz*dz);
+                        if (dist > 0) {
+                            let nx = dx/dist, ny = dy/dist, nz = dz/dist;
+                            n.ax += (forceMag * nx) / n.mass;
+                            n.ay += (forceMag * ny) / n.mass;
+                            n.az += (forceMag * nz) / n.mass;
+                        }
+                    }
+                }
+            }
+
+            integrate(dt) {
+                for (let n of this.nodes) {
+                    let nx = 2 * n.x - n.px + n.ax * dt * dt;
+                    let ny = 2 * n.y - n.py + n.ay * dt * dt;
+                    let nz = 2 * n.z - n.pz + n.az * dt * dt;
+                    n.px = n.x; n.py = n.y; n.pz = n.z;
+                    n.x = nx; n.y = ny; n.z = nz;
+
+                    // Ground collision
+                    if (n.y < 0) {
+                        let vy = (n.y - n.py) / dt;
+                        n.y = 0;
+                        n.py = n.y - (-vy * 0.3) * dt;
+                        
+                        // Friction
+                        let vx = (n.x - n.px) / dt;
+                        let vz = (n.z - n.pz) / dt;
+                        n.px = n.x - vx * 0.9 * dt;
+                        n.pz = n.z - vz * 0.9 * dt;
+                    }
+                }
+            }
+
+            updateMesh() {
+                const posAttr = this.geometry.attributes.position;
+                for (let i = 0; i < this.surfaceNodes.length; i++) {
+                    let n = this.surfaceNodes[i];
+                    posAttr.setXYZ(i, n.x, n.y, n.z);
+                }
+                posAttr.needsUpdate = true;
+                this.geometry.computeVertexNormals();
+
+                // Update lines
+                const linePos = this.lines.geometry.attributes.position.array;
+                let idx = 0;
+                let cx = this.centerNode.x, cy = this.centerNode.y, cz = this.centerNode.z;
+                for (let n of this.surfaceNodes) {
+                    linePos[idx++] = cx; linePos[idx++] = cy; linePos[idx++] = cz;
+                    linePos[idx++] = n.x; linePos[idx++] = n.y; linePos[idx++] = n.z;
+                }
+                this.lines.geometry.attributes.position.needsUpdate = true;
+
+                // Update marker
+                this.marker.position.set(cx, cy, cz);
+            }
+
+            dispose() {
+                this.scene.remove(this.mesh);
+                this.scene.remove(this.lines);
+                this.scene.remove(this.marker);
+                this.geometry.dispose();
+                this.material.dispose();
+                this.lines.geometry.dispose();
+                this.lines.material.dispose();
+                this.marker.geometry.dispose();
+                this.marker.material.dispose();
+            }
+        }
+
+        // --- Main Setup ---
+
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x111111);
+        scene.fog = new THREE.Fog(0x111111, 10, 50);
+
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+        camera.position.set(0, 5, 15);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        container.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.target.set(0, 3, 0);
+        controls.update();
+
+        // Lights
+        const ambientLight = new THREE.AmbientLight(0x404040, 2.0);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 2.0);
+        dirLight.position.set(5, 10, 5);
+        dirLight.castShadow = true;
+        dirLight.shadow.mapSize.width = 2048;
+        dirLight.shadow.mapSize.height = 2048;
+        dirLight.shadow.camera.near = 0.5;
+        dirLight.shadow.camera.far = 50;
+        dirLight.shadow.camera.left = -10;
+        dirLight.shadow.camera.right = 10;
+        dirLight.shadow.camera.top = 10;
+        dirLight.shadow.camera.bottom = -10;
+        scene.add(dirLight);
+
+        // Ground
+        const groundGeo = new THREE.PlaneGeometry(50, 50);
+        const groundMat = new THREE.MeshStandardMaterial({ color: 0x555555, roughness: 0.8 });
+        const ground = new THREE.Mesh(groundGeo, groundMat);
+        ground.rotation.x = -Math.PI / 2;
+        ground.receiveShadow = true;
+        scene.add(ground);
+
+        const gridHelper = new THREE.GridHelper(50, 50, 0x000000, 0x000000);
+        gridHelper.material.opacity = 0.2;
+        gridHelper.material.transparent = true;
+        scene.add(gridHelper);
+
+        // Simulation Variables
+        let ballA, ballB;
+        let simTime = 0;
+        const dt = 0.002;
+        const substeps = 5;
+
+        function initSimulation() {
+            if (ballA) ballA.dispose();
+            if (ballB) ballB.dispose();
+            
+            ballA = new SoftBody(scene, -1.5, 5, 0, 0xff0000);
+            ballB = new SoftBody(scene, 1.5, 6, 0, 0x0000ff);
+            simTime = 0;
+        }
+
+        function handleBallCollision(dt) {
+            for (let nA of ballA.surfaceNodes) {
+                for (let nB of ballB.surfaceNodes) {
+                    let dx = nA.x - nB.x;
+                    let dy = nA.y - nB.y;
+                    let dz = nA.z - nB.z;
+                    let distSq = dx*dx + dy*dy + dz*dz;
+                    
+                    if (distSq < 0.01) { // 0.1^2
+                        let dist = Math.sqrt(distSq);
+                        if (dist === 0) continue;
+                        let nx = dx/dist, ny = dy/dist, nz = dz/dist;
+                        let f = 1000 * (0.1 - dist);
+                        let fx = f * nx, fy = f * ny, fz = f * nz;
+                        
+                        nA.ax += fx / nA.mass;
+                        nA.ay += fy / nA.mass;
+                        nA.az += fz / nA.mass;
+                        
+                        nB.ax -= fx / nB.mass;
+                        nB.ay -= fy / nB.mass;
+                        nB.az -= fz / nB.mass;
+                    }
+                }
+            }
+        }
+
+        function updateStateObject() {
+            let totalEnergy = 0;
+            let groundContacts = 0;
+
+            const getBodyState = (ball) => {
+                let speedSum = 0;
+                ball.nodes.forEach(n => {
+                    let vx = (n.x - n.px)/dt;
+                    let vy = (n.y - n.py)/dt;
+                    let vz = (n.z - n.pz)/dt;
+                    let v2 = vx*vx + vy*vy + vz*vz;
+                    speedSum += Math.sqrt(v2);
+                    
+                    totalEnergy += 0.5 * n.mass * v2; // KE
+                    totalEnergy += n.mass * 9.8 * n.y; // PE grav
+                    if (n.y <= 0.001) groundContacts++;
+                });
+
+                ball.springs.forEach(s => {
+                    let dx = s.n2.x - s.n1.x, dy = s.n2.y - s.n1.y, dz = s.n2.z - s.n1.z;
+                    let dist = Math.sqrt(dx*dx + dy*dy + dz*dz);
+                    totalEnergy += 0.5 * s.k * Math.pow(dist - s.rest, 2); // PE spring
+                });
+
+                return {
+                    center: { x: ball.centerNode.x, y: ball.centerNode.y, z: ball.centerNode.z },
+                    avgRadius: ball.avgRadius,
+                    volumeRatio: ball.currentVolume / ball.V0,
+                    speed: speedSum / ball.nodes.length,
+                    nodeCount: ball.nodes.length,
+                    nodes: ball.nodes.slice(0, 25).map(n => ({x: n.x, y: n.y, z: n.z}))
+                };
+            };
+
+            window.__3D_STATE__ = {
+                simTime: simTime,
+                bodyA: getBodyState(ballA),
+                bodyB: getBodyState(ballB),
+                totalEnergy: totalEnergy,
+                groundContacts: groundContacts
+            };
+        }
+
+        function updateHUD() {
+            document.getElementById('simTime').innerText = simTime.toFixed(3);
+            
+            let cA = ballA.centerNode;
+            document.getElementById('posA').innerText = `${cA.x.toFixed(2)}, ${cA.y.toFixed(2)}, ${cA.z.toFixed(2)}`;
+            document.getElementById('volRatioA').innerText = (ballA.currentVolume / ballA.V0).toFixed(3);
+
+            let cB = ballB.centerNode;
+            document.getElementById('posB').innerText = `${cB.x.toFixed(2)}, ${cB.y.toFixed(2)}, ${cB.z.toFixed(2)}`;
+            document.getElementById('volRatioB').innerText = (ballB.currentVolume / ballB.V0).toFixed(3);
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            for (let i = 0; i < substeps; i++) {
+                ballA.applyForces(dt);
+                ballB.applyForces(dt);
+                
+                handleBallCollision(dt);
+                
+                ballA.integrate(dt);
+                ballB.integrate(dt);
+                
+                simTime += dt;
+            }
+
+            ballA.updateMesh();
+            ballB.updateMesh();
+
+            updateHUD();
+            updateStateObject();
+
+            renderer.render(scene, camera);
+        }
+
+        // Events
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        document.getElementById('resetBtn').addEventListener('click', initSimulation);
+        
+        document.getElementById('pushBtn').addEventListener('click', () => {
+            for (let n of ballA.nodes) {
+                n.px -= 15 * dt; // Impulse to the right (+x direction)
+            }
+        });
+
+        // Start
+        initSimulation();
+        animate();
+
+    </script>
+</body>
+</html>

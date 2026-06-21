@@ -1,0 +1,693 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Elastic Band Slingshot</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #000;
+            font-family: monospace;
+            user-select: none;
+        }
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+        }
+        #hud {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(0, 0, 0, 0.65);
+            color: white;
+            padding: 12px;
+            font-size: 13px;
+            border-radius: 8px;
+            z-index: 1000;
+            pointer-events: none;
+            min-width: 200px;
+            line-height: 1.5;
+        }
+        #controls {
+            position: absolute;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: rgba(0, 0, 0, 0.65);
+            color: white;
+            padding: 15px;
+            border-radius: 8px;
+            z-index: 1000;
+            display: flex;
+            gap: 20px;
+            align-items: center;
+        }
+        .control-group {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        .instructions {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            background: rgba(0, 0, 0, 0.65);
+            color: white;
+            padding: 12px;
+            font-size: 13px;
+            border-radius: 8px;
+            z-index: 1000;
+            pointer-events: none;
+            text-align: right;
+            line-height: 1.5;
+        }
+        input[type=range] {
+            cursor: pointer;
+        }
+    </style>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+                "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="canvas-container"></div>
+    
+    <div id="hud">
+        <div>Score: <span id="hud-score">0</span></div>
+        <div>Hits: <span id="hud-hits">0</span> / 5</div>
+        <div>Shots: <span id="hud-shots">0</span></div>
+        <div>Pull Dist: <span id="hud-pull">0.00</span> m</div>
+        <div>Elastic PE: <span id="hud-pe">0.00</span> J</div>
+        <div>Launch Speed: <span id="hud-launch-speed">0.00</span> m/s</div>
+        <div>Stiffness (k): <span id="hud-stiffness">80</span> N/m</div>
+        <div>Status: <span id="hud-status" style="color: #ffaa00;">Ready</span></div>
+        <div>Models Loaded: <span id="hud-models">No</span></div>
+    </div>
+
+    <div class="instructions">
+        <b>Controls:</b><br>
+        Mouse Drag: Aim & Pull<br>
+        Release: Launch<br>
+        N: Next Projectile<br>
+        R: Reset Game<br>
+        Space: Pause/Play
+    </div>
+
+    <div id="controls">
+        <div class="control-group">
+            <label for="slider-stiffness">Stiffness (k)</label>
+            <input type="range" id="slider-stiffness" min="20" max="200" step="5" value="80">
+        </div>
+        <div class="control-group">
+            <label for="slider-band-length">Band Rest Length</label>
+            <input type="range" id="slider-band-length" min="0.3" max="1.0" step="0.05" value="0.50">
+        </div>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+        // --- State Management ---
+        window.__3D_STATE__ = {
+            score: 0,
+            hits: 0,
+            shots: 0,
+            pullDistance: 0,
+            elasticPE: 0,
+            launchSpeed: 0,
+            stiffness: 80,
+            bandRestLength: 0.50,
+            status: 'Ready', // 'Ready', 'Aiming', 'Flying', 'Landed'
+            projectilePosition: { x: 0, y: 2.0, z: 0.3 },
+            targetsRemaining: 5,
+            modelsLoaded: false,
+            isPaused: false,
+            frameCount: 0,
+            simValid: true
+        };
+
+        // --- Constants & Physics Params ---
+        const MASS = 0.2; // kg
+        const GRAVITY = new THREE.Vector3(0, -9.81, 0);
+        const DRAG_COEFF = 0.05;
+        const MAX_PULL = 3.0;
+        const FORK_CENTER = new THREE.Vector3(0, 2.2, 0);
+        const REST_POS = new THREE.Vector3(0, 2.0, 0.3);
+        const LEFT_TIP = new THREE.Vector3(-0.5, 2.2, 0);
+        const RIGHT_TIP = new THREE.Vector3(0.5, 2.2, 0);
+        
+        let currentVelocity = new THREE.Vector3();
+        let isDragging = false;
+        let dragPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -2.0); // Plane at y=2.0
+        let raycaster = new THREE.Raycaster();
+        let mouse = new THREE.Vector2();
+
+        // --- Scene Setup ---
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x87CEEB); // Sky blue
+
+        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+        camera.position.set(0, 3, 8);
+        camera.lookAt(0, 2, -5);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        container.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.target.set(0, 2, -5);
+
+        // Lights
+        const ambientLight = new THREE.AmbientLight(0x88aacc, 0.5);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 0.9);
+        dirLight.position.set(5, 10, 5);
+        dirLight.castShadow = true;
+        dirLight.shadow.camera.top = 20;
+        dirLight.shadow.camera.bottom = -20;
+        dirLight.shadow.camera.left = -20;
+        dirLight.shadow.camera.right = 20;
+        dirLight.shadow.mapSize.width = 2048;
+        dirLight.shadow.mapSize.height = 2048;
+        scene.add(dirLight);
+
+        // Ground
+        const groundGeo = new THREE.PlaneGeometry(40, 40);
+        const groundMat = new THREE.MeshStandardMaterial({ color: 0x55aa44, roughness: 0.8 });
+        const ground = new THREE.Mesh(groundGeo, groundMat);
+        ground.rotation.x = -Math.PI / 2;
+        ground.receiveShadow = true;
+        scene.add(ground);
+
+        // Wall Backdrop
+        const wallGeo = new THREE.BoxGeometry(20, 5, 0.5);
+        const wallMat = new THREE.MeshStandardMaterial({ color: 0x884433 });
+        const textureLoader = new THREE.TextureLoader();
+        textureLoader.load('https://threejs.org/examples/textures/brick_diffuse.jpg', (tex) => {
+            tex.wrapS = THREE.RepeatWrapping;
+            tex.wrapT = THREE.RepeatWrapping;
+            tex.repeat.set(4, 1);
+            wallMat.map = tex;
+            wallMat.needsUpdate = true;
+        });
+        const wall = new THREE.Mesh(wallGeo, wallMat);
+        wall.position.set(0, 2.5, -20);
+        wall.castShadow = true;
+        wall.receiveShadow = true;
+        scene.add(wall);
+
+        // --- Slingshot Structure ---
+        const slingshotGroup = new THREE.Group();
+        scene.add(slingshotGroup);
+
+        const woodMat = new THREE.MeshStandardMaterial({ color: 0x664422, roughness: 0.9 });
+        const baseMat = new THREE.MeshStandardMaterial({ color: 0x553311, roughness: 0.9 });
+
+        // Base
+        const baseGeo = new THREE.CylinderGeometry(0.15, 0.15, 0.3, 16);
+        const base = new THREE.Mesh(baseGeo, baseMat);
+        base.position.set(0, 0.15, 0);
+        base.castShadow = true;
+        slingshotGroup.add(base);
+
+        // Forks
+        const forkGeo = new THREE.CylinderGeometry(0.08, 0.08, 2.5, 16);
+        
+        const leftFork = new THREE.Mesh(forkGeo, woodMat);
+        leftFork.position.set(-0.4, 1.25, 0);
+        leftFork.rotation.z = THREE.MathUtils.degToRad(10);
+        leftFork.castShadow = true;
+        slingshotGroup.add(leftFork);
+
+        const rightFork = new THREE.Mesh(forkGeo, woodMat);
+        rightFork.position.set(0.4, 1.25, 0);
+        rightFork.rotation.z = THREE.MathUtils.degToRad(-10);
+        rightFork.castShadow = true;
+        slingshotGroup.add(rightFork);
+
+        // Elastic Bands (Cylinders updated dynamically)
+        const bandMat = new THREE.MeshStandardMaterial({ color: 0xcc3333, roughness: 0.5 });
+        const leftBand = new THREE.Mesh(new THREE.CylinderGeometry(1, 1, 1, 8), bandMat);
+        const rightBand = new THREE.Mesh(new THREE.CylinderGeometry(1, 1, 1, 8), bandMat);
+        scene.add(leftBand);
+        scene.add(rightBand);
+
+        function updateBands(targetPos) {
+            const l0 = window.__3D_STATE__.bandRestLength;
+            
+            // Left Band
+            const distL = LEFT_TIP.distanceTo(targetPos);
+            const thickL = 0.03 * (l0 / Math.max(l0, distL));
+            leftBand.scale.set(thickL, distL, thickL);
+            leftBand.position.copy(LEFT_TIP).lerp(targetPos, 0.5);
+            leftBand.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), targetPos.clone().sub(LEFT_TIP).normalize());
+
+            // Right Band
+            const distR = RIGHT_TIP.distanceTo(targetPos);
+            const thickR = 0.03 * (l0 / Math.max(l0, distR));
+            rightBand.scale.set(thickR, distR, thickR);
+            rightBand.position.copy(RIGHT_TIP).lerp(targetPos, 0.5);
+            rightBand.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), targetPos.clone().sub(RIGHT_TIP).normalize());
+        }
+
+        // --- Projectile & Targets ---
+        let projectileMesh;
+        const projectileGroup = new THREE.Group();
+        projectileGroup.position.copy(REST_POS);
+        scene.add(projectileGroup);
+
+        // Fallback Projectile
+        const fallbackProjGeo = new THREE.SphereGeometry(0.1, 16, 16);
+        const fallbackProjMat = new THREE.MeshStandardMaterial({ color: 0x336611 });
+        projectileMesh = new THREE.Mesh(fallbackProjGeo, fallbackProjMat);
+        projectileMesh.castShadow = true;
+        projectileGroup.add(projectileMesh);
+
+        // Hitbox for raycasting
+        const hitboxGeo = new THREE.SphereGeometry(0.3, 8, 8);
+        const hitboxMat = new THREE.MeshBasicMaterial({ visible: false });
+        const projectileHitbox = new THREE.Mesh(hitboxGeo, hitboxMat);
+        projectileGroup.add(projectileHitbox);
+
+        const targets = [];
+        const targetPositions = [
+            { pos: new THREE.Vector3(-2, 0.4, -8), score: 10, ped: false },
+            { pos: new THREE.Vector3(0, 0.4, -12), score: 20, ped: false },
+            { pos: new THREE.Vector3(2, 0.4, -8), score: 10, ped: false },
+            { pos: new THREE.Vector3(-1, 1.5, -15), score: 50, ped: true },
+            { pos: new THREE.Vector3(1, 1.5, -15), score: 50, ped: true }
+        ];
+
+        const pedGeo = new THREE.BoxGeometry(0.5, 1.1, 0.5);
+        const pedMat = new THREE.MeshStandardMaterial({ color: 0x888888 });
+
+        // Fallback Target
+        const fallbackTargetGeo = new THREE.BoxGeometry(0.3, 0.3, 0.3);
+        const fallbackTargetMat = new THREE.MeshStandardMaterial({ color: 0xddaa00 });
+
+        function createTargets() {
+            targets.forEach(t => scene.remove(t.group));
+            targets.length = 0;
+
+            targetPositions.forEach(data => {
+                const group = new THREE.Group();
+                group.position.copy(data.pos);
+                
+                if (data.ped) {
+                    const ped = new THREE.Mesh(pedGeo, pedMat);
+                    ped.position.set(0, -0.55, 0); // Center is 1.5, ped is 1.1 tall. Top at 1.5 -> center at 1.5 - 0.55 = 0.95. Wait, prompt says target at 1.5, ped 1.1 tall. Let's put ped center at 1.5 - 1.1/2 = 0.95.
+                    ped.position.y = - (1.1 / 2) - 0.1; // Adjust relative to target center
+                    ped.castShadow = true;
+                    ped.receiveShadow = true;
+                    group.add(ped);
+                }
+
+                const mesh = new THREE.Mesh(fallbackTargetGeo, fallbackTargetMat);
+                mesh.castShadow = true;
+                group.add(mesh);
+                scene.add(group);
+
+                targets.push({
+                    group: group,
+                    mesh: mesh,
+                    active: true,
+                    score: data.score,
+                    velocity: new THREE.Vector3(),
+                    angularVelocity: new THREE.Vector3()
+                });
+            });
+        }
+        createTargets();
+
+        // Load GLTFs
+        const gltfLoader = new GLTFLoader();
+        let modelsLoadedCount = 0;
+        const checkModelsLoaded = () => {
+            modelsLoadedCount++;
+            if (modelsLoadedCount === 2) {
+                window.__3D_STATE__.modelsLoaded = true;
+                document.getElementById('hud-models').innerText = 'Yes';
+            }
+        };
+
+        // Avocado
+        gltfLoader.load('https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Models/main/2.0/Avocado/glTF-Binary/Avocado.glb', (gltf) => {
+            const model = gltf.scene;
+            model.scale.set(0.08, 0.08, 0.08);
+            model.traverse(child => { if (child.isMesh) child.castShadow = true; });
+            projectileGroup.remove(projectileMesh);
+            projectileMesh = model;
+            projectileGroup.add(projectileMesh);
+            checkModelsLoaded();
+        }, undefined, () => { checkModelsLoaded(); }); // Ignore error, keep fallback
+
+        // Duck
+        gltfLoader.load('https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Models/main/2.0/Duck/glTF-Binary/Duck.glb', (gltf) => {
+            targets.forEach(t => {
+                const model = gltf.scene.clone();
+                model.scale.set(0.015, 0.015, 0.015);
+                model.traverse(child => { if (child.isMesh) child.castShadow = true; });
+                t.group.remove(t.mesh);
+                t.mesh = model;
+                t.group.add(t.mesh);
+            });
+            checkModelsLoaded();
+        }, undefined, () => { checkModelsLoaded(); });
+
+        // --- Visual Effects ---
+        // Aim Guide
+        const guideGeo = new THREE.SphereGeometry(0.05, 8, 8);
+        const guideMat = new THREE.MeshBasicMaterial({ color: 0xffff00 });
+        const aimGuide = new THREE.InstancedMesh(guideGeo, guideMat, 20);
+        aimGuide.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+        scene.add(aimGuide);
+
+        // Trail
+        const MAX_TRAIL = 150;
+        const trailPositions = new Float32Array(MAX_TRAIL * 3);
+        const trailGeo = new THREE.BufferGeometry();
+        trailGeo.setAttribute('position', new THREE.BufferAttribute(trailPositions, 3));
+        const trailMat = new THREE.LineBasicMaterial({ color: 0xff6600, linewidth: 2 });
+        const trailLine = new THREE.Line(trailGeo, trailMat);
+        scene.add(trailLine);
+        let trailCount = 0;
+
+        function resetTrail() {
+            trailCount = 0;
+            trailGeo.setDrawRange(0, 0);
+        }
+
+        function addTrailPoint(pos) {
+            if (trailCount < MAX_TRAIL) {
+                trailPositions[trailCount * 3] = pos.x;
+                trailPositions[trailCount * 3 + 1] = pos.y;
+                trailPositions[trailCount * 3 + 2] = pos.z;
+                trailCount++;
+            } else {
+                // Shift array
+                for (let i = 0; i < MAX_TRAIL - 1; i++) {
+                    trailPositions[i * 3] = trailPositions[(i + 1) * 3];
+                    trailPositions[i * 3 + 1] = trailPositions[(i + 1) * 3 + 1];
+                    trailPositions[i * 3 + 2] = trailPositions[(i + 1) * 3 + 2];
+                }
+                trailPositions[(MAX_TRAIL - 1) * 3] = pos.x;
+                trailPositions[(MAX_TRAIL - 1) * 3 + 1] = pos.y;
+                trailPositions[(MAX_TRAIL - 1) * 3 + 2] = pos.z;
+            }
+            trailGeo.attributes.position.needsUpdate = true;
+            trailGeo.setDrawRange(0, trailCount);
+        }
+
+        // --- Physics & Logic ---
+        function calculateEnergy(pos) {
+            const k = window.__3D_STATE__.stiffness;
+            const l0 = window.__3D_STATE__.bandRestLength;
+            
+            const dL = LEFT_TIP.distanceTo(pos);
+            const dR = RIGHT_TIP.distanceTo(pos);
+            
+            const sL = Math.max(0, dL - l0);
+            const sR = Math.max(0, dR - l0);
+            
+            const pe = 0.5 * k * (sL * sL + sR * sR);
+            return pe;
+        }
+
+        function updateAimGuide() {
+            if (window.__3D_STATE__.status !== 'Aiming') {
+                aimGuide.count = 0;
+                return;
+            }
+            aimGuide.count = 20;
+            
+            const pe = calculateEnergy(projectileGroup.position);
+            const vMag = Math.sqrt((2 * pe) / MASS);
+            const dir = new THREE.Vector3().subVectors(FORK_CENTER, projectileGroup.position).normalize();
+            const v0 = dir.multiplyScalar(vMag);
+            
+            let p = projectileGroup.position.clone();
+            let v = v0.clone();
+            const dt = 0.05; // 1 second total (20 * 0.05)
+            
+            const dummy = new THREE.Object3D();
+            for (let i = 0; i < 20; i++) {
+                // Simple Euler integration for guide (including drag for accuracy)
+                const speed = v.length();
+                const dragForce = v.clone().normalize().multiplyScalar(-DRAG_COEFF * speed * speed);
+                const a = new THREE.Vector3().copy(GRAVITY).add(dragForce.divideScalar(MASS));
+                
+                v.add(a.multiplyScalar(dt));
+                p.add(v.clone().multiplyScalar(dt));
+                
+                dummy.position.copy(p);
+                dummy.updateMatrix();
+                aimGuide.setMatrixAt(i, dummy.matrix);
+            }
+            aimGuide.instanceMatrix.needsUpdate = true;
+        }
+
+        function launch() {
+            const pe = calculateEnergy(projectileGroup.position);
+            if (pe < 0.1) {
+                // Not pulled enough, reset
+                projectileGroup.position.copy(REST_POS);
+                window.__3D_STATE__.status = 'Ready';
+                return;
+            }
+
+            const vMag = Math.sqrt((2 * pe) / MASS);
+            const dir = new THREE.Vector3().subVectors(FORK_CENTER, projectileGroup.position).normalize();
+            currentVelocity.copy(dir).multiplyScalar(vMag);
+            
+            window.__3D_STATE__.status = 'Flying';
+            window.__3D_STATE__.launchSpeed = vMag;
+            window.__3D_STATE__.shots++;
+            resetTrail();
+            aimGuide.count = 0;
+        }
+
+        function resetProjectile() {
+            projectileGroup.position.copy(REST_POS);
+            currentVelocity.set(0, 0, 0);
+            window.__3D_STATE__.status = 'Ready';
+            window.__3D_STATE__.pullDistance = 0;
+            window.__3D_STATE__.elasticPE = 0;
+            resetTrail();
+            updateBands(REST_POS);
+        }
+
+        function resetGame() {
+            resetProjectile();
+            window.__3D_STATE__.score = 0;
+            window.__3D_STATE__.hits = 0;
+            window.__3D_STATE__.shots = 0;
+            window.__3D_STATE__.targetsRemaining = 5;
+            createTargets();
+        }
+
+        // --- Interaction ---
+        renderer.domElement.addEventListener('pointerdown', (e) => {
+            if (window.__3D_STATE__.status !== 'Ready' && window.__3D_STATE__.status !== 'Aiming') return;
+            
+            mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+            
+            raycaster.setFromCamera(mouse, camera);
+            const intersects = raycaster.intersectObject(projectileHitbox);
+            
+            if (intersects.length > 0) {
+                isDragging = true;
+                window.__3D_STATE__.status = 'Aiming';
+                controls.enabled = false;
+            }
+        });
+
+        renderer.domElement.addEventListener('pointermove', (e) => {
+            if (!isDragging) return;
+            
+            mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+            
+            raycaster.setFromCamera(mouse, camera);
+            const targetPoint = new THREE.Vector3();
+            raycaster.ray.intersectPlane(dragPlane, targetPoint);
+            
+            if (targetPoint) {
+                // Constrain to max pull
+                const pullVec = new THREE.Vector3().subVectors(targetPoint, FORK_CENTER);
+                // Keep y at 2.0
+                pullVec.y = 0; 
+                
+                let dist = pullVec.length();
+                if (dist > MAX_PULL) {
+                    pullVec.normalize().multiplyScalar(MAX_PULL);
+                    dist = MAX_PULL;
+                }
+                
+                // Only allow pulling backwards (z > 0 relative to fork)
+                if (pullVec.z < 0) pullVec.z = 0;
+
+                projectileGroup.position.copy(FORK_CENTER).add(pullVec);
+                projectileGroup.position.y = 2.0; // Enforce height
+
+                window.__3D_STATE__.pullDistance = dist;
+                window.__3D_STATE__.elasticPE = calculateEnergy(projectileGroup.position);
+            }
+        });
+
+        window.addEventListener('pointerup', () => {
+            if (isDragging) {
+                isDragging = false;
+                controls.enabled = true;
+                launch();
+            }
+        });
+
+        // Controls
+        document.getElementById('slider-stiffness').addEventListener('input', (e) => {
+            window.__3D_STATE__.stiffness = parseFloat(e.target.value);
+        });
+        document.getElementById('slider-band-length').addEventListener('input', (e) => {
+            window.__3D_STATE__.bandRestLength = parseFloat(e.target.value);
+        });
+
+        window.addEventListener('keydown', (e) => {
+            if (e.code === 'KeyN') {
+                if (window.__3D_STATE__.status === 'Landed' || window.__3D_STATE__.status === 'Flying') {
+                    resetProjectile();
+                }
+            }
+            if (e.code === 'KeyR') {
+                resetGame();
+            }
+            if (e.code === 'Space') {
+                window.__3D_STATE__.isPaused = !window.__3D_STATE__.isPaused;
+            }
+        });
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // --- Animation Loop ---
+        const clock = new THREE.Clock();
+
+        function animate() {
+            requestAnimationFrame(animate);
+            
+            const dt = Math.min(clock.getDelta(), 0.1); // Cap dt
+            window.__3D_STATE__.frameCount++;
+
+            if (!window.__3D_STATE__.isPaused) {
+                controls.update();
+
+                if (window.__3D_STATE__.status === 'Aiming') {
+                    updateBands(projectileGroup.position);
+                    updateAimGuide();
+                } else if (window.__3D_STATE__.status === 'Ready') {
+                    updateBands(REST_POS);
+                } else if (window.__3D_STATE__.status === 'Flying') {
+                    // Physics update
+                    const speed = currentVelocity.length();
+                    const dragForce = currentVelocity.clone().normalize().multiplyScalar(-DRAG_COEFF * speed * speed);
+                    const acceleration = new THREE.Vector3().copy(GRAVITY).add(dragForce.divideScalar(MASS));
+                    
+                    currentVelocity.add(acceleration.multiplyScalar(dt));
+                    projectileGroup.position.add(currentVelocity.clone().multiplyScalar(dt));
+                    
+                    // Spin projectile
+                    if (projectileMesh) {
+                        projectileMesh.rotation.x += currentVelocity.z * dt;
+                        projectileMesh.rotation.z -= currentVelocity.x * dt;
+                    }
+
+                    addTrailPoint(projectileGroup.position);
+                    updateBands(FORK_CENTER); // Bands snap back
+
+                    // Collision with ground
+                    if (projectileGroup.position.y < 0.1) {
+                        projectileGroup.position.y = 0.1;
+                        currentVelocity.set(0, 0, 0);
+                        window.__3D_STATE__.status = 'Landed';
+                    }
+
+                    // Collision with targets
+                    targets.forEach(t => {
+                        if (t.active) {
+                            // Target center is roughly at group position + offset
+                            const targetCenter = t.group.position.clone();
+                            if (t.score === 50) targetCenter.y += 0.5; // Adjust for elevated targets
+
+                            if (projectileGroup.position.distanceTo(targetCenter) < 0.8) {
+                                t.active = false;
+                                window.__3D_STATE__.score += t.score;
+                                window.__3D_STATE__.hits++;
+                                window.__3D_STATE__.targetsRemaining--;
+                                
+                                // Fly away effect
+                                t.velocity.set((Math.random() - 0.5) * 10, 5 + Math.random() * 5, -5 - Math.random() * 5);
+                                t.angularVelocity.set(Math.random() * 10, Math.random() * 10, Math.random() * 10);
+                            }
+                        }
+                    });
+                }
+
+                // Update hit targets
+                targets.forEach(t => {
+                    if (!t.active) {
+                        t.velocity.add(GRAVITY.clone().multiplyScalar(dt));
+                        t.group.position.add(t.velocity.clone().multiplyScalar(dt));
+                        t.mesh.rotation.x += t.angularVelocity.x * dt;
+                        t.mesh.rotation.y += t.angularVelocity.y * dt;
+                        t.mesh.rotation.z += t.angularVelocity.z * dt;
+                    }
+                });
+            }
+
+            // Update HUD
+            document.getElementById('hud-score').innerText = window.__3D_STATE__.score;
+            document.getElementById('hud-hits').innerText = window.__3D_STATE__.hits;
+            document.getElementById('hud-shots').innerText = window.__3D_STATE__.shots;
+            document.getElementById('hud-pull').innerText = window.__3D_STATE__.pullDistance.toFixed(2);
+            document.getElementById('hud-pe').innerText = window.__3D_STATE__.elasticPE.toFixed(2);
+            document.getElementById('hud-launch-speed').innerText = window.__3D_STATE__.launchSpeed.toFixed(2);
+            document.getElementById('hud-stiffness').innerText = window.__3D_STATE__.stiffness;
+            
+            const statusEl = document.getElementById('hud-status');
+            statusEl.innerText = window.__3D_STATE__.status;
+            statusEl.style.color = window.__3D_STATE__.status === 'Ready' ? '#00ff00' : 
+                                   window.__3D_STATE__.status === 'Aiming' ? '#ffff00' : 
+                                   window.__3D_STATE__.status === 'Flying' ? '#ff0000' : '#aaaaaa';
+
+            // Update State Object
+            const p = projectileGroup.position;
+            window.__3D_STATE__.projectilePosition = { x: p.x, y: p.y, z: p.z };
+            window.__3D_STATE__.simValid = !isNaN(p.x) && !isNaN(p.y) && !isNaN(p.z) && !isNaN(currentVelocity.x);
+
+            renderer.render(scene, camera);
+        }
+
+        // Init
+        updateBands(REST_POS);
+        animate();
+
+    </script>
+</body>
+</html>

@@ -1,0 +1,432 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>3D Asteroid Defense</title>
+  <style>
+    html, body {
+      margin: 0;
+      overflow: hidden;
+      background: #000;
+      font-family: Arial, sans-serif;
+    }
+
+    canvas {
+      display: block;
+    }
+
+    #hud {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      color: white;
+      background: rgba(0,0,0,0.45);
+      padding: 10px 14px;
+      border-radius: 8px;
+      font-size: 16px;
+      z-index: 10;
+      user-select: none;
+    }
+
+    #pause-overlay,
+    #game-over-overlay {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      color: white;
+      background: rgba(0,0,0,0.7);
+      padding: 20px 30px;
+      border-radius: 12px;
+      font-size: 40px;
+      font-weight: bold;
+      z-index: 20;
+      display: none;
+      user-select: none;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <div id="hud">Score: 0 | Wave: 1 | HP: 5 | Shield CD: 0s</div>
+  <div id="pause-overlay">PAUSED</div>
+  <div id="game-over-overlay">GAME OVER</div>
+
+  <script type="module">
+    import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
+    import { GLTFLoader } from 'https://unpkg.com/three@0.160.0/examples/jsm/loaders/GLTFLoader.js';
+
+    const scene = new THREE.Scene();
+
+    const camera = new THREE.PerspectiveCamera(
+      60,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      1000
+    );
+    camera.position.set(0, 5, 20);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    document.body.appendChild(renderer.domElement);
+
+    // Lights
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+    scene.add(ambientLight);
+
+    const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
+    directionalLight.position.set(10, 20, 10);
+    scene.add(directionalLight);
+
+    // Starfield background
+    const starGeometry = new THREE.SphereGeometry(0.2, 6, 6);
+    const starMaterial = new THREE.MeshBasicMaterial({ color: 0xffffff });
+
+    function randomPointInSphere(radius) {
+      const u = Math.random();
+      const v = Math.random();
+      const theta = 2 * Math.PI * u;
+      const phi = Math.acos(2 * v - 1);
+      const r = radius * Math.cbrt(Math.random());
+
+      return new THREE.Vector3(
+        r * Math.sin(phi) * Math.cos(theta),
+        r * Math.sin(phi) * Math.sin(theta),
+        r * Math.cos(phi)
+      );
+    }
+
+    for (let i = 0; i < 500; i++) {
+      const star = new THREE.Mesh(starGeometry, starMaterial);
+      const pos = randomPointInSphere(200);
+      star.position.copy(pos);
+      scene.add(star);
+    }
+
+    // Invisible plane for aiming
+    const aimPlane = new THREE.Mesh(
+      new THREE.PlaneGeometry(500, 500),
+      new THREE.MeshBasicMaterial({ visible: false })
+    );
+    aimPlane.position.set(0, 0, 0);
+    scene.add(aimPlane);
+
+    // Defense station
+    let station = new THREE.Group();
+    scene.add(station);
+
+    const loader = new GLTFLoader();
+    loader.load(
+      'https://cdn.jsdelivr.net/gh/AlaricRFF/assets-for-three-js/MaterialsVariantsShoe.glb',
+      (gltf) => {
+        station = gltf.scene;
+        station.scale.set(3, 3, 3);
+        station.position.set(0, 0, 0);
+        station.rotation.x = -Math.PI / 2;
+        scene.add(station);
+        state.modelLoaded = true;
+      },
+      undefined,
+      (err) => {
+        console.error('Model failed to load:', err);
+        const fallback = new THREE.Mesh(
+          new THREE.CylinderGeometry(1.5, 2, 3, 16),
+          new THREE.MeshStandardMaterial({ color: 0x8888ff })
+        );
+        fallback.position.set(0, 0, 0);
+        scene.add(fallback);
+        station = fallback;
+        state.modelLoaded = false;
+      }
+    );
+
+    // Shield
+    const shieldGeometry = new THREE.SphereGeometry(4, 16, 16);
+    const shieldMaterial = new THREE.MeshBasicMaterial({
+      color: 0x3399ff,
+      wireframe: true,
+      transparent: true,
+      opacity: 0.6
+    });
+    const shieldMesh = new THREE.Mesh(shieldGeometry, shieldMaterial);
+    shieldMesh.visible = false;
+    scene.add(shieldMesh);
+
+    // Game objects
+    const asteroids = [];
+    const projectiles = [];
+
+    const asteroidGeometry = new THREE.IcosahedronGeometry(1, 0);
+    const asteroidMaterial = new THREE.MeshStandardMaterial({ color: 0x8B4513 });
+
+    const projectileGeometry = new THREE.SphereGeometry(0.2, 8, 8);
+    const projectileMaterial = new THREE.MeshBasicMaterial({ color: 0xffff00 });
+
+    // HUD and overlays
+    const hud = document.getElementById('hud');
+    const pauseOverlay = document.getElementById('pause-overlay');
+    const gameOverOverlay = document.getElementById('game-over-overlay');
+
+    // State
+    const state = {
+      score: 0,
+      wave: 1,
+      stationHP: 5,
+      asteroidCount: 0,
+      projectileCount: 0,
+      shieldActive: false,
+      shieldCooldownRemaining: 0,
+      gameOver: false,
+      paused: false,
+      modelLoaded: false,
+      totalAsteroidsDestroyed: 0,
+      totalShotsFired: 0
+    };
+
+    window.__3D_STATE__ = state;
+
+    let spawnInterval = 2.0;
+    let asteroidSpeed = 0.05;
+    const maxAsteroids = 10;
+    const maxProjectiles = 20;
+
+    let spawnTimer = 0;
+    let waveTimer = 0;
+    let shieldTimer = 0;
+    let shieldCooldownTimer = 0;
+
+    const raycaster = new THREE.Raycaster();
+    const mouse = new THREE.Vector2();
+    const clock = new THREE.Clock();
+
+    function updateHUD() {
+      const cd = Math.max(0, Math.ceil(shieldCooldownTimer));
+      hud.textContent = `Score: ${state.score} | Wave: ${state.wave} | HP: ${state.stationHP} | Shield CD: ${cd}s`;
+    }
+
+    function spawnAsteroid() {
+      if (asteroids.length >= maxAsteroids || state.gameOver) return;
+
+      const asteroid = new THREE.Mesh(asteroidGeometry, asteroidMaterial.clone());
+      const dir = randomPointOnSphere(40);
+      asteroid.position.copy(dir);
+
+      const toOrigin = new THREE.Vector3().subVectors(new THREE.Vector3(0, 0, 0), asteroid.position).normalize();
+
+      asteroid.userData = {
+        velocity: toOrigin,
+        hp: 3
+      };
+
+      scene.add(asteroid);
+      asteroids.push(asteroid);
+    }
+
+    function randomPointOnSphere(radius) {
+      const u = Math.random();
+      const v = Math.random();
+      const theta = 2 * Math.PI * u;
+      const phi = Math.acos(2 * v - 1);
+
+      return new THREE.Vector3(
+        radius * Math.sin(phi) * Math.cos(theta),
+        radius * Math.sin(phi) * Math.sin(theta),
+        radius * Math.cos(phi)
+      );
+    }
+
+    function removeAsteroid(index) {
+      scene.remove(asteroids[index]);
+      asteroids.splice(index, 1);
+    }
+
+    function removeProjectile(index) {
+      scene.remove(projectiles[index]);
+      projectiles.splice(index, 1);
+    }
+
+    function shootAt(targetPoint) {
+      if (state.gameOver || state.paused) return;
+      if (projectiles.length >= maxProjectiles) return;
+
+      const projectile = new THREE.Mesh(projectileGeometry, projectileMaterial);
+      projectile.position.set(0, 1, 0);
+
+      const direction = new THREE.Vector3().subVectors(targetPoint, projectile.position).normalize();
+      projectile.userData = {
+        velocity: direction.clone().multiplyScalar(0.5)
+      };
+
+      scene.add(projectile);
+      projectiles.push(projectile);
+      state.totalShotsFired++;
+    }
+
+    function activateShield() {
+      if (state.gameOver || state.paused) return;
+      if (state.shieldActive) return;
+      if (shieldCooldownTimer > 0) return;
+
+      state.shieldActive = true;
+      shieldTimer = 3.0;
+      shieldCooldownTimer = 5.0;
+      shieldMesh.visible = true;
+    }
+
+    renderer.domElement.addEventListener('click', (event) => {
+      const rect = renderer.domElement.getBoundingClientRect();
+      mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+      mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+
+      raycaster.setFromCamera(mouse, camera);
+      const intersections = raycaster.intersectObject(aimPlane);
+
+      let targetPoint;
+      if (intersections.length > 0) {
+        targetPoint = intersections[0].point;
+      } else {
+        targetPoint = new THREE.Vector3(mouse.x * 10, mouse.y * 10, 0);
+      }
+
+      shootAt(targetPoint);
+    });
+
+    window.addEventListener('keydown', (event) => {
+      const key = event.key.toLowerCase();
+      if (key === 's') {
+        activateShield();
+      } else if (key === 'p') {
+        state.paused = !state.paused;
+        pauseOverlay.style.display = state.paused ? 'block' : 'none';
+      }
+    });
+
+    function updateGame(dt) {
+      if (state.gameOver || state.paused) return;
+
+      // Wave system
+      waveTimer += dt;
+      if (waveTimer >= 20) {
+        waveTimer -= 20;
+        state.wave++;
+        spawnInterval *= 0.8;
+        asteroidSpeed *= 1.1;
+      }
+
+      // Spawn asteroids
+      spawnTimer += dt;
+      if (spawnTimer >= spawnInterval) {
+        spawnTimer -= spawnInterval;
+        spawnAsteroid();
+      }
+
+      // Shield timers
+      if (state.shieldActive) {
+        shieldTimer -= dt;
+        if (shieldTimer <= 0) {
+          state.shieldActive = false;
+          shieldMesh.visible = false;
+        }
+      }
+
+      if (shieldCooldownTimer > 0) {
+        shieldCooldownTimer -= dt;
+        if (shieldCooldownTimer < 0) shieldCooldownTimer = 0;
+      }
+
+      // Move asteroids
+      for (let i = asteroids.length - 1; i >= 0; i--) {
+        const asteroid = asteroids[i];
+        asteroid.position.add(
+          asteroid.userData.velocity.clone().multiplyScalar(asteroidSpeed)
+        );
+        asteroid.rotation.x += 0.01;
+        asteroid.rotation.y += 0.01;
+
+        const dist = asteroid.position.length();
+
+        if (state.shieldActive && dist < 4) {
+          state.score += 50;
+          state.totalAsteroidsDestroyed++;
+          removeAsteroid(i);
+          continue;
+        }
+
+        if (dist < 2) {
+          state.stationHP -= 1;
+          removeAsteroid(i);
+
+          if (state.stationHP <= 0) {
+            state.stationHP = 0;
+            state.gameOver = true;
+            gameOverOverlay.style.display = 'block';
+          }
+        }
+      }
+
+      // Move projectiles
+      for (let i = projectiles.length - 1; i >= 0; i--) {
+        const projectile = projectiles[i];
+        projectile.position.add(projectile.userData.velocity);
+
+        if (projectile.position.length() > 50) {
+          removeProjectile(i);
+          continue;
+        }
+
+        let hit = false;
+        for (let j = asteroids.length - 1; j >= 0; j--) {
+          const asteroid = asteroids[j];
+          if (projectile.position.distanceTo(asteroid.position) < 1.5) {
+            asteroid.userData.hp -= 1;
+            removeProjectile(i);
+            hit = true;
+
+            if (asteroid.userData.hp <= 0) {
+              state.score += 100;
+              state.totalAsteroidsDestroyed++;
+              removeAsteroid(j);
+            }
+            break;
+          }
+        }
+
+        if (hit) continue;
+      }
+
+      shieldMesh.position.set(0, 0, 0);
+    }
+
+    function updateExposedState() {
+      state.asteroidCount = asteroids.length;
+      state.projectileCount = projectiles.length;
+      state.shieldCooldownRemaining = Math.max(0, shieldCooldownTimer);
+      window.__3D_STATE__ = state;
+    }
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      const dt = Math.min(clock.getDelta(), 0.05);
+
+      updateGame(dt);
+      updateHUD();
+      updateExposedState();
+
+      renderer.render(scene, camera);
+    }
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    updateHUD();
+    animate();
+  </script>
+</body>
+</html>

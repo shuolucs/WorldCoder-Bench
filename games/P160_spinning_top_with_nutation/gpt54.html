@@ -1,0 +1,447 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Three.js Spinning Top - Precession & Nutation</title>
+  <style>
+    html, body {
+      margin: 0;
+      height: 100%;
+      overflow: hidden;
+      background: #1a1a2e;
+      font-family: Arial, sans-serif;
+    }
+
+    #ui {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      z-index: 20;
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    button {
+      padding: 10px 14px;
+      border: none;
+      border-radius: 6px;
+      background: #2e3b55;
+      color: white;
+      cursor: pointer;
+      font-size: 14px;
+    }
+
+    button:hover {
+      background: #40527a;
+    }
+
+    #hud {
+      position: absolute;
+      top: 56px;
+      left: 12px;
+      z-index: 20;
+      min-width: 240px;
+      padding: 12px 14px;
+      color: #fff;
+      background: rgba(10, 10, 20, 0.65);
+      border: 1px solid rgba(255,255,255,0.12);
+      border-radius: 8px;
+      line-height: 1.45;
+      font-size: 14px;
+      white-space: pre-line;
+    }
+
+    #help {
+      position: absolute;
+      bottom: 12px;
+      left: 12px;
+      z-index: 20;
+      color: rgba(255,255,255,0.85);
+      background: rgba(10, 10, 20, 0.45);
+      padding: 8px 10px;
+      border-radius: 6px;
+      font-size: 13px;
+    }
+
+    canvas {
+      display: block;
+    }
+  </style>
+</head>
+<body>
+  <div id="ui">
+    <button id="launchBtn">Launch Top</button>
+    <button id="frictionBtn">Friction: ON</button>
+  </div>
+
+  <div id="hud"></div>
+  <div id="help">Keys: <b>B</b> Spin Boost, <b>T</b> Increase Tilt, <b>Space</b> Pause/Resume</div>
+
+  <script type="module">
+    import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js';
+    import { OrbitControls } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js';
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color('#1a1a2e');
+
+    const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+    camera.position.set(4, 3, 4);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    document.body.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.set(0, 0.6, 0);
+    controls.enableDamping = true;
+
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+    scene.add(ambientLight);
+
+    const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+    dirLight.position.set(5, 10, 5);
+    dirLight.castShadow = true;
+    dirLight.shadow.mapSize.set(2048, 2048);
+    dirLight.shadow.camera.left = -10;
+    dirLight.shadow.camera.right = 10;
+    dirLight.shadow.camera.top = 10;
+    dirLight.shadow.camera.bottom = -10;
+    dirLight.shadow.camera.near = 0.5;
+    dirLight.shadow.camera.far = 30;
+    scene.add(dirLight);
+
+    const groundGeo = new THREE.PlaneGeometry(20, 20);
+    const groundMat = new THREE.MeshStandardMaterial({ color: '#556B2F' });
+    const ground = new THREE.Mesh(groundGeo, groundMat);
+    ground.rotation.x = -Math.PI / 2;
+    ground.position.y = 0;
+    ground.receiveShadow = true;
+    scene.add(ground);
+
+    const grid = new THREE.GridHelper(20, 20, 0x999999, 0x666666);
+    grid.position.y = 0.001;
+    grid.material.transparent = true;
+    grid.material.opacity = 0.18;
+    scene.add(grid);
+
+    // Top hierarchy:
+    // pivotGroup (at tip / contact point)
+    //   precessionGroup (rotate around world-up / local y)
+    //     tiltGroup (tilt away from vertical)
+    //       spinGroup (spin around own symmetry axis)
+    //         meshes
+    const pivotGroup = new THREE.Group();
+    pivotGroup.position.set(0, 0, 0);
+    scene.add(pivotGroup);
+
+    const precessionGroup = new THREE.Group();
+    pivotGroup.add(precessionGroup);
+
+    const tiltGroup = new THREE.Group();
+    precessionGroup.add(tiltGroup);
+
+    const spinGroup = new THREE.Group();
+    tiltGroup.add(spinGroup);
+
+    const topMatBody = new THREE.MeshStandardMaterial({
+      color: '#DAA520',
+      metalness: 0.75,
+      roughness: 0.35
+    });
+
+    const topMatTip = new THREE.MeshStandardMaterial({
+      color: '#C0C0C0',
+      metalness: 0.9,
+      roughness: 0.2
+    });
+
+    const topMatDisc = new THREE.MeshStandardMaterial({
+      color: '#B22222',
+      metalness: 0.45,
+      roughness: 0.45
+    });
+
+    const topMatHandle = new THREE.MeshStandardMaterial({
+      color: '#8B4513',
+      metalness: 0.2,
+      roughness: 0.7
+    });
+
+    // ConeGeometry points along +Y by default with center at origin.
+    // To make tip contact ground at y=0, place cone center at y=0.75 so bottom tip sits at 0.
+    const body = new THREE.Mesh(new THREE.ConeGeometry(0.5, 1.5, 48), topMatBody);
+    body.position.y = 0.75;
+    body.castShadow = true;
+    body.receiveShadow = true;
+    spinGroup.add(body);
+
+    const tip = new THREE.Mesh(new THREE.SphereGeometry(0.05, 24, 24), topMatTip);
+    tip.position.y = 0.05;
+    tip.castShadow = true;
+    tip.receiveShadow = true;
+    spinGroup.add(tip);
+
+    const disc = new THREE.Mesh(new THREE.CylinderGeometry(0.6, 0.6, 0.08, 48), topMatDisc);
+    disc.position.y = 1.25;
+    disc.castShadow = true;
+    disc.receiveShadow = true;
+    spinGroup.add(disc);
+
+    const handle = new THREE.Mesh(new THREE.CylinderGeometry(0.08, 0.08, 0.3, 24), topMatHandle);
+    handle.position.y = 1.65;
+    handle.castShadow = true;
+    handle.receiveShadow = true;
+    spinGroup.add(handle);
+
+    const launchBtn = document.getElementById('launchBtn');
+    const frictionBtn = document.getElementById('frictionBtn');
+    const hud = document.getElementById('hud');
+
+    const params = {
+      mass: 0.5,
+      gravity: 9.81,
+      d: 0.5,
+      I_spin: 0.02,
+      I_perp: 0.05,
+      initialSpinRate: 15,
+      initialTilt: 0.3,
+      spinDecay: 0.3
+    };
+
+    const state = {
+      spinRate: 0,
+      precessionRate: 0,
+      tiltAngle: params.initialTilt,
+      nutationAmplitude: 0.05,
+      status: 'idle',
+      frictionEnabled: true,
+      elapsedTime: 0,
+      topPosition: { x: 0, y: 0, z: 0 },
+      spinBoostCount: 0,
+      totalEnergy: 0,
+
+      spinning: false,
+      paused: false,
+      toppled: false,
+
+      spinAngle: 0,
+      precessionAngle: 0,
+      baseTilt: params.initialTilt,
+      toppleAngularSpeed: 0,
+      lastComputedTheta: params.initialTilt
+    };
+
+    window.__3D_STATE__ = state;
+
+    function resetTop() {
+      state.spinRate = params.initialSpinRate;
+      state.precessionRate = (params.mass * params.gravity * params.d) / (params.I_spin * state.spinRate);
+      state.tiltAngle = params.initialTilt;
+      state.nutationAmplitude = 0.05;
+      state.status = 'spinning';
+      state.elapsedTime = 0;
+      state.spinBoostCount = 0;
+      state.totalEnergy = 0;
+
+      state.spinning = true;
+      state.paused = false;
+      state.toppled = false;
+
+      state.spinAngle = 0;
+      state.precessionAngle = 0;
+      state.baseTilt = params.initialTilt;
+      state.toppleAngularSpeed = 0;
+      state.lastComputedTheta = params.initialTilt;
+
+      pivotGroup.position.set(0, 0, 0);
+      precessionGroup.rotation.set(0, 0, 0);
+      tiltGroup.rotation.set(0, 0, 0);
+      spinGroup.rotation.set(0, 0, 0);
+
+      launchBtn.textContent = 'Reset';
+      updateHUD();
+    }
+
+    function updateHUD() {
+      const statusText =
+        state.paused ? 'Paused' :
+        state.toppled ? 'Toppled' :
+        state.spinning ? 'Spinning' : 'Idle';
+
+      hud.textContent =
+`Spin Rate: ${state.spinRate.toFixed(2)} rad/s
+Precession Rate: ${state.precessionRate.toFixed(3)} rad/s
+Tilt Angle: ${(THREE.MathUtils.radToDeg(state.tiltAngle)).toFixed(1)}°
+Nutation Amplitude: ${state.nutationAmplitude.toFixed(3)} rad
+Status: ${statusText}`;
+    }
+
+    function updateExposedState() {
+      const worldPos = new THREE.Vector3();
+      pivotGroup.getWorldPosition(worldPos);
+
+      state.topPosition = {
+        x: worldPos.x,
+        y: worldPos.y,
+        z: worldPos.z
+      };
+
+      const rotationalEnergy =
+        0.5 * params.I_spin * state.spinRate * state.spinRate +
+        0.5 * params.I_perp * state.precessionRate * state.precessionRate;
+
+      const comHeight = params.d * Math.cos(state.tiltAngle);
+      const potentialEnergy = params.mass * params.gravity * comHeight;
+
+      state.totalEnergy = rotationalEnergy + potentialEnergy;
+
+      state.status =
+        state.paused ? 'paused' :
+        state.toppled ? 'toppled' :
+        state.spinning ? 'spinning' : 'idle';
+
+      window.__3D_STATE__ = {
+        spinRate: state.spinRate,
+        precessionRate: state.precessionRate,
+        tiltAngle: state.tiltAngle,
+        nutationAmplitude: state.nutationAmplitude,
+        status: state.status,
+        frictionEnabled: state.frictionEnabled,
+        elapsedTime: state.elapsedTime,
+        topPosition: { ...state.topPosition },
+        spinBoostCount: state.spinBoostCount,
+        totalEnergy: state.totalEnergy
+      };
+    }
+
+    function applyVisualRotation(theta) {
+      precessionGroup.rotation.y = state.precessionAngle;
+      tiltGroup.rotation.z = theta;
+      spinGroup.rotation.y = state.spinAngle;
+    }
+
+    launchBtn.addEventListener('click', () => {
+      resetTop();
+    });
+
+    frictionBtn.addEventListener('click', () => {
+      state.frictionEnabled = !state.frictionEnabled;
+      frictionBtn.textContent = `Friction: ${state.frictionEnabled ? 'ON' : 'OFF'}`;
+      updateHUD();
+      updateExposedState();
+    });
+
+    window.addEventListener('keydown', (e) => {
+      if (e.code === 'KeyB') {
+        if (state.spinning && !state.toppled && !state.paused) {
+          state.spinRate += 5;
+          state.spinBoostCount += 1;
+        }
+      }
+
+      if (e.code === 'KeyT') {
+        if (state.spinning && !state.paused) {
+          state.baseTilt += 0.05;
+          state.baseTilt = Math.min(state.baseTilt, Math.PI / 3);
+        }
+      }
+
+      if (e.code === 'Space') {
+        e.preventDefault();
+        if (state.spinning || state.toppled) {
+          state.paused = !state.paused;
+        }
+      }
+    });
+
+    const clock = new THREE.Clock();
+    let accumulator = 0;
+    const fixedDt = 0.016;
+
+    function simulate(dt) {
+      if (!state.spinning && !state.toppled) return;
+      if (state.paused) return;
+
+      state.elapsedTime += dt;
+
+      if (!state.toppled) {
+        if (state.frictionEnabled) {
+          state.spinRate = Math.max(0, state.spinRate - params.spinDecay * dt);
+        }
+
+        const safeSpin = Math.max(state.spinRate, 0.2);
+        state.precessionRate = (params.mass * params.gravity * params.d) / (params.I_spin * safeSpin);
+
+        const nutFreq = 0.35 * safeSpin + 1.0;
+
+        if (state.spinRate >= 2) {
+          state.nutationAmplitude = 0.05;
+        } else {
+          const lowSpinFactor = (2 - state.spinRate) / 2;
+          state.nutationAmplitude = 0.05 + lowSpinFactor * 0.22;
+        }
+
+        const theta =
+          state.baseTilt +
+          state.nutationAmplitude * Math.sin(nutFreq * state.elapsedTime);
+
+        state.lastComputedTheta = theta;
+        state.tiltAngle = Math.max(0, theta);
+
+        state.precessionAngle += state.precessionRate * dt;
+        state.spinAngle += state.spinRate * dt;
+
+        if (state.spinRate < 2 && state.tiltAngle > Math.PI / 4) {
+          state.toppled = true;
+          state.spinning = false;
+          state.toppleAngularSpeed = 0.9;
+        }
+      } else {
+        state.precessionRate *= 0.985;
+        state.spinRate *= state.frictionEnabled ? 0.985 : 0.995;
+        state.spinAngle += state.spinRate * dt;
+        state.precessionAngle += state.precessionRate * dt;
+
+        state.toppleAngularSpeed += 0.55 * dt;
+        state.tiltAngle += state.toppleAngularSpeed * dt;
+        state.tiltAngle = Math.min(state.tiltAngle, Math.PI / 2 - 0.02);
+      }
+
+      applyVisualRotation(state.tiltAngle);
+    }
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      const rawDt = Math.min(clock.getDelta(), 0.05);
+      accumulator += rawDt;
+
+      while (accumulator >= fixedDt) {
+        simulate(fixedDt);
+        accumulator -= fixedDt;
+      }
+
+      controls.update();
+      updateHUD();
+      updateExposedState();
+      renderer.render(scene, camera);
+    }
+
+    updateHUD();
+    updateExposedState();
+    animate();
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+  </script>
+</body>
+</html>

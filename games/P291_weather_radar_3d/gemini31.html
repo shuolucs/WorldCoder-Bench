@@ -1,0 +1,399 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Weather Radar</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #0a0a1a;
+            font-family: monospace;
+            color: #ffffff;
+            user-select: none;
+        }
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+        }
+        #hud-panel {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            background-color: rgba(10, 15, 30, 0.8);
+            border: 1px solid #334466;
+            border-radius: 8px;
+            padding: 15px;
+            width: 300px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.5);
+            pointer-events: auto;
+        }
+        .hud-line {
+            margin-bottom: 8px;
+            font-size: 14px;
+            text-shadow: 1px 1px 2px #000;
+        }
+        .hud-title {
+            font-size: 16px;
+            font-weight: bold;
+            color: #00ff88;
+            margin-bottom: 15px;
+            border-bottom: 1px solid #334466;
+            padding-bottom: 5px;
+        }
+        .btn-row {
+            display: flex;
+            justify-content: space-between;
+            margin-top: 15px;
+            margin-bottom: 10px;
+        }
+        button {
+            background-color: #1a2a4a;
+            color: #fff;
+            border: 1px solid #334466;
+            padding: 6px 10px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-family: monospace;
+            font-size: 12px;
+            transition: all 0.2s;
+            flex: 1;
+            margin: 0 2px;
+        }
+        button:hover {
+            background-color: #2a3a5a;
+            border-color: #00ff88;
+        }
+        button.active {
+            background-color: #00ff88;
+            color: #000;
+            font-weight: bold;
+        }
+        .control-btn {
+            width: 100%;
+            margin: 5px 0;
+            padding: 8px;
+        }
+    </style>
+    <!-- Import Three.js -->
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="canvas-container"></div>
+
+    <div id="hud-panel">
+        <div class="hud-title">NEXRAD WSR-88D</div>
+        <div id="mode-display" class="hud-line">Radar Mode: Reflectivity</div>
+        <div id="layer-count" class="hud-line">Active Layers: 3/3</div>
+        <div id="sweep-angle" class="hud-line">Sweep Angle: 0°</div>
+        <div id="timestamp" class="hud-line">Timestamp: 2024-03-15 14:00 UTC</div>
+        
+        <div class="btn-row">
+            <button id="btn-layer0" class="active">Low</button>
+            <button id="btn-layer1" class="active">Mid</button>
+            <button id="btn-layer2" class="active">High</button>
+        </div>
+        
+        <button id="btn-mode" class="control-btn">Cycle Mode</button>
+        <button id="btn-pause" class="control-btn">Pause</button>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        // --- State Management ---
+        window.__3D_STATE__ = {
+            sweepAngle: 0,
+            isPaused: false,
+            mode: 'Reflectivity',
+            modeIndex: 0,
+            layerVisible: [true, true, true],
+            activeLayerCount: 3,
+            totalPrecipitationBoxes: 62,
+            sweepSpeed: 1.0,
+            layerHeights: [5, 15, 25],
+            cameraDistance: 0,
+            frameCount: 0
+        };
+
+        const state = window.__3D_STATE__;
+        const modes = ['Reflectivity', 'Velocity', 'Composite'];
+        let allBoxes = [];
+
+        // --- Scene Setup ---
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x0a0a1a);
+
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 1, 1000);
+        camera.position.set(0, 80, 120);
+        camera.lookAt(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        container.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.05;
+        controls.maxDistance = 300;
+
+        // Lights
+        const ambientLight = new THREE.AmbientLight(0x334466, 0.4);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 0.6);
+        dirLight.position.set(50, 100, 50);
+        scene.add(dirLight);
+
+        // --- Ground Map ---
+        const groundGeo = new THREE.CircleGeometry(80, 64);
+        const groundMat = new THREE.MeshBasicMaterial({ color: 0x1a2a1a, side: THREE.DoubleSide });
+        const ground = new THREE.Mesh(groundGeo, groundMat);
+        ground.rotation.x = -Math.PI / 2;
+        scene.add(ground);
+
+        // Concentric Rings
+        const ringRadii = [20, 40, 60, 80];
+        const ringMat = new THREE.LineBasicMaterial({ color: 0x2a3a2a });
+        ringRadii.forEach(r => {
+            const pts = [];
+            for (let i = 0; i <= 64; i++) {
+                const theta = (i / 64) * Math.PI * 2;
+                pts.push(new THREE.Vector3(r * Math.cos(theta), 0.1, r * Math.sin(theta)));
+            }
+            const geo = new THREE.BufferGeometry().setFromPoints(pts);
+            const line = new THREE.LineLoop(geo, ringMat);
+            scene.add(line);
+        });
+
+        // Cardinal Labels
+        function createLabel(text, x, z) {
+            const canvas = document.createElement('canvas');
+            canvas.width = 64; canvas.height = 64;
+            const ctx = canvas.getContext('2d');
+            ctx.fillStyle = '#556688';
+            ctx.font = 'bold 40px monospace';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(text, 32, 32);
+            const tex = new THREE.CanvasTexture(canvas);
+            const mat = new THREE.SpriteMaterial({ map: tex, transparent: true });
+            const sprite = new THREE.Sprite(mat);
+            sprite.position.set(x, 2, z);
+            sprite.scale.set(8, 8, 1);
+            scene.add(sprite);
+        }
+        createLabel('N', 0, -85);
+        createLabel('S', 0, 85);
+        createLabel('E', 85, 0);
+        createLabel('W', -85, 0);
+
+        // --- Weather Data Layers ---
+        const layers = [];
+        
+        function createLayer(index, y, count, sizeRange, maxRadius, colorStart, colorEnd, opacity) {
+            const group = new THREE.Group();
+            group.name = `layer${index}`;
+            group.position.y = y;
+            
+            const cStart = new THREE.Color(colorStart);
+            const cEnd = new THREE.Color(colorEnd);
+
+            for (let i = 0; i < count; i++) {
+                const size = sizeRange[0] + Math.random() * (sizeRange[1] - sizeRange[0]);
+                const geo = new THREE.BoxGeometry(size, size, size);
+                
+                const r = Math.random() * maxRadius;
+                const theta = Math.random() * Math.PI * 2;
+                const x = r * Math.cos(theta);
+                const z = r * Math.sin(theta);
+                
+                const distNorm = r / maxRadius;
+                const color = cStart.clone().lerp(cEnd, distNorm);
+                
+                const mat = new THREE.MeshStandardMaterial({
+                    color: color,
+                    transparent: true,
+                    opacity: opacity,
+                    emissive: color,
+                    emissiveIntensity: 0
+                });
+                
+                const mesh = new THREE.Mesh(geo, mat);
+                mesh.position.set(x, 0, z);
+                
+                let angle = Math.atan2(z, x);
+                if (angle < 0) angle += Math.PI * 2;
+
+                mesh.userData = {
+                    layerIndex: index,
+                    distNorm: distNorm,
+                    pulseTimer: 0,
+                    baseColor: color.clone(),
+                    angle: angle
+                };
+                
+                group.add(mesh);
+                allBoxes.push(mesh);
+            }
+            scene.add(group);
+            return group;
+        }
+
+        layers.push(createLayer(0, 5, 30, [3, 5], 60, 0x00ff00, 0xffff00, 0.6));
+        layers.push(createLayer(1, 15, 20, [4, 7], 45, 0xffff00, 0xff8800, 0.5));
+        layers.push(createLayer(2, 25, 12, [5, 9], 30, 0xff8800, 0xff0000, 0.4));
+
+        // --- Radar Sweep ---
+        const sweepAngleWidth = Math.PI / 36; // 5 degrees
+        const sweepGeo = new THREE.CircleGeometry(80, 32, 0, sweepAngleWidth);
+        const sweepMat = new THREE.MeshBasicMaterial({
+            color: 0x00ff88,
+            transparent: true,
+            opacity: 0.3,
+            side: THREE.DoubleSide,
+            depthWrite: false
+        });
+        const sweep = new THREE.Mesh(sweepGeo, sweepMat);
+        sweep.rotation.x = -Math.PI / 2;
+        sweep.position.y = 0.5;
+        scene.add(sweep);
+
+        // --- UI & Interactions ---
+        const uiMode = document.getElementById('mode-display');
+        const uiLayerCount = document.getElementById('layer-count');
+        const uiSweepAngle = document.getElementById('sweep-angle');
+        const btnLayers = [
+            document.getElementById('btn-layer0'),
+            document.getElementById('btn-layer1'),
+            document.getElementById('btn-layer2')
+        ];
+        const btnMode = document.getElementById('btn-mode');
+        const btnPause = document.getElementById('btn-pause');
+
+        function updateColors() {
+            const mode = modes[state.modeIndex];
+            allBoxes.forEach(box => {
+                let newColor = new THREE.Color();
+                const dist = box.userData.distNorm;
+                const layer = box.userData.layerIndex;
+                
+                if (mode === 'Reflectivity') {
+                    if (layer === 0) newColor.lerpColors(new THREE.Color(0x00ff00), new THREE.Color(0xffff00), dist);
+                    else if (layer === 1) newColor.lerpColors(new THREE.Color(0xffff00), new THREE.Color(0xff8800), dist);
+                    else if (layer === 2) newColor.lerpColors(new THREE.Color(0xff8800), new THREE.Color(0xff0000), dist);
+                } else if (mode === 'Velocity') {
+                    newColor.lerpColors(new THREE.Color(0x0000ff), new THREE.Color(0x00ffff), dist);
+                } else if (mode === 'Composite') {
+                    newColor.setHSL(0.7 - dist * 0.7, 1.0, 0.5);
+                }
+                
+                box.material.color.copy(newColor);
+                box.material.emissive.copy(newColor);
+                box.userData.baseColor.copy(newColor);
+            });
+        }
+
+        function toggleLayer(index) {
+            state.layerVisible[index] = !state.layerVisible[index];
+            layers[index].visible = state.layerVisible[index];
+            btnLayers[index].classList.toggle('active', state.layerVisible[index]);
+            
+            state.activeLayerCount = state.layerVisible.filter(v => v).length;
+            uiLayerCount.innerText = `Active Layers: ${state.activeLayerCount}/3`;
+        }
+
+        function cycleMode() {
+            state.modeIndex = (state.modeIndex + 1) % 3;
+            state.mode = modes[state.modeIndex];
+            uiMode.innerText = `Radar Mode: ${state.mode}`;
+            updateColors();
+        }
+
+        function togglePause() {
+            state.isPaused = !state.isPaused;
+            btnPause.innerText = state.isPaused ? 'Resume' : 'Pause';
+        }
+
+        btnLayers.forEach((btn, i) => btn.addEventListener('click', () => toggleLayer(i)));
+        btnMode.addEventListener('click', cycleMode);
+        btnPause.addEventListener('click', togglePause);
+
+        window.addEventListener('keydown', (e) => {
+            if (e.key === '1') toggleLayer(0);
+            if (e.key === '2') toggleLayer(1);
+            if (e.key === '3') toggleLayer(2);
+            if (e.key.toLowerCase() === 'm') cycleMode();
+            if (e.key === ' ') {
+                e.preventDefault();
+                togglePause();
+            }
+        });
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // --- Animation Loop ---
+        const clock = new THREE.Clock();
+
+        function animate() {
+            requestAnimationFrame(animate);
+            
+            const delta = clock.getDelta();
+            state.frameCount++;
+            state.cameraDistance = camera.position.distanceTo(scene.position);
+
+            if (!state.isPaused) {
+                // Rotate sweep clockwise (negative Y rotation)
+                sweep.rotation.z -= delta * state.sweepSpeed; // z because mesh is rotated on x
+                
+                // Calculate current sweep angle in XZ plane [0, 2pi)
+                let sAngle = (-sweep.rotation.z) % (Math.PI * 2);
+                if (sAngle < 0) sAngle += Math.PI * 2;
+                
+                state.sweepAngle = (sAngle * 180 / Math.PI).toFixed(1);
+                uiSweepAngle.innerText = `Sweep Angle: ${state.sweepAngle}°`;
+
+                // Check intersections and pulse
+                allBoxes.forEach(box => {
+                    if (!layers[box.userData.layerIndex].visible) return;
+
+                    let diff = Math.abs(sAngle - box.userData.angle);
+                    if (diff > Math.PI) diff = Math.PI * 2 - diff;
+
+                    if (diff < 0.15) {
+                        box.userData.pulseTimer = 0.3;
+                    }
+
+                    if (box.userData.pulseTimer > 0) {
+                        box.userData.pulseTimer -= delta;
+                        box.material.emissiveIntensity = 0.8;
+                    } else {
+                        box.material.emissiveIntensity = 0;
+                    }
+                });
+            }
+
+            controls.update();
+            renderer.render(scene, camera);
+        }
+
+        animate();
+    </script>
+</body>
+</html>

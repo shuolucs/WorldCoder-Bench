@@ -1,0 +1,519 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3D SPH Dam Break Simulation</title>
+<style>
+  body { margin: 0; overflow: hidden; background: #000; font-family: 'Segoe UI', Arial, sans-serif; }
+  canvas { display: block; }
+  #hud {
+    position: absolute; top: 15px; left: 15px;
+    background: rgba(0,0,0,0.75); color: #e0e0e0;
+    padding: 15px 20px; border-radius: 10px;
+    font-size: 14px; line-height: 1.8;
+    border: 1px solid rgba(66,165,245,0.3);
+    backdrop-filter: blur(5px);
+  }
+  #hud .label { color: #90caf9; }
+  #hud .value { color: #fff; font-weight: bold; }
+  #resetBtn {
+    position: absolute; top: 15px; right: 15px;
+    background: linear-gradient(135deg, #1a237e, #42a5f5);
+    color: #fff; border: none; padding: 12px 24px;
+    border-radius: 8px; cursor: pointer; font-size: 15px;
+    font-weight: bold; transition: all 0.3s;
+    box-shadow: 0 4px 15px rgba(66,165,245,0.3);
+  }
+  #resetBtn:hover { transform: scale(1.05); box-shadow: 0 6px 20px rgba(66,165,245,0.5); }
+</style>
+<script type="importmap">
+{ "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="hud">
+  <div><span class="label">Particles: </span><span class="value" id="particleCount">0</span></div>
+  <div><span class="label">Avg Density: </span><span class="value" id="avgDensity">0</span></div>
+  <div><span class="label">Avg Speed: </span><span class="value" id="avgSpeed">0</span></div>
+  <div><span class="label">Sim Time: </span><span class="value" id="simTime">0.000</span></div>
+</div>
+<button id="resetBtn">⟳ Reset</button>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// Constants
+const N = 500;
+const PARTICLE_MASS = 0.02;
+const PARTICLE_RADIUS = 0.08;
+const H = 0.2;
+const H2 = H * H;
+const H6 = H * H * H * H * H * H;
+const H9 = H6 * H * H * H;
+const K_STIFFNESS = 20.0;
+const RHO0 = 1000.0;
+const MU = 0.1;
+const GRAVITY = -9.81;
+const DT = 0.001;
+const SUB_STEPS = 4;
+const BOUNCE = 0.3;
+
+// Container bounds
+const XMIN = 0, XMAX = 6;
+const YMIN = 0, YMAX = 4;
+const ZMIN = 0, ZMAX = 2;
+
+// Kernel constants
+const POLY6_COEFF = 315.0 / (64.0 * Math.PI * H9);
+const SPIKY_GRAD_COEFF = -45.0 / (Math.PI * H6);
+const VISC_LAP_COEFF = 45.0 / (Math.PI * H6);
+
+// Scene setup
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0a0a1a);
+scene.fog = new THREE.FogExp2(0x0a0a1a, 0.05);
+
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+camera.position.set(3, 5, 8);
+camera.lookAt(3, 2, 1);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.shadowMap.enabled = false;
+document.body.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(3, 2, 1);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+controls.update();
+
+// Lighting
+const ambientLight = new THREE.AmbientLight(0x404060, 1.5);
+scene.add(ambientLight);
+
+const dirLight = new THREE.DirectionalLight(0xffffff, 2.0);
+dirLight.position.set(5, 10, 5);
+scene.add(dirLight);
+
+const pointLight = new THREE.PointLight(0x42a5f5, 1.5, 20);
+pointLight.position.set(3, 5, 1);
+scene.add(pointLight);
+
+// Container wireframe
+function createContainer() {
+  const edges = [];
+  const corners = [
+    [XMIN, YMIN, ZMIN], [XMAX, YMIN, ZMIN], [XMAX, YMAX, ZMIN], [XMIN, YMAX, ZMIN],
+    [XMIN, YMIN, ZMAX], [XMAX, YMIN, ZMAX], [XMAX, YMAX, ZMAX], [XMIN, YMAX, ZMAX]
+  ];
+  // Bottom edges
+  const bottomEdges = [[0,1],[1,5],[5,4],[4,0]];
+  // Wall edges (vertical)
+  const wallEdges = [[0,3],[1,2],[4,7],[5,6]];
+  // Top edges of walls
+  const topEdges = [[3,2],[2,6],[6,7],[7,3]];
+
+  const allEdges = [...bottomEdges, ...wallEdges, ...topEdges];
+  const points = [];
+  for (const [a, b] of allEdges) {
+    points.push(new THREE.Vector3(...corners[a]));
+    points.push(new THREE.Vector3(...corners[b]));
+  }
+  const geom = new THREE.BufferGeometry().setFromPoints(points);
+  const mat = new THREE.LineBasicMaterial({ color: 0x42a5f5, transparent: true, opacity: 0.6 });
+  return new THREE.LineSegments(geom, mat);
+}
+scene.add(createContainer());
+
+// Bottom floor
+const floorGeom = new THREE.PlaneGeometry(XMAX - XMIN, ZMAX - ZMIN);
+const floorMat = new THREE.MeshStandardMaterial({
+  color: 0x1a237e, transparent: true, opacity: 0.3, side: THREE.DoubleSide,
+  metalness: 0.5, roughness: 0.5
+});
+const floor = new THREE.Mesh(floorGeom, floorMat);
+floor.rotation.x = -Math.PI / 2;
+floor.position.set((XMIN + XMAX) / 2, YMIN, (ZMIN + ZMAX) / 2);
+scene.add(floor);
+
+// Grid on floor
+const gridHelper = new THREE.GridHelper(6, 12, 0x1a237e, 0x1a237e);
+gridHelper.position.set(3, 0.001, 1);
+gridHelper.material.transparent = true;
+gridHelper.material.opacity = 0.2;
+scene.add(gridHelper);
+
+// Particle data
+let positions = new Float32Array(N * 3);
+let velocities = new Float32Array(N * 3);
+let densities = new Float32Array(N);
+let pressures = new Float32Array(N);
+let forces = new Float32Array(N * 3);
+
+// Spatial hashing for neighbor search
+const CELL_SIZE = H;
+const neighborMap = new Map();
+
+function hashKey(cx, cy, cz) {
+  return cx * 73856093 ^ cy * 19349663 ^ cz * 83492791;
+}
+
+function getCellCoords(x, y, z) {
+  return [
+    Math.floor(x / CELL_SIZE),
+    Math.floor(y / CELL_SIZE),
+    Math.floor(z / CELL_SIZE)
+  ];
+}
+
+function buildSpatialHash() {
+  neighborMap.clear();
+  for (let i = 0; i < N; i++) {
+    const [cx, cy, cz] = getCellCoords(positions[i*3], positions[i*3+1], positions[i*3+2]);
+    const key = hashKey(cx, cy, cz);
+    if (!neighborMap.has(key)) neighborMap.set(key, []);
+    neighborMap.get(key).push(i);
+  }
+}
+
+function getNeighbors(i) {
+  const [cx, cy, cz] = getCellCoords(positions[i*3], positions[i*3+1], positions[i*3+2]);
+  const neighbors = [];
+  for (let dx = -1; dx <= 1; dx++) {
+    for (let dy = -1; dy <= 1; dy++) {
+      for (let dz = -1; dz <= 1; dz++) {
+        const key = hashKey(cx + dx, cy + dy, cz + dz);
+        const cell = neighborMap.get(key);
+        if (cell) {
+          for (let j = 0; j < cell.length; j++) {
+            neighbors.push(cell[j]);
+          }
+        }
+      }
+    }
+  }
+  return neighbors;
+}
+
+// Initialize particles in a grid in the left half of the container
+function initParticles() {
+  // We want ~500 particles in [0,2] x [0,3] x [0,2]
+  // Find a good grid spacing
+  const spacing = 0.18;
+  const particles = [];
+  const margin = 0.1;
+
+  for (let x = XMIN + margin; x < 2.0 - margin; x += spacing) {
+    for (let y = YMIN + margin; y < 3.0 - margin; y += spacing) {
+      for (let z = ZMIN + margin; z < 2.0 - margin; z += spacing) {
+        if (particles.length < N) {
+          particles.push([x, y, z]);
+        }
+      }
+    }
+  }
+
+  // If we don't have enough, add more with tighter spacing
+  if (particles.length < N) {
+    const spacing2 = 0.15;
+    for (let x = XMIN + margin; x < 2.0 - margin && particles.length < N; x += spacing2) {
+      for (let y = YMIN + margin; y < 3.0 - margin && particles.length < N; y += spacing2) {
+        for (let z = ZMIN + margin; z < 2.0 - margin && particles.length < N; z += spacing2) {
+          // Check if not too close to existing
+          let tooClose = false;
+          for (const p of particles) {
+            const dx = x - p[0], dy = y - p[1], dz = z - p[2];
+            if (dx*dx + dy*dy + dz*dz < 0.01) { tooClose = true; break; }
+          }
+          if (!tooClose && particles.length < N) {
+            particles.push([x, y, z]);
+          }
+        }
+      }
+    }
+  }
+
+  for (let i = 0; i < N; i++) {
+    if (i < particles.length) {
+      positions[i*3] = particles[i][0];
+      positions[i*3+1] = particles[i][1];
+      positions[i*3+2] = particles[i][2];
+    } else {
+      // Fallback random placement
+      positions[i*3] = XMIN + Math.random() * 2.0;
+      positions[i*3+1] = YMIN + Math.random() * 3.0;
+      positions[i*3+2] = ZMIN + Math.random() * 2.0;
+    }
+    velocities[i*3] = 0;
+    velocities[i*3+1] = 0;
+    velocities[i*3+2] = 0;
+  }
+
+  densities.fill(RHO0);
+  pressures.fill(0);
+  forces.fill(0);
+}
+
+initParticles();
+
+// Instanced mesh for particles
+const sphereGeom = new THREE.SphereGeometry(PARTICLE_RADIUS, 8, 6);
+const sphereMat = new THREE.MeshStandardMaterial({
+  color: 0x42a5f5, metalness: 0.3, roughness: 0.4
+});
+const instancedMesh = new THREE.InstancedMesh(sphereGeom, sphereMat, N);
+scene.add(instancedMesh);
+
+const dummy = new THREE.Object3D();
+const colorObj = new THREE.Color();
+const deepBlue = new THREE.Color(0x1a237e);
+const lightBlue = new THREE.Color(0x42a5f5);
+
+function updateInstancedMesh(maxSpd) {
+  const invMaxSpd = maxSpd > 0.001 ? 1.0 / maxSpd : 1.0;
+  for (let i = 0; i < N; i++) {
+    dummy.position.set(positions[i*3], positions[i*3+1], positions[i*3+2]);
+    dummy.updateMatrix();
+    instancedMesh.setMatrixAt(i, dummy.matrix);
+
+    const vx = velocities[i*3], vy = velocities[i*3+1], vz = velocities[i*3+2];
+    const spd = Math.sqrt(vx*vx + vy*vy + vz*vz);
+    const t = Math.min(spd * invMaxSpd, 1.0);
+    colorObj.copy(deepBlue).lerp(lightBlue, t);
+    instancedMesh.setColorAt(i, colorObj);
+  }
+  instancedMesh.instanceMatrix.needsUpdate = true;
+  if (instancedMesh.instanceColor) instancedMesh.instanceColor.needsUpdate = true;
+}
+
+// SPH kernels
+function poly6(r2) {
+  if (r2 >= H2) return 0;
+  const diff = H2 - r2;
+  return POLY6_COEFF * diff * diff * diff;
+}
+
+// SPH simulation step
+function sphStep() {
+  buildSpatialHash();
+
+  // Compute densities
+  for (let i = 0; i < N; i++) {
+    let rho = 0;
+    const xi = positions[i*3], yi = positions[i*3+1], zi = positions[i*3+2];
+    const neighbors = getNeighbors(i);
+    for (let ni = 0; ni < neighbors.length; ni++) {
+      const j = neighbors[ni];
+      const dx = xi - positions[j*3];
+      const dy = yi - positions[j*3+1];
+      const dz = zi - positions[j*3+2];
+      const r2 = dx*dx + dy*dy + dz*dz;
+      rho += PARTICLE_MASS * poly6(r2);
+    }
+    densities[i] = Math.max(rho, RHO0 * 0.01); // prevent zero density
+
+    // Tait equation
+    const ratio = densities[i] / RHO0;
+    const ratio7 = ratio * ratio * ratio * ratio * ratio * ratio * ratio;
+    pressures[i] = K_STIFFNESS * (ratio7 - 1.0);
+  }
+
+  // Compute forces
+  for (let i = 0; i < N; i++) {
+    let fx = 0, fy = 0, fz = 0;
+    const xi = positions[i*3], yi = positions[i*3+1], zi = positions[i*3+2];
+    const vxi = velocities[i*3], vyi = velocities[i*3+1], vzi = velocities[i*3+2];
+    const pi = pressures[i];
+    const rhoi = densities[i];
+
+    const neighbors = getNeighbors(i);
+    for (let ni = 0; ni < neighbors.length; ni++) {
+      const j = neighbors[ni];
+      if (i === j) continue;
+
+      const dx = xi - positions[j*3];
+      const dy = yi - positions[j*3+1];
+      const dz = zi - positions[j*3+2];
+      const r2 = dx*dx + dy*dy + dz*dz;
+
+      if (r2 >= H2 || r2 < 1e-12) continue;
+
+      const r = Math.sqrt(r2);
+      const invR = 1.0 / r;
+      const rxN = dx * invR, ryN = dy * invR, rzN = dz * invR;
+      const rhoj = densities[j];
+      const invRhoj = 1.0 / rhoj;
+
+      // Pressure force (Spiky kernel gradient)
+      const hMinusR = H - r;
+      const spikyGrad = SPIKY_GRAD_COEFF * hMinusR * hMinusR;
+      const pressureTerm = -PARTICLE_MASS * (pi + pressures[j]) * 0.5 * invRhoj * spikyGrad;
+      fx += pressureTerm * rxN;
+      fy += pressureTerm * ryN;
+      fz += pressureTerm * rzN;
+
+      // Viscosity force
+      const viscLap = VISC_LAP_COEFF * hMinusR;
+      const viscTerm = MU * PARTICLE_MASS * invRhoj * viscLap;
+      fx += viscTerm * (velocities[j*3] - vxi);
+      fy += viscTerm * (velocities[j*3+1] - vyi);
+      fz += viscTerm * (velocities[j*3+2] - vzi);
+    }
+
+    // Gravity
+    fy += GRAVITY * rhoi;
+
+    forces[i*3] = fx;
+    forces[i*3+1] = fy;
+    forces[i*3+2] = fz;
+  }
+
+  // Integration (semi-implicit Euler)
+  for (let i = 0; i < N; i++) {
+    const invRho = 1.0 / densities[i];
+
+    velocities[i*3] += DT * forces[i*3] * invRho;
+    velocities[i*3+1] += DT * forces[i*3+1] * invRho;
+    velocities[i*3+2] += DT * forces[i*3+2] * invRho;
+
+    // Clamp velocity to prevent explosion
+    const vx = velocities[i*3], vy = velocities[i*3+1], vz = velocities[i*3+2];
+    const spd2 = vx*vx + vy*vy + vz*vz;
+    const maxV = 10.0;
+    if (spd2 > maxV * maxV) {
+      const scale = maxV / Math.sqrt(spd2);
+      velocities[i*3] *= scale;
+      velocities[i*3+1] *= scale;
+      velocities[i*3+2] *= scale;
+    }
+
+    positions[i*3] += DT * velocities[i*3];
+    positions[i*3+1] += DT * velocities[i*3+1];
+    positions[i*3+2] += DT * velocities[i*3+2];
+
+    // Boundary handling
+    const margin = PARTICLE_RADIUS;
+    if (positions[i*3] < XMIN + margin) {
+      positions[i*3] = XMIN + margin;
+      velocities[i*3] *= -BOUNCE;
+    }
+    if (positions[i*3] > XMAX - margin) {
+      positions[i*3] = XMAX - margin;
+      velocities[i*3] *= -BOUNCE;
+    }
+    if (positions[i*3+1] < YMIN + margin) {
+      positions[i*3+1] = YMIN + margin;
+      velocities[i*3+1] *= -BOUNCE;
+    }
+    if (positions[i*3+1] > YMAX - margin) {
+      positions[i*3+1] = YMAX - margin;
+      velocities[i*3+1] *= -BOUNCE;
+    }
+    if (positions[i*3+2] < ZMIN + margin) {
+      positions[i*3+2] = ZMIN + margin;
+      velocities[i*3+2] *= -BOUNCE;
+    }
+    if (positions[i*3+2] > ZMAX - margin) {
+      positions[i*3+2] = ZMAX - margin;
+      velocities[i*3+2] *= -BOUNCE;
+    }
+  }
+}
+
+// Simulation state
+let simTime = 0;
+
+function reset() {
+  initParticles();
+  simTime = 0;
+}
+
+document.getElementById('resetBtn').addEventListener('click', reset);
+
+// HUD elements
+const elParticleCount = document.getElementById('particleCount');
+const elAvgDensity = document.getElementById('avgDensity');
+const elAvgSpeed = document.getElementById('avgSpeed');
+const elSimTime = document.getElementById('simTime');
+
+// Animation loop
+function animate() {
+  requestAnimationFrame(animate);
+
+  // Physics sub-steps
+  for (let s = 0; s < SUB_STEPS; s++) {
+    sphStep();
+    simTime += DT;
+  }
+
+  // Compute stats
+  let totalDensity = 0, totalSpeed = 0, maxSpeed = 0, totalKE = 0;
+  let comX = 0, comY = 0, comZ = 0;
+
+  const particlesData = [];
+
+  for (let i = 0; i < N; i++) {
+    const vx = velocities[i*3], vy = velocities[i*3+1], vz = velocities[i*3+2];
+    const spd = Math.sqrt(vx*vx + vy*vy + vz*vz);
+    totalDensity += densities[i];
+    totalSpeed += spd;
+    if (spd > maxSpeed) maxSpeed = spd;
+    totalKE += 0.5 * PARTICLE_MASS * (vx*vx + vy*vy + vz*vz);
+    comX += positions[i*3];
+    comY += positions[i*3+1];
+    comZ += positions[i*3+2];
+
+    particlesData.push({
+      x: positions[i*3], y: positions[i*3+1], z: positions[i*3+2],
+      vx, vy, vz,
+      density: densities[i],
+      pressure: pressures[i]
+    });
+  }
+
+  const avgDensity = totalDensity / N;
+  const avgSpeed = totalSpeed / N;
+
+  // Update HUD
+  elParticleCount.textContent = N;
+  elAvgDensity.textContent = avgDensity.toFixed(1);
+  elAvgSpeed.textContent = avgSpeed.toFixed(3);
+  elSimTime.textContent = simTime.toFixed(3);
+
+  // Update instanced mesh
+  updateInstancedMesh(Math.max(maxSpeed, 0.5));
+
+  // Expose state
+  window.__3D_STATE__ = {
+    particleCount: N,
+    particles: particlesData,
+    avgDensity,
+    avgSpeed,
+    maxSpeed,
+    simTime,
+    totalKE,
+    centerOfMass: { x: comX / N, y: comY / N, z: comZ / N }
+  };
+
+  controls.update();
+  renderer.render(scene, camera);
+}
+
+// Handle resize
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+animate();
+</script>
+</body>
+</html>

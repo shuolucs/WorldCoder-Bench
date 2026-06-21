@@ -1,0 +1,584 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Three.js Social Network Force-Directed Graph</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #000;
+            color: #fff;
+            font-family: monospace;
+            user-select: none;
+        }
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+        }
+        #hud {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 15px;
+            border: 1px solid #444;
+            border-radius: 5px;
+            pointer-events: auto;
+            z-index: 10;
+        }
+        .hud-line {
+            margin-bottom: 5px;
+        }
+        .controls {
+            margin-top: 15px;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+        button, select {
+            background: #333;
+            color: #fff;
+            border: 1px solid #666;
+            padding: 5px 10px;
+            cursor: pointer;
+            font-family: monospace;
+        }
+        button:hover, select:hover {
+            background: #555;
+        }
+    </style>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="hud">
+        <div class="hud-line" id="hud-nodes">Nodes: 0</div>
+        <div class="hud-line" id="hud-edges">Edges: 0</div>
+        <div class="hud-line" id="hud-iter">Iteration: 0</div>
+        <div class="hud-line" id="hud-ke">Kinetic Energy: 0.00</div>
+        <div class="hud-line" id="hud-debug">Debug: OFF</div>
+        <div class="hud-line" id="hud-sim">Simulation: RUNNING</div>
+        
+        <div class="controls">
+            <button id="btn-pause">Pause/Resume (SPACE)</button>
+            <button id="btn-reset">Reset (R)</button>
+            <select id="select-highlight">
+                <option value="0">Highlight: None</option>
+                <option value="1">Cluster 1 (Red)</option>
+                <option value="2">Cluster 2 (Green)</option>
+                <option value="3">Cluster 3 (Blue)</option>
+            </select>
+        </div>
+    </div>
+    <div id="canvas-container"></div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+        // --- STATE MANAGEMENT ---
+        window.__3D_STATE__ = {
+            nodeCount: 30,
+            edgeCount: 0,
+            simulationRunning: true,
+            iterationCount: 0,
+            kineticEnergy: 0,
+            debugOverlayVisible: false,
+            selectedNodeIndex: -1,
+            highlightedCluster: 0,
+            storkLoaded: false,
+            clusterCentroids: [{x:0,y:0,z:0}, {x:0,y:0,z:0}, {x:0,y:0,z:0}],
+            nodesHaveNaN: false,
+            averageVelocity: 0
+        };
+
+        // --- SCENE SETUP ---
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x000000);
+
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.set(0, 0, 50);
+        camera.lookAt(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        container.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.05;
+
+        const ambientLight = new THREE.AmbientLight(0x404040);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 1);
+        dirLight.position.set(10, 10, 10);
+        scene.add(dirLight);
+
+        // --- NETWORK GRAPH DATA ---
+        const nodes = [];
+        const edges = [];
+        const clusterColors = [0xff4444, 0x44ff44, 0x4444ff];
+        const clusterBiases = [
+            new THREE.Vector3(-15, 15, 0),
+            new THREE.Vector3(15, 15, 0),
+            new THREE.Vector3(0, -15, 0)
+        ];
+
+        const nodeGeometry = new THREE.SphereGeometry(0.5, 16, 16);
+        const edgeMaterial = new THREE.LineBasicMaterial({ color: 0x888888, transparent: true, opacity: 0.6 });
+
+        // Generate Nodes
+        for (let i = 0; i < window.__3D_STATE__.nodeCount; i++) {
+            const clusterIndex = Math.floor(i / 10);
+            const material = new THREE.MeshStandardMaterial({ 
+                color: clusterColors[clusterIndex],
+                roughness: 0.4,
+                metalness: 0.1
+            });
+            const mesh = new THREE.Mesh(nodeGeometry, material);
+            
+            // Initial random position with cluster bias
+            mesh.position.set(
+                (Math.random() - 0.5) * 20 + clusterBiases[clusterIndex].x,
+                (Math.random() - 0.5) * 20 + clusterBiases[clusterIndex].y,
+                (Math.random() - 0.5) * 20 + clusterBiases[clusterIndex].z
+            );
+
+            scene.add(mesh);
+            nodes.push({
+                index: i,
+                mesh: mesh,
+                velocity: new THREE.Vector3(0, 0, 0),
+                cluster: clusterIndex,
+                isStork: false,
+                originalColor: clusterColors[clusterIndex]
+            });
+        }
+
+        // Load Stork (Influencer Node 0 in Cluster 0)
+        const gltfLoader = new GLTFLoader();
+        gltfLoader.load('https://cdn.jsdelivr.net/gh/mrdoob/three.js@master/examples/models/gltf/Stork.glb', (gltf) => {
+            const stork = gltf.scene;
+            
+            // Calculate bounding box to scale to roughly size 2
+            const box = new THREE.Box3().setFromObject(stork);
+            const size = box.getSize(new THREE.Vector3()).length();
+            const scale = 2 / size;
+            stork.scale.set(scale, scale, scale);
+
+            // Replace placeholder mesh
+            const oldMesh = nodes[0].mesh;
+            stork.position.copy(oldMesh.position);
+            scene.remove(oldMesh);
+            scene.add(stork);
+            
+            nodes[0].mesh = stork;
+            nodes[0].isStork = true;
+            window.__3D_STATE__.storkLoaded = true;
+
+            // Store original materials for highlighting
+            stork.traverse((child) => {
+                if (child.isMesh) {
+                    child.userData.originalMaterial = child.material.clone();
+                }
+            });
+        });
+
+        // Generate Edges
+        function addEdge(sourceIdx, targetIdx) {
+            // Check if exists
+            if (edges.some(e => (e.source.index === sourceIdx && e.target.index === targetIdx) || 
+                                (e.source.index === targetIdx && e.target.index === sourceIdx))) {
+                return false;
+            }
+            
+            const source = nodes[sourceIdx];
+            const target = nodes[targetIdx];
+            
+            const points = [source.mesh.position, target.mesh.position];
+            const geometry = new THREE.BufferGeometry().setFromPoints(points);
+            const line = new THREE.Line(geometry, edgeMaterial);
+            scene.add(line);
+            
+            edges.push({ source, target, line });
+            return true;
+        }
+
+        // Intra-cluster edges
+        for (let c = 0; c < 3; c++) {
+            const clusterNodes = nodes.filter(n => n.cluster === c);
+            clusterNodes.forEach(n1 => {
+                const numEdges = Math.floor(Math.random() * 2) + 3; // 3 to 4
+                let added = 0;
+                let attempts = 0;
+                while (added < numEdges && attempts < 20) {
+                    const n2 = clusterNodes[Math.floor(Math.random() * clusterNodes.length)];
+                    if (n1.index !== n2.index) {
+                        if (addEdge(n1.index, n2.index)) added++;
+                    }
+                    attempts++;
+                }
+            });
+        }
+
+        // Inter-cluster edges
+        let crossEdgesAdded = 0;
+        while (crossEdgesAdded < 5) {
+            const n1 = nodes[Math.floor(Math.random() * nodes.length)];
+            const n2 = nodes[Math.floor(Math.random() * nodes.length)];
+            if (n1.cluster !== n2.cluster) {
+                if (addEdge(n1.index, n2.index)) crossEdgesAdded++;
+            }
+        }
+        window.__3D_STATE__.edgeCount = edges.length;
+
+        // --- DEBUG OVERLAY ---
+        const debugGroup = new THREE.Group();
+        debugGroup.visible = false;
+        scene.add(debugGroup);
+
+        // Debug Grid Plane
+        const planeGeo = new THREE.PlaneGeometry(100, 100);
+        const planeMat = new THREE.MeshBasicMaterial({ color: 0x222222, transparent: true, opacity: 0.5, side: THREE.DoubleSide });
+        const plane = new THREE.Mesh(planeGeo, planeMat);
+        plane.rotation.x = Math.PI / 2;
+        debugGroup.add(plane);
+
+        const gridHelper = new THREE.GridHelper(100, 50, 0x888888, 0x444444);
+        debugGroup.add(gridHelper);
+
+        // Cluster AABBs
+        const clusterBoxes = [new THREE.Box3(), new THREE.Box3(), new THREE.Box3()];
+        const boxHelpers = clusterBoxes.map((box, i) => {
+            const helper = new THREE.Box3Helper(box, clusterColors[i]);
+            debugGroup.add(helper);
+            return helper;
+        });
+
+        // Velocity Arrows
+        const arrowHelpers = nodes.map(n => {
+            const arrow = new THREE.ArrowHelper(new THREE.Vector3(0,1,0), new THREE.Vector3(), 1, 0xffff00);
+            debugGroup.add(arrow);
+            return arrow;
+        });
+
+        // --- SELECTION & HIGHLIGHTING ---
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+        
+        const selectionIndicator = new THREE.Mesh(
+            new THREE.SphereGeometry(0.8, 16, 16),
+            new THREE.MeshBasicMaterial({ color: 0xffff00, wireframe: true })
+        );
+        selectionIndicator.visible = false;
+        scene.add(selectionIndicator);
+
+        window.addEventListener('pointerdown', (event) => {
+            if (event.target.tagName !== 'CANVAS') return;
+            
+            mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+            
+            raycaster.setFromCamera(mouse, camera);
+            
+            // Create array of meshes to intersect
+            const interactableMeshes = nodes.map(n => n.mesh);
+            // If stork is loaded, we need to intersect its children
+            if (window.__3D_STATE__.storkLoaded) {
+                interactableMeshes[0] = nodes[0].mesh.children[0] || nodes[0].mesh; 
+            }
+
+            const intersects = raycaster.intersectObjects(interactableMeshes, true);
+            
+            if (intersects.length > 0) {
+                // Find which node this mesh belongs to
+                let hitMesh = intersects[0].object;
+                // Traverse up to find the root node mesh if it's part of a GLTF
+                while (hitMesh.parent && hitMesh.parent.type !== 'Scene' && !nodes.find(n => n.mesh === hitMesh)) {
+                    hitMesh = hitMesh.parent;
+                }
+
+                const selectedNode = nodes.find(n => n.mesh === hitMesh || (n.isStork && n.mesh.contains(intersects[0].object)));
+                
+                if (selectedNode) {
+                    window.__3D_STATE__.selectedNodeIndex = selectedNode.index;
+                    selectionIndicator.visible = true;
+                }
+            } else {
+                window.__3D_STATE__.selectedNodeIndex = -1;
+                selectionIndicator.visible = false;
+            }
+        });
+
+        function applyHighlight() {
+            const hlCluster = window.__3D_STATE__.highlightedCluster - 1; // -1 means none, 0,1,2 are clusters
+            
+            nodes.forEach(n => {
+                const isHighlighted = hlCluster === -1 || n.cluster === hlCluster;
+                
+                if (n.isStork) {
+                    n.mesh.traverse((child) => {
+                        if (child.isMesh && child.userData.originalMaterial) {
+                            if (isHighlighted) {
+                                child.material = child.userData.originalMaterial;
+                                if (hlCluster !== -1) {
+                                    child.material = child.material.clone();
+                                    child.material.emissive.setHex(clusterColors[n.cluster]);
+                                    child.material.emissiveIntensity = 0.5;
+                                }
+                            } else {
+                                child.material = child.userData.originalMaterial.clone();
+                                child.material.transparent = true;
+                                child.material.opacity = 0.2;
+                                child.material.emissive.setHex(0x000000);
+                            }
+                        }
+                    });
+                } else {
+                    if (isHighlighted) {
+                        n.mesh.material.opacity = 1;
+                        n.mesh.material.transparent = false;
+                        if (hlCluster !== -1) {
+                            n.mesh.material.emissive.setHex(clusterColors[n.cluster]);
+                            n.mesh.material.emissiveIntensity = 0.5;
+                        } else {
+                            n.mesh.material.emissive.setHex(0x000000);
+                        }
+                    } else {
+                        n.mesh.material.transparent = true;
+                        n.mesh.material.opacity = 0.2;
+                        n.mesh.material.emissive.setHex(0x000000);
+                    }
+                }
+            });
+
+            edges.forEach(e => {
+                const sourceHL = hlCluster === -1 || e.source.cluster === hlCluster;
+                const targetHL = hlCluster === -1 || e.target.cluster === hlCluster;
+                if (hlCluster === -1) {
+                    e.line.material.opacity = 0.6;
+                } else if (sourceHL && targetHL) {
+                    e.line.material.opacity = 1.0;
+                } else {
+                    e.line.material.opacity = 0.1;
+                }
+            });
+        }
+
+        document.getElementById('select-highlight').addEventListener('change', (e) => {
+            window.__3D_STATE__.highlightedCluster = parseInt(e.target.value);
+            applyHighlight();
+        });
+
+        // --- PHYSICS SIMULATION ---
+        const REPULSION_COEFF = 50;
+        const SPRING_REST = 5;
+        const SPRING_K = 0.05;
+        const GRAVITY = 0.01;
+        const DAMPING = 0.95;
+
+        function updatePhysics() {
+            if (!window.__3D_STATE__.simulationRunning) return;
+
+            // Calculate Centroids
+            const centroids = [new THREE.Vector3(), new THREE.Vector3(), new THREE.Vector3()];
+            const counts = [0, 0, 0];
+            nodes.forEach(n => {
+                centroids[n.cluster].add(n.mesh.position);
+                counts[n.cluster]++;
+            });
+            centroids.forEach((c, i) => {
+                if (counts[i] > 0) c.divideScalar(counts[i]);
+                window.__3D_STATE__.clusterCentroids[i] = {x: c.x, y: c.y, z: c.z};
+            });
+
+            let totalKE = 0;
+            let totalVel = 0;
+            let hasNaN = false;
+
+            // Calculate Forces
+            for (let i = 0; i < nodes.length; i++) {
+                const n1 = nodes[i];
+                const force = new THREE.Vector3();
+
+                // Repulsion
+                for (let j = 0; j < nodes.length; j++) {
+                    if (i === j) continue;
+                    const n2 = nodes[j];
+                    const delta = new THREE.Vector3().subVectors(n1.mesh.position, n2.mesh.position);
+                    let distSq = delta.lengthSq();
+                    if (distSq < 0.1) distSq = 0.1; // Prevent singularity
+                    const fMag = REPULSION_COEFF / distSq;
+                    force.add(delta.normalize().multiplyScalar(fMag));
+                }
+
+                // Cluster Gravity
+                const toCentroid = new THREE.Vector3().subVectors(centroids[n1.cluster], n1.mesh.position);
+                force.add(toCentroid.multiplyScalar(GRAVITY));
+
+                n1.velocity.add(force);
+            }
+
+            // Attraction (Springs)
+            edges.forEach(edge => {
+                const delta = new THREE.Vector3().subVectors(edge.target.mesh.position, edge.source.mesh.position);
+                const dist = delta.length();
+                const fMag = (dist - SPRING_REST) * SPRING_K;
+                const f = delta.normalize().multiplyScalar(fMag);
+                
+                edge.source.velocity.add(f);
+                edge.target.velocity.sub(f);
+            });
+
+            // Apply Velocity & Damping
+            nodes.forEach(n => {
+                n.velocity.multiplyScalar(DAMPING);
+                
+                // Cap velocity to prevent explosions
+                if (n.velocity.length() > 5) n.velocity.setLength(5);
+
+                n.mesh.position.add(n.velocity);
+                
+                const vSq = n.velocity.lengthSq();
+                totalKE += 0.5 * vSq;
+                totalVel += Math.sqrt(vSq);
+
+                if (isNaN(n.mesh.position.x)) hasNaN = true;
+            });
+
+            // Update Edge Geometries
+            edges.forEach(edge => {
+                const positions = edge.line.geometry.attributes.position.array;
+                positions[0] = edge.source.mesh.position.x;
+                positions[1] = edge.source.mesh.position.y;
+                positions[2] = edge.source.mesh.position.z;
+                positions[3] = edge.target.mesh.position.x;
+                positions[4] = edge.target.mesh.position.y;
+                positions[5] = edge.target.mesh.position.z;
+                edge.line.geometry.attributes.position.needsUpdate = true;
+            });
+
+            window.__3D_STATE__.iterationCount++;
+            window.__3D_STATE__.kineticEnergy = totalKE;
+            window.__3D_STATE__.averageVelocity = totalVel / nodes.length;
+            window.__3D_STATE__.nodesHaveNaN = hasNaN;
+        }
+
+        // --- UI & INTERACTION ---
+        function toggleSimulation() {
+            window.__3D_STATE__.simulationRunning = !window.__3D_STATE__.simulationRunning;
+        }
+
+        function toggleDebug() {
+            window.__3D_STATE__.debugOverlayVisible = !window.__3D_STATE__.debugOverlayVisible;
+            debugGroup.visible = window.__3D_STATE__.debugOverlayVisible;
+        }
+
+        function resetSimulation() {
+            nodes.forEach(n => {
+                n.mesh.position.set(
+                    (Math.random() - 0.5) * 40 + clusterBiases[n.cluster].x,
+                    (Math.random() - 0.5) * 40 + clusterBiases[n.cluster].y,
+                    (Math.random() - 0.5) * 40 + clusterBiases[n.cluster].z
+                );
+                n.velocity.set(0, 0, 0);
+            });
+            window.__3D_STATE__.iterationCount = 0;
+            window.__3D_STATE__.simulationRunning = true;
+        }
+
+        document.getElementById('btn-pause').addEventListener('click', toggleSimulation);
+        document.getElementById('btn-reset').addEventListener('click', resetSimulation);
+
+        window.addEventListener('keydown', (e) => {
+            if (e.code === 'Space') {
+                toggleSimulation();
+                e.preventDefault();
+            }
+            if (e.code === 'KeyD') toggleDebug();
+            if (e.code === 'KeyR') resetSimulation();
+        });
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        function updateHUD() {
+            document.getElementById('hud-nodes').innerText = `Nodes: ${window.__3D_STATE__.nodeCount}`;
+            document.getElementById('hud-edges').innerText = `Edges: ${window.__3D_STATE__.edgeCount}`;
+            document.getElementById('hud-iter').innerText = `Iteration: ${window.__3D_STATE__.iterationCount}`;
+            document.getElementById('hud-ke').innerText = `Kinetic Energy: ${window.__3D_STATE__.kineticEnergy.toFixed(2)}`;
+            document.getElementById('hud-debug').innerText = `Debug: ${window.__3D_STATE__.debugOverlayVisible ? 'ON' : 'OFF'}`;
+            document.getElementById('hud-sim').innerText = `Simulation: ${window.__3D_STATE__.simulationRunning ? 'RUNNING' : 'PAUSED'}`;
+        }
+
+        function updateDebugVisuals() {
+            if (!window.__3D_STATE__.debugOverlayVisible) return;
+
+            clusterBoxes.forEach(b => b.makeEmpty());
+            nodes.forEach((n, i) => {
+                clusterBoxes[n.cluster].expandByPoint(n.mesh.position);
+                
+                const speed = n.velocity.length();
+                if (speed > 0.01) {
+                    arrowHelpers[i].setDirection(n.velocity.clone().normalize());
+                    arrowHelpers[i].setLength(speed * 10); // Scale for visibility
+                    arrowHelpers[i].position.copy(n.mesh.position);
+                    arrowHelpers[i].visible = true;
+                } else {
+                    arrowHelpers[i].visible = false;
+                }
+            });
+        }
+
+        // --- MAIN LOOP ---
+        const clock = new THREE.Clock();
+
+        function animate() {
+            requestAnimationFrame(animate);
+            
+            const delta = clock.getDelta();
+
+            updatePhysics();
+            updateDebugVisuals();
+            updateHUD();
+
+            if (window.__3D_STATE__.selectedNodeIndex !== -1) {
+                const selectedNode = nodes[window.__3D_STATE__.selectedNodeIndex];
+                selectionIndicator.position.copy(selectedNode.mesh.position);
+                // If it's the stork, make indicator a bit larger
+                selectionIndicator.scale.setScalar(selectedNode.isStork ? 2.5 : 1);
+            }
+
+            // Rotate stork slightly if loaded
+            if (window.__3D_STATE__.storkLoaded && nodes[0].isStork) {
+                // Orient stork towards its velocity vector if moving, else gentle rotation
+                if (nodes[0].velocity.lengthSq() > 0.001) {
+                    const targetPos = nodes[0].mesh.position.clone().add(nodes[0].velocity);
+                    nodes[0].mesh.lookAt(targetPos);
+                }
+            }
+
+            controls.update();
+            renderer.render(scene, camera);
+        }
+
+        animate();
+    </script>
+</body>
+</html>

@@ -1,0 +1,428 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Mesh Deformation Tool</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #222;
+            font-family: sans-serif;
+            color: #fff;
+        }
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+        }
+        #ui-layer {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+            display: flex;
+            justify-content: space-between;
+            padding: 20px;
+            box-sizing: border-box;
+        }
+        .panel {
+            background: rgba(0, 0, 0, 0.6);
+            padding: 15px;
+            border-radius: 8px;
+            pointer-events: auto;
+            backdrop-filter: blur(4px);
+        }
+        #hud {
+            align-self: flex-start;
+            font-size: 14px;
+            line-height: 1.6;
+        }
+        #controls {
+            align-self: flex-start;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            width: 250px;
+        }
+        .control-group {
+            display: flex;
+            flex-direction: column;
+            gap: 5px;
+        }
+        .control-group label {
+            display: flex;
+            justify-content: space-between;
+            font-size: 12px;
+        }
+        input[type="range"] {
+            width: 100%;
+        }
+        .btn-group {
+            display: flex;
+            gap: 10px;
+            margin-top: 10px;
+        }
+        button {
+            flex: 1;
+            padding: 8px;
+            background: #444;
+            color: white;
+            border: 1px solid #666;
+            border-radius: 4px;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        button:hover {
+            background: #555;
+        }
+        button:active {
+            background: #333;
+        }
+        #loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            font-size: 24px;
+            pointer-events: none;
+        }
+    </style>
+    <script type="importmap">
+    { "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+    } }
+    </script>
+</head>
+<body>
+    <div id="canvas-container"></div>
+    <div id="loading">Loading Model...</div>
+    <div id="ui-layer">
+        <div id="hud" class="panel">
+            <div>Deform Count: <span id="deformCount">0</span></div>
+            <div>Brush Size: <span id="brushValue">0.15</span></div>
+            <div>Undo Stack: <span id="undoSize">0</span></div>
+            <div style="margin-top: 10px; font-size: 12px; color: #aaa;">
+                Left Click + Drag: Pull<br>
+                Shift + Left Click + Drag: Push
+            </div>
+        </div>
+        <div id="controls" class="panel">
+            <div class="control-group">
+                <label><span>Brush Size</span> <span id="brushSizeLabel">0.15</span></label>
+                <input type="range" id="brushSize" min="0.05" max="0.5" step="0.01" value="0.15">
+            </div>
+            <div class="control-group">
+                <label><span>Strength</span> <span id="strengthLabel">0.03</span></label>
+                <input type="range" id="strength" min="0.01" max="0.1" step="0.001" value="0.03">
+            </div>
+            <div class="btn-group">
+                <button id="undoBtn">Undo</button>
+                <button id="resetBtn">Reset</button>
+            </div>
+        </div>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        // --- State Management ---
+        window.__3D_STATE__ = {
+            modelLoaded: false,
+            deformCount: 0,
+            brushSize: 0.15,
+            strength: 0.03,
+            undoStackSize: 0,
+            vertexCount: 0
+        };
+
+        // --- Scene Setup ---
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+        camera.position.set(0, 0, 4);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        container.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.05;
+
+        // Lights
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+        scene.add(ambientLight);
+        const dirLight = new THREE.DirectionalLight(0xffffff, 1.5);
+        dirLight.position.set(5, 5, 5);
+        scene.add(dirLight);
+        const dirLight2 = new THREE.DirectionalLight(0xffffff, 0.8);
+        dirLight2.position.set(-5, -5, -5);
+        scene.add(dirLight2);
+
+        // --- Brush Visualizer ---
+        const brushGeo = new THREE.RingGeometry(0.9, 1, 32);
+        brushGeo.translate(0, 0, 0.01); // slight offset to prevent z-fighting
+        const brushMat = new THREE.MeshBasicMaterial({ 
+            color: 0x00aaff, 
+            side: THREE.DoubleSide, 
+            transparent: true, 
+            opacity: 0.8,
+            depthTest: false
+        });
+        const brushMesh = new THREE.Mesh(brushGeo, brushMat);
+        brushMesh.visible = false;
+        scene.add(brushMesh);
+
+        // --- Variables ---
+        let targetMeshes = [];
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+        let isDragging = false;
+        let isShiftDown = false;
+        let hasDeformedInStroke = false;
+
+        // --- History System ---
+        class History {
+            constructor() {
+                this.stack = [];
+                this.maxSize = 20;
+                this.originalState = null;
+            }
+            init(meshes) {
+                this.meshes = meshes;
+                this.originalState = this.captureState();
+            }
+            captureState() {
+                return this.meshes.map(m => m.geometry.attributes.position.array.slice());
+            }
+            save() {
+                this.stack.push(this.captureState());
+                if (this.stack.length > this.maxSize) {
+                    this.stack.shift();
+                }
+                window.__3D_STATE__.undoStackSize = this.stack.length;
+            }
+            undo() {
+                if (this.stack.length === 0) return;
+                const state = this.stack.pop();
+                this.applyState(state);
+                window.__3D_STATE__.undoStackSize = this.stack.length;
+            }
+            reset() {
+                if (!this.originalState) return;
+                this.applyState(this.originalState);
+                this.stack = [];
+                window.__3D_STATE__.undoStackSize = 0;
+            }
+            applyState(state) {
+                this.meshes.forEach((m, i) => {
+                    m.geometry.attributes.position.array.set(state[i]);
+                    m.geometry.attributes.position.needsUpdate = true;
+                    m.geometry.computeVertexNormals();
+                });
+            }
+        }
+        const history = new History();
+
+        // --- Load Model ---
+        const loader = new GLTFLoader();
+        loader.load('assets/Corset.glb', (gltf) => {
+            const model = gltf.scene;
+            
+            // Center and Scale
+            const box = new THREE.Box3().setFromObject(model);
+            const center = box.getCenter(new THREE.Vector3());
+            const size = box.getSize(new THREE.Vector3());
+            const maxDim = Math.max(size.x, size.y, size.z);
+            const scale = 2 / maxDim;
+            
+            model.position.sub(center).multiplyScalar(scale);
+            model.scale.setScalar(scale);
+
+            let vertexCount = 0;
+            model.traverse((child) => {
+                if (child.isMesh) {
+                    child.geometry.attributes.position.setUsage(THREE.DynamicDrawUsage);
+                    if (!child.geometry.attributes.normal) {
+                        child.geometry.computeVertexNormals();
+                    }
+                    targetMeshes.push(child);
+                    vertexCount += child.geometry.attributes.position.count;
+                }
+            });
+
+            scene.add(model);
+            history.init(targetMeshes);
+            
+            window.__3D_STATE__.modelLoaded = true;
+            window.__3D_STATE__.vertexCount = vertexCount;
+            document.getElementById('loading').style.display = 'none';
+        }, undefined, (error) => {
+            console.error('Error loading model:', error);
+            document.getElementById('loading').innerText = 'Failed to load model.';
+        });
+
+        // --- Interaction Logic ---
+        function updateMouse(event) {
+            const rect = renderer.domElement.getBoundingClientRect();
+            mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+            mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+        }
+
+        const vPos = new THREE.Vector3();
+        const vNorm = new THREE.Vector3();
+        const scaleVec = new THREE.Vector3();
+
+        function applyDeformation(intersect) {
+            const mesh = intersect.object;
+            const geometry = mesh.geometry;
+            const positions = geometry.attributes.position;
+            const normals = geometry.attributes.normal;
+
+            // Convert intersect point to local space
+            const localPt = mesh.worldToLocal(intersect.point.clone());
+            
+            // Get global scale to adjust brush radius and strength
+            mesh.getWorldScale(scaleVec);
+            const localBrushRadius = window.__3D_STATE__.brushSize / scaleVec.x;
+            const localStrength = window.__3D_STATE__.strength / scaleVec.x;
+
+            let deformed = false;
+            const dir = isShiftDown ? -1 : 1;
+
+            for (let i = 0; i < positions.count; i++) {
+                vPos.fromBufferAttribute(positions, i);
+                const dist = vPos.distanceTo(localPt);
+
+                if (dist < localBrushRadius) {
+                    // Gaussian falloff: exp(-(x^2)/(2*c^2)), c = radius/3
+                    const c = localBrushRadius / 3;
+                    const weight = Math.exp(-(dist * dist) / (2 * c * c));
+                    
+                    vNorm.fromBufferAttribute(normals, i);
+                    vPos.addScaledVector(vNorm, weight * localStrength * dir);
+                    positions.setXYZ(i, vPos.x, vPos.y, vPos.z);
+                    deformed = true;
+                }
+            }
+
+            if (deformed) {
+                positions.needsUpdate = true;
+                hasDeformedInStroke = true;
+            }
+        }
+
+        // Events
+        window.addEventListener('keydown', (e) => { if (e.key === 'Shift') isShiftDown = true; });
+        window.addEventListener('keyup', (e) => { if (e.key === 'Shift') isShiftDown = false; });
+
+        renderer.domElement.addEventListener('pointerdown', (e) => {
+            if (e.button !== 0 || !window.__3D_STATE__.modelLoaded) return;
+            updateMouse(e);
+            raycaster.setFromCamera(mouse, camera);
+            const intersects = raycaster.intersectObjects(targetMeshes);
+            
+            if (intersects.length > 0) {
+                isDragging = true;
+                controls.enabled = false;
+                hasDeformedInStroke = false;
+                history.save();
+                applyDeformation(intersects[0]);
+            }
+        });
+
+        renderer.domElement.addEventListener('pointermove', (e) => {
+            if (!window.__3D_STATE__.modelLoaded) return;
+            updateMouse(e);
+            raycaster.setFromCamera(mouse, camera);
+            const intersects = raycaster.intersectObjects(targetMeshes);
+
+            if (intersects.length > 0) {
+                const hit = intersects[0];
+                brushMesh.position.copy(hit.point);
+                brushMesh.lookAt(hit.point.clone().add(hit.face.normal));
+                brushMesh.scale.setScalar(window.__3D_STATE__.brushSize);
+                brushMesh.visible = true;
+
+                if (isDragging) {
+                    applyDeformation(hit);
+                }
+            } else {
+                brushMesh.visible = false;
+            }
+        });
+
+        const endStroke = () => {
+            if (isDragging) {
+                isDragging = false;
+                controls.enabled = true;
+                if (hasDeformedInStroke) {
+                    window.__3D_STATE__.deformCount++;
+                    targetMeshes.forEach(m => m.geometry.computeVertexNormals());
+                } else {
+                    // If clicked but didn't deform anything, pop the saved state
+                    history.stack.pop();
+                    window.__3D_STATE__.undoStackSize = history.stack.length;
+                }
+            }
+        };
+
+        renderer.domElement.addEventListener('pointerup', endStroke);
+        renderer.domElement.addEventListener('pointerleave', endStroke);
+
+        // --- UI Listeners ---
+        const brushInput = document.getElementById('brushSize');
+        const strengthInput = document.getElementById('strength');
+        const brushLabel = document.getElementById('brushSizeLabel');
+        const strengthLabel = document.getElementById('strengthLabel');
+        const hudBrush = document.getElementById('brushValue');
+
+        brushInput.addEventListener('input', (e) => {
+            const val = parseFloat(e.target.value);
+            window.__3D_STATE__.brushSize = val;
+            brushLabel.innerText = val.toFixed(2);
+            hudBrush.innerText = val.toFixed(2);
+            brushMesh.scale.setScalar(val);
+        });
+
+        strengthInput.addEventListener('input', (e) => {
+            const val = parseFloat(e.target.value);
+            window.__3D_STATE__.strength = val;
+            strengthLabel.innerText = val.toFixed(3);
+        });
+
+        document.getElementById('undoBtn').addEventListener('click', () => history.undo());
+        document.getElementById('resetBtn').addEventListener('click', () => history.reset());
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // --- Render Loop ---
+        const hudDeformCount = document.getElementById('deformCount');
+        const hudUndoSize = document.getElementById('undoSize');
+
+        function animate() {
+            requestAnimationFrame(animate);
+            controls.update();
+            
+            // Update HUD
+            hudDeformCount.innerText = window.__3D_STATE__.deformCount;
+            hudUndoSize.innerText = window.__3D_STATE__.undoStackSize;
+
+            renderer.render(scene, camera);
+        }
+        animate();
+    </script>
+</body>
+</html>

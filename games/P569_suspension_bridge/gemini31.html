@@ -1,0 +1,660 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Suspension Bridge Physics Simulation</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #000;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+        }
+        #ui-container {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            width: 320px;
+            pointer-events: none;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+        .panel {
+            background: rgba(20, 25, 30, 0.85);
+            color: #eee;
+            padding: 15px;
+            border-radius: 8px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            pointer-events: auto;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+        }
+        h2 {
+            margin: 0 0 10px 0;
+            font-size: 16px;
+            color: #fff;
+            border-bottom: 1px solid rgba(255,255,255,0.2);
+            padding-bottom: 5px;
+        }
+        .control-group {
+            margin-bottom: 10px;
+        }
+        .control-group label {
+            display: flex;
+            justify-content: space-between;
+            font-size: 12px;
+            margin-bottom: 4px;
+        }
+        input[type=range] {
+            width: 100%;
+            cursor: pointer;
+        }
+        .hud-line {
+            display: flex;
+            justify-content: space-between;
+            font-size: 13px;
+            margin-bottom: 4px;
+            font-family: monospace;
+        }
+        .hud-value {
+            color: #4da6ff;
+            font-weight: bold;
+        }
+        .instructions {
+            font-size: 11px;
+            color: #aaa;
+            margin-top: 10px;
+            line-height: 1.4;
+        }
+        .key {
+            background: #333;
+            padding: 2px 5px;
+            border-radius: 3px;
+            color: #fff;
+            font-family: monospace;
+        }
+    </style>
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+            "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+        }
+    }
+    </script>
+</head>
+<body>
+    <div id="canvas-container"></div>
+    
+    <div id="ui-container">
+        <div class="panel" id="controls">
+            <h2>Controls</h2>
+            <div class="control-group">
+                <label><span>Vehicle Speed</span> <span id="val-speed">2.0 m/s</span></label>
+                <input type="range" id="slider-speed" min="0" max="5" step="0.1" value="2">
+            </div>
+            <div class="control-group">
+                <label><span>Vehicle Mass</span> <span id="val-mass">5.0 kg</span></label>
+                <input type="range" id="slider-mass" min="1" max="20" step="0.5" value="5">
+            </div>
+            <div class="control-group">
+                <label><span>Wind Strength</span> <span id="val-wind">0.0</span></label>
+                <input type="range" id="slider-wind" min="0" max="3" step="0.1" value="0">
+            </div>
+            <div class="instructions">
+                <span class="key">Space</span> Pause/Resume<br>
+                <span class="key">R</span> Reset Bridge<br>
+                <span class="key">V</span> Toggle Vehicle
+            </div>
+        </div>
+
+        <div class="panel" id="hud">
+            <h2>Telemetry</h2>
+            <div class="hud-line">Vehicle X: <span class="hud-value" id="hud-vehicle-x">-20.0</span></div>
+            <div class="hud-line">Max Stress: <span class="hud-value" id="hud-max-stress">0.000</span></div>
+            <div class="hud-line">Max Deflection: <span class="hud-value" id="hud-max-deflection">0.00</span></div>
+            <div class="hud-line">Avg Cable Tension: <span class="hud-value" id="hud-cable-tension">0.0 N</span></div>
+            <div class="hud-line">Wind Strength: <span class="hud-value" id="hud-wind">0.0</span></div>
+            <div class="hud-line">Sim Time: <span class="hud-value" id="hud-sim-time">0.0 s</span></div>
+        </div>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+        // --- Global State ---
+        window.__3D_STATE__ = {
+            frameCount: 0,
+            vehicleX: -20,
+            vehicleSpeed: 2,
+            vehicleMass: 5,
+            maxStress: 0,
+            maxDeflection: 0,
+            avgCableTension: 0,
+            windStrength: 0,
+            deckNodeCount: 40,
+            midDeckY: 0,
+            isPaused: false,
+            simTime: 0
+        };
+
+        // --- Scene Setup ---
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        
+        // Overcast sky gradient using a large sphere and custom shader
+        const skyGeo = new THREE.SphereGeometry(200, 32, 15);
+        const skyMat = new THREE.ShaderMaterial({
+            vertexShader: `
+                varying vec3 vWorldPosition;
+                void main() {
+                    vec4 worldPosition = modelMatrix * vec4(position, 1.0);
+                    vWorldPosition = worldPosition.xyz;
+                    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+                }
+            `,
+            fragmentShader: `
+                uniform vec3 topColor;
+                uniform vec3 bottomColor;
+                varying vec3 vWorldPosition;
+                void main() {
+                    float h = normalize(vWorldPosition).y;
+                    gl_FragColor = vec4(mix(bottomColor, topColor, max(h, 0.0)), 1.0);
+                }
+            `,
+            uniforms: {
+                topColor: { value: new THREE.Color(0xB0C4DE) },
+                bottomColor: { value: new THREE.Color(0xF0F0F0) }
+            },
+            side: THREE.BackSide
+        });
+        const sky = new THREE.Mesh(skyGeo, skyMat);
+        scene.add(sky);
+
+        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.set(0, 15, 40);
+        camera.lookAt(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        container.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.05;
+        controls.target.set(0, 0, 0);
+
+        // Lights
+        const hemiLight = new THREE.HemisphereLight(0x87CEEB, 0x8B4513, 0.6);
+        scene.add(hemiLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+        dirLight.position.set(10, 30, 20);
+        dirLight.castShadow = true;
+        dirLight.shadow.camera.top = 25;
+        dirLight.shadow.camera.bottom = -25;
+        dirLight.shadow.camera.left = -25;
+        dirLight.shadow.camera.right = 25;
+        dirLight.shadow.mapSize.width = 2048;
+        dirLight.shadow.mapSize.height = 2048;
+        scene.add(dirLight);
+
+        // Water
+        const waterGeo = new THREE.PlaneGeometry(200, 200);
+        const waterMat = new THREE.MeshStandardMaterial({ 
+            color: 0x1ca3ec, 
+            transparent: true, 
+            opacity: 0.6,
+            roughness: 0.1,
+            metalness: 0.1
+        });
+        const water = new THREE.Mesh(waterGeo, waterMat);
+        water.rotation.x = -Math.PI / 2;
+        water.position.y = -5;
+        water.receiveShadow = true;
+        scene.add(water);
+
+        // Towers
+        const towerMat = new THREE.MeshStandardMaterial({ color: 0x888888, roughness: 0.7 });
+        function createTower(x) {
+            const group = new THREE.Group();
+            const pillarGeo = new THREE.BoxGeometry(1, 30, 1);
+            
+            const p1 = new THREE.Mesh(pillarGeo, towerMat);
+            p1.position.set(0, 10, -1.5);
+            p1.castShadow = true;
+            p1.receiveShadow = true;
+            
+            const p2 = new THREE.Mesh(pillarGeo, towerMat);
+            p2.position.set(0, 10, 1.5);
+            p2.castShadow = true;
+            p2.receiveShadow = true;
+            
+            const crossGeo = new THREE.BoxGeometry(1.2, 1, 4);
+            const cross = new THREE.Mesh(crossGeo, towerMat);
+            cross.position.set(0, 24.5, 0);
+            cross.castShadow = true;
+            cross.receiveShadow = true;
+
+            group.add(p1, p2, cross);
+            group.position.x = x;
+            scene.add(group);
+        }
+        createTower(-20);
+        createTower(20);
+
+        // --- Physics Model ---
+        const N = window.__3D_STATE__.deckNodeCount;
+        const span = 40;
+        const spacing = span / (N - 1);
+        const g = 9.81;
+        
+        class Node {
+            constructor(x, y, z, mass, pinned) {
+                this.pos = new THREE.Vector3(x, y, z);
+                this.initPos = this.pos.clone();
+                this.vel = new THREE.Vector3();
+                this.force = new THREE.Vector3();
+                this.mass = mass;
+                this.pinned = pinned;
+            }
+        }
+
+        class Spring {
+            constructor(n1, n2, k, type) {
+                this.n1 = n1;
+                this.n2 = n2;
+                this.k = k;
+                this.restLen = n1.pos.distanceTo(n2.pos);
+                this.type = type; // 'deck', 'cable', 'hanger'
+                this.currentStrain = 0;
+                this.currentTension = 0;
+            }
+        }
+
+        let nodes = [];
+        let springs = [];
+        let deckNodes = [];
+        let cableLNodes = [];
+        let cableRNodes = [];
+
+        function initPhysics() {
+            nodes = [];
+            springs = [];
+            deckNodes = [];
+            cableLNodes = [];
+            cableRNodes = [];
+
+            // Create Nodes
+            for (let i = 0; i < N; i++) {
+                const x = -20 + i * spacing;
+                const isEnd = (i === 0 || i === N - 1);
+                
+                // Deck node
+                const dNode = new Node(x, 0, 0, 0.5, isEnd);
+                deckNodes.push(dNode);
+                nodes.push(dNode);
+
+                // Cable nodes (Parabola: y = 15 * (x/20)^2 + 5)
+                const cableY = 15 * Math.pow(x / 20, 2) + 5;
+                
+                const cLNode = new Node(x, cableY, -1.5, 0.5, isEnd);
+                cableLNodes.push(cLNode);
+                nodes.push(cLNode);
+
+                const cRNode = new Node(x, cableY, 1.5, 0.5, isEnd);
+                cableRNodes.push(cRNode);
+                nodes.push(cRNode);
+            }
+
+            // Create Springs
+            for (let i = 0; i < N; i++) {
+                // Hangers
+                springs.push(new Spring(cableLNodes[i], deckNodes[i], 200, 'hanger'));
+                springs.push(new Spring(cableRNodes[i], deckNodes[i], 200, 'hanger'));
+
+                if (i < N - 1) {
+                    // Deck segments
+                    springs.push(new Spring(deckNodes[i], deckNodes[i+1], 500, 'deck'));
+                    // Cable segments
+                    springs.push(new Spring(cableLNodes[i], cableLNodes[i+1], 1000, 'cable'));
+                    springs.push(new Spring(cableRNodes[i], cableRNodes[i+1], 1000, 'cable'));
+                }
+            }
+        }
+        initPhysics();
+
+        // --- Visualization ---
+        const deckMeshes = [];
+        const deckGeo = new THREE.BoxGeometry(1, 1, 1);
+        // Move origin to left face for easier scaling/positioning
+        deckGeo.translate(0.5, 0, 0); 
+        
+        for (let i = 0; i < N - 1; i++) {
+            const mat = new THREE.MeshStandardMaterial({ color: 0x00ff00 });
+            const mesh = new THREE.Mesh(deckGeo, mat);
+            mesh.castShadow = true;
+            mesh.receiveShadow = true;
+            scene.add(mesh);
+            deckMeshes.push(mesh);
+        }
+
+        // Cables and Hangers using LineSegments for performance
+        const cableMat = new THREE.LineBasicMaterial({ color: 0x333333, linewidth: 3 }); // linewidth might be ignored by WebGL, but requested
+        const hangerMat = new THREE.LineBasicMaterial({ color: 0x666666, linewidth: 1 });
+
+        const cableGeo = new THREE.BufferGeometry();
+        const cableLines = new THREE.LineSegments(cableGeo, cableMat);
+        scene.add(cableLines);
+
+        const hangerGeo = new THREE.BufferGeometry();
+        const hangerLines = new THREE.LineSegments(hangerGeo, hangerMat);
+        scene.add(hangerLines);
+
+        function updateLinesGeometry() {
+            const cablePositions = [];
+            const hangerPositions = [];
+
+            for (let i = 0; i < N; i++) {
+                // Hangers
+                hangerPositions.push(
+                    cableLNodes[i].pos.x, cableLNodes[i].pos.y, cableLNodes[i].pos.z,
+                    deckNodes[i].pos.x, deckNodes[i].pos.y, deckNodes[i].pos.z,
+                    cableRNodes[i].pos.x, cableRNodes[i].pos.y, cableRNodes[i].pos.z,
+                    deckNodes[i].pos.x, deckNodes[i].pos.y, deckNodes[i].pos.z
+                );
+
+                // Cables
+                if (i < N - 1) {
+                    cablePositions.push(
+                        cableLNodes[i].pos.x, cableLNodes[i].pos.y, cableLNodes[i].pos.z,
+                        cableLNodes[i+1].pos.x, cableLNodes[i+1].pos.y, cableLNodes[i+1].pos.z,
+                        cableRNodes[i].pos.x, cableRNodes[i].pos.y, cableRNodes[i].pos.z,
+                        cableRNodes[i+1].pos.x, cableRNodes[i+1].pos.y, cableRNodes[i+1].pos.z
+                    );
+                }
+            }
+
+            cableGeo.setAttribute('position', new THREE.Float32BufferAttribute(cablePositions, 3));
+            hangerGeo.setAttribute('position', new THREE.Float32BufferAttribute(hangerPositions, 3));
+        }
+
+        function getStrainColor(strain) {
+            if (strain < 0.02) return 0x00ff00; // Green
+            if (strain < 0.05) return 0xffff00; // Yellow
+            if (strain < 0.10) return 0xffa500; // Orange
+            return 0xff0000; // Red
+        }
+
+        // --- Vehicle ---
+        const vehicleGroup = new THREE.Group();
+        scene.add(vehicleGroup);
+        
+        // Fallback box
+        const fallbackGeo = new THREE.BoxGeometry(3, 1.5, 1.5);
+        const fallbackMat = new THREE.MeshStandardMaterial({ color: 0xcc0000 });
+        const fallbackMesh = new THREE.Mesh(fallbackGeo, fallbackMat);
+        fallbackMesh.position.y = 0.75;
+        fallbackMesh.castShadow = true;
+        vehicleGroup.add(fallbackMesh);
+
+        // Load GLTF
+        const loader = new GLTFLoader();
+        loader.load('https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Models/master/2.0/CesiumMilkTruck/glTF-Binary/CesiumMilkTruck.glb', (gltf) => {
+            vehicleGroup.remove(fallbackMesh);
+            const model = gltf.scene;
+            
+            // Scale to ~3 units
+            const box = new THREE.Box3().setFromObject(model);
+            const size = box.getSize(new THREE.Vector3());
+            const scale = 3 / size.x;
+            model.scale.set(scale, scale, scale);
+            
+            // Center and align
+            model.position.y = -box.min.y * scale;
+            
+            // The Cesium truck faces +X natively, so no rotation needed if we move along +X
+            // Let's verify by traversing and enabling shadows
+            model.traverse((child) => {
+                if (child.isMesh) {
+                    child.castShadow = true;
+                    child.receiveShadow = true;
+                }
+            });
+            
+            vehicleGroup.add(model);
+        }, undefined, (error) => {
+            console.error('Error loading vehicle model:', error);
+        });
+
+        // --- UI & Controls ---
+        const sliderSpeed = document.getElementById('slider-speed');
+        const sliderMass = document.getElementById('slider-mass');
+        const sliderWind = document.getElementById('slider-wind');
+        
+        sliderSpeed.addEventListener('input', (e) => {
+            window.__3D_STATE__.vehicleSpeed = parseFloat(e.target.value);
+            document.getElementById('val-speed').innerText = window.__3D_STATE__.vehicleSpeed.toFixed(1) + ' m/s';
+        });
+        
+        sliderMass.addEventListener('input', (e) => {
+            window.__3D_STATE__.vehicleMass = parseFloat(e.target.value);
+            document.getElementById('val-mass').innerText = window.__3D_STATE__.vehicleMass.toFixed(1) + ' kg';
+        });
+        
+        sliderWind.addEventListener('input', (e) => {
+            window.__3D_STATE__.windStrength = parseFloat(e.target.value);
+            document.getElementById('val-wind').innerText = window.__3D_STATE__.windStrength.toFixed(1);
+        });
+
+        window.addEventListener('keydown', (e) => {
+            if (e.code === 'Space') {
+                window.__3D_STATE__.isPaused = !window.__3D_STATE__.isPaused;
+            } else if (e.code === 'KeyR') {
+                // Reset
+                nodes.forEach(n => {
+                    n.pos.copy(n.initPos);
+                    n.vel.set(0,0,0);
+                });
+                window.__3D_STATE__.vehicleX = -20;
+                window.__3D_STATE__.simTime = 0;
+            } else if (e.code === 'KeyV') {
+                vehicleGroup.visible = !vehicleGroup.visible;
+            }
+        });
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // --- Physics Step ---
+        const dt = 0.005;
+        const substeps = 4;
+        const damping = 0.995;
+
+        function stepPhysics() {
+            const state = window.__3D_STATE__;
+            
+            for (let step = 0; step < substeps; step++) {
+                // 1. Clear forces
+                nodes.forEach(n => n.force.set(0, 0, 0));
+
+                // 2. Gravity & Wind
+                const time = state.simTime;
+                nodes.forEach((n, i) => {
+                    if (!n.pinned) {
+                        n.force.y -= n.mass * g;
+                        n.force.z += state.windStrength * Math.sin(time * 0.3 + i * 0.2);
+                    }
+                });
+
+                // 3. Vehicle Load
+                if (vehicleGroup.visible) {
+                    // Find nearest nodes
+                    let localX = state.vehicleX + 20;
+                    let index = Math.floor(localX / spacing);
+                    if (index >= 0 && index < N - 1) {
+                        let t = (localX - index * spacing) / spacing;
+                        let load = state.vehicleMass * g;
+                        
+                        // Distribute load
+                        deckNodes[index].force.y -= load * (1 - t);
+                        deckNodes[index + 1].force.y -= load * t;
+                    }
+                }
+
+                // 4. Springs
+                let totalCableTension = 0;
+                let cableSpringCount = 0;
+                let maxDeckStrain = 0;
+
+                springs.forEach(s => {
+                    const dir = new THREE.Vector3().subVectors(s.n2.pos, s.n1.pos);
+                    const len = dir.length();
+                    const strain = len - s.restLen;
+                    const strainRatio = Math.abs(strain) / s.restLen;
+
+                    if (s.type === 'hanger' && strain < 0) {
+                        s.currentTension = 0;
+                        return; // Tension only
+                    }
+
+                    const forceMag = s.k * strain;
+                    s.currentTension = Math.abs(forceMag);
+                    const fVec = dir.normalize().multiplyScalar(forceMag);
+
+                    if (!s.n1.pinned) s.n1.force.add(fVec);
+                    if (!s.n2.pinned) s.n2.force.sub(fVec);
+
+                    if (s.type === 'cable') {
+                        totalCableTension += s.currentTension;
+                        cableSpringCount++;
+                    } else if (s.type === 'deck') {
+                        s.currentStrain = strainRatio;
+                        if (strainRatio > maxDeckStrain) maxDeckStrain = strainRatio;
+                    }
+                });
+
+                state.avgCableTension = totalCableTension / cableSpringCount;
+                state.maxStress = maxDeckStrain;
+
+                // 5. Integrate
+                let maxDef = 0;
+                nodes.forEach(n => {
+                    if (!n.pinned) {
+                        n.vel.add(n.force.clone().multiplyScalar(dt / n.mass));
+                        n.vel.multiplyScalar(damping);
+                        n.pos.add(n.vel.clone().multiplyScalar(dt));
+                    }
+                    
+                    // Calculate deflection for deck nodes
+                    if (n.initPos.y === 0) {
+                        const def = n.initPos.y - n.pos.y;
+                        if (def > maxDef) maxDef = def;
+                    }
+                });
+                state.maxDeflection = maxDef;
+                state.midDeckY = deckNodes[Math.floor(N/2)].pos.y;
+                
+                state.simTime += dt;
+            }
+        }
+
+        // --- Main Loop ---
+        const clock = new THREE.Clock();
+
+        function animate() {
+            requestAnimationFrame(animate);
+            
+            const delta = clock.getDelta();
+            const state = window.__3D_STATE__;
+            state.frameCount++;
+
+            if (!state.isPaused) {
+                // Update Vehicle Position
+                if (vehicleGroup.visible) {
+                    state.vehicleX += state.vehicleSpeed * delta;
+                    if (state.vehicleX > 20) {
+                        state.vehicleX = -20;
+                    }
+                }
+
+                // Physics
+                stepPhysics();
+            }
+
+            // Update Visuals
+            // 1. Deck Meshes
+            let deckSpringIndex = 0;
+            for (let i = 0; i < N - 1; i++) {
+                const n1 = deckNodes[i];
+                const n2 = deckNodes[i+1];
+                const mesh = deckMeshes[i];
+                
+                const dist = n1.pos.distanceTo(n2.pos);
+                
+                mesh.position.copy(n1.pos);
+                mesh.lookAt(n2.pos);
+                
+                // Scale: length = dist, height = 0.2, width = 3
+                mesh.scale.set(dist, 0.2, 3);
+
+                // Find corresponding deck spring for color
+                const spring = springs.find(s => s.type === 'deck' && s.n1 === n1 && s.n2 === n2);
+                if (spring) {
+                    mesh.material.color.setHex(getStrainColor(spring.currentStrain));
+                }
+            }
+
+            // 2. Lines
+            updateLinesGeometry();
+
+            // 3. Vehicle Transform
+            if (vehicleGroup.visible) {
+                let localX = state.vehicleX + 20;
+                let index = Math.floor(localX / spacing);
+                if (index >= 0 && index < N - 1) {
+                    let t = (localX - index * spacing) / spacing;
+                    const p1 = deckNodes[index].pos;
+                    const p2 = deckNodes[index + 1].pos;
+                    
+                    // Interpolate position
+                    const pos = new THREE.Vector3().lerpVectors(p1, p2, t);
+                    vehicleGroup.position.copy(pos);
+                    
+                    // Calculate slope for rotation
+                    const dir = new THREE.Vector3().subVectors(p2, p1).normalize();
+                    // Create a target point slightly ahead
+                    const target = pos.clone().add(dir);
+                    vehicleGroup.lookAt(target);
+                }
+            }
+
+            // Update HUD
+            document.getElementById('hud-vehicle-x').innerText = state.vehicleX.toFixed(1);
+            document.getElementById('hud-max-stress').innerText = state.maxStress.toFixed(3);
+            document.getElementById('hud-max-deflection').innerText = state.maxDeflection.toFixed(2);
+            document.getElementById('hud-cable-tension').innerText = state.avgCableTension.toFixed(1) + ' N';
+            document.getElementById('hud-wind').innerText = state.windStrength.toFixed(1);
+            document.getElementById('hud-sim-time').innerText = state.simTime.toFixed(1) + ' s';
+
+            controls.update();
+            renderer.render(scene, camera);
+        }
+
+        animate();
+    </script>
+</body>
+</html>

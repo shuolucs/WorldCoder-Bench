@@ -1,0 +1,623 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3D Brain Connectivity Map</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { overflow: hidden; background: #0a0a1a; }
+canvas { display: block; }
+#hud {
+    position: fixed;
+    top: 15px;
+    left: 15px;
+    background: rgba(10, 10, 26, 0.85);
+    color: #e0e0ff;
+    font-family: 'Courier New', monospace;
+    font-size: 14px;
+    padding: 12px 18px;
+    border-radius: 8px;
+    border: 1px solid rgba(100, 120, 255, 0.3);
+    z-index: 100;
+    line-height: 1.6;
+    backdrop-filter: blur(5px);
+}
+#hud .label { color: #7788cc; }
+#hud .value { color: #ffffff; font-weight: bold; }
+#controls {
+    position: fixed;
+    bottom: 15px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: rgba(10, 10, 26, 0.85);
+    color: #9999bb;
+    font-family: 'Courier New', monospace;
+    font-size: 12px;
+    padding: 10px 20px;
+    border-radius: 8px;
+    border: 1px solid rgba(100, 120, 255, 0.2);
+    z-index: 100;
+    text-align: center;
+    backdrop-filter: blur(5px);
+    max-width: 90vw;
+}
+#controls span { color: #aabbff; font-weight: bold; }
+#loading {
+    position: fixed;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    color: #6677cc;
+    font-family: 'Courier New', monospace;
+    font-size: 18px;
+    z-index: 200;
+}
+</style>
+</head>
+<body>
+
+<div id="hud">
+    <div><span class="label">Nodes: </span><span class="value" id="hud-nodes">20/20</span> <span class="label">| Edges: </span><span class="value" id="hud-edges">30/30</span></div>
+    <div><span class="label">Selected: </span><span class="value" id="hud-selected">-1</span> <span class="label">| Group: </span><span class="value" id="hud-group">ALL</span></div>
+    <div><span class="label">Mode: </span><span class="value" id="hud-mode">uniform</span> <span class="label">| Rotation: </span><span class="value" id="hud-rotation">ON</span></div>
+    <div><span class="label">Pulse: </span><span class="value" id="hud-pulse">OFF</span> <span class="label">| Zoom: </span><span class="value" id="hud-zoom">1.0</span></div>
+</div>
+
+<div id="controls">
+    <span>Click</span> Select Node | <span>G</span> Cycle Group | <span>R</span> Toggle Rotation | <span>W</span> Weight Mode | <span>P</span> Pulse | <span>+/-</span> Zoom | <span>T</span> Toggle Model
+</div>
+
+<div id="loading">Loading Brain Model...</div>
+
+<script type="importmap">
+{
+    "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+    }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// State
+window.__3D_STATE__ = {
+    modelLoaded: false,
+    nodeCount: 20,
+    edgeCount: 30,
+    selectedNode: -1,
+    hoveredNode: -1,
+    activeGroup: -1,
+    connectionStrengthMode: 'uniform',
+    rotationEnabled: true,
+    rotationSpeed: 0.002,
+    currentRotationY: 0,
+    visibleNodes: 20,
+    visibleEdges: 30,
+    highlightedEdges: 0,
+    pulseActive: false,
+    modelOpacity: 0.3,
+    zoomLevel: 1.0
+};
+
+const state = window.__3D_STATE__;
+
+// Scene setup
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0a0a1a);
+scene.fog = new THREE.FogExp2(0x0a0a1a, 0.05);
+
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+camera.position.set(0, 3, 8);
+camera.lookAt(0, 0, 0);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.0;
+document.body.appendChild(renderer.domElement);
+
+// Lights
+const ambientLight = new THREE.AmbientLight(0x334466, 0.4);
+scene.add(ambientLight);
+
+const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+dirLight.position.set(5, 10, 5);
+scene.add(dirLight);
+
+// Add subtle point lights for atmosphere
+const pointLight1 = new THREE.PointLight(0x3366ff, 0.3, 20);
+pointLight1.position.set(-3, 2, 3);
+scene.add(pointLight1);
+
+const pointLight2 = new THREE.PointLight(0xff3366, 0.2, 20);
+pointLight2.position.set(3, -1, -3);
+scene.add(pointLight2);
+
+// Groups
+const brainGroup = new THREE.Group(); // nodes + edges
+scene.add(brainGroup);
+
+let modelGroup = null;
+const modelMaterials = [];
+
+// Node data
+const NODE_COUNT = 20;
+const GROUP_COLORS = [
+    new THREE.Color(0xff3333),
+    new THREE.Color(0x3366ff),
+    new THREE.Color(0x33ff66),
+    new THREE.Color(0xffcc33)
+];
+
+const nodes = [];
+const nodeMeshes = [];
+const nodePositions = [];
+const nodeGroups = [];
+
+// Calculate node positions
+for (let i = 0; i < NODE_COUNT; i++) {
+    const x = 2.5 * Math.cos(i * 0.314) * Math.sin(i * 0.5);
+    const y = 1.5 * Math.sin(i * 0.628);
+    const z = 2.0 * Math.cos(i * 0.5) * Math.cos(i * 0.314);
+    nodePositions.push(new THREE.Vector3(x, y, z));
+    nodeGroups.push(Math.floor(i / 5));
+}
+
+// Create node meshes
+const nodeGeometry = new THREE.SphereGeometry(0.15, 16, 16);
+
+for (let i = 0; i < NODE_COUNT; i++) {
+    const groupIdx = nodeGroups[i];
+    const color = GROUP_COLORS[groupIdx];
+
+    const material = new THREE.MeshPhongMaterial({
+        color: color,
+        emissive: color.clone().multiplyScalar(0.4),
+        transparent: true,
+        opacity: 0.9,
+        shininess: 80
+    });
+
+    const mesh = new THREE.Mesh(nodeGeometry, material);
+    mesh.position.copy(nodePositions[i]);
+    mesh.userData.nodeIndex = i;
+    mesh.userData.baseScale = 1.0;
+
+    // Add glow sprite
+    const spriteMaterial = new THREE.SpriteMaterial({
+        map: createGlowTexture(),
+        color: color,
+        transparent: true,
+        opacity: 0.4,
+        blending: THREE.AdditiveBlending
+    });
+    const sprite = new THREE.Sprite(spriteMaterial);
+    sprite.scale.set(0.6, 0.6, 1);
+    mesh.add(sprite);
+
+    brainGroup.add(mesh);
+    nodeMeshes.push(mesh);
+    nodes.push({ position: nodePositions[i], group: groupIdx, mesh: mesh });
+}
+
+// Create glow texture
+function createGlowTexture() {
+    const canvas = document.createElement('canvas');
+    canvas.width = 64;
+    canvas.height = 64;
+    const ctx = canvas.getContext('2d');
+    const gradient = ctx.createRadialGradient(32, 32, 0, 32, 32, 32);
+    gradient.addColorStop(0, 'rgba(255,255,255,1)');
+    gradient.addColorStop(0.3, 'rgba(255,255,255,0.5)');
+    gradient.addColorStop(1, 'rgba(255,255,255,0)');
+    ctx.fillStyle = gradient;
+    ctx.fillRect(0, 0, 64, 64);
+    const texture = new THREE.CanvasTexture(canvas);
+    return texture;
+}
+
+// Define connections
+const connections = [];
+for (let i = 0; i < NODE_COUNT; i++) {
+    connections.push([i, (i + 3) % 20]);
+}
+for (let i = 0; i < NODE_COUNT; i++) {
+    connections.push([i, (i + 7) % 20]);
+}
+for (let i = 0; i < 10; i++) {
+    connections.push([i, i + 10]);
+}
+// That gives us 20 + 20 + 10 = 50, but we need exactly 30
+// Let's redefine: first 20 from (i+3)%20, then 10 from i to i+10
+const edgeConnections = [];
+for (let i = 0; i < 20; i++) {
+    edgeConnections.push([i, (i + 3) % 20]);
+}
+for (let i = 0; i < 10; i++) {
+    edgeConnections.push([i, i + 10]);
+}
+// That's exactly 30
+
+const edges = [];
+const edgeLines = [];
+
+// Calculate max distance for weighted mode
+let maxDist = 0;
+for (const [a, b] of edgeConnections) {
+    const d = nodePositions[a].distanceTo(nodePositions[b]);
+    if (d > maxDist) maxDist = d;
+}
+
+for (const [a, b] of edgeConnections) {
+    const colorA = GROUP_COLORS[nodeGroups[a]];
+    const colorB = GROUP_COLORS[nodeGroups[b]];
+    const blendedColor = colorA.clone().lerp(colorB, 0.5);
+
+    const points = createCurvePoints(nodePositions[a], nodePositions[b]);
+    const geometry = new THREE.BufferGeometry().setFromPoints(points);
+
+    // Set vertex colors for gradient effect
+    const colors = [];
+    for (let t = 0; t < points.length; t++) {
+        const frac = t / (points.length - 1);
+        const c = colorA.clone().lerp(colorB, frac);
+        colors.push(c.r, c.g, c.b);
+    }
+    geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+
+    const material = new THREE.LineBasicMaterial({
+        vertexColors: true,
+        transparent: true,
+        opacity: 0.3,
+        blending: THREE.AdditiveBlending
+    });
+
+    const line = new THREE.Line(geometry, material);
+    line.userData.nodeA = a;
+    line.userData.nodeB = b;
+    line.userData.distance = nodePositions[a].distanceTo(nodePositions[b]);
+
+    brainGroup.add(line);
+    edgeLines.push(line);
+    edges.push({ a, b, line, distance: line.userData.distance });
+}
+
+function createCurvePoints(start, end, segments = 20) {
+    const mid = start.clone().add(end).multiplyScalar(0.5);
+    // Add slight curve outward from center
+    const dir = mid.clone().normalize();
+    mid.add(dir.multiplyScalar(0.3));
+
+    const curve = new THREE.QuadraticBezierCurve3(start, mid, end);
+    return curve.getPoints(segments);
+}
+
+// Load GLB model
+const loader = new GLTFLoader();
+loader.load(
+    'https://threejs.org/examples/models/gltf/LittlestTokyo.glb',
+    (gltf) => {
+        modelGroup = gltf.scene;
+
+        // Calculate bounding sphere and scale to fit within 3 units
+        const box = new THREE.Box3().setFromObject(modelGroup);
+        const sphere = new THREE.Sphere();
+        box.getBoundingSphere(sphere);
+        const scale = 3.0 / sphere.radius;
+        modelGroup.scale.setScalar(scale);
+
+        // Center the model
+        const center = sphere.center.multiplyScalar(scale);
+        modelGroup.position.sub(center);
+
+        // Make all materials transparent
+        modelGroup.traverse((child) => {
+            if (child.isMesh && child.material) {
+                const mats = Array.isArray(child.material) ? child.material : [child.material];
+                mats.forEach(mat => {
+                    mat.transparent = true;
+                    mat.opacity = state.modelOpacity;
+                    mat.depthWrite = false;
+                    modelMaterials.push(mat);
+                });
+            }
+        });
+
+        scene.add(modelGroup);
+        state.modelLoaded = true;
+        document.getElementById('loading').style.display = 'none';
+    },
+    (progress) => {
+        const pct = progress.total ? Math.round(progress.loaded / progress.total * 100) : '...';
+        document.getElementById('loading').textContent = `Loading Brain Model... ${pct}%`;
+    },
+    (error) => {
+        console.error('Error loading model:', error);
+        document.getElementById('loading').textContent = 'Model load failed - visualization continues';
+        setTimeout(() => {
+            document.getElementById('loading').style.display = 'none';
+        }, 2000);
+        state.modelLoaded = true; // Continue without model
+    }
+);
+
+// Raycaster
+const raycaster = new THREE.Raycaster();
+const mouse = new THREE.Vector2();
+
+// Mouse move handler
+renderer.domElement.addEventListener('mousemove', (event) => {
+    mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+    mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+    raycaster.setFromCamera(mouse, camera);
+    const intersects = raycaster.intersectObjects(nodeMeshes);
+
+    // Reset previous hover
+    if (state.hoveredNode >= 0 && state.hoveredNode !== state.selectedNode) {
+        const prevMesh = nodeMeshes[state.hoveredNode];
+        prevMesh.scale.setScalar(prevMesh.userData.baseScale);
+    }
+
+    if (intersects.length > 0) {
+        const idx = intersects[0].object.userData.nodeIndex;
+        if (idx !== undefined && nodeMeshes[idx].visible) {
+            state.hoveredNode = idx;
+            if (idx !== state.selectedNode) {
+                nodeMeshes[idx].scale.setScalar(1.5 * nodeMeshes[idx].userData.baseScale);
+            }
+            renderer.domElement.style.cursor = 'pointer';
+        } else {
+            state.hoveredNode = -1;
+            renderer.domElement.style.cursor = 'default';
+        }
+    } else {
+        state.hoveredNode = -1;
+        renderer.domElement.style.cursor = 'default';
+    }
+});
+
+// Click handler
+renderer.domElement.addEventListener('click', (event) => {
+    mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+    mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+    raycaster.setFromCamera(mouse, camera);
+    const intersects = raycaster.intersectObjects(nodeMeshes);
+
+    // Reset previous selection
+    resetSelection();
+
+    if (intersects.length > 0) {
+        const idx = intersects[0].object.userData.nodeIndex;
+        if (idx !== undefined && nodeMeshes[idx].visible) {
+            state.selectedNode = idx;
+            nodeMeshes[idx].scale.setScalar(1.8);
+            nodeMeshes[idx].material.emissive.setHex(0xffffff);
+            nodeMeshes[idx].material.emissiveIntensity = 0.5;
+
+            // Highlight connected edges
+            let highlighted = 0;
+            for (const edge of edges) {
+                if (edge.a === idx || edge.b === idx) {
+                    edge.line.material.opacity = 1.0;
+                    highlighted++;
+                }
+            }
+            state.highlightedEdges = highlighted;
+        }
+    } else {
+        state.selectedNode = -1;
+    }
+
+    updateHUD();
+});
+
+function resetSelection() {
+    if (state.selectedNode >= 0) {
+        const mesh = nodeMeshes[state.selectedNode];
+        mesh.scale.setScalar(mesh.userData.baseScale);
+        const groupColor = GROUP_COLORS[nodeGroups[state.selectedNode]];
+        mesh.material.emissive.copy(groupColor.clone().multiplyScalar(0.4));
+    }
+
+    // Reset edge opacities
+    for (const edge of edges) {
+        if (state.connectionStrengthMode === 'weighted') {
+            edge.line.material.opacity = 0.1 + 0.9 * (1 - edge.distance / maxDist);
+        } else {
+            edge.line.material.opacity = 0.3;
+        }
+    }
+    state.highlightedEdges = 0;
+    state.selectedNode = -1;
+}
+
+// Keyboard handlers
+document.addEventListener('keydown', (event) => {
+    const key = event.key.toLowerCase();
+
+    if (key === 'g') {
+        state.activeGroup = (state.activeGroup + 1);
+        if (state.activeGroup > 3) state.activeGroup = -1;
+        updateGroupVisibility();
+    } else if (key === 'r') {
+        state.rotationEnabled = !state.rotationEnabled;
+    } else if (key === 'w') {
+        state.connectionStrengthMode = state.connectionStrengthMode === 'uniform' ? 'weighted' : 'uniform';
+        updateEdgeWeights();
+    } else if (key === 'p') {
+        state.pulseActive = !state.pulseActive;
+    } else if (key === '+' || key === '=') {
+        state.zoomLevel = Math.min(3.0, state.zoomLevel + 0.2);
+        updateCamera();
+    } else if (key === '-' || key === '_') {
+        state.zoomLevel = Math.max(0.4, state.zoomLevel - 0.2);
+        updateCamera();
+    } else if (key === 't') {
+        state.modelOpacity = state.modelOpacity > 0 ? 0.0 : 0.3;
+        modelMaterials.forEach(mat => {
+            mat.opacity = state.modelOpacity;
+        });
+    }
+
+    updateHUD();
+});
+
+function updateGroupVisibility() {
+    let visNodes = 0;
+    let visEdges = 0;
+
+    for (let i = 0; i < NODE_COUNT; i++) {
+        const visible = state.activeGroup === -1 || nodeGroups[i] === state.activeGroup;
+        nodeMeshes[i].visible = visible;
+        if (visible) visNodes++;
+    }
+
+    for (const edge of edges) {
+        const aVisible = state.activeGroup === -1 || nodeGroups[edge.a] === state.activeGroup;
+        const bVisible = state.activeGroup === -1 || nodeGroups[edge.b] === state.activeGroup;
+        const visible = aVisible || bVisible;
+        edge.line.visible = visible;
+        if (visible) visEdges++;
+    }
+
+    state.visibleNodes = visNodes;
+    state.visibleEdges = visEdges;
+
+    // Reset selection if selected node is hidden
+    if (state.selectedNode >= 0 && !nodeMeshes[state.selectedNode].visible) {
+        resetSelection();
+    }
+}
+
+function updateEdgeWeights() {
+    for (const edge of edges) {
+        if (state.connectionStrengthMode === 'weighted') {
+            edge.line.material.opacity = 0.1 + 0.9 * (1 - edge.distance / maxDist);
+        } else {
+            edge.line.material.opacity = 0.3;
+        }
+    }
+
+    // Re-highlight if node is selected
+    if (state.selectedNode >= 0) {
+        for (const edge of edges) {
+            if (edge.a === state.selectedNode || edge.b === state.selectedNode) {
+                edge.line.material.opacity = 1.0;
+            }
+        }
+    }
+}
+
+function updateCamera() {
+    camera.position.set(0, 3, 8 / state.zoomLevel);
+    camera.lookAt(0, 0, 0);
+}
+
+function updateHUD() {
+    document.getElementById('hud-nodes').textContent = `${state.visibleNodes}/20`;
+    document.getElementById('hud-edges').textContent = `${state.visibleEdges}/30`;
+    document.getElementById('hud-selected').textContent = state.selectedNode >= 0 ? state.selectedNode : 'None';
+    document.getElementById('hud-group').textContent = state.activeGroup === -1 ? 'ALL' : `G${state.activeGroup}`;
+    document.getElementById('hud-mode').textContent = state.connectionStrengthMode;
+    document.getElementById('hud-rotation').textContent = state.rotationEnabled ? 'ON' : 'OFF';
+    document.getElementById('hud-pulse').textContent = state.pulseActive ? 'ON' : 'OFF';
+    document.getElementById('hud-zoom').textContent = state.zoomLevel.toFixed(1);
+}
+
+// Add particle field for atmosphere
+const particleCount = 500;
+const particleGeometry = new THREE.BufferGeometry();
+const particlePositions = new Float32Array(particleCount * 3);
+for (let i = 0; i < particleCount; i++) {
+    particlePositions[i * 3] = (Math.random() - 0.5) * 20;
+    particlePositions[i * 3 + 1] = (Math.random() - 0.5) * 20;
+    particlePositions[i * 3 + 2] = (Math.random() - 0.5) * 20;
+}
+particleGeometry.setAttribute('position', new THREE.BufferAttribute(particlePositions, 3));
+const particleMaterial = new THREE.PointsMaterial({
+    color: 0x4466aa,
+    size: 0.03,
+    transparent: true,
+    opacity: 0.4,
+    blending: THREE.AdditiveBlending
+});
+const particles = new THREE.Points(particleGeometry, particleMaterial);
+scene.add(particles);
+
+// Animation loop
+const clock = new THREE.Clock();
+
+function animate() {
+    requestAnimationFrame(animate);
+
+    const time = clock.getElapsedTime();
+    const delta = clock.getDelta();
+
+    // Auto-rotation
+    if (state.rotationEnabled) {
+        state.currentRotationY += state.rotationSpeed;
+        brainGroup.rotation.y = state.currentRotationY;
+    }
+
+    // Pulse effect
+    if (state.pulseActive) {
+        for (let i = 0; i < NODE_COUNT; i++) {
+            if (nodeMeshes[i].visible && i !== state.selectedNode) {
+                const pulseScale = 0.8 + 0.4 * (0.5 + 0.5 * Math.sin(time * 3 + i * 0.5));
+                const baseScale = (i === state.hoveredNode) ? 1.5 : 1.0;
+                nodeMeshes[i].userData.baseScale = pulseScale;
+                if (i === state.hoveredNode) {
+                    nodeMeshes[i].scale.setScalar(pulseScale * 1.5);
+                } else {
+                    nodeMeshes[i].scale.setScalar(pulseScale);
+                }
+            }
+        }
+    } else {
+        for (let i = 0; i < NODE_COUNT; i++) {
+            nodeMeshes[i].userData.baseScale = 1.0;
+            if (i !== state.hoveredNode && i !== state.selectedNode) {
+                nodeMeshes[i].scale.setScalar(1.0);
+            }
+        }
+    }
+
+    // Subtle node glow animation
+    for (let i = 0; i < NODE_COUNT; i++) {
+        if (nodeMeshes[i].visible) {
+            const sprite = nodeMeshes[i].children[0];
+            if (sprite) {
+                sprite.material.opacity = 0.3 + 0.15 * Math.sin(time * 2 + i);
+            }
+        }
+    }
+
+    // Particle rotation
+    particles.rotation.y = time * 0.02;
+    particles.rotation.x = time * 0.01;
+
+    renderer.render(scene, camera);
+}
+
+animate();
+
+// Window resize
+window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// Initial HUD update
+updateHUD();
+</script>
+</body>
+</html>

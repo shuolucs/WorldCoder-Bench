@@ -1,0 +1,627 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Three.js 3D 赛车游戏</title>
+  <style>
+    html, body {
+      margin: 0;
+      overflow: hidden;
+      background: #101418;
+      font-family: Arial, Helvetica, sans-serif;
+    }
+
+    #hud {
+      position: fixed;
+      top: 12px;
+      left: 12px;
+      z-index: 10;
+      color: #fff;
+      background: rgba(0, 0, 0, 0.45);
+      padding: 12px 14px;
+      border-radius: 10px;
+      line-height: 1.7;
+      min-width: 220px;
+      backdrop-filter: blur(4px);
+    }
+
+    #hud b {
+      display: inline-block;
+      min-width: 86px;
+      color: #8fd3ff;
+    }
+
+    #resetBtn {
+      margin-top: 8px;
+      width: 100%;
+      padding: 8px 10px;
+      border: none;
+      border-radius: 8px;
+      background: #2d89ef;
+      color: white;
+      font-size: 14px;
+      cursor: pointer;
+    }
+
+    #resetBtn:hover {
+      background: #226fca;
+    }
+
+    #hint {
+      position: fixed;
+      right: 12px;
+      top: 12px;
+      z-index: 10;
+      color: #fff;
+      background: rgba(0,0,0,0.4);
+      padding: 10px 12px;
+      border-radius: 10px;
+      font-size: 13px;
+    }
+  </style>
+
+  <script type="importmap">
+  { "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+  } }
+  </script>
+</head>
+<body>
+  <div id="hud">
+    <div><b>车速</b><span id="speed">0.0</span></div>
+    <div><b>圈数</b><span id="lapCount">0</span></div>
+    <div><b>本局时间</b><span id="raceTime">0.0</span></div>
+    <div><b>最佳单圈</b><span id="bestLap">--</span></div>
+    <button id="resetBtn">重置</button>
+  </div>
+
+  <div id="hint">
+    操作：W 加速 / S 刹车 / A D 转向
+  </div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+    // =========================
+    // 自动化评测兼容：按键状态
+    // =========================
+    window.__keys__ = window.__keys__ || {
+      KeyW: false,
+      KeyS: false,
+      KeyA: false,
+      KeyD: false
+    };
+
+    const realKeys = {
+      KeyW: false,
+      KeyS: false,
+      KeyA: false,
+      KeyD: false
+    };
+
+    window.addEventListener('keydown', (e) => {
+      if (e.code in realKeys) realKeys[e.code] = true;
+    });
+
+    window.addEventListener('keyup', (e) => {
+      if (e.code in realKeys) realKeys[e.code] = false;
+    });
+
+    function isKeyDown(code) {
+      return !!realKeys[code] || !!window.__keys__[code];
+    }
+
+    // =========================
+    // 基础场景
+    // =========================
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x87b8e6);
+    scene.fog = new THREE.Fog(0x87b8e6, 120, 360);
+
+    const camera = new THREE.PerspectiveCamera(
+      60,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      1000
+    );
+    camera.position.set(0, 12, 20);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.shadowMap.enabled = true;
+    document.body.appendChild(renderer.domElement);
+
+    // 可保留控制器，便于调试；默认禁用交互
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enabled = false;
+
+    // =========================
+    // 光照
+    // =========================
+    scene.add(new THREE.AmbientLight(0xffffff, 0.7));
+
+    const dirLight = new THREE.DirectionalLight(0xffffff, 1.1);
+    dirLight.position.set(30, 40, 20);
+    dirLight.castShadow = true;
+    dirLight.shadow.mapSize.set(2048, 2048);
+    dirLight.shadow.camera.left = -120;
+    dirLight.shadow.camera.right = 120;
+    dirLight.shadow.camera.top = 120;
+    dirLight.shadow.camera.bottom = -120;
+    dirLight.shadow.camera.near = 1;
+    dirLight.shadow.camera.far = 200;
+    scene.add(dirLight);
+
+    // =========================
+    // 地面
+    // =========================
+    const ground = new THREE.Mesh(
+      new THREE.PlaneGeometry(500, 500),
+      new THREE.MeshStandardMaterial({ color: 0x356b3a })
+    );
+    ground.rotation.x = -Math.PI / 2;
+    ground.receiveShadow = true;
+    scene.add(ground);
+
+    // =========================
+    // 赛道参数
+    // =========================
+    const trackCenter = new THREE.Vector3(0, 0, 0);
+    const trackA = 60;        // 椭圆长半轴
+    const trackB = 36;        // 椭圆短半轴
+    const trackWidth = 12;
+    const railHeight = 1.6;
+    const railThickness = 1.2;
+
+    // 椭圆闭合曲线
+    class EllipseCurve3D extends THREE.Curve {
+      constructor(a, b) {
+        super();
+        this.a = a;
+        this.b = b;
+      }
+      getPoint(t, target = new THREE.Vector3()) {
+        const angle = t * Math.PI * 2;
+        return target.set(
+          this.a * Math.cos(angle),
+          0,
+          this.b * Math.sin(angle)
+        );
+      }
+    }
+
+    const centerCurve = new EllipseCurve3D(trackA, trackB);
+
+    // 路面：TubeGeometry
+    const roadGeometry = new THREE.TubeGeometry(centerCurve, 240, trackWidth / 2, 20, true);
+    const roadMaterial = new THREE.MeshStandardMaterial({
+      color: 0x2f3136,
+      roughness: 0.9,
+      metalness: 0.05
+    });
+    const road = new THREE.Mesh(roadGeometry, roadMaterial);
+    road.receiveShadow = true;
+    road.castShadow = false;
+    scene.add(road);
+
+    // 赛道中心线
+    const linePoints = [];
+    for (let i = 0; i <= 240; i++) {
+      const t = i / 240;
+      const p = centerCurve.getPoint(t);
+      linePoints.push(p.x, 0.05, p.z);
+    }
+    const lineGeo = new THREE.BufferGeometry();
+    lineGeo.setAttribute('position', new THREE.Float32BufferAttribute(linePoints, 3));
+    const line = new THREE.Line(
+      lineGeo,
+      new THREE.LineBasicMaterial({ color: 0xffffff })
+    );
+    scene.add(line);
+
+    // 内外护栏：用很多 box 沿椭圆摆放
+    function createRail(radiusOffset, color) {
+      const group = new THREE.Group();
+      const count = 120;
+      for (let i = 0; i < count; i++) {
+        const t = i / count;
+        const ang = t * Math.PI * 2;
+        const x = (trackA + radiusOffset) * Math.cos(ang);
+        const z = (trackB + radiusOffset) * Math.sin(ang);
+
+        const tangent = new THREE.Vector3(
+          -(trackA + radiusOffset) * Math.sin(ang),
+           0,
+           (trackB + radiusOffset) * Math.cos(ang)
+        ).normalize();
+
+        const box = new THREE.Mesh(
+          new THREE.BoxGeometry(3.2, railHeight, railThickness),
+          new THREE.MeshStandardMaterial({ color })
+        );
+        box.position.set(x, railHeight / 2, z);
+        box.rotation.y = Math.atan2(tangent.x, tangent.z);
+        box.castShadow = true;
+        box.receiveShadow = true;
+        group.add(box);
+      }
+      scene.add(group);
+      return group;
+    }
+
+    createRail(trackWidth / 2 + 2.2, 0xd94c4c);
+    createRail(-(trackWidth / 2 + 2.2), 0xf5f5f5);
+
+    // 起终点线
+    const startAngle = 0; // 椭圆 x 正方向处
+    const startPosition = new THREE.Vector3(
+      trackA * Math.cos(startAngle),
+      0.02,
+      trackB * Math.sin(startAngle)
+    );
+
+    const startLine = new THREE.Mesh(
+      new THREE.PlaneGeometry(trackWidth * 1.15, 2.5),
+      new THREE.MeshStandardMaterial({
+        color: 0xffffff,
+        side: THREE.DoubleSide
+      })
+    );
+    startLine.rotation.x = -Math.PI / 2;
+    startLine.rotation.z = Math.PI / 2;
+    startLine.position.copy(startPosition);
+    scene.add(startLine);
+
+    // 棋盘格纹理效果：用小条纹覆盖
+    const stripeGroup = new THREE.Group();
+    for (let i = -5; i < 5; i++) {
+      const stripe = new THREE.Mesh(
+        new THREE.PlaneGeometry(trackWidth * 0.115, 2.5),
+        new THREE.MeshStandardMaterial({
+          color: i % 2 === 0 ? 0x000000 : 0xffffff,
+          side: THREE.DoubleSide
+        })
+      );
+      stripe.rotation.x = -Math.PI / 2;
+      stripe.rotation.z = Math.PI / 2;
+      stripe.position.set(
+        startPosition.x,
+        0.03,
+        startPosition.z + i * (2.5 / 10)
+      );
+      stripeGroup.add(stripe);
+    }
+    scene.add(stripeGroup);
+
+    // =========================
+    // 车辆
+    // =========================
+    const car = new THREE.Group();
+    scene.add(car);
+
+    const carBody = new THREE.Mesh(
+      new THREE.BoxGeometry(3.2, 1.2, 6),
+      new THREE.MeshStandardMaterial({ color: 0x1e88e5, metalness: 0.2, roughness: 0.55 })
+    );
+    carBody.position.y = 1.2;
+    carBody.castShadow = true;
+    carBody.receiveShadow = true;
+    car.add(carBody);
+
+    const cabin = new THREE.Mesh(
+      new THREE.BoxGeometry(2.2, 0.9, 2.8),
+      new THREE.MeshStandardMaterial({ color: 0x90caf9, metalness: 0.35, roughness: 0.3 })
+    );
+    cabin.position.set(0, 1.95, -0.2);
+    cabin.castShadow = true;
+    cabin.receiveShadow = true;
+    car.add(cabin);
+
+    const wheelMaterial = new THREE.MeshStandardMaterial({ color: 0x111111 });
+    const wheelGeometry = new THREE.CylinderGeometry(0.75, 0.75, 0.6, 20);
+
+    function createWheel(x, y, z) {
+      const wheel = new THREE.Mesh(wheelGeometry, wheelMaterial);
+      wheel.rotation.z = Math.PI / 2;
+      wheel.position.set(x, y, z);
+      wheel.castShadow = true;
+      wheel.receiveShadow = true;
+      car.add(wheel);
+      return wheel;
+    }
+
+    const wheelFL = createWheel(-1.55, 0.75, -1.9);
+    const wheelFR = createWheel( 1.55, 0.75, -1.9);
+    const wheelRL = createWheel(-1.55, 0.75,  1.9);
+    const wheelRR = createWheel( 1.55, 0.75,  1.9);
+
+    // 车辆朝向：让车头初始沿 +Z 的切线方向前进
+    car.position.set(trackA, 0, 0);
+    car.rotation.y = Math.PI / 2;
+
+    // =========================
+    // HUD
+    // =========================
+    const speedEl = document.getElementById('speed');
+    const lapCountEl = document.getElementById('lapCount');
+    const raceTimeEl = document.getElementById('raceTime');
+    const bestLapEl = document.getElementById('bestLap');
+    const resetBtn = document.getElementById('resetBtn');
+
+    // =========================
+    // 车辆物理参数
+    // =========================
+    const MAX_SPEED = 50;
+    const ACCELERATION = 15;
+    const BRAKE_DECELERATION = 30;
+    const DRAG = 2;
+    const MAX_STEERING = THREE.MathUtils.degToRad(30);
+    const STEER_SPEED = THREE.MathUtils.degToRad(95);
+    const STEER_RETURN_SPEED = THREE.MathUtils.degToRad(120);
+    const WHEELBASE = 4.2;
+    const CAR_RADIUS = 2.2;
+
+    let speed = 0;
+    let steeringAngle = 0;
+
+    let lapCount = 0;
+    let raceTime = 0;
+    let bestLapTime = null;
+    let lapStartTime = 0;
+    let previousLapSide = null;
+    let hasLeftStartZone = false;
+
+    const clock = new THREE.Clock();
+
+    // =========================
+    // 工具函数
+    // =========================
+    function formatTime(t) {
+      if (t == null || !isFinite(t)) return '--';
+      return t.toFixed(2) + 's';
+    }
+
+    function resetCar() {
+      speed = 0;
+      steeringAngle = 0;
+      lapCount = 0;
+      raceTime = 0;
+      bestLapTime = null;
+      lapStartTime = 0;
+      hasLeftStartZone = false;
+      previousLapSide = null;
+
+      car.position.set(trackA, 0, 0);
+      car.rotation.y = Math.PI / 2;
+
+      updateHUD();
+      updateStateExposure();
+    }
+
+    resetBtn.addEventListener('click', resetCar);
+
+    function getTrackNormalizedValue(x, z) {
+      return (x * x) / (trackA * trackA) + (z * z) / (trackB * trackB);
+    }
+
+    // 简化护栏碰撞：与椭圆赛道宽度比较
+    function handleBarrierCollision() {
+      const x = car.position.x;
+      const z = car.position.z;
+
+      const angle = Math.atan2(z / trackB, x / trackA);
+      const centerX = trackA * Math.cos(angle);
+      const centerZ = trackB * Math.sin(angle);
+
+      const dx = x - centerX;
+      const dz = z - centerZ;
+      const distFromCenterLine = Math.sqrt(dx * dx + dz * dz);
+
+      const maxOffset = trackWidth / 2 - CAR_RADIUS * 0.35;
+
+      if (distFromCenterLine > maxOffset) {
+        const nx = dx / (distFromCenterLine || 1);
+        const nz = dz / (distFromCenterLine || 1);
+
+        const correction = distFromCenterLine - maxOffset;
+        car.position.x -= nx * correction;
+        car.position.z -= nz * correction;
+
+        speed = -speed * 0.5;
+      }
+    }
+
+    function updateLapDetection() {
+      const lineX = startPosition.x;
+      const nearLine = Math.abs(car.position.x - lineX) < 1.2;
+      const withinTrackSpan = Math.abs(car.position.z - startPosition.z) < (trackWidth * 0.75);
+
+      const side = car.position.x >= lineX ? 1 : -1;
+
+      if (previousLapSide === null) previousLapSide = side;
+
+      // 离开起点区域后，才允许再次计圈
+      if (Math.abs(car.position.x - lineX) > 8) {
+        hasLeftStartZone = true;
+      }
+
+      // 从左侧穿到右侧，且在起点附近，视为通过起终点
+      if (
+        hasLeftStartZone &&
+        nearLine &&
+        withinTrackSpan &&
+        previousLapSide < 0 &&
+        side > 0
+      ) {
+        lapCount += 1;
+        const lapTime = raceTime - lapStartTime;
+        if (lapCount >= 1) {
+          if (bestLapTime === null || lapTime < bestLapTime) {
+            bestLapTime = lapTime;
+          }
+        }
+        lapStartTime = raceTime;
+        hasLeftStartZone = false;
+      }
+
+      previousLapSide = side;
+    }
+
+    function updateHUD() {
+      speedEl.textContent = Math.abs(speed).toFixed(1);
+      lapCountEl.textContent = String(lapCount);
+      raceTimeEl.textContent = raceTime.toFixed(1) + 's';
+      bestLapEl.textContent = formatTime(bestLapTime);
+    }
+
+    function updateStateExposure() {
+      window.__3D_STATE__ = {
+        speed: speed,
+        position: {
+          x: car.position.x,
+          y: car.position.y,
+          z: car.position.z
+        },
+        rotation: car.rotation.y,
+        steeringAngle: steeringAngle,
+        lapCount: lapCount,
+        raceTime: raceTime,
+        bestLapTime: bestLapTime,
+        startPosition: {
+          x: trackA,
+          y: 0,
+          z: 0
+        }
+      };
+    }
+
+    // =========================
+    // 相机跟随
+    // =========================
+    const cameraOffset = new THREE.Vector3(0, 7, -14);
+    const cameraLookOffset = new THREE.Vector3(0, 2, 8);
+    const cameraWorldPos = new THREE.Vector3();
+    const lookTarget = new THREE.Vector3();
+
+    function updateCamera(dt) {
+      const rot = new THREE.Matrix4().makeRotationY(car.rotation.y);
+      const desiredOffset = cameraOffset.clone().applyMatrix4(rot);
+      cameraWorldPos.copy(car.position).add(desiredOffset);
+
+      camera.position.lerp(cameraWorldPos, 1 - Math.pow(0.001, dt));
+
+      lookTarget.copy(car.position).add(cameraLookOffset.clone().applyMatrix4(rot));
+      camera.lookAt(lookTarget);
+    }
+
+    // =========================
+    // 动画循环
+    // =========================
+    function animate() {
+      requestAnimationFrame(animate);
+
+      let dt = clock.getDelta();
+      dt = Math.min(dt, 0.033);
+
+      raceTime += dt;
+
+      const forwardPressed = isKeyDown('KeyW');
+      const brakePressed = isKeyDown('KeyS');
+      const leftPressed = isKeyDown('KeyA');
+      const rightPressed = isKeyDown('KeyD');
+
+      // 速度控制
+      if (forwardPressed) {
+        speed += ACCELERATION * dt;
+      } else if (brakePressed) {
+        if (speed > 0) {
+          speed -= BRAKE_DECELERATION * dt;
+        } else {
+          speed -= ACCELERATION * 0.5 * dt;
+        }
+      } else {
+        if (speed > 0) {
+          speed = Math.max(0, speed - DRAG * dt);
+        } else if (speed < 0) {
+          speed = Math.min(0, speed + DRAG * dt);
+        }
+      }
+
+      speed = THREE.MathUtils.clamp(speed, -15, MAX_SPEED);
+
+      // 转向控制
+      if (leftPressed && !rightPressed) {
+        steeringAngle += STEER_SPEED * dt;
+      } else if (rightPressed && !leftPressed) {
+        steeringAngle -= STEER_SPEED * dt;
+      } else {
+        if (steeringAngle > 0) {
+          steeringAngle = Math.max(0, steeringAngle - STEER_RETURN_SPEED * dt);
+        } else if (steeringAngle < 0) {
+          steeringAngle = Math.min(0, steeringAngle + STEER_RETURN_SPEED * dt);
+        }
+      }
+
+      steeringAngle = THREE.MathUtils.clamp(steeringAngle, -MAX_STEERING, MAX_STEERING);
+
+      // 简化自行车模型
+      if (Math.abs(speed) > 0.001) {
+        const yawRate = (speed / WHEELBASE) * Math.tan(steeringAngle);
+        car.rotation.y -= yawRate * dt;
+      }
+
+      const forward = new THREE.Vector3(
+        Math.sin(car.rotation.y),
+        0,
+        Math.cos(car.rotation.y)
+      );
+
+      car.position.addScaledVector(forward, speed * dt);
+
+      // 车轮视觉转向
+      wheelFL.rotation.y = steeringAngle;
+      wheelFR.rotation.y = steeringAngle;
+
+      // 车轮滚动
+      const wheelSpin = speed * dt / 0.75;
+      wheelFL.rotation.x -= wheelSpin;
+      wheelFR.rotation.x -= wheelSpin;
+      wheelRL.rotation.x -= wheelSpin;
+      wheelRR.rotation.x -= wheelSpin;
+
+      // 碰撞
+      handleBarrierCollision();
+
+      // 计圈
+      updateLapDetection();
+
+      // 相机
+      updateCamera(dt);
+
+      // HUD / 状态暴露
+      updateHUD();
+      updateStateExposure();
+
+      renderer.render(scene, camera);
+    }
+
+    // 初始化状态
+    updateHUD();
+    updateStateExposure();
+    animate();
+
+    // =========================
+    // 自适应
+    // =========================
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+  </script>
+</body>
+</html>

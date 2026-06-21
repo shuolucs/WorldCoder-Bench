@@ -1,0 +1,525 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Three.js NURBS / B-spline 曲面编辑器</title>
+  <style>
+    html, body {
+      margin: 0;
+      height: 100%;
+      overflow: hidden;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #111;
+      color: #eee;
+    }
+
+    #app {
+      width: 100%;
+      height: 100%;
+      position: relative;
+    }
+
+    #panel {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      z-index: 10;
+      background: rgba(20, 20, 24, 0.82);
+      padding: 12px 14px;
+      border-radius: 10px;
+      border: 1px solid rgba(255,255,255,0.12);
+      backdrop-filter: blur(6px);
+      min-width: 240px;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.28);
+    }
+
+    #panel h3 {
+      margin: 0 0 10px;
+      font-size: 15px;
+      font-weight: 700;
+    }
+
+    #panel .row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin: 8px 0;
+      font-size: 13px;
+    }
+
+    #panel input[type="range"] {
+      width: 130px;
+    }
+
+    #panel .hint {
+      margin-top: 10px;
+      font-size: 12px;
+      line-height: 1.45;
+      color: #c9c9d2;
+      opacity: 0.92;
+    }
+
+    #panel .value {
+      min-width: 18px;
+      text-align: right;
+      display: inline-block;
+      font-variant-numeric: tabular-nums;
+    }
+
+    canvas {
+      display: block;
+    }
+  </style>
+
+  <script type="importmap">
+  { "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+  } }
+  </script>
+</head>
+<body>
+  <div id="app">
+    <div id="panel">
+      <h3>NURBS / B-spline 曲面编辑器</h3>
+
+      <div class="row">
+        <label for="degree">度数 degree</label>
+        <div>
+          <input id="degree" type="range" min="2" max="5" step="1" value="3" />
+          <span id="degreeValue" class="value">3</span>
+        </div>
+      </div>
+
+      <div class="row">
+        <label for="showPolygon">显示控制多边形</label>
+        <input id="showPolygon" type="checkbox" checked />
+      </div>
+
+      <div class="hint">
+        鼠标左键拖拽控制点可编辑曲面。<br>
+        空白处拖动可旋转视角，滚轮缩放。
+      </div>
+    </div>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+    const app = document.getElementById('app');
+    const degreeInput = document.getElementById('degree');
+    const degreeValue = document.getElementById('degreeValue');
+    const showPolygonInput = document.getElementById('showPolygon');
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x101318);
+
+    const camera = new THREE.PerspectiveCamera(
+      50,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      1000
+    );
+    camera.position.set(10, 9, 12);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    app.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.target.set(0, 0.2, 0);
+
+    scene.add(new THREE.AmbientLight(0xffffff, 0.7));
+
+    const dir1 = new THREE.DirectionalLight(0xffffff, 1.1);
+    dir1.position.set(10, 18, 8);
+    scene.add(dir1);
+
+    const dir2 = new THREE.DirectionalLight(0x99bbff, 0.5);
+    dir2.position.set(-8, 6, -10);
+    scene.add(dir2);
+
+    const gridHelper = new THREE.GridHelper(16, 16, 0x446688, 0x2c3642);
+    gridHelper.position.y = -2.2;
+    scene.add(gridHelper);
+
+    const axesHelper = new THREE.AxesHelper(3);
+    scene.add(axesHelper);
+
+    const raycaster = new THREE.Raycaster();
+    const pointer = new THREE.Vector2();
+
+    const dragPlane = new THREE.Plane();
+    const dragIntersection = new THREE.Vector3();
+    const dragOffset = new THREE.Vector3();
+    const tempVec = new THREE.Vector3();
+
+    const controlGroup = new THREE.Group();
+    scene.add(controlGroup);
+
+    const polygonGroup = new THREE.Group();
+    scene.add(polygonGroup);
+
+    const controlPointMeshes = [];
+    const controlPoints = [];
+
+    const GRID_U = 5;
+    const GRID_V = 5;
+    const SAMPLE_U = 64;
+    const SAMPLE_V = 64;
+
+    let degree = parseInt(degreeInput.value, 10);
+
+    const cpMaterial = new THREE.MeshStandardMaterial({
+      color: 0xff8844,
+      roughness: 0.35,
+      metalness: 0.05
+    });
+
+    const cpMaterialActive = new THREE.MeshStandardMaterial({
+      color: 0x33ddff,
+      roughness: 0.2,
+      metalness: 0.1,
+      emissive: 0x113344
+    });
+
+    const sphereGeo = new THREE.SphereGeometry(0.16, 24, 16);
+
+    function initControlPoints() {
+      const spacing = 1.5;
+      const offsetU = ((GRID_U - 1) * spacing) / 2;
+      const offsetV = ((GRID_V - 1) * spacing) / 2;
+
+      for (let i = 0; i < GRID_U; i++) {
+        controlPoints[i] = [];
+        controlPointMeshes[i] = [];
+        for (let j = 0; j < GRID_V; j++) {
+          const x = i * spacing - offsetU;
+          const z = j * spacing - offsetV;
+          const y =
+            0.5 * Math.sin((i / (GRID_U - 1)) * Math.PI) * Math.cos((j / (GRID_V - 1)) * Math.PI) +
+            0.15 * Math.sin(i * 0.9 + j * 0.6);
+
+          const p = new THREE.Vector4(x, y, z, 1.0);
+          controlPoints[i][j] = p;
+
+          const mesh = new THREE.Mesh(sphereGeo, cpMaterial.clone());
+          mesh.position.set(x, y, z);
+          mesh.userData.i = i;
+          mesh.userData.j = j;
+          controlGroup.add(mesh);
+          controlPointMeshes[i][j] = mesh;
+        }
+      }
+    }
+
+    initControlPoints();
+
+    function makeOpenUniformKnotVector(numCtrlPts, deg) {
+      const n = numCtrlPts - 1;
+      const m = n + deg + 1;
+      const knots = [];
+
+      for (let i = 0; i <= m; i++) {
+        if (i <= deg) {
+          knots.push(0);
+        } else if (i >= m - deg) {
+          knots.push(1);
+        } else {
+          knots.push((i - deg) / (m - 2 * deg));
+        }
+      }
+      return knots;
+    }
+
+    function basis(i, p, u, knots) {
+      if (p === 0) {
+        if (
+          (knots[i] <= u && u < knots[i + 1]) ||
+          (u === 1 && knots[i] <= 1 && 1 <= knots[i + 1] && knots[i + 1] === 1)
+        ) {
+          return 1;
+        }
+        return 0;
+      }
+
+      let left = 0;
+      let right = 0;
+
+      const denom1 = knots[i + p] - knots[i];
+      const denom2 = knots[i + p + 1] - knots[i + 1];
+
+      if (denom1 !== 0) {
+        left = ((u - knots[i]) / denom1) * basis(i, p - 1, u, knots);
+      }
+      if (denom2 !== 0) {
+        right = ((knots[i + p + 1] - u) / denom2) * basis(i + 1, p - 1, u, knots);
+      }
+
+      return left + right;
+    }
+
+    function evaluateSurface(u, v, degU, degV, knotsU, knotsV) {
+      const Nu = new Array(GRID_U);
+      const Nv = new Array(GRID_V);
+
+      for (let i = 0; i < GRID_U; i++) Nu[i] = basis(i, degU, u, knotsU);
+      for (let j = 0; j < GRID_V; j++) Nv[j] = basis(j, degV, v, knotsV);
+
+      let sx = 0, sy = 0, sz = 0, sw = 0;
+
+      for (let i = 0; i < GRID_U; i++) {
+        for (let j = 0; j < GRID_V; j++) {
+          const cp = controlPoints[i][j];
+          const w = cp.w;
+          const b = Nu[i] * Nv[j] * w;
+          sx += cp.x * b;
+          sy += cp.y * b;
+          sz += cp.z * b;
+          sw += b;
+        }
+      }
+
+      if (sw === 0) return new THREE.Vector3(0, 0, 0);
+      return new THREE.Vector3(sx / sw, sy / sw, sz / sw);
+    }
+
+    let surfaceGeometry = null;
+    let surfaceMesh = null;
+    let wireframe = null;
+
+    const surfaceMaterial = new THREE.MeshStandardMaterial({
+      color: 0x4aa3ff,
+      roughness: 0.35,
+      metalness: 0.08,
+      side: THREE.DoubleSide
+    });
+
+    function buildSurface() {
+      const deg = Math.min(Math.max(degree, 2), 5);
+      const knotsU = makeOpenUniformKnotVector(GRID_U, deg);
+      const knotsV = makeOpenUniformKnotVector(GRID_V, deg);
+
+      const positions = [];
+      const indices = [];
+
+      for (let iu = 0; iu <= SAMPLE_U; iu++) {
+        const u = iu / SAMPLE_U;
+        for (let iv = 0; iv <= SAMPLE_V; iv++) {
+          const v = iv / SAMPLE_V;
+          const p = evaluateSurface(u, v, deg, deg, knotsU, knotsV);
+          positions.push(p.x, p.y, p.z);
+        }
+      }
+
+      const row = SAMPLE_V + 1;
+      for (let iu = 0; iu < SAMPLE_U; iu++) {
+        for (let iv = 0; iv < SAMPLE_V; iv++) {
+          const a = iu * row + iv;
+          const b = (iu + 1) * row + iv;
+          const c = (iu + 1) * row + iv + 1;
+          const d = iu * row + iv + 1;
+          indices.push(a, b, d);
+          indices.push(b, c, d);
+        }
+      }
+
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+      geometry.setIndex(indices);
+      geometry.computeVertexNormals();
+
+      if (surfaceMesh) {
+        scene.remove(surfaceMesh);
+        surfaceMesh.geometry.dispose();
+      }
+
+      if (wireframe) {
+        scene.remove(wireframe);
+        wireframe.geometry.dispose();
+        wireframe.material.dispose();
+      }
+
+      surfaceGeometry = geometry;
+      surfaceMesh = new THREE.Mesh(surfaceGeometry, surfaceMaterial);
+      scene.add(surfaceMesh);
+
+      wireframe = new THREE.LineSegments(
+        new THREE.WireframeGeometry(surfaceGeometry),
+        new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.18 })
+      );
+      scene.add(wireframe);
+
+      updateState();
+    }
+
+    function clearPolygonGroup() {
+      while (polygonGroup.children.length > 0) {
+        const obj = polygonGroup.children.pop();
+        if (obj.geometry) obj.geometry.dispose();
+        if (obj.material) obj.material.dispose();
+      }
+    }
+
+    function buildControlPolygon() {
+      clearPolygonGroup();
+
+      const visible = showPolygonInput.checked;
+      polygonGroup.visible = visible;
+
+      const lineMatU = new THREE.LineBasicMaterial({ color: 0xffcc66 });
+      const lineMatV = new THREE.LineBasicMaterial({ color: 0x66ffaa });
+
+      for (let i = 0; i < GRID_U; i++) {
+        const pts = [];
+        for (let j = 0; j < GRID_V; j++) {
+          const p = controlPoints[i][j];
+          pts.push(new THREE.Vector3(p.x, p.y, p.z));
+        }
+        const geo = new THREE.BufferGeometry().setFromPoints(pts);
+        const line = new THREE.Line(geo, lineMatU);
+        polygonGroup.add(line);
+      }
+
+      for (let j = 0; j < GRID_V; j++) {
+        const pts = [];
+        for (let i = 0; i < GRID_U; i++) {
+          const p = controlPoints[i][j];
+          pts.push(new THREE.Vector3(p.x, p.y, p.z));
+        }
+        const geo = new THREE.BufferGeometry().setFromPoints(pts);
+        const line = new THREE.Line(geo, lineMatV);
+        polygonGroup.add(line);
+      }
+
+      updateState();
+    }
+
+    function syncControlMeshes() {
+      for (let i = 0; i < GRID_U; i++) {
+        for (let j = 0; j < GRID_V; j++) {
+          const p = controlPoints[i][j];
+          controlPointMeshes[i][j].position.set(p.x, p.y, p.z);
+        }
+      }
+    }
+
+    function updateEverything() {
+      syncControlMeshes();
+      buildControlPolygon();
+      buildSurface();
+    }
+
+    function updateState() {
+      window.__3D_STATE__ = {
+        controlPointCount: 25,
+        degree: degree,
+        surfaceVertexCount: (SAMPLE_U + 1) * (SAMPLE_V + 1),
+        showPolygon: showPolygonInput.checked
+      };
+    }
+
+    degreeInput.addEventListener('input', () => {
+      degree = parseInt(degreeInput.value, 10);
+      degreeValue.textContent = degree;
+      buildSurface();
+      updateState();
+    });
+
+    showPolygonInput.addEventListener('change', () => {
+      polygonGroup.visible = showPolygonInput.checked;
+      buildControlPolygon();
+      updateState();
+    });
+
+    let dragging = false;
+    let selectedMesh = null;
+
+    function setPointer(event) {
+      const rect = renderer.domElement.getBoundingClientRect();
+      pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+      pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+    }
+
+    renderer.domElement.addEventListener('pointerdown', (event) => {
+      setPointer(event);
+      raycaster.setFromCamera(pointer, camera);
+      const hits = raycaster.intersectObjects(controlGroup.children, false);
+
+      if (hits.length > 0) {
+        dragging = true;
+        selectedMesh = hits[0].object;
+
+        controlGroup.children.forEach(m => {
+          m.material = cpMaterial;
+        });
+        selectedMesh.material = cpMaterialActive;
+
+        const selectedPos = selectedMesh.position.clone();
+        const normal = camera.getWorldDirection(tempVec).clone();
+        dragPlane.setFromNormalAndCoplanarPoint(normal, selectedPos);
+
+        if (raycaster.ray.intersectPlane(dragPlane, dragIntersection)) {
+          dragOffset.copy(selectedPos).sub(dragIntersection);
+        } else {
+          dragOffset.set(0, 0, 0);
+        }
+
+        controls.enabled = false;
+      }
+    });
+
+    window.addEventListener('pointermove', (event) => {
+      setPointer(event);
+
+      if (!dragging || !selectedMesh) return;
+
+      raycaster.setFromCamera(pointer, camera);
+      if (raycaster.ray.intersectPlane(dragPlane, dragIntersection)) {
+        const newPos = dragIntersection.clone().add(dragOffset);
+        selectedMesh.position.copy(newPos);
+
+        const i = selectedMesh.userData.i;
+        const j = selectedMesh.userData.j;
+        controlPoints[i][j].x = newPos.x;
+        controlPoints[i][j].y = newPos.y;
+        controlPoints[i][j].z = newPos.z;
+
+        buildControlPolygon();
+        buildSurface();
+      }
+    });
+
+    window.addEventListener('pointerup', () => {
+      dragging = false;
+      if (selectedMesh) {
+        selectedMesh.material = cpMaterial;
+      }
+      selectedMesh = null;
+      controls.enabled = true;
+    });
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    degreeValue.textContent = degree;
+    updateEverything();
+
+    function animate() {
+      requestAnimationFrame(animate);
+      controls.update();
+      renderer.render(scene, camera);
+    }
+    animate();
+  </script>
+</body>
+</html>

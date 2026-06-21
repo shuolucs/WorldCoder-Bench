@@ -1,0 +1,426 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>3D Marble Maze</title>
+  <style>
+    html, body {
+      margin: 0;
+      overflow: hidden;
+      width: 100%;
+      height: 100%;
+      background: #1a1a2e;
+      font-family: Arial, sans-serif;
+    }
+
+    #hud {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      z-index: 10;
+      color: #fff;
+      background: rgba(0, 0, 0, 0.45);
+      padding: 12px 14px;
+      border-radius: 8px;
+      font-size: 14px;
+      line-height: 1.5;
+      min-width: 260px;
+      box-shadow: 0 4px 14px rgba(0,0,0,0.3);
+    }
+
+    #controls {
+      margin-top: 10px;
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    button {
+      background: #e94560;
+      color: white;
+      border: none;
+      padding: 8px 12px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 13px;
+    }
+
+    button:hover {
+      background: #ff5f7a;
+    }
+
+    button:active {
+      transform: scale(0.98);
+    }
+
+    #info {
+      margin-top: 8px;
+      font-size: 12px;
+      opacity: 0.85;
+    }
+  </style>
+</head>
+<body>
+  <div id="hud">
+    <div id="hud-content">Loading...</div>
+    <div id="controls">
+      <button id="btn-undo">Undo</button>
+      <button id="btn-redo">Redo</button>
+      <button id="btn-reset">Reset</button>
+    </div>
+    <div id="info">
+      Arrow Keys = Tilt Maze<br />
+      U = Undo, R = Redo
+    </div>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js';
+    import { OrbitControls } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js';
+    import { GLTFLoader } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/GLTFLoader.js';
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color('#1a1a2e');
+
+    const camera = new THREE.PerspectiveCamera(
+      60,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      1000
+    );
+    camera.position.set(0, 15, 15);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    document.body.appendChild(renderer.domElement);
+
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
+    scene.add(ambientLight);
+
+    const directionalLight = new THREE.DirectionalLight(0xffffff, 1.0);
+    directionalLight.position.set(5, 10, 5);
+    directionalLight.castShadow = true;
+    directionalLight.shadow.mapSize.set(2048, 2048);
+    directionalLight.shadow.camera.near = 0.1;
+    directionalLight.shadow.camera.far = 50;
+    directionalLight.shadow.camera.left = -20;
+    directionalLight.shadow.camera.right = 20;
+    directionalLight.shadow.camera.top = 20;
+    directionalLight.shadow.camera.bottom = -20;
+    scene.add(directionalLight);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enabled = false;
+    controls.target.set(0, 0, 0);
+
+    let collisionWorld = null;
+    let modelLoaded = false;
+
+    const loader = new GLTFLoader();
+    loader.load(
+      'collision-world.glb',
+      (gltf) => {
+        collisionWorld = gltf.scene;
+
+        const box = new THREE.Box3().setFromObject(collisionWorld);
+        const size = new THREE.Vector3();
+        const center = new THREE.Vector3();
+        box.getSize(size);
+        box.getCenter(center);
+
+        collisionWorld.position.sub(center);
+
+        const maxDimension = Math.max(size.x, size.z, size.y || 1);
+        const targetSize = 20;
+        const scale = maxDimension > 0 ? targetSize / maxDimension : 1;
+        collisionWorld.scale.setScalar(scale);
+
+        const postScaleBox = new THREE.Box3().setFromObject(collisionWorld);
+        const postCenter = new THREE.Vector3();
+        postScaleBox.getCenter(postCenter);
+        collisionWorld.position.sub(postCenter);
+
+        collisionWorld.traverse((child) => {
+          if (child.isMesh) {
+            child.receiveShadow = true;
+            child.castShadow = false;
+          }
+        });
+
+        scene.add(collisionWorld);
+        modelLoaded = true;
+      },
+      undefined,
+      (err) => {
+        console.error('Failed to load collision-world.glb:', err);
+      }
+    );
+
+    const marbleRadius = 0.4;
+    const marbleGeometry = new THREE.SphereGeometry(marbleRadius, 32, 32);
+    const marbleMaterial = new THREE.MeshStandardMaterial({
+      color: '#e94560',
+      metalness: 0.8,
+      roughness: 0.2
+    });
+    const marble = new THREE.Mesh(marbleGeometry, marbleMaterial);
+    marble.position.set(0, 2, 0);
+    marble.castShadow = true;
+    marble.receiveShadow = false;
+    scene.add(marble);
+
+    const velocity = new THREE.Vector3(0, 0, 0);
+    let tiltX = 0;
+    let tiltZ = 0;
+    let fallCount = 0;
+
+    const keys = {
+      ArrowUp: false,
+      ArrowDown: false,
+      ArrowLeft: false,
+      ArrowRight: false
+    };
+
+    const snapshots = [];
+    let undoIndex = -1;
+    let snapshotTimer = 0;
+
+    const hudContent = document.getElementById('hud-content');
+    const btnUndo = document.getElementById('btn-undo');
+    const btnRedo = document.getElementById('btn-redo');
+    const btnReset = document.getElementById('btn-reset');
+
+    function clamp(value, min, max) {
+      return Math.max(min, Math.min(max, value));
+    }
+
+    function resetMarbleOnly() {
+      marble.position.set(0, 2, 0);
+      velocity.set(0, 0, 0);
+    }
+
+    function clearSnapshots() {
+      snapshots.length = 0;
+      undoIndex = -1;
+      snapshotTimer = 0;
+    }
+
+    function fullReset() {
+      resetMarbleOnly();
+      tiltX = 0;
+      tiltZ = 0;
+      if (collisionWorld) {
+        collisionWorld.rotation.x = tiltX;
+        collisionWorld.rotation.z = tiltZ;
+      }
+      clearSnapshots();
+    }
+
+    function createSnapshot() {
+      return {
+        position: {
+          x: marble.position.x,
+          y: marble.position.y,
+          z: marble.position.z
+        },
+        velocity: {
+          x: velocity.x,
+          y: velocity.y,
+          z: velocity.z
+        },
+        tiltX,
+        tiltZ
+      };
+    }
+
+    function applySnapshot(snapshot) {
+      marble.position.set(
+        snapshot.position.x,
+        snapshot.position.y,
+        snapshot.position.z
+      );
+      velocity.set(
+        snapshot.velocity.x,
+        snapshot.velocity.y,
+        snapshot.velocity.z
+      );
+      tiltX = snapshot.tiltX;
+      tiltZ = snapshot.tiltZ;
+
+      if (collisionWorld) {
+        collisionWorld.rotation.x = tiltX;
+        collisionWorld.rotation.z = tiltZ;
+      }
+    }
+
+    function saveSnapshot() {
+      if (undoIndex < snapshots.length - 1) {
+        snapshots.splice(undoIndex + 1);
+      }
+
+      snapshots.push(createSnapshot());
+
+      if (snapshots.length > 60) {
+        snapshots.shift();
+      }
+
+      undoIndex = snapshots.length - 1;
+    }
+
+    function undo() {
+      if (undoIndex > 0) {
+        undoIndex--;
+        applySnapshot(snapshots[undoIndex]);
+      }
+    }
+
+    function redo() {
+      if (undoIndex >= 0 && undoIndex < snapshots.length - 1) {
+        undoIndex++;
+        applySnapshot(snapshots[undoIndex]);
+      }
+    }
+
+    btnUndo.addEventListener('click', undo);
+    btnRedo.addEventListener('click', redo);
+    btnReset.addEventListener('click', fullReset);
+
+    window.addEventListener('keydown', (e) => {
+      if (e.code in keys) {
+        keys[e.code] = true;
+        e.preventDefault();
+      }
+
+      if (e.code === 'KeyU') {
+        undo();
+      } else if (e.code === 'KeyR') {
+        redo();
+      }
+    });
+
+    window.addEventListener('keyup', (e) => {
+      if (e.code in keys) {
+        keys[e.code] = false;
+        e.preventDefault();
+      }
+    });
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    const startTime = performance.now();
+    let lastTime = performance.now();
+
+    function updateHUD(timeElapsed) {
+      const speed = velocity.length();
+      const canUndo = undoIndex > 0;
+      const canRedo = undoIndex >= 0 && undoIndex < snapshots.length - 1;
+
+      hudContent.innerHTML = `
+        <div>Tilt X: ${tiltX.toFixed(3)}</div>
+        <div>Tilt Z: ${tiltZ.toFixed(3)}</div>
+        <div>Marble Pos: (${marble.position.x.toFixed(2)}, ${marble.position.y.toFixed(2)}, ${marble.position.z.toFixed(2)})</div>
+        <div>Speed: ${speed.toFixed(2)}</div>
+        <div>Falls: ${fallCount}</div>
+        <div>Snapshots: ${snapshots.length} | Index: ${undoIndex}</div>
+        <div>Undo (U): ${canUndo ? 'Yes' : 'No'}</div>
+        <div>Redo (R): ${canRedo ? 'Yes' : 'No'}</div>
+        <div>Model Loaded: ${modelLoaded ? 'Yes' : 'No'}</div>
+        <div>Time: ${timeElapsed.toFixed(2)}s</div>
+      `;
+
+      window.__3D_STATE__ = {
+        marblePos: {
+          x: marble.position.x,
+          y: marble.position.y,
+          z: marble.position.z
+        },
+        marbleVel: {
+          x: velocity.x,
+          y: velocity.y,
+          z: velocity.z
+        },
+        speed,
+        tiltX,
+        tiltZ,
+        fallCount,
+        snapshotCount: snapshots.length,
+        undoIndex,
+        canUndo,
+        canRedo,
+        modelLoaded,
+        timeElapsed
+      };
+    }
+
+    function animate(now) {
+      requestAnimationFrame(animate);
+
+      let dt = (now - lastTime) / 1000;
+      lastTime = now;
+      dt = Math.min(dt, 1 / 30);
+
+      const timeElapsed = (now - startTime) / 1000;
+
+      const tiltStep = 0.005;
+      const tiltLimit = 0.15;
+
+      if (keys.ArrowUp) tiltX += tiltStep;
+      if (keys.ArrowDown) tiltX -= tiltStep;
+      if (keys.ArrowLeft) tiltZ += tiltStep;
+      if (keys.ArrowRight) tiltZ -= tiltStep;
+
+      tiltX = clamp(tiltX, -tiltLimit, tiltLimit);
+      tiltZ = clamp(tiltZ, -tiltLimit, tiltLimit);
+
+      if (collisionWorld) {
+        collisionWorld.rotation.x = tiltX;
+        collisionWorld.rotation.z = tiltZ;
+      }
+
+      velocity.y -= 9.8 * dt;
+
+      velocity.x += Math.sin(tiltZ) * 8.0 * dt;
+      velocity.z += Math.sin(tiltX) * 8.0 * dt;
+
+      velocity.x *= 0.98;
+      velocity.z *= 0.98;
+
+      marble.position.x += velocity.x * dt;
+      marble.position.y += velocity.y * dt;
+      marble.position.z += velocity.z * dt;
+
+      if (marble.position.y < marbleRadius) {
+        marble.position.y = marbleRadius;
+        if (velocity.y < 0) velocity.y = 0;
+      }
+
+      if (marble.position.y < -10) {
+        resetMarbleOnly();
+        fallCount++;
+      }
+
+      snapshotTimer += dt;
+      if (snapshotTimer >= 1.0) {
+        saveSnapshot();
+        snapshotTimer = 0;
+      }
+
+      updateHUD(timeElapsed);
+      controls.update();
+      renderer.render(scene, camera);
+    }
+
+    updateHUD(0);
+    requestAnimationFrame(animate);
+  </script>
+</body>
+</html>

@@ -1,0 +1,620 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Three.js Avalanche Simulation</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #87CEEB;
+            font-family: monospace;
+            user-select: none;
+        }
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+        }
+        #hud {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(0, 0, 0, 0.7);
+            color: #00ff00;
+            padding: 15px;
+            border-radius: 5px;
+            pointer-events: none;
+            font-size: 14px;
+            line-height: 1.5;
+            min-width: 250px;
+        }
+        #controls {
+            position: absolute;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            gap: 10px;
+            background: rgba(0, 0, 0, 0.5);
+            padding: 10px;
+            border-radius: 8px;
+        }
+        button {
+            background: #444;
+            color: white;
+            border: 1px solid #666;
+            padding: 8px 16px;
+            cursor: pointer;
+            border-radius: 4px;
+            font-family: inherit;
+            font-weight: bold;
+            transition: background 0.2s;
+        }
+        button:hover {
+            background: #666;
+        }
+        button:active {
+            background: #888;
+        }
+        #instructions {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            background: rgba(0, 0, 0, 0.7);
+            color: #fff;
+            padding: 10px;
+            border-radius: 5px;
+            pointer-events: none;
+            font-size: 12px;
+            text-align: right;
+        }
+    </style>
+    <!-- Import maps polyfill -->
+    <script async src="https://unpkg.com/es-module-shims@1.8.0/dist/es-module-shims.js"></script>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="canvas-container"></div>
+    
+    <div id="hud">
+        <div>Particles: <span id="hud-count">0</span></div>
+        <div>Time: <span id="hud-time">0.0</span> s</div>
+        <div>Kinetic Energy: <span id="hud-ke">0.00</span></div>
+        <div>Center of Mass: <span id="hud-com">0.0, 0.0, 0.0</span></div>
+        <div>History (U/R): <span id="hud-history">0 / 0</span></div>
+        <div style="color:#ffaa00; margin-top:5px;">Status: <span id="hud-status">Paused</span></div>
+    </div>
+
+    <div id="instructions">
+        Controls:<br>
+        Left Click: Rotate Camera<br>
+        Right Click: Pan Camera<br>
+        Scroll: Zoom<br>
+        Click Terrain: Drop 5 particles<br>
+        'A' Key: Add 10 particles at peak<br>
+        'E' Key: Explosion at CoM<br>
+        Ctrl+Z: Undo | Ctrl+Y: Redo
+    </div>
+
+    <div id="controls">
+        <button id="startBtn">Start</button>
+        <button id="pauseBtn">Pause</button>
+        <button id="resetBtn">Reset</button>
+        <button id="undoBtn">Undo</button>
+        <button id="redoBtn">Redo</button>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+        // --- Global State ---
+        window.__3D_STATE__ = {
+            simRunning: false,
+            particleCount: 0,
+            simTime: 0,
+            totalKineticEnergy: 0,
+            centerOfMass: { x: 0, y: 0, z: 0 },
+            undoStackSize: 0,
+            redoStackSize: 0,
+            fishPosition: { x: -10, y: 0, z: -10 },
+            maxParticleSpeed: 0,
+            particlesAtRest: 0,
+            frameCount: 0,
+            historySnapshotCount: 0,
+            lastAction: 'none',
+            allParticlesAboveTerrain: true,
+            hasNaN: false
+        };
+
+        // --- Scene Setup ---
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x87CEEB);
+        scene.fog = new THREE.FogExp2(0x87CEEB, 0.005);
+
+        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.set(0, 40, 60);
+        camera.lookAt(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        container.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.05;
+        controls.target.set(0, 0, 0);
+
+        // --- Lighting ---
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+        dirLight.position.set(50, 80, 30);
+        dirLight.castShadow = true;
+        dirLight.shadow.mapSize.width = 2048;
+        dirLight.shadow.mapSize.height = 2048;
+        dirLight.shadow.camera.near = 0.5;
+        dirLight.shadow.camera.far = 200;
+        const d = 60;
+        dirLight.shadow.camera.left = -d;
+        dirLight.shadow.camera.right = d;
+        dirLight.shadow.camera.top = d;
+        dirLight.shadow.camera.bottom = -d;
+        scene.add(dirLight);
+
+        // --- Terrain Generation ---
+        function getTerrainHeight(x, z) {
+            return 8 * Math.sin(x * 0.15) * Math.cos(z * 0.12) + 4 * Math.sin(x * 0.3 + 1) * Math.sin(z * 0.25 + 2);
+        }
+
+        function getTerrainGradient(x, z) {
+            const dx = 8 * 0.15 * Math.cos(x * 0.15) * Math.cos(z * 0.12) + 4 * 0.3 * Math.cos(x * 0.3 + 1) * Math.sin(z * 0.25 + 2);
+            const dz = -8 * 0.12 * Math.sin(x * 0.15) * Math.sin(z * 0.12) + 4 * 0.25 * Math.sin(x * 0.3 + 1) * Math.cos(z * 0.25 + 2);
+            return { dx, dz };
+        }
+
+        const terrainGeo = new THREE.PlaneGeometry(100, 100, 64, 64);
+        terrainGeo.rotateX(-Math.PI / 2);
+        
+        const posAttr = terrainGeo.attributes.position;
+        const colors = [];
+        const colorGreen = new THREE.Color(0x228B22);
+        const colorWhite = new THREE.Color(0xffffff);
+        let highestPeak = new THREE.Vector3(0, -Infinity, 0);
+
+        for (let i = 0; i < posAttr.count; i++) {
+            const x = posAttr.getX(i);
+            const z = posAttr.getZ(i);
+            const y = getTerrainHeight(x, z);
+            posAttr.setY(i, y);
+
+            if (y > highestPeak.y) {
+                highestPeak.set(x, y, z);
+            }
+
+            const t = THREE.MathUtils.clamp((y - 4) / (8 - 4), 0, 1);
+            const c = new THREE.Color().lerpColors(colorGreen, colorWhite, t);
+            colors.push(c.r, c.g, c.b);
+        }
+
+        terrainGeo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+        terrainGeo.computeVertexNormals();
+
+        const terrainMat = new THREE.MeshStandardMaterial({
+            vertexColors: true,
+            roughness: 0.8,
+            metalness: 0.1,
+            side: THREE.DoubleSide
+        });
+        const terrainMesh = new THREE.Mesh(terrainGeo, terrainMat);
+        terrainMesh.receiveShadow = true;
+        scene.add(terrainMesh);
+
+        // --- Fish Model ---
+        const fishGroup = new THREE.Group();
+        fishGroup.position.set(-10, 0, -10);
+        fishGroup.scale.set(5, 5, 5);
+        scene.add(fishGroup);
+
+        // Placeholder until loaded
+        const placeholderGeo = new THREE.BoxGeometry(0.2, 0.2, 0.5);
+        const placeholderMat = new THREE.MeshStandardMaterial({ color: 0xffaa00 });
+        const placeholderMesh = new THREE.Mesh(placeholderGeo, placeholderMat);
+        fishGroup.add(placeholderMesh);
+
+        const loader = new GLTFLoader();
+        loader.load('._BarramundiFish.glb', (gltf) => {
+            fishGroup.remove(placeholderMesh);
+            const model = gltf.scene;
+            model.traverse((child) => {
+                if (child.isMesh) {
+                    child.castShadow = true;
+                    child.receiveShadow = true;
+                }
+            });
+            fishGroup.add(model);
+        }, undefined, (error) => {
+            console.warn("Could not load ._BarramundiFish.glb, using placeholder.", error);
+        });
+
+        // --- Particle System ---
+        const particles = [];
+        const particleGeo = new THREE.SphereGeometry(0.3, 8, 8);
+        const particleMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.4 });
+        const MAX_PARTICLES = 200;
+
+        function createParticle(position) {
+            if (particles.length >= MAX_PARTICLES) return null;
+            const mesh = new THREE.Mesh(particleGeo, particleMat);
+            mesh.castShadow = true;
+            mesh.receiveShadow = true;
+            mesh.position.copy(position);
+            scene.add(mesh);
+            
+            const p = {
+                mesh: mesh,
+                pos: position.clone(),
+                vel: new THREE.Vector3(0, 0, 0)
+            };
+            particles.push(p);
+            return p;
+        }
+
+        function removeAllParticles() {
+            for (const p of particles) {
+                scene.remove(p.mesh);
+                p.mesh.geometry.dispose();
+            }
+            particles.length = 0;
+        }
+
+        function initParticles() {
+            removeAllParticles();
+            for (let i = 0; i < 50; i++) {
+                const offset = new THREE.Vector3(
+                    (Math.random() - 0.5) * 2,
+                    Math.random() * 2,
+                    (Math.random() - 0.5) * 2
+                );
+                createParticle(highestPeak.clone().add(offset));
+            }
+            window.__3D_STATE__.particleCount = particles.length;
+        }
+
+        // --- Undo/Redo System ---
+        const undoStack = [];
+        let redoStack = [];
+        const MAX_HISTORY = 30;
+
+        function saveSnapshot() {
+            const state = {
+                simTime: window.__3D_STATE__.simTime,
+                frameCount: window.__3D_STATE__.frameCount,
+                particles: particles.map(p => ({
+                    pos: p.pos.clone(),
+                    vel: p.vel.clone()
+                })),
+                fishPos: fishGroup.position.clone()
+            };
+            
+            undoStack.push(state);
+            if (undoStack.length > MAX_HISTORY) {
+                undoStack.shift();
+            }
+            redoStack = []; // Clear redo on new action/snapshot
+            window.__3D_STATE__.historySnapshotCount++;
+            updateHistoryState();
+        }
+
+        function applySnapshot(state) {
+            window.__3D_STATE__.simTime = state.simTime;
+            window.__3D_STATE__.frameCount = state.frameCount;
+            
+            removeAllParticles();
+            for (const pState of state.particles) {
+                const p = createParticle(pState.pos);
+                if (p) p.vel.copy(pState.vel);
+            }
+            
+            fishGroup.position.copy(state.fishPos);
+            window.__3D_STATE__.particleCount = particles.length;
+            updateHistoryState();
+        }
+
+        function performUndo() {
+            if (undoStack.length === 0) return;
+            
+            // Save current state to redo stack before undoing
+            const currentState = {
+                simTime: window.__3D_STATE__.simTime,
+                frameCount: window.__3D_STATE__.frameCount,
+                particles: particles.map(p => ({ pos: p.pos.clone(), vel: p.vel.clone() })),
+                fishPos: fishGroup.position.clone()
+            };
+            redoStack.push(currentState);
+            
+            const prevState = undoStack.pop();
+            applySnapshot(prevState);
+            window.__3D_STATE__.lastAction = 'undo';
+        }
+
+        function performRedo() {
+            if (redoStack.length === 0) return;
+            
+            // Save current state to undo stack before redoing
+            const currentState = {
+                simTime: window.__3D_STATE__.simTime,
+                frameCount: window.__3D_STATE__.frameCount,
+                particles: particles.map(p => ({ pos: p.pos.clone(), vel: p.vel.clone() })),
+                fishPos: fishGroup.position.clone()
+            };
+            undoStack.push(currentState);
+            
+            const nextState = redoStack.pop();
+            applySnapshot(nextState);
+            window.__3D_STATE__.lastAction = 'redo';
+        }
+
+        function updateHistoryState() {
+            window.__3D_STATE__.undoStackSize = undoStack.length;
+            window.__3D_STATE__.redoStackSize = redoStack.length;
+        }
+
+        // --- Physics Engine ---
+        const TIME_STEP = 1 / 60;
+        let accumulator = 0;
+        let lastTime = performance.now();
+
+        function physicsStep() {
+            if (!window.__3D_STATE__.simRunning) return;
+
+            window.__3D_STATE__.simTime += TIME_STEP;
+            window.__3D_STATE__.frameCount++;
+
+            let totalKE = 0;
+            let com = new THREE.Vector3();
+            let maxSpeed = 0;
+            let atRestCount = 0;
+            let allAbove = true;
+            let hasNaN = false;
+
+            for (const p of particles) {
+                // Gravity
+                p.vel.y -= 9.8 * TIME_STEP;
+
+                // Terrain slope force
+                const grad = getTerrainGradient(p.pos.x, p.pos.z);
+                p.vel.x -= grad.dx * 5.0 * TIME_STEP;
+                p.vel.z -= grad.dz * 5.0 * TIME_STEP;
+
+                // Damping
+                p.vel.multiplyScalar(0.98);
+
+                // Velocity cap
+                let speed = p.vel.length();
+                if (speed > 20) {
+                    p.vel.multiplyScalar(20 / speed);
+                    speed = 20;
+                }
+
+                // Update position
+                p.pos.addScaledVector(p.vel, TIME_STEP);
+
+                // Collision with terrain
+                const terrainY = getTerrainHeight(p.pos.x, p.pos.z);
+                if (p.pos.y < terrainY) {
+                    p.pos.y = terrainY;
+                    allAbove = false;
+                    
+                    // Project velocity onto tangent plane to slide
+                    const normal = new THREE.Vector3(-grad.dx, 1, -grad.dz).normalize();
+                    const dot = p.vel.dot(normal);
+                    if (dot < 0) {
+                        p.vel.sub(normal.multiplyScalar(dot));
+                    }
+                }
+
+                // Update mesh
+                p.mesh.position.copy(p.pos);
+
+                // NaN Check
+                if (Number.isNaN(p.pos.x) || Number.isNaN(p.pos.y) || Number.isNaN(p.pos.z) ||
+                    Number.isNaN(p.vel.x) || Number.isNaN(p.vel.y) || Number.isNaN(p.vel.z)) {
+                    hasNaN = true;
+                }
+
+                // Stats
+                const currentSpeed = p.vel.length();
+                totalKE += 0.5 * 1.0 * currentSpeed * currentSpeed;
+                com.add(p.pos);
+                if (currentSpeed > maxSpeed) maxSpeed = currentSpeed;
+                if (currentSpeed < 0.1) atRestCount++;
+            }
+
+            if (particles.length > 0) {
+                com.divideScalar(particles.length);
+            }
+
+            // Update State
+            window.__3D_STATE__.totalKineticEnergy = totalKE;
+            window.__3D_STATE__.centerOfMass = { x: com.x, y: com.y, z: com.z };
+            window.__3D_STATE__.maxParticleSpeed = maxSpeed;
+            window.__3D_STATE__.particlesAtRest = atRestCount;
+            window.__3D_STATE__.allParticlesAboveTerrain = allAbove;
+            window.__3D_STATE__.hasNaN = hasNaN;
+
+            // Fish Animation
+            fishGroup.position.y = 0 + 0.3 * Math.sin(window.__3D_STATE__.simTime * 2 * Math.PI * 1);
+            window.__3D_STATE__.fishPosition = { x: fishGroup.position.x, y: fishGroup.position.y, z: fishGroup.position.z };
+
+            // Auto Pause on NaN
+            if (hasNaN) {
+                window.__3D_STATE__.simRunning = false;
+                window.__3D_STATE__.lastAction = 'auto-pause-nan';
+                document.getElementById('hud-status').innerText = 'ERROR: NaN Detected - Paused';
+                document.getElementById('hud-status').style.color = '#ff0000';
+            }
+
+            // Auto Snapshot
+            if (window.__3D_STATE__.frameCount % 60 === 0) {
+                saveSnapshot();
+            }
+        }
+
+        // --- Interactions ---
+        document.getElementById('startBtn').addEventListener('click', () => {
+            window.__3D_STATE__.simRunning = true;
+            window.__3D_STATE__.lastAction = 'start';
+            document.getElementById('hud-status').innerText = 'Running';
+            document.getElementById('hud-status').style.color = '#00ff00';
+        });
+
+        document.getElementById('pauseBtn').addEventListener('click', () => {
+            window.__3D_STATE__.simRunning = false;
+            window.__3D_STATE__.lastAction = 'pause';
+            document.getElementById('hud-status').innerText = 'Paused';
+            document.getElementById('hud-status').style.color = '#ffaa00';
+        });
+
+        document.getElementById('resetBtn').addEventListener('click', () => {
+            window.__3D_STATE__.simRunning = false;
+            window.__3D_STATE__.simTime = 0;
+            window.__3D_STATE__.frameCount = 0;
+            undoStack.length = 0;
+            redoStack.length = 0;
+            initParticles();
+            updateHistoryState();
+            window.__3D_STATE__.lastAction = 'reset';
+            document.getElementById('hud-status').innerText = 'Reset';
+            document.getElementById('hud-status').style.color = '#ffaa00';
+        });
+
+        document.getElementById('undoBtn').addEventListener('click', performUndo);
+        document.getElementById('redoBtn').addEventListener('click', performRedo);
+
+        window.addEventListener('keydown', (e) => {
+            if (e.key.toLowerCase() === 'a') {
+                let added = 0;
+                for (let i = 0; i < 10; i++) {
+                    const offset = new THREE.Vector3((Math.random() - 0.5)*2, Math.random()*2, (Math.random() - 0.5)*2);
+                    if (createParticle(highestPeak.clone().add(offset))) added++;
+                }
+                if (added > 0) {
+                    redoStack = [];
+                    window.__3D_STATE__.particleCount = particles.length;
+                    window.__3D_STATE__.lastAction = 'addParticles';
+                }
+            } else if (e.key.toLowerCase() === 'e') {
+                if (particles.length === 0) return;
+                const com = new THREE.Vector3(
+                    window.__3D_STATE__.centerOfMass.x,
+                    window.__3D_STATE__.centerOfMass.y,
+                    window.__3D_STATE__.centerOfMass.z
+                );
+                for (const p of particles) {
+                    let dir = new THREE.Vector3().subVectors(p.pos, com);
+                    if (dir.lengthSq() < 0.0001) dir.set(0, 1, 0);
+                    dir.normalize();
+                    p.vel.add(dir.multiplyScalar(8));
+                }
+                redoStack = [];
+                window.__3D_STATE__.lastAction = 'explosion';
+            } else if (e.ctrlKey && e.key.toLowerCase() === 'z') {
+                performUndo();
+            } else if (e.ctrlKey && e.key.toLowerCase() === 'y') {
+                performRedo();
+            }
+        });
+
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+
+        window.addEventListener('pointerdown', (e) => {
+            if (e.target.tagName === 'BUTTON') return;
+            if (e.button !== 0) return; // Only left click
+
+            mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+
+            raycaster.setFromCamera(mouse, camera);
+            const intersects = raycaster.intersectObject(terrainMesh);
+
+            if (intersects.length > 0) {
+                const pt = intersects[0].point;
+                let added = 0;
+                for (let i = 0; i < 5; i++) {
+                    const offset = new THREE.Vector3((Math.random() - 0.5), Math.random() * 2 + 1, (Math.random() - 0.5));
+                    if (createParticle(pt.clone().add(offset))) added++;
+                }
+                if (added > 0) {
+                    redoStack = [];
+                    window.__3D_STATE__.particleCount = particles.length;
+                    window.__3D_STATE__.lastAction = 'clickDrop';
+                }
+            }
+        });
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // --- HUD Update ---
+        function updateHUD() {
+            document.getElementById('hud-count').innerText = window.__3D_STATE__.particleCount;
+            document.getElementById('hud-time').innerText = window.__3D_STATE__.simTime.toFixed(1);
+            document.getElementById('hud-ke').innerText = window.__3D_STATE__.totalKineticEnergy.toFixed(2);
+            document.getElementById('hud-com').innerText = 
+                `${window.__3D_STATE__.centerOfMass.x.toFixed(1)}, ` +
+                `${window.__3D_STATE__.centerOfMass.y.toFixed(1)}, ` +
+                `${window.__3D_STATE__.centerOfMass.z.toFixed(1)}`;
+            document.getElementById('hud-history').innerText = 
+                `${window.__3D_STATE__.undoStackSize} / ${window.__3D_STATE__.redoStackSize}`;
+        }
+
+        // --- Main Loop ---
+        initParticles();
+        saveSnapshot(); // Initial state
+
+        function animate(currentTime) {
+            requestAnimationFrame(animate);
+
+            let dt = (currentTime - lastTime) / 1000;
+            lastTime = currentTime;
+            
+            // Prevent spiral of death
+            if (dt > 0.1) dt = 0.1;
+
+            accumulator += dt;
+
+            while (accumulator >= TIME_STEP) {
+                physicsStep();
+                accumulator -= TIME_STEP;
+            }
+
+            controls.update();
+            updateHUD();
+            renderer.render(scene, camera);
+        }
+
+        requestAnimationFrame(animate);
+
+    </script>
+</body>
+</html>

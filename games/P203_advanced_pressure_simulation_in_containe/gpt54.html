@@ -1,0 +1,696 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1.0" />
+  <title>Three.js Pressure Simulation with Fish</title>
+  <style>
+    html, body {
+      margin: 0;
+      overflow: hidden;
+      background: #1a1a2e;
+      font-family: Arial, Helvetica, sans-serif;
+      color: white;
+    }
+
+    canvas {
+      display: block;
+    }
+
+    #hud {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      background: rgba(0, 0, 0, 0.45);
+      padding: 14px 16px;
+      border-radius: 10px;
+      border: 1px solid rgba(255,255,255,0.15);
+      min-width: 240px;
+      z-index: 10;
+      backdrop-filter: blur(4px);
+      box-shadow: 0 4px 20px rgba(0,0,0,0.25);
+    }
+
+    #hud h2 {
+      margin: 0 0 10px 0;
+      font-size: 18px;
+      color: #8be9fd;
+    }
+
+    .hud-line {
+      margin: 6px 0;
+      font-size: 14px;
+      line-height: 1.3;
+    }
+
+    #score-display {
+      font-size: 18px;
+      font-weight: bold;
+      color: #ffd166;
+      margin-top: 10px;
+    }
+
+    #status-display {
+      font-weight: bold;
+      color: #7CFC98;
+    }
+
+    #instructions {
+      position: absolute;
+      bottom: 12px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(0, 0, 0, 0.5);
+      padding: 10px 16px;
+      border-radius: 10px;
+      border: 1px solid rgba(255,255,255,0.15);
+      z-index: 10;
+      font-size: 13px;
+      text-align: center;
+      max-width: 90vw;
+      line-height: 1.45;
+    }
+
+    #warning {
+      position: absolute;
+      top: 12px;
+      right: 12px;
+      background: rgba(255, 80, 80, 0.18);
+      color: #ffd6d6;
+      padding: 10px 12px;
+      border-radius: 8px;
+      border: 1px solid rgba(255,120,120,0.35);
+      z-index: 10;
+      max-width: 300px;
+      display: none;
+      font-size: 13px;
+      line-height: 1.4;
+    }
+  </style>
+</head>
+<body>
+  <div id="hud">
+    <h2>Gas Pressure Simulation</h2>
+    <div class="hud-line" id="pressure-display">Pressure: 0.00</div>
+    <div class="hud-line" id="temperature-display">Temperature: 300</div>
+    <div class="hud-line" id="volume-display">Volume: 144.00</div>
+    <div class="hud-line" id="particle-display">Particles: 100</div>
+    <div class="hud-line" id="piston-display">Piston Height: 4.00</div>
+    <div class="hud-line" id="status-display">RUNNING</div>
+    <div class="hud-line" id="score-display">Score: 0</div>
+  </div>
+
+  <div id="warning">
+    Could not load <b>BarramundiFish.glb</b>. Make sure the file exists in the same folder as this HTML file.
+    A fallback fish shape is being used.
+  </div>
+
+  <div id="instructions">
+    <b>Controls:</b>
+    ↑/↓ Move piston |
+    H Heat +50 |
+    C Cool -50 |
+    R Reset |
+    P Pause/Resume |
+    Space Release valve |
+    Click container to add 10 particles
+  </div>
+
+  <script type="module">
+    import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
+    import { OrbitControls } from 'https://unpkg.com/three@0.160.0/examples/jsm/controls/OrbitControls.js';
+    import { GLTFLoader } from 'https://unpkg.com/three@0.160.0/examples/jsm/loaders/GLTFLoader.js';
+
+    // --------------------------------------------------
+    // Basic setup
+    // --------------------------------------------------
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x1a1a2e);
+
+    const camera = new THREE.PerspectiveCamera(
+      60,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      1000
+    );
+    camera.position.set(0, 5, 12);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    document.body.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.target.set(0, 2, 0);
+
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
+    scene.add(ambientLight);
+
+    const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+    dirLight.position.set(5, 10, 5);
+    scene.add(dirLight);
+
+    const grid = new THREE.GridHelper(20, 20, 0x4e5d94, 0x313a63);
+    scene.add(grid);
+
+    // --------------------------------------------------
+    // Simulation constants
+    // --------------------------------------------------
+    const CONTAINER_WIDTH = 6;
+    const CONTAINER_HEIGHT = 8;
+    const CONTAINER_DEPTH = 6;
+    const MIN_PISTON_Y = 1;
+    const MAX_PISTON_Y = 4;
+    const BASE_SPEED = 0.02;
+    const MAX_PARTICLES = 200;
+    const INITIAL_PARTICLES = 100;
+    const N_CONSTANT_BASE = 100; // used in requested pressure formula
+    const R_CONSTANT = 0.01;
+
+    // Inner bounds
+    const xMin = -CONTAINER_WIDTH / 2;
+    const xMax = CONTAINER_WIDTH / 2;
+    const zMin = -CONTAINER_DEPTH / 2;
+    const zMax = CONTAINER_DEPTH / 2;
+    const yMin = 0;
+
+    // --------------------------------------------------
+    // State
+    // --------------------------------------------------
+    let pistonY = 4;
+    let temperature = 300;
+    let pressure = 0;
+    let volume = CONTAINER_WIDTH * CONTAINER_DEPTH * pistonY;
+    let paused = false;
+    let score = 0;
+    let frameCount = 0;
+    let maxPressureReached = 0;
+    let fishLoaded = false;
+
+    let milestone5Awarded = false;
+    let milestone10Awarded = false;
+    let milestone15Awarded = false;
+
+    // --------------------------------------------------
+    // HUD references
+    // --------------------------------------------------
+    const pressureDisplay = document.getElementById('pressure-display');
+    const temperatureDisplay = document.getElementById('temperature-display');
+    const volumeDisplay = document.getElementById('volume-display');
+    const particleDisplay = document.getElementById('particle-display');
+    const scoreDisplay = document.getElementById('score-display');
+    const pistonDisplay = document.getElementById('piston-display');
+    const statusDisplay = document.getElementById('status-display');
+    const warningBox = document.getElementById('warning');
+
+    // --------------------------------------------------
+    // Container
+    // --------------------------------------------------
+    const containerGroup = new THREE.Group();
+    scene.add(containerGroup);
+
+    const boxGeometry = new THREE.BoxGeometry(CONTAINER_WIDTH, CONTAINER_HEIGHT, CONTAINER_DEPTH);
+    const boxMaterial = new THREE.MeshPhysicalMaterial({
+      color: 0x99ccff,
+      transparent: true,
+      opacity: 0.12,
+      transmission: 0.4,
+      roughness: 0.2,
+      metalness: 0.05,
+      side: THREE.DoubleSide
+    });
+    const containerMesh = new THREE.Mesh(boxGeometry, boxMaterial);
+    containerMesh.position.set(0, CONTAINER_HEIGHT / 2, 0);
+    containerGroup.add(containerMesh);
+
+    const edgeGeometry = new THREE.EdgesGeometry(boxGeometry);
+    const edgeLines = new THREE.LineSegments(
+      edgeGeometry,
+      new THREE.LineBasicMaterial({ color: 0xbfd7ff })
+    );
+    edgeLines.position.copy(containerMesh.position);
+    containerGroup.add(edgeLines);
+
+    const pistonGeometry = new THREE.BoxGeometry(CONTAINER_WIDTH, 0.3, CONTAINER_DEPTH);
+    const pistonMaterial = new THREE.MeshStandardMaterial({
+      color: 0x999999,
+      metalness: 0.85,
+      roughness: 0.25
+    });
+    const piston = new THREE.Mesh(pistonGeometry, pistonMaterial);
+    piston.position.set(0, pistonY, 0);
+    scene.add(piston);
+
+    // --------------------------------------------------
+    // Fish
+    // --------------------------------------------------
+    let fish = null;
+    let fishBaseY = 2;
+    let fishScaleCurrent = 2.0;
+
+    function applyFishTintAndScale() {
+      if (!fish) return;
+
+      const pressureNorm = THREE.MathUtils.clamp((pressure - 2.0) / 15.0, 0, 1);
+      fishScaleCurrent = THREE.MathUtils.lerp(2.0, 1.0, pressureNorm);
+      fish.scale.setScalar(fishScaleCurrent);
+
+      const lowColor = new THREE.Color(0x4da6ff);
+      const highColor = new THREE.Color(0xff4d4d);
+      const tint = lowColor.clone().lerp(highColor, pressureNorm);
+
+      fish.traverse((child) => {
+        if (child.isMesh && child.material) {
+          if (Array.isArray(child.material)) {
+            child.material.forEach(mat => {
+              if (mat.color) mat.color.copy(tint);
+            });
+          } else {
+            if (child.material.color) child.material.color.copy(tint);
+          }
+        }
+      });
+    }
+
+    function createFallbackFish() {
+      const group = new THREE.Group();
+
+      const body = new THREE.Mesh(
+        new THREE.SphereGeometry(0.55, 24, 16),
+        new THREE.MeshStandardMaterial({ color: 0x4da6ff, roughness: 0.5, metalness: 0.1 })
+      );
+      body.scale.set(1.4, 0.8, 0.7);
+
+      const tail = new THREE.Mesh(
+        new THREE.ConeGeometry(0.35, 0.7, 4),
+        new THREE.MeshStandardMaterial({ color: 0x4da6ff, roughness: 0.5, metalness: 0.1 })
+      );
+      tail.rotation.z = Math.PI / 2;
+      tail.position.set(-1.0, 0, 0);
+
+      const finTop = new THREE.Mesh(
+        new THREE.ConeGeometry(0.15, 0.35, 3),
+        new THREE.MeshStandardMaterial({ color: 0x6fb6ff })
+      );
+      finTop.position.set(0.0, 0.45, 0);
+      finTop.rotation.z = Math.PI;
+
+      const eye = new THREE.Mesh(
+        new THREE.SphereGeometry(0.05, 12, 12),
+        new THREE.MeshStandardMaterial({ color: 0xffffff })
+      );
+      eye.position.set(0.45, 0.12, 0.28);
+
+      const pupil = new THREE.Mesh(
+        new THREE.SphereGeometry(0.025, 12, 12),
+        new THREE.MeshStandardMaterial({ color: 0x111111 })
+      );
+      pupil.position.set(0.48, 0.12, 0.31);
+
+      group.add(body, tail, finTop, eye, pupil);
+      group.position.set(0, fishBaseY, 0);
+      group.rotation.y = Math.PI / 2;
+      group.scale.setScalar(2.0);
+      scene.add(group);
+      fish = group;
+      fishLoaded = true;
+    }
+
+    const loader = new GLTFLoader();
+    loader.load(
+      'BarramundiFish.glb',
+      (gltf) => {
+        fish = gltf.scene;
+        fish.position.set(0, fishBaseY, 0);
+        fish.scale.setScalar(2.0);
+        fish.rotation.y = Math.PI / 2;
+
+        fish.traverse((child) => {
+          if (child.isMesh) {
+            child.castShadow = false;
+            child.receiveShadow = false;
+            if (child.material) {
+              if (Array.isArray(child.material)) {
+                child.material = child.material.map(m => m.clone());
+              } else {
+                child.material = child.material.clone();
+              }
+            }
+          }
+        });
+
+        scene.add(fish);
+        fishLoaded = true;
+      },
+      undefined,
+      () => {
+        warningBox.style.display = 'block';
+        createFallbackFish();
+      }
+    );
+
+    // --------------------------------------------------
+    // Particles
+    // --------------------------------------------------
+    const particleGroup = new THREE.Group();
+    scene.add(particleGroup);
+
+    const particles = [];
+    const particleGeometry = new THREE.SphereGeometry(0.05, 10, 10);
+
+    function randomRange(min, max) {
+      return min + Math.random() * (max - min);
+    }
+
+    function getPressureFactor() {
+      const norm = THREE.MathUtils.clamp((MAX_PISTON_Y - pistonY) / (MAX_PISTON_Y - MIN_PISTON_Y), 0, 1);
+      return 1.0 + norm * 2.0;
+    }
+
+    function updateParticleColor(particle, speed) {
+      const minSpeed = BASE_SPEED * 1.0;
+      const maxSpeed = BASE_SPEED * 3.0;
+      const t = THREE.MathUtils.clamp((speed - minSpeed) / (maxSpeed - minSpeed), 0, 1);
+      const color = new THREE.Color(0x3366ff).lerp(new THREE.Color(0xff3333), t);
+      particle.mesh.material.color.copy(color);
+    }
+
+    function createParticle() {
+      const material = new THREE.MeshStandardMaterial({
+        color: 0x3366ff,
+        emissive: 0x111111
+      });
+      const mesh = new THREE.Mesh(particleGeometry, material);
+
+      const currentTop = pistonY - 0.18;
+      mesh.position.set(
+        randomRange(xMin + 0.1, xMax - 0.1),
+        randomRange(yMin + 0.1, Math.max(yMin + 0.2, currentTop - 0.1)),
+        randomRange(zMin + 0.1, zMax - 0.1)
+      );
+
+      const dir = new THREE.Vector3(
+        randomRange(-1, 1),
+        randomRange(-1, 1),
+        randomRange(-1, 1)
+      ).normalize();
+
+      const particle = {
+        mesh,
+        velocity: dir.multiplyScalar(BASE_SPEED * getPressureFactor())
+      };
+
+      updateParticleColor(particle, particle.velocity.length());
+      particleGroup.add(mesh);
+      particles.push(particle);
+    }
+
+    function initializeParticles(count) {
+      for (let i = particles.length - 1; i >= 0; i--) {
+        particleGroup.remove(particles[i].mesh);
+      }
+      particles.length = 0;
+      for (let i = 0; i < count; i++) createParticle();
+    }
+
+    initializeParticles(INITIAL_PARTICLES);
+
+    // --------------------------------------------------
+    // Pressure / score
+    // --------------------------------------------------
+    function calculateVolume() {
+      return CONTAINER_WIDTH * CONTAINER_DEPTH * pistonY;
+    }
+
+    function calculatePressure() {
+      // As requested: P = nRT/V, with n=100
+      volume = calculateVolume();
+      pressure = (N_CONSTANT_BASE * R_CONSTANT * temperature) / volume;
+      maxPressureReached = Math.max(maxPressureReached, pressure);
+    }
+
+    function checkScoreMilestones() {
+      if (pressure > 5.0 && !milestone5Awarded) {
+        score += 10;
+        milestone5Awarded = true;
+      }
+      if (pressure > 10.0 && !milestone10Awarded) {
+        score += 25;
+        milestone10Awarded = true;
+      }
+      if (pressure > 15.0 && !milestone15Awarded) {
+        score += 50;
+        milestone15Awarded = true;
+      }
+    }
+
+    function clampScore() {
+      score = Math.max(0, score);
+    }
+
+    // --------------------------------------------------
+    // Interaction helpers
+    // --------------------------------------------------
+    function setPistonY(newY) {
+      pistonY = THREE.MathUtils.clamp(newY, MIN_PISTON_Y, MAX_PISTON_Y);
+      piston.position.y = pistonY;
+
+      const topLimit = pistonY - 0.18;
+      for (const p of particles) {
+        if (p.mesh.position.y > topLimit) {
+          p.mesh.position.y = topLimit;
+          p.velocity.y *= -1;
+        }
+      }
+    }
+
+    function resetSimulation() {
+      score -= 10;
+      clampScore();
+
+      pistonY = 4;
+      temperature = 300;
+      pressure = 0;
+      paused = false;
+      maxPressureReached = 0;
+      frameCount = 0;
+
+      milestone5Awarded = false;
+      milestone10Awarded = false;
+      milestone15Awarded = false;
+
+      setPistonY(4);
+      initializeParticles(INITIAL_PARTICLES);
+
+      if (fish) {
+        fish.position.set(0, fishBaseY, 0);
+        fish.scale.setScalar(2.0);
+      }
+    }
+
+    // --------------------------------------------------
+    // Raycast click on container to add particles
+    // --------------------------------------------------
+    const raycaster = new THREE.Raycaster();
+    const mouse = new THREE.Vector2();
+
+    function addParticles(amount) {
+      const canAdd = Math.min(amount, MAX_PARTICLES - particles.length);
+      if (canAdd <= 0) return;
+      for (let i = 0; i < canAdd; i++) createParticle();
+      score += 5;
+      clampScore();
+    }
+
+    renderer.domElement.addEventListener('click', (event) => {
+      mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+      mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+      raycaster.setFromCamera(mouse, camera);
+
+      const intersects = raycaster.intersectObjects([containerMesh, edgeLines], true);
+      if (intersects.length > 0) {
+        addParticles(10);
+      }
+    });
+
+    // --------------------------------------------------
+    // Keyboard controls
+    // --------------------------------------------------
+    window.addEventListener('keydown', (e) => {
+      switch (e.code) {
+        case 'ArrowUp':
+          setPistonY(pistonY + 0.2);
+          break;
+        case 'ArrowDown':
+          setPistonY(pistonY - 0.2);
+          break;
+        case 'KeyH':
+          temperature = Math.min(600, temperature + 50);
+          break;
+        case 'KeyC':
+          temperature = Math.max(100, temperature - 50);
+          break;
+        case 'KeyR':
+          resetSimulation();
+          break;
+        case 'KeyP':
+          paused = !paused;
+          break;
+        case 'Space':
+          e.preventDefault();
+          setPistonY(4);
+          break;
+      }
+    });
+
+    // --------------------------------------------------
+    // Window state exposure
+    // --------------------------------------------------
+    window.__3D_STATE__ = {
+      pressure: 0,
+      temperature: 300,
+      volume: 144.00,
+      pistonY: 4,
+      particleCount: INITIAL_PARTICLES,
+      score: 0,
+      paused: false,
+      fishScale: 2.00,
+      maxPressureReached: 0,
+      particleAvgSpeed: 0,
+      fishLoaded: false,
+      frameCount: 0
+    };
+
+    // --------------------------------------------------
+    // Animation
+    // --------------------------------------------------
+    const clock = new THREE.Clock();
+
+    function updateParticles() {
+      const pressureFactor = getPressureFactor();
+      const topY = pistonY - 0.18;
+      let totalSpeed = 0;
+
+      for (const p of particles) {
+        const currentSpeed = p.velocity.length();
+        const targetSpeed = BASE_SPEED * pressureFactor;
+
+        if (currentSpeed > 0) {
+          p.velocity.setLength(THREE.MathUtils.lerp(currentSpeed, targetSpeed, 0.05));
+        } else {
+          p.velocity.set(
+            randomRange(-1, 1),
+            randomRange(-1, 1),
+            randomRange(-1, 1)
+          ).normalize().multiplyScalar(targetSpeed);
+        }
+
+        if (!paused) {
+          p.mesh.position.add(p.velocity);
+
+          if (p.mesh.position.x <= xMin + 0.05) {
+            p.mesh.position.x = xMin + 0.05;
+            p.velocity.x *= -1;
+          } else if (p.mesh.position.x >= xMax - 0.05) {
+            p.mesh.position.x = xMax - 0.05;
+            p.velocity.x *= -1;
+          }
+
+          if (p.mesh.position.z <= zMin + 0.05) {
+            p.mesh.position.z = zMin + 0.05;
+            p.velocity.z *= -1;
+          } else if (p.mesh.position.z >= zMax - 0.05) {
+            p.mesh.position.z = zMax - 0.05;
+            p.velocity.z *= -1;
+          }
+
+          if (p.mesh.position.y <= yMin + 0.05) {
+            p.mesh.position.y = yMin + 0.05;
+            p.velocity.y *= -1;
+          } else if (p.mesh.position.y >= topY) {
+            p.mesh.position.y = topY;
+            p.velocity.y *= -1;
+          }
+
+          // Small random thermal jitter
+          p.velocity.x += randomRange(-0.001, 0.001);
+          p.velocity.y += randomRange(-0.001, 0.001);
+          p.velocity.z += randomRange(-0.001, 0.001);
+          p.velocity.setLength(targetSpeed);
+        }
+
+        const speed = p.velocity.length();
+        totalSpeed += speed;
+        updateParticleColor(p, speed);
+      }
+
+      return particles.length ? totalSpeed / particles.length : 0;
+    }
+
+    function updateFish(elapsedTime) {
+      if (!fish) return;
+
+      if (!paused) {
+        fish.position.y = fishBaseY + Math.sin(elapsedTime * 2.0 * Math.PI * 1.0) * 0.3;
+      }
+
+      applyFishTintAndScale();
+    }
+
+    function updateHUD(avgSpeed) {
+      pressureDisplay.textContent = `Pressure: ${pressure.toFixed(2)}`;
+      temperatureDisplay.textContent = `Temperature: ${temperature}`;
+      volumeDisplay.textContent = `Volume: ${volume.toFixed(2)}`;
+      particleDisplay.textContent = `Particles: ${particles.length}`;
+      scoreDisplay.textContent = `Score: ${score}`;
+      pistonDisplay.textContent = `Piston Height: ${pistonY.toFixed(2)}`;
+      statusDisplay.textContent = paused ? 'PAUSED' : 'RUNNING';
+      statusDisplay.style.color = paused ? '#ffb86c' : '#7CFC98';
+
+      window.__3D_STATE__.pressure = Number(pressure.toFixed(2));
+      window.__3D_STATE__.temperature = temperature;
+      window.__3D_STATE__.volume = Number(volume.toFixed(2));
+      window.__3D_STATE__.pistonY = pistonY;
+      window.__3D_STATE__.particleCount = particles.length;
+      window.__3D_STATE__.score = score;
+      window.__3D_STATE__.paused = paused;
+      window.__3D_STATE__.fishScale = Number(fishScaleCurrent.toFixed(2));
+      window.__3D_STATE__.maxPressureReached = Number(maxPressureReached.toFixed(2));
+      window.__3D_STATE__.particleAvgSpeed = Number(avgSpeed.toFixed(4));
+      window.__3D_STATE__.fishLoaded = fishLoaded;
+      window.__3D_STATE__.frameCount = frameCount;
+    }
+
+    function animate() {
+      requestAnimationFrame(animate);
+      frameCount++;
+
+      const elapsedTime = clock.getElapsedTime();
+
+      calculatePressure();
+      checkScoreMilestones();
+      clampScore();
+
+      const avgSpeed = updateParticles();
+      updateFish(elapsedTime);
+      controls.update();
+      updateHUD(avgSpeed);
+
+      renderer.render(scene, camera);
+    }
+
+    animate();
+
+    // --------------------------------------------------
+    // Resize
+    // --------------------------------------------------
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,639 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Three.js Flamingo Projectile with Drag</title>
+  <style>
+    html, body {
+      margin: 0;
+      overflow: hidden;
+      height: 100%;
+      font-family: Arial, sans-serif;
+      background: #87CEEB;
+    }
+
+    #ui {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      z-index: 10;
+      color: white;
+      user-select: none;
+    }
+
+    #hud {
+      background: rgba(0, 0, 0, 0.45);
+      padding: 12px 14px;
+      border-radius: 8px;
+      line-height: 1.45;
+      min-width: 260px;
+      font-size: 14px;
+    }
+
+    #controlsPanel {
+      margin-top: 10px;
+      background: rgba(0, 0, 0, 0.35);
+      padding: 10px 12px;
+      border-radius: 8px;
+      font-size: 14px;
+    }
+
+    .label {
+      display: inline-block;
+      min-width: 140px;
+    }
+
+    .hint {
+      margin-top: 8px;
+      font-size: 12px;
+      opacity: 0.9;
+    }
+  </style>
+</head>
+<body>
+  <div id="ui">
+    <div id="hud">
+      <div><span class="label">Launch Angle:</span> <span id="hudAngle">45</span>°</div>
+      <div><span class="label">Launch Speed:</span> <span id="hudSpeed">30</span> m/s</div>
+      <div><span class="label">Drag:</span> <span id="hudDrag">ON</span></div>
+      <div><span class="label">Status:</span> <span id="hudStatus">GROUNDED</span></div>
+      <div><span class="label">Velocity:</span> <span id="hudVelocity">0.00</span> m/s</div>
+      <div><span class="label">Height:</span> <span id="hudHeight">1.00</span> m</div>
+      <div><span class="label">Max Height:</span> <span id="hudMaxHeight">1.00</span> m</div>
+      <div><span class="label">Range:</span> <span id="hudRange">0.00</span> m</div>
+      <div><span class="label">Flight Time:</span> <span id="hudTime">0.00</span> s</div>
+      <div><span class="label">Launch Count:</span> <span id="hudLaunchCount">0</span></div>
+    </div>
+
+    <div id="controlsPanel">
+      <label>
+        <input type="checkbox" id="dragToggle" checked />
+        Enable Drag
+      </label>
+      <div class="hint">
+        SPACE: Launch<br>
+        R: Reset<br>
+        UP/DOWN: Angle ±5°<br>
+        LEFT/RIGHT: Speed ±5 m/s
+      </div>
+    </div>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.163.0/build/three.module.js';
+    import { OrbitControls } from 'https://cdn.jsdelivr.net/npm/three@0.163.0/examples/jsm/controls/OrbitControls.js';
+    import { GLTFLoader } from 'https://cdn.jsdelivr.net/npm/three@0.163.0/examples/jsm/loaders/GLTFLoader.js';
+
+    // ----------------------------
+    // Constants / Physics params
+    // ----------------------------
+    const g = 9.81;
+    const rho = 1.225;
+    const Cd = 0.47;
+    const A = 0.25;
+    const m = 3.0;
+    const FIXED_DT = 1 / 60;
+
+    // ----------------------------
+    // Three.js setup
+    // ----------------------------
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color('#87CEEB');
+
+    const camera = new THREE.PerspectiveCamera(
+      60,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      1000
+    );
+    camera.position.set(0, 15, 40);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    document.body.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.set(0, 5, 0);
+    controls.update();
+
+    // Lights
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+    scene.add(ambientLight);
+
+    const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+    dirLight.position.set(50, 100, 50);
+    dirLight.castShadow = true;
+    dirLight.shadow.mapSize.set(2048, 2048);
+    dirLight.shadow.camera.left = -120;
+    dirLight.shadow.camera.right = 120;
+    dirLight.shadow.camera.top = 120;
+    dirLight.shadow.camera.bottom = -120;
+    dirLight.shadow.camera.near = 1;
+    dirLight.shadow.camera.far = 300;
+    scene.add(dirLight);
+
+    // Ground
+    const groundGeo = new THREE.PlaneGeometry(200, 200);
+    const groundMat = new THREE.MeshLambertMaterial({ color: '#3a7d3a' });
+    const ground = new THREE.Mesh(groundGeo, groundMat);
+    ground.rotation.x = -Math.PI / 2;
+    ground.position.y = 0;
+    ground.receiveShadow = true;
+    scene.add(ground);
+
+    const grid = new THREE.GridHelper(200, 40, 0x444444, 0x888888);
+    grid.position.y = 0.01;
+    scene.add(grid);
+
+    // ----------------------------
+    // Flamingo state
+    // ----------------------------
+    const startPosition = new THREE.Vector3(-30, 1, 0);
+
+    let flamingo = null;
+    let mixer = null;
+    let animationActions = [];
+    let flamingoLoaded = false;
+
+    const loader = new GLTFLoader();
+    loader.load(
+      'flamingo.glb',
+      (gltf) => {
+        flamingo = gltf.scene;
+        flamingo.scale.setScalar(0.05);
+        flamingo.position.copy(startPosition);
+        flamingo.rotation.y = -Math.PI / 2; // face +X
+        flamingo.traverse((obj) => {
+          if (obj.isMesh) {
+            obj.castShadow = true;
+            obj.receiveShadow = true;
+          }
+        });
+        scene.add(flamingo);
+
+        if (gltf.animations && gltf.animations.length > 0) {
+          mixer = new THREE.AnimationMixer(flamingo);
+          animationActions = gltf.animations.map((clip) => mixer.clipAction(clip));
+          animationActions.forEach(action => {
+            action.loop = THREE.LoopRepeat;
+            action.enabled = true;
+            action.paused = true;
+          });
+        }
+
+        flamingoLoaded = true;
+        syncVisualState();
+      },
+      undefined,
+      (err) => {
+        console.error('Failed to load flamingo.glb:', err);
+
+        // Fallback placeholder to keep app functional
+        const geo = new THREE.ConeGeometry(0.7, 2.2, 12);
+        const mat = new THREE.MeshStandardMaterial({ color: 0xff88aa });
+        flamingo = new THREE.Mesh(geo, mat);
+        flamingo.castShadow = true;
+        flamingo.receiveShadow = true;
+        flamingo.position.copy(startPosition);
+        flamingo.rotation.z = -Math.PI / 2;
+        scene.add(flamingo);
+        flamingoLoaded = false;
+        syncVisualState();
+      }
+    );
+
+    // ----------------------------
+    // Trajectory visuals
+    // ----------------------------
+    const MAX_TRAIL_POINTS = 2000;
+    let trailPoints = [];
+
+    const trailGeometry = new THREE.BufferGeometry();
+    const trailMaterial = new THREE.LineBasicMaterial({ color: 0xffff00 });
+    const trailLine = new THREE.Line(trailGeometry, trailMaterial);
+    scene.add(trailLine);
+
+    function updateTrailGeometry() {
+      if (trailPoints.length === 0) {
+        trailGeometry.setFromPoints([new THREE.Vector3(), new THREE.Vector3()]);
+        trailGeometry.setDrawRange(0, 0);
+        return;
+      }
+      trailGeometry.setFromPoints(trailPoints);
+      trailGeometry.setDrawRange(0, trailPoints.length);
+    }
+
+    let ghostLine = null;
+    function updateGhostTrajectory() {
+      if (ghostLine) {
+        scene.remove(ghostLine);
+        ghostLine.geometry.dispose();
+        ghostLine.material.dispose();
+        ghostLine = null;
+      }
+
+      if (sim.status === 'FLYING') return;
+
+      const points = [];
+      const angleRad = THREE.MathUtils.degToRad(sim.launchAngle);
+      const v0x = sim.launchSpeed * Math.cos(angleRad);
+      const v0y = sim.launchSpeed * Math.sin(angleRad);
+      const y0 = startPosition.y;
+      const x0 = startPosition.x;
+
+      const discriminant = v0y * v0y + 2 * g * y0;
+      const flightT = (v0y + Math.sqrt(discriminant)) / g;
+
+      const samples = 100;
+      for (let i = 0; i < samples; i++) {
+        const t = (i / (samples - 1)) * flightT;
+        const x = x0 + v0x * t;
+        const y = y0 + v0y * t - 0.5 * g * t * t;
+        points.push(new THREE.Vector3(x, Math.max(0, y), 0));
+      }
+
+      const geom = new THREE.BufferGeometry().setFromPoints(points);
+      const mat = new THREE.LineDashedMaterial({
+        color: 0xffffff,
+        dashSize: 1.0,
+        gapSize: 0.5
+      });
+      ghostLine = new THREE.Line(geom, mat);
+      ghostLine.computeLineDistances();
+      scene.add(ghostLine);
+    }
+
+    // ----------------------------
+    // Landing markers
+    // ----------------------------
+    const landingMarkers = [];
+    function addLandingMarker(pos) {
+      const marker = new THREE.Mesh(
+        new THREE.SphereGeometry(0.5, 16, 16),
+        new THREE.MeshStandardMaterial({ color: 0xff0000 })
+      );
+      marker.position.copy(pos);
+      marker.position.y = 0.5;
+      marker.castShadow = true;
+      marker.receiveShadow = true;
+      scene.add(marker);
+      landingMarkers.push(marker);
+
+      if (landingMarkers.length > 10) {
+        const old = landingMarkers.shift();
+        scene.remove(old);
+        old.geometry.dispose();
+        old.material.dispose();
+      }
+    }
+
+    // ----------------------------
+    // Simulation state
+    // ----------------------------
+    const sim = {
+      launchAngle: 45,
+      launchSpeed: 30,
+      dragEnabled: true,
+      status: 'GROUNDED',
+
+      position: startPosition.clone(),
+      velocity: new THREE.Vector3(0, 0, 0),
+
+      maxHeight: startPosition.y,
+      range: 0,
+      flightTime: 0,
+      launchCount: 0,
+
+      kineticEnergy: 0,
+      potentialEnergy: m * g * startPosition.y,
+      totalMechanicalEnergy: m * g * startPosition.y,
+      dragEnergyLost: 0,
+      initialTotalEnergy: m * g * startPosition.y,
+
+      physicsStepCount: 0,
+      launchX: startPosition.x
+    };
+
+    // ----------------------------
+    // HUD
+    // ----------------------------
+    const hudAngle = document.getElementById('hudAngle');
+    const hudSpeed = document.getElementById('hudSpeed');
+    const hudDrag = document.getElementById('hudDrag');
+    const hudStatus = document.getElementById('hudStatus');
+    const hudVelocity = document.getElementById('hudVelocity');
+    const hudHeight = document.getElementById('hudHeight');
+    const hudMaxHeight = document.getElementById('hudMaxHeight');
+    const hudRange = document.getElementById('hudRange');
+    const hudTime = document.getElementById('hudTime');
+    const hudLaunchCount = document.getElementById('hudLaunchCount');
+    const dragToggle = document.getElementById('dragToggle');
+
+    function updateHUD() {
+      hudAngle.textContent = sim.launchAngle.toFixed(0);
+      hudSpeed.textContent = sim.launchSpeed.toFixed(0);
+      hudDrag.textContent = sim.dragEnabled ? 'ON' : 'OFF';
+      hudStatus.textContent = sim.status;
+      hudVelocity.textContent = sim.velocity.length().toFixed(2);
+      hudHeight.textContent = sim.position.y.toFixed(2);
+      hudMaxHeight.textContent = sim.maxHeight.toFixed(2);
+      hudRange.textContent = sim.range.toFixed(2);
+      hudTime.textContent = sim.flightTime.toFixed(2);
+      hudLaunchCount.textContent = sim.launchCount.toString();
+    }
+
+    // ----------------------------
+    // State exposure
+    // ----------------------------
+    window.__3D_STATE__ = {};
+
+    function updateExposedState() {
+      const animationPlaying = animationActions.some(a => a.isRunning() && !a.paused);
+      window.__3D_STATE__ = {
+        launchAngle: sim.launchAngle,
+        launchSpeed: sim.launchSpeed,
+        dragEnabled: sim.dragEnabled,
+        status: sim.status,
+        position: { x: sim.position.x, y: sim.position.y, z: sim.position.z },
+        velocity: { x: sim.velocity.x, y: sim.velocity.y, z: sim.velocity.z },
+        velocityMagnitude: sim.velocity.length(),
+        currentHeight: sim.position.y,
+        maxHeight: sim.maxHeight,
+        range: sim.range,
+        flightTime: sim.flightTime,
+        launchCount: sim.launchCount,
+        kineticEnergy: sim.kineticEnergy,
+        potentialEnergy: sim.potentialEnergy,
+        totalMechanicalEnergy: sim.totalMechanicalEnergy,
+        dragEnergyLost: sim.dragEnergyLost,
+        initialTotalEnergy: sim.initialTotalEnergy,
+        trailPointCount: trailPoints.length,
+        landingMarkerCount: landingMarkers.length,
+        physicsStepCount: sim.physicsStepCount,
+        flamingo_loaded: flamingoLoaded,
+        ghostTrajectoryVisible: !!ghostLine && sim.status !== 'FLYING',
+        animationPlaying
+      };
+    }
+
+    // ----------------------------
+    // Helper functions
+    // ----------------------------
+    function clearTrail() {
+      trailPoints = [];
+      updateTrailGeometry();
+    }
+
+    function syncVisualState() {
+      if (!flamingo) return;
+      flamingo.position.copy(sim.position);
+
+      if (sim.status === 'FLYING') {
+        const v = sim.velocity.clone();
+        if (v.lengthSq() > 1e-8) {
+          const angle = Math.atan2(v.y, v.x);
+          flamingo.rotation.set(0, -Math.PI / 2, angle);
+        }
+      } else {
+        flamingo.rotation.set(0, -Math.PI / 2, 0);
+      }
+    }
+
+    function updateAnimationPlayback() {
+      const shouldPlay = sim.status === 'FLYING';
+      animationActions.forEach(action => {
+        if (shouldPlay) {
+          if (!action.isRunning()) action.play();
+          action.paused = false;
+        } else {
+          action.paused = true;
+        }
+      });
+    }
+
+    function resetFlamingo() {
+      sim.status = 'GROUNDED';
+      sim.position.copy(startPosition);
+      sim.velocity.set(0, 0, 0);
+      sim.maxHeight = startPosition.y;
+      sim.range = 0;
+      sim.flightTime = 0;
+      sim.kineticEnergy = 0;
+      sim.potentialEnergy = m * g * sim.position.y;
+      sim.totalMechanicalEnergy = sim.kineticEnergy + sim.potentialEnergy;
+      sim.dragEnergyLost = 0;
+      sim.initialTotalEnergy = sim.totalMechanicalEnergy;
+      sim.physicsStepCount = 0;
+      sim.launchX = startPosition.x;
+
+      clearTrail();
+      updateGhostTrajectory();
+      syncVisualState();
+      updateAnimationPlayback();
+      updateHUD();
+      updateExposedState();
+    }
+
+    function launchFlamingo() {
+      if (sim.status === 'FLYING') return;
+
+      const angleRad = THREE.MathUtils.degToRad(sim.launchAngle);
+      sim.velocity.set(
+        sim.launchSpeed * Math.cos(angleRad),
+        sim.launchSpeed * Math.sin(angleRad),
+        0
+      );
+
+      sim.position.copy(startPosition);
+      sim.maxHeight = sim.position.y;
+      sim.range = 0;
+      sim.flightTime = 0;
+      sim.dragEnergyLost = 0;
+      sim.physicsStepCount = 0;
+      sim.launchX = startPosition.x;
+      sim.status = 'FLYING';
+      sim.launchCount += 1;
+
+      sim.kineticEnergy = 0.5 * m * sim.velocity.lengthSq();
+      sim.potentialEnergy = m * g * sim.position.y;
+      sim.totalMechanicalEnergy = sim.kineticEnergy + sim.potentialEnergy;
+      sim.initialTotalEnergy = sim.totalMechanicalEnergy;
+
+      clearTrail();
+      trailPoints.push(sim.position.clone());
+      updateTrailGeometry();
+
+      updateGhostTrajectory();
+      syncVisualState();
+      updateAnimationPlayback();
+      updateHUD();
+      updateExposedState();
+    }
+
+    // ----------------------------
+    // Physics
+    // ----------------------------
+    function physicsStep(dt) {
+      if (sim.status !== 'FLYING') return;
+
+      const prevPosition = sim.position.clone();
+      const prevVelocity = sim.velocity.clone();
+
+      const accel = new THREE.Vector3(0, -g, 0);
+
+      let dragForceMag = 0;
+      const speed = sim.velocity.length();
+
+      if (sim.dragEnabled && speed > 1e-8) {
+        dragForceMag = 0.5 * rho * Cd * A * speed * speed;
+        const dragAccel = sim.velocity.clone().normalize().multiplyScalar(-dragForceMag / m);
+        accel.add(dragAccel);
+
+        // cumulative energy lost to drag: F_drag * |v| * dt
+        sim.dragEnergyLost += dragForceMag * speed * dt;
+      }
+
+      // Semi-implicit Euler
+      sim.velocity.addScaledVector(accel, dt);
+      sim.position.addScaledVector(sim.velocity, dt);
+
+      sim.flightTime += dt;
+      sim.physicsStepCount += 1;
+
+      if (sim.position.y > sim.maxHeight) {
+        sim.maxHeight = sim.position.y;
+      }
+
+      trailPoints.push(sim.position.clone());
+      if (trailPoints.length > MAX_TRAIL_POINTS) {
+        trailPoints.shift();
+      }
+
+      // landing detection
+      if (sim.position.y <= 0) {
+        const dy = sim.position.y - prevPosition.y;
+        let alpha = 0;
+        if (Math.abs(dy) > 1e-8) {
+          alpha = (0 - prevPosition.y) / dy;
+        }
+
+        const landingPos = prevPosition.clone().lerp(sim.position, alpha);
+        const landingVel = prevVelocity.clone().lerp(sim.velocity, alpha);
+
+        sim.position.copy(landingPos);
+        sim.position.y = 0;
+        sim.velocity.copy(landingVel);
+
+        sim.range = sim.position.x - sim.launchX;
+        sim.status = 'LANDED';
+
+        addLandingMarker(sim.position);
+
+        trailPoints.push(sim.position.clone());
+        if (trailPoints.length > MAX_TRAIL_POINTS) {
+          trailPoints.shift();
+        }
+
+        updateGhostTrajectory();
+        updateAnimationPlayback();
+      }
+
+      sim.kineticEnergy = 0.5 * m * sim.velocity.lengthSq();
+      sim.potentialEnergy = m * g * sim.position.y;
+      sim.totalMechanicalEnergy = sim.kineticEnergy + sim.potentialEnergy;
+    }
+
+    // ----------------------------
+    // Input
+    // ----------------------------
+    dragToggle.addEventListener('change', () => {
+      sim.dragEnabled = dragToggle.checked;
+      if (sim.status !== 'FLYING') updateGhostTrajectory();
+      updateHUD();
+      updateExposedState();
+    });
+
+    window.addEventListener('keydown', (e) => {
+      const key = e.key;
+
+      if (key === 'ArrowUp') {
+        sim.launchAngle = Math.min(80, sim.launchAngle + 5);
+        if (sim.status !== 'FLYING') updateGhostTrajectory();
+        updateHUD();
+      } else if (key === 'ArrowDown') {
+        sim.launchAngle = Math.max(10, sim.launchAngle - 5);
+        if (sim.status !== 'FLYING') updateGhostTrajectory();
+        updateHUD();
+      } else if (key === 'ArrowRight') {
+        sim.launchSpeed = Math.min(60, sim.launchSpeed + 5);
+        if (sim.status !== 'FLYING') updateGhostTrajectory();
+        updateHUD();
+      } else if (key === 'ArrowLeft') {
+        sim.launchSpeed = Math.max(10, sim.launchSpeed - 5);
+        if (sim.status !== 'FLYING') updateGhostTrajectory();
+        updateHUD();
+      } else if (key === ' ' || key === 'Spacebar' || e.code === 'Space') {
+        e.preventDefault();
+        launchFlamingo();
+      } else if (key === 'r' || key === 'R') {
+        resetFlamingo();
+      }
+
+      updateExposedState();
+    });
+
+    // ----------------------------
+    // Resize
+    // ----------------------------
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    // ----------------------------
+    // Init
+    // ----------------------------
+    resetFlamingo();
+
+    // ----------------------------
+    // Main loop with accumulator
+    // ----------------------------
+    const clock = new THREE.Clock();
+    let accumulator = 0;
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      let frameDelta = clock.getDelta();
+      frameDelta = Math.min(frameDelta, 0.1);
+      accumulator += frameDelta;
+
+      while (accumulator >= FIXED_DT) {
+        physicsStep(FIXED_DT);
+        accumulator -= FIXED_DT;
+      }
+
+      updateTrailGeometry();
+      syncVisualState();
+
+      if (mixer) {
+        mixer.update(frameDelta);
+      }
+
+      updateHUD();
+      updateExposedState();
+
+      controls.update();
+      renderer.render(scene, camera);
+    }
+
+    animate();
+  </script>
+</body>
+</html>

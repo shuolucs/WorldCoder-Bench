@@ -1,0 +1,729 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Two-Player 3D Mitosis - Three.js</title>
+  <style>
+    html, body {
+      margin: 0;
+      overflow: hidden;
+      background: #0a0a2e;
+      font-family: monospace;
+    }
+
+    #uiRoot {
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      z-index: 10;
+    }
+
+    .hud {
+      position: absolute;
+      font-size: 16px;
+      text-shadow: 0 0 6px rgba(0,0,0,0.9);
+      user-select: none;
+    }
+
+    #p1Phase {
+      top: 12px;
+      left: 12px;
+      color: #44dd88;
+    }
+
+    #controlsPanel {
+      position: absolute;
+      top: 12px;
+      right: 12px;
+      display: flex;
+      flex-direction: column;
+      align-items: flex-end;
+      gap: 10px;
+      pointer-events: auto;
+    }
+
+    #resetBtn, #speedSlider {
+      pointer-events: auto;
+    }
+
+    #resetBtn {
+      background: #1a1a44;
+      color: #ffffff;
+      border: 1px solid #8888cc;
+      padding: 8px 12px;
+      cursor: pointer;
+      font-family: monospace;
+      font-size: 14px;
+    }
+
+    #speedWrap {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-end;
+      color: #ddd;
+      text-shadow: 0 0 6px rgba(0,0,0,0.9);
+      font-size: 14px;
+    }
+
+    #p2Phase {
+      top: 90px;
+      right: 12px;
+      color: #dd4488;
+      text-align: right;
+    }
+
+    #cellCount {
+      bottom: 14px;
+      left: 50%;
+      transform: translateX(-50%);
+      color: #ffffff;
+    }
+  </style>
+</head>
+<body>
+  <div id="uiRoot">
+    <div id="p1Phase" class="hud">Player 1 Phase: interphase</div>
+
+    <div id="controlsPanel">
+      <button id="resetBtn">Reset All</button>
+      <div id="speedWrap">
+        <label for="speedSlider">Animation Speed</label>
+        <input id="speedSlider" type="range" min="0.5" max="3" step="0.5" value="1" />
+      </div>
+    </div>
+
+    <div id="p2Phase" class="hud">Player 2 Phase: interphase</div>
+    <div id="cellCount" class="hud">Total Cells: 2</div>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
+
+    const PHASES = ['interphase', 'prophase', 'metaphase', 'anaphase', 'telophase', 'complete'];
+    const PHASE_DURATIONS = {
+      prophase: 2,
+      metaphase: 2,
+      anaphase: 2,
+      telophase: 3
+    };
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0a0a2e);
+
+    const camera = new THREE.PerspectiveCamera(
+      60,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      1000
+    );
+    camera.position.set(0, 0, 30);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    document.body.appendChild(renderer.domElement);
+
+    const ambient = new THREE.AmbientLight(0x404080, 0.4);
+    scene.add(ambient);
+
+    const point1 = new THREE.PointLight(0x00ffaa, 1.0, 100);
+    point1.position.set(-10, 10, 10);
+    scene.add(point1);
+
+    const point2 = new THREE.PointLight(0xff88cc, 1.0, 100);
+    point2.position.set(10, -10, 10);
+    scene.add(point2);
+
+    // Field-of-view circular boundary
+    const boundaryGeo = new THREE.RingGeometry(19.85, 20, 128);
+    const boundaryMat = new THREE.MeshBasicMaterial({
+      color: 0x4466aa,
+      transparent: true,
+      opacity: 0.22,
+      side: THREE.DoubleSide
+    });
+    const boundary = new THREE.Mesh(boundaryGeo, boundaryMat);
+    boundary.rotation.x = 0;
+    boundary.position.z = -0.2;
+    scene.add(boundary);
+
+    // Subtle grid
+    const grid = new THREE.GridHelper(40, 20, 0x223355, 0x162040);
+    grid.rotation.x = Math.PI / 2;
+    grid.position.z = -0.3;
+    grid.material.transparent = true;
+    grid.material.opacity = 0.15;
+    scene.add(grid);
+
+    const ui = {
+      p1Phase: document.getElementById('p1Phase'),
+      p2Phase: document.getElementById('p2Phase'),
+      cellCount: document.getElementById('cellCount'),
+      resetBtn: document.getElementById('resetBtn'),
+      speedSlider: document.getElementById('speedSlider')
+    };
+
+    const keys = {};
+
+    const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
+    const lerp = (a, b, t) => a + (b - a) * t;
+    const easeInOut = (t) => t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+    const safeSet = (obj, x, y, z) => {
+      obj.set(
+        Number.isFinite(x) ? x : 0,
+        Number.isFinite(y) ? y : 0,
+        Number.isFinite(z) ? z : 0
+      );
+    };
+
+    function createChromosome(color) {
+      const g = new THREE.BoxGeometry(0.18, 0.75, 0.18);
+      const m = new THREE.MeshStandardMaterial({
+        color,
+        emissive: color,
+        emissiveIntensity: 0.25,
+        roughness: 0.5,
+        metalness: 0.1
+      });
+      return new THREE.Mesh(g, m);
+    }
+
+    function createCell(playerId, outerColor, nucleusColor, startX) {
+      const root = new THREE.Group();
+      root.position.set(startX, 0, 0);
+      scene.add(root);
+
+      const mainCellGroup = new THREE.Group();
+      root.add(mainCellGroup);
+
+      const membraneGeo = new THREE.SphereGeometry(2, 40, 40);
+      const membraneMat = new THREE.MeshStandardMaterial({
+        color: outerColor,
+        transparent: true,
+        opacity: 0.7,
+        roughness: 0.35,
+        metalness: 0.05
+      });
+      const membrane = new THREE.Mesh(membraneGeo, membraneMat);
+      mainCellGroup.add(membrane);
+
+      const nucleusGeo = new THREE.SphereGeometry(0.8, 24, 24);
+      const nucleusMat = new THREE.MeshStandardMaterial({
+        color: nucleusColor,
+        emissive: 0x000000,
+        roughness: 0.5,
+        metalness: 0.05
+      });
+      const nucleus = new THREE.Mesh(nucleusGeo, nucleusMat);
+      mainCellGroup.add(nucleus);
+
+      const equator = new THREE.Mesh(
+        new THREE.TorusGeometry(1.1, 0.05, 12, 64),
+        new THREE.MeshBasicMaterial({
+          color: 0xffffaa,
+          transparent: true,
+          opacity: 0.0
+        })
+      );
+      equator.rotation.y = Math.PI / 2;
+      mainCellGroup.add(equator);
+
+      const chromosomes = [];
+      for (let i = 0; i < 4; i++) {
+        const c = createChromosome(playerId === 1 ? 0xaaffcc : 0xffbbdd);
+        c.visible = false;
+        mainCellGroup.add(c);
+        chromosomes.push(c);
+      }
+
+      const cytokinesisGroup = new THREE.Group();
+      cytokinesisGroup.visible = false;
+      root.add(cytokinesisGroup);
+
+      const cytoLeft = new THREE.Mesh(
+        new THREE.SphereGeometry(1.55, 32, 32),
+        membraneMat.clone()
+      );
+      const cytoRight = new THREE.Mesh(
+        new THREE.SphereGeometry(1.55, 32, 32),
+        membraneMat.clone()
+      );
+      const connector = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.45, 0.45, 1.6, 24),
+        membraneMat.clone()
+      );
+      connector.rotation.z = Math.PI / 2;
+
+      const cytoNucleusLeft = new THREE.Mesh(
+        new THREE.SphereGeometry(0.45, 20, 20),
+        nucleusMat.clone()
+      );
+      const cytoNucleusRight = new THREE.Mesh(
+        new THREE.SphereGeometry(0.45, 20, 20),
+        nucleusMat.clone()
+      );
+
+      cytokinesisGroup.add(cytoLeft, cytoRight, connector, cytoNucleusLeft, cytoNucleusRight);
+
+      const daughterGroup = new THREE.Group();
+      daughterGroup.visible = false;
+      root.add(daughterGroup);
+
+      const daughterRadius = 1.6; // close to volume conservation from radius 2 parent
+      function createDaughterCell() {
+        const g = new THREE.Group();
+        const outer = new THREE.Mesh(
+          new THREE.SphereGeometry(daughterRadius, 28, 28),
+          membraneMat.clone()
+        );
+        const inner = new THREE.Mesh(
+          new THREE.SphereGeometry(0.5, 20, 20),
+          nucleusMat.clone()
+        );
+        g.add(outer, inner);
+        return g;
+      }
+
+      const daughter1 = createDaughterCell();
+      const daughter2 = createDaughterCell();
+      daughterGroup.add(daughter1, daughter2);
+
+      return {
+        playerId,
+        root,
+        mainCellGroup,
+        membrane,
+        nucleus,
+        equator,
+        chromosomes,
+        cytokinesisGroup,
+        cytoLeft,
+        cytoRight,
+        connector,
+        cytoNucleusLeft,
+        cytoNucleusRight,
+        daughterGroup,
+        daughter1,
+        daughter2,
+        baseOuterColor: outerColor,
+        baseNucleusColor: nucleusColor,
+        startPos: new THREE.Vector3(startX, 0, 0),
+        phase: 'interphase',
+        cellCount: 1,
+        isAnimating: false,
+        phaseTimer: 0,
+        animDuration: 0,
+        fromPhase: 'interphase',
+        targetPhase: 'interphase'
+      };
+    }
+
+    const player1 = createCell(1, 0x44dd88, 0x226644, -6);
+    const player2 = createCell(2, 0xdd4488, 0x662244, 6);
+
+    const state = {
+      player1Phase: 'interphase',
+      player2Phase: 'interphase',
+      player1CellCount: 1,
+      player2CellCount: 1,
+      totalCellCount: 2,
+      player1Position: { x: -6, y: 0, z: 0 },
+      player2Position: { x: 6, y: 0, z: 0 },
+      animationSpeed: 1,
+      isAnimating: false,
+      phaseHistory: []
+    };
+    window.__3D_STATE__ = state;
+
+    function resetVisuals(cell) {
+      cell.mainCellGroup.visible = true;
+      cell.cytokinesisGroup.visible = false;
+      cell.daughterGroup.visible = false;
+
+      safeSet(cell.mainCellGroup.scale, 1, 1, 1);
+      safeSet(cell.nucleus.scale, 1, 1, 1);
+      cell.nucleus.material.color.setHex(cell.baseNucleusColor);
+      cell.nucleus.material.emissive.setHex(0x000000);
+
+      cell.equator.material.opacity = 0.0;
+
+      cell.chromosomes.forEach((c, i) => {
+        c.visible = false;
+        safeSet(c.scale, 1, 1, 1);
+        c.position.set((i - 1.5) * 0.35, (i % 2 === 0 ? 0.35 : -0.35), 0);
+        c.rotation.set(0, 0, i % 2 === 0 ? 0.5 : -0.5);
+      });
+
+      cell.cytoLeft.position.set(-1.1, 0, 0);
+      cell.cytoRight.position.set(1.1, 0, 0);
+      cell.connector.position.set(0, 0, 0);
+      safeSet(cell.connector.scale, 1, 1, 1);
+      cell.cytoNucleusLeft.position.set(-1.1, 0, 0);
+      cell.cytoNucleusRight.position.set(1.1, 0, 0);
+
+      cell.daughter1.position.set(-1.5, 0, 0);
+      cell.daughter2.position.set(1.5, 0, 0);
+      safeSet(cell.daughter1.scale, 1, 1, 1);
+      safeSet(cell.daughter2.scale, 1, 1, 1);
+    }
+
+    function syncHUD() {
+      ui.p1Phase.textContent = `Player 1 Phase: ${player1.phase}`;
+      ui.p2Phase.textContent = `Player 2 Phase: ${player2.phase}`;
+      ui.cellCount.textContent = `Total Cells: ${player1.cellCount + player2.cellCount}`;
+    }
+
+    function syncState() {
+      state.player1Phase = player1.phase;
+      state.player2Phase = player2.phase;
+      state.player1CellCount = player1.cellCount;
+      state.player2CellCount = player2.cellCount;
+      state.totalCellCount = player1.cellCount + player2.cellCount;
+      state.player1Position = {
+        x: player1.root.position.x,
+        y: player1.root.position.y,
+        z: player1.root.position.z
+      };
+      state.player2Position = {
+        x: player2.root.position.x,
+        y: player2.root.position.y,
+        z: player2.root.position.z
+      };
+      state.animationSpeed = parseFloat(ui.speedSlider.value);
+      state.isAnimating = player1.isAnimating || player2.isAnimating;
+    }
+
+    function setPhase(cell, phase, log = true) {
+      cell.phase = phase;
+      if (log) {
+        state.phaseHistory.push(`P${cell.playerId}:${phase}`);
+      }
+    }
+
+    function advancePhase(cell) {
+      if (cell.isAnimating) return;
+      const idx = PHASES.indexOf(cell.phase);
+      if (idx < 0 || idx >= PHASES.length - 1) return;
+
+      const next = PHASES[idx + 1];
+      if (next === 'complete') {
+        setPhase(cell, 'complete');
+        cell.cellCount = 2;
+        resetVisuals(cell);
+        cell.mainCellGroup.visible = false;
+        cell.daughterGroup.visible = true;
+        syncHUD();
+        syncState();
+        return;
+      }
+
+      cell.isAnimating = true;
+      cell.phaseTimer = 0;
+      cell.animDuration = PHASE_DURATIONS[next];
+      cell.fromPhase = cell.phase;
+      cell.targetPhase = next;
+      setPhase(cell, next);
+      syncHUD();
+      syncState();
+    }
+
+    function updateCellPulse(cell, time) {
+      const pulse = 1 + 0.05 * Math.sin(time * Math.PI); // 2-second cycle
+      if (cell.phase === 'complete') {
+        safeSet(cell.daughter1.scale, pulse, pulse, pulse);
+        safeSet(cell.daughter2.scale, pulse, pulse, pulse);
+      } else if (cell.phase === 'telophase' && cell.isAnimating) {
+        safeSet(cell.cytokinesisGroup.scale, pulse, pulse, pulse);
+      } else {
+        const sx = cell.mainCellGroup.scale.x;
+        const sy = cell.mainCellGroup.scale.y;
+        const sz = cell.mainCellGroup.scale.z;
+        const len = Math.max((sx + sy + sz) / 3, 0.0001);
+        const factor = pulse / len;
+        safeSet(
+          cell.mainCellGroup.scale,
+          sx * factor,
+          sy * factor,
+          sz * factor
+        );
+      }
+    }
+
+    function updateCellPhaseAnimation(cell, dt) {
+      if (!cell.isAnimating) return;
+
+      const speed = parseFloat(ui.speedSlider.value);
+      cell.phaseTimer += dt * speed;
+      const tRaw = clamp(cell.phaseTimer / cell.animDuration, 0, 1);
+      const t = easeInOut(tRaw);
+
+      resetVisuals(cell);
+
+      if (cell.targetPhase === 'prophase') {
+        cell.chromosomes.forEach((c, i) => {
+          c.visible = true;
+          c.position.set(
+            (i - 1.5) * 0.35,
+            (i % 2 === 0 ? 0.4 : -0.4),
+            (i < 2 ? 0.2 : -0.2)
+          );
+        });
+
+        const ns = lerp(1.0, 1.3, t);
+        safeSet(cell.nucleus.scale, ns, ns, ns);
+
+        const bright = new THREE.Color(cell.baseNucleusColor).lerp(new THREE.Color(0xffffff), 0.35 * t);
+        cell.nucleus.material.color.copy(bright);
+        cell.nucleus.material.emissive.setHex(cell.playerId === 1 ? 0x114422 : 0x441122);
+      }
+
+      if (cell.targetPhase === 'metaphase') {
+        cell.chromosomes.forEach((c, i) => {
+          c.visible = true;
+          c.position.set(0, lerp((i - 1.5) * 0.35, (i - 1.5) * 0.28, t), 0);
+          c.rotation.set(0, 0, 0);
+        });
+        safeSet(cell.nucleus.scale, 1.2, 1.2, 1.2);
+        cell.equator.material.opacity = lerp(0.0, 0.85, t);
+      }
+
+      if (cell.targetPhase === 'anaphase') {
+        safeSet(
+          cell.mainCellGroup.scale,
+          lerp(1.0, 1.5, t),
+          lerp(1.0, 0.8, t),
+          1.0
+        );
+        cell.equator.material.opacity = lerp(0.85, 0.15, t);
+
+        cell.chromosomes.forEach((c, i) => {
+          c.visible = true;
+          const dir = i < 2 ? -1 : 1;
+          c.position.set(lerp(0, 1.1 * dir, t), (i % 2 === 0 ? 0.22 : -0.22), 0);
+          c.rotation.set(0, 0, dir * 0.4);
+        });
+        safeSet(cell.nucleus.scale, 0.7, 0.7, 0.7);
+      }
+
+      if (cell.targetPhase === 'telophase') {
+        cell.mainCellGroup.visible = false;
+        cell.cytokinesisGroup.visible = true;
+
+        const sep = lerp(1.0, 1.5, t);
+        cell.cytoLeft.position.set(-sep, 0, 0);
+        cell.cytoRight.position.set(sep, 0, 0);
+        cell.cytoNucleusLeft.position.set(-sep, 0, 0);
+        cell.cytoNucleusRight.position.set(sep, 0, 0);
+
+        const pinch = lerp(1.0, 0.35, t);
+        safeSet(cell.connector.scale, pinch, pinch, pinch);
+
+        if (t > 0.6) {
+          const localT = (t - 0.6) / 0.4;
+          const daughterSep = lerp(1.5, 3.0, localT);
+          const daughterScale = lerp(0.75, 1.0, localT);
+
+          cell.daughterGroup.visible = true;
+          cell.daughter1.position.set(-daughterSep / 2, 0, 0);
+          cell.daughter2.position.set(daughterSep / 2, 0, 0);
+          safeSet(cell.daughter1.scale, daughterScale, daughterScale, daughterScale);
+          safeSet(cell.daughter2.scale, daughterScale, daughterScale, daughterScale);
+        }
+      }
+
+      if (tRaw >= 1) {
+        cell.isAnimating = false;
+
+        if (cell.targetPhase === 'telophase') {
+          setPhase(cell, 'complete');
+          cell.cellCount = 2;
+          resetVisuals(cell);
+          cell.mainCellGroup.visible = false;
+          cell.daughterGroup.visible = true;
+        } else {
+          resetVisuals(cell);
+
+          if (cell.phase === 'prophase') {
+            cell.chromosomes.forEach((c, i) => {
+              c.visible = true;
+              c.position.set(
+                (i - 1.5) * 0.35,
+                (i % 2 === 0 ? 0.4 : -0.4),
+                0
+              );
+            });
+            safeSet(cell.nucleus.scale, 1.3, 1.3, 1.3);
+            cell.nucleus.material.color.setHex(
+              cell.playerId === 1 ? 0x55aa77 : 0xaa5577
+            );
+          }
+
+          if (cell.phase === 'metaphase') {
+            cell.chromosomes.forEach((c, i) => {
+              c.visible = true;
+              c.position.set(0, (i - 1.5) * 0.28, 0);
+              c.rotation.set(0, 0, 0);
+            });
+            cell.equator.material.opacity = 0.85;
+          }
+
+          if (cell.phase === 'anaphase') {
+            safeSet(cell.mainCellGroup.scale, 1.5, 0.8, 1.0);
+            cell.chromosomes.forEach((c, i) => {
+              c.visible = true;
+              const dir = i < 2 ? -1 : 1;
+              c.position.set(1.1 * dir, (i % 2 === 0 ? 0.22 : -0.22), 0);
+            });
+          }
+        }
+
+        syncHUD();
+        syncState();
+      }
+    }
+
+    function enforceBounds(cell) {
+      cell.root.position.x = clamp(cell.root.position.x, -15, 15);
+      cell.root.position.y = clamp(cell.root.position.y, -10, 10);
+      cell.root.position.z = clamp(cell.root.position.z, -10, 10);
+
+      if (!Number.isFinite(cell.root.position.x)) cell.root.position.x = cell.startPos.x;
+      if (!Number.isFinite(cell.root.position.y)) cell.root.position.y = 0;
+      if (!Number.isFinite(cell.root.position.z)) cell.root.position.z = 0;
+    }
+
+    function resetCell(cell) {
+      cell.root.position.copy(cell.startPos);
+      cell.phase = 'interphase';
+      cell.cellCount = 1;
+      cell.isAnimating = false;
+      cell.phaseTimer = 0;
+      cell.animDuration = 0;
+      cell.fromPhase = 'interphase';
+      cell.targetPhase = 'interphase';
+      resetVisuals(cell);
+    }
+
+    ui.resetBtn.addEventListener('click', () => {
+      resetCell(player1);
+      resetCell(player2);
+      state.phaseHistory.length = 0;
+      syncHUD();
+      syncState();
+    });
+
+    ui.speedSlider.addEventListener('input', () => {
+      syncState();
+    });
+
+    window.addEventListener('keydown', (e) => {
+      keys[e.code] = true;
+
+      if (e.code === 'KeyQ') advancePhase(player1);
+      if (e.code === 'KeyP') advancePhase(player2);
+    });
+
+    window.addEventListener('keyup', (e) => {
+      keys[e.code] = false;
+    });
+
+    const clock = new THREE.Clock();
+
+    function handleMovement() {
+      const speed = 0.1;
+
+      if (keys['KeyA']) player1.root.position.x -= speed;
+      if (keys['KeyD']) player1.root.position.x += speed;
+
+      if (keys['ArrowLeft']) player2.root.position.x -= speed;
+      if (keys['ArrowRight']) player2.root.position.x += speed;
+
+      enforceBounds(player1);
+      enforceBounds(player2);
+    }
+
+    function applySteadyPhaseVisuals(cell) {
+      if (cell.isAnimating) return;
+
+      resetVisuals(cell);
+
+      if (cell.phase === 'interphase') {
+        return;
+      }
+
+      if (cell.phase === 'prophase') {
+        cell.chromosomes.forEach((c, i) => {
+          c.visible = true;
+          c.position.set((i - 1.5) * 0.35, (i % 2 === 0 ? 0.4 : -0.4), 0);
+        });
+        safeSet(cell.nucleus.scale, 1.3, 1.3, 1.3);
+        cell.nucleus.material.color.setHex(cell.playerId === 1 ? 0x55aa77 : 0xaa5577);
+      }
+
+      if (cell.phase === 'metaphase') {
+        cell.chromosomes.forEach((c, i) => {
+          c.visible = true;
+          c.position.set(0, (i - 1.5) * 0.28, 0);
+          c.rotation.set(0, 0, 0);
+        });
+        cell.equator.material.opacity = 0.85;
+        safeSet(cell.nucleus.scale, 1.2, 1.2, 1.2);
+      }
+
+      if (cell.phase === 'anaphase') {
+        safeSet(cell.mainCellGroup.scale, 1.5, 0.8, 1.0);
+        cell.chromosomes.forEach((c, i) => {
+          c.visible = true;
+          const dir = i < 2 ? -1 : 1;
+          c.position.set(1.1 * dir, (i % 2 === 0 ? 0.22 : -0.22), 0);
+          c.rotation.set(0, 0, dir * 0.4);
+        });
+      }
+
+      if (cell.phase === 'complete') {
+        cell.mainCellGroup.visible = false;
+        cell.daughterGroup.visible = true;
+        cell.daughter1.position.set(-1.5, 0, 0);
+        cell.daughter2.position.set(1.5, 0, 0);
+      }
+    }
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      const dt = clock.getDelta();
+      const elapsed = clock.elapsedTime;
+
+      handleMovement();
+
+      updateCellPhaseAnimation(player1, dt);
+      updateCellPhaseAnimation(player2, dt);
+
+      applySteadyPhaseVisuals(player1);
+      applySteadyPhaseVisuals(player2);
+
+      updateCellPulse(player1, elapsed);
+      updateCellPulse(player2, elapsed);
+
+      syncState();
+      syncHUD();
+
+      renderer.render(scene, camera);
+    }
+
+    resetCell(player1);
+    resetCell(player2);
+    syncHUD();
+    syncState();
+    animate();
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+  </script>
+</body>
+</html>

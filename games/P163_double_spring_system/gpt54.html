@@ -1,0 +1,432 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>3D Double Spring-Mass System</title>
+  <style>
+    body {
+      margin: 0;
+      overflow: hidden;
+      background: #1a1a2e;
+      font-family: Arial, sans-serif;
+    }
+    #hud {
+      position: fixed;
+      top: 10px;
+      left: 10px;
+      color: #ffffff;
+      background: rgba(0, 0, 0, 0.45);
+      padding: 12px 14px;
+      border-radius: 8px;
+      font-size: 14px;
+      line-height: 1.5;
+      white-space: pre-line;
+      z-index: 10;
+    }
+    #info {
+      position: fixed;
+      bottom: 10px;
+      left: 10px;
+      color: #ddd;
+      background: rgba(0, 0, 0, 0.35);
+      padding: 10px 12px;
+      border-radius: 8px;
+      font-size: 13px;
+      z-index: 10;
+    }
+  </style>
+</head>
+<body>
+  <div id="hud"></div>
+  <div id="info">
+    Drag red/blue masses vertically<br>
+    R: Reset | G: Gravity | Space: Pause | 1: impulse A up | 2: impulse B down | D: Damping
+  </div>
+
+  <script type="module">
+    import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
+
+    // Scene setup
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x1a1a2e);
+
+    const camera = new THREE.PerspectiveCamera(
+      60,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      100
+    );
+    camera.position.set(0, 0, 12);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    document.body.appendChild(renderer.domElement);
+
+    const ambientLight = new THREE.AmbientLight(0x404040, 0.6);
+    scene.add(ambientLight);
+
+    const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
+    directionalLight.position.set(5, 10, 7);
+    scene.add(directionalLight);
+
+    // Constants
+    const anchorY = 4;
+    const massARestY = 2;
+    const massBRestY = 0;
+
+    const mA = 1.0;
+    const mB = 1.5;
+    const k1 = 20;
+    const k2 = 15;
+    const restLength1 = 2.0;
+    const restLength2 = 2.0;
+
+    const fixedDt = 1 / 60;
+    const defaultGravity = 9.81;
+    const defaultDamping = 0.05;
+
+    let gravityOn = true;
+    let dampingOn = true;
+    let paused = false;
+
+    // Physics state
+    let yA = massARestY;
+    let yB = massBRestY;
+    let vA = 0;
+    let vB = 0;
+    let simTime = 0;
+
+    let draggingA = false;
+    let draggingB = false;
+    let accumulator = 0;
+    let lastTime = performance.now() / 1000;
+
+    // Anchor
+    const anchorGeom = new THREE.BoxGeometry(0.4, 0.4, 0.4);
+    const anchorMat = new THREE.MeshStandardMaterial({ color: 0x888888 });
+    const anchorMesh = new THREE.Mesh(anchorGeom, anchorMat);
+    anchorMesh.position.set(0, anchorY, 0);
+    scene.add(anchorMesh);
+
+    // Mass A
+    const massGeom = new THREE.SphereGeometry(0.3, 32, 32);
+    const massAMat = new THREE.MeshStandardMaterial({ color: 0xff3333 });
+    const massA = new THREE.Mesh(massGeom, massAMat);
+    massA.position.set(0, yA, 0);
+    scene.add(massA);
+
+    // Mass B
+    const massBMat = new THREE.MeshStandardMaterial({ color: 0x3399ff });
+    const massB = new THREE.Mesh(massGeom, massBMat);
+    massB.position.set(0, yB, 0);
+    scene.add(massB);
+
+    // Optional guide line
+    const guideMat = new THREE.LineBasicMaterial({ color: 0x444466 });
+    const guideGeom = new THREE.BufferGeometry().setFromPoints([
+      new THREE.Vector3(0, 5, 0),
+      new THREE.Vector3(0, -5, 0),
+    ]);
+    const guideLine = new THREE.Line(guideGeom, guideMat);
+    scene.add(guideLine);
+
+    // Spring lines
+    function createSpringLine(color) {
+      const geometry = new THREE.BufferGeometry();
+      const material = new THREE.LineBasicMaterial({ color });
+      const line = new THREE.Line(geometry, material);
+      scene.add(line);
+      return line;
+    }
+
+    const spring1Line = createSpringLine(0xffff00);
+    const spring2Line = createSpringLine(0x00ff00);
+
+    function buildZigZagPoints(start, end, segments = 12, amplitude = 0.18) {
+      const points = [];
+      const dir = new THREE.Vector3().subVectors(end, start);
+      const len = dir.length();
+
+      if (len < 1e-6) {
+        points.push(start.clone(), end.clone());
+        return points;
+      }
+
+      dir.normalize();
+
+      let perp = new THREE.Vector3(1, 0, 0);
+      if (Math.abs(dir.dot(perp)) > 0.99) perp = new THREE.Vector3(0, 0, 1);
+
+      perp.sub(dir.clone().multiplyScalar(perp.dot(dir))).normalize();
+
+      points.push(start.clone());
+
+      for (let i = 1; i < segments; i++) {
+        const t = i / segments;
+        const base = start.clone().lerp(end, t);
+        const offsetSign = i % 2 === 0 ? -1 : 1;
+        const offset = perp.clone().multiplyScalar(amplitude * offsetSign);
+        points.push(base.add(offset));
+      }
+
+      points.push(end.clone());
+      return points;
+    }
+
+    function updateSpringGeometry(line, startY, endY) {
+      const start = new THREE.Vector3(0, startY, 0);
+      const end = new THREE.Vector3(0, endY, 0);
+      const points = buildZigZagPoints(start, end, 12, 0.18);
+      line.geometry.dispose();
+      line.geometry = new THREE.BufferGeometry().setFromPoints(points);
+    }
+
+    function currentG() {
+      return gravityOn ? defaultGravity : 0.0;
+    }
+
+    function currentDamping() {
+      return dampingOn ? defaultDamping : 0.0;
+    }
+
+    function resetSystem() {
+      yA = massARestY;
+      yB = massBRestY;
+      vA = 0;
+      vB = 0;
+    }
+
+    function getSpringLengths() {
+      return {
+        L1: Math.abs(anchorY - yA),
+        L2: Math.abs(yA - yB),
+      };
+    }
+
+    function computeEnergy() {
+      const g = currentG();
+      const { L1, L2 } = getSpringLengths();
+
+      const keA = 0.5 * mA * vA * vA;
+      const keB = 0.5 * mB * vB * vB;
+      const peS1 = 0.5 * k1 * Math.pow(L1 - restLength1, 2);
+      const peS2 = 0.5 * k2 * Math.pow(L2 - restLength2, 2);
+      const peGA = mA * g * yA;
+      const peGB = mB * g * yB;
+
+      return keA + keB + peS1 + peS2 + peGA + peGB;
+    }
+
+    function physicsStep(dt) {
+      const g = currentG();
+      const damping = currentDamping();
+
+      let aA = 0;
+      let aB = 0;
+
+      // Spring 1 force on A from anchor
+      if (!draggingA) {
+        const dy1 = yA - anchorY;
+        const L1 = Math.abs(dy1);
+        if (L1 > 1e-8) {
+          const dir1 = dy1 / L1;
+          const F1 = -k1 * (L1 - restLength1) * dir1;
+          aA += F1 / mA;
+        }
+      }
+
+      // Spring 2 force between A and B
+      const dy2 = yB - yA;
+      const L2 = Math.abs(dy2);
+      if (L2 > 1e-8) {
+        const dirAB = dy2 / L2; // from A to B
+        const forceOnAFromB = k2 * (L2 - restLength2) * dirAB;
+        const forceOnBFromA = -forceOnAFromB;
+
+        if (!draggingA) aA += forceOnAFromB / mA;
+        if (!draggingB) aB += forceOnBFromA / mB;
+      }
+
+      if (!draggingA) aA += -g;
+      if (!draggingB) aB += -g;
+
+      // Semi-implicit Euler
+      if (!draggingA) {
+        vA += aA * dt;
+        vA *= (1 - damping * dt);
+        yA += vA * dt;
+      } else {
+        vA = 0;
+      }
+
+      if (!draggingB) {
+        vB += aB * dt;
+        vB *= (1 - damping * dt);
+        yB += vB * dt;
+      } else {
+        vB = 0;
+      }
+
+      simTime += dt;
+    }
+
+    // Drag interaction
+    const raycaster = new THREE.Raycaster();
+    const pointer = new THREE.Vector2();
+    const dragPlane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0);
+    const dragPoint = new THREE.Vector3();
+    let dragTarget = null;
+
+    function setPointer(event) {
+      const rect = renderer.domElement.getBoundingClientRect();
+      pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+      pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+    }
+
+    function updateDragPosition(event) {
+      setPointer(event);
+      raycaster.setFromCamera(pointer, camera);
+      if (raycaster.ray.intersectPlane(dragPlane, dragPoint)) {
+        const clampedY = THREE.MathUtils.clamp(dragPoint.y, -4.5, 4.5);
+        if (dragTarget === massA) {
+          yA = clampedY;
+          vA = 0;
+        } else if (dragTarget === massB) {
+          yB = clampedY;
+          vB = 0;
+        }
+      }
+    }
+
+    renderer.domElement.addEventListener('pointerdown', (event) => {
+      setPointer(event);
+      raycaster.setFromCamera(pointer, camera);
+      const hits = raycaster.intersectObjects([massA, massB], false);
+      if (hits.length > 0) {
+        dragTarget = hits[0].object;
+        if (dragTarget === massA) {
+          draggingA = true;
+          vA = 0;
+        } else if (dragTarget === massB) {
+          draggingB = true;
+          vB = 0;
+        }
+        updateDragPosition(event);
+      }
+    });
+
+    window.addEventListener('pointermove', (event) => {
+      if (dragTarget) updateDragPosition(event);
+    });
+
+    window.addEventListener('pointerup', () => {
+      if (dragTarget === massA) draggingA = false;
+      if (dragTarget === massB) draggingB = false;
+      dragTarget = null;
+    });
+
+    // Keyboard controls
+    window.addEventListener('keydown', (event) => {
+      const key = event.key.toLowerCase();
+
+      if (event.code === 'Space') {
+        event.preventDefault();
+        paused = !paused;
+        return;
+      }
+
+      if (key === 'r') {
+        resetSystem();
+      } else if (key === 'g') {
+        gravityOn = !gravityOn;
+      } else if (key === 'd') {
+        dampingOn = !dampingOn;
+      } else if (key === '1') {
+        if (!draggingA) vA += 5;
+      } else if (key === '2') {
+        if (!draggingB) vB += -5;
+      }
+    });
+
+    const hud = document.getElementById('hud');
+
+    function updateVisuals() {
+      massA.position.y = yA;
+      massB.position.y = yB;
+
+      updateSpringGeometry(spring1Line, anchorY, yA);
+      updateSpringGeometry(spring2Line, yA, yB);
+    }
+
+    function updateHUDAndState() {
+      const { L1, L2 } = getSpringLengths();
+      const totalEnergy = computeEnergy();
+
+      hud.textContent =
+`Mass A Y: ${yA.toFixed(2)}
+Mass B Y: ${yB.toFixed(2)}
+Vel A: ${vA.toFixed(2)}
+Vel B: ${vB.toFixed(2)}
+Total Energy: ${totalEnergy.toFixed(2)}
+Gravity: ${gravityOn ? 'ON' : 'OFF'}
+Paused: ${paused ? 'YES' : 'NO'}
+Damping: ${dampingOn ? 'ON' : 'OFF'}`;
+
+      window.__3D_STATE__ = {
+        massA_y: yA,
+        massB_y: yB,
+        velA: vA,
+        velB: vB,
+        spring1_length: L1,
+        spring2_length: L2,
+        totalEnergy,
+        gravityOn,
+        paused,
+        dampingOn,
+        draggingA,
+        draggingB,
+        simTime,
+        massA_mass: mA,
+        massB_mass: mB,
+        k1,
+        k2
+      };
+    }
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      const now = performance.now() / 1000;
+      let frameTime = now - lastTime;
+      lastTime = now;
+
+      frameTime = Math.min(frameTime, 0.1);
+
+      if (!paused) {
+        accumulator += frameTime;
+        while (accumulator >= fixedDt) {
+          physicsStep(fixedDt);
+          accumulator -= fixedDt;
+        }
+      }
+
+      updateVisuals();
+      updateHUDAndState();
+      renderer.render(scene, camera);
+    }
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    resetSystem();
+    updateVisuals();
+    updateHUDAndState();
+    animate();
+  </script>
+</body>
+</html>

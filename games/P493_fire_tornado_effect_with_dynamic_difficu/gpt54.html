@@ -1,0 +1,527 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>3D Fire Tornado - Dynamic Difficulty</title>
+  <style>
+    html, body {
+      margin: 0;
+      overflow: hidden;
+      background: #0a0a0a;
+      font-family: monospace;
+    }
+
+    canvas {
+      display: block;
+    }
+
+    #hud {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      color: white;
+      background: rgba(0, 0, 0, 0.55);
+      padding: 12px 14px;
+      border-radius: 8px;
+      line-height: 1.5;
+      font-size: 14px;
+      user-select: none;
+      z-index: 10;
+      min-width: 260px;
+    }
+
+    #hud .controls {
+      margin-top: 8px;
+      font-size: 12px;
+      opacity: 0.9;
+      border-top: 1px solid rgba(255,255,255,0.2);
+      padding-top: 8px;
+    }
+  </style>
+</head>
+<body>
+  <div id="hud">
+    <div id="difficulty-display">Difficulty: 1</div>
+    <div id="particle-count">Particles: 400</div>
+    <div id="tornado-height">Height: 10.0</div>
+    <div id="pause-indicator">Status: RUNNING</div>
+    <div id="color-mode">Color: fire</div>
+    <div class="controls">
+      Keys: 1-5 set difficulty, U/D adjust, P pause, R reset, C color mode, Click = burst
+    </div>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js';
+    import { OrbitControls } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js';
+    import { GLTFLoader } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/GLTFLoader.js';
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0a0a0a);
+
+    const camera = new THREE.PerspectiveCamera(
+      60,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      1000
+    );
+    camera.position.set(0, 8, 20);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    document.body.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.target.set(0, 5, 0);
+
+    const ambientLight = new THREE.AmbientLight(0x331100, 0.3);
+    scene.add(ambientLight);
+
+    const pointLight = new THREE.PointLight(0xff4400, 2, 100);
+    pointLight.position.set(0, 10, 0);
+    scene.add(pointLight);
+
+    const baseGlow = new THREE.Mesh(
+      new THREE.CylinderGeometry(2.5, 3.5, 0.4, 32),
+      new THREE.MeshStandardMaterial({
+        color: 0x221100,
+        emissive: 0xff4400,
+        emissiveIntensity: 0.8,
+        roughness: 0.8,
+        metalness: 0.1
+      })
+    );
+    baseGlow.position.y = -0.2;
+    scene.add(baseGlow);
+
+    let fuelModel = null;
+    let modelLoaded = false;
+    const loader = new GLTFLoader();
+
+    loader.load(
+      'https://threejs.org/examples/models/gltf/TextureTransformMultiTest.glb',
+      (gltf) => {
+        fuelModel = gltf.scene;
+        fuelModel.position.set(0, 0, 0);
+        fuelModel.scale.set(2, 2, 2);
+
+        fuelModel.traverse((child) => {
+          if (child.isMesh) {
+            child.castShadow = false;
+            child.receiveShadow = false;
+            if (child.material) {
+              child.material = child.material.clone();
+              if (!('emissive' in child.material)) {
+                child.material.emissive = new THREE.Color(0x220800);
+              }
+              child.material.emissiveIntensity = 0.5;
+            }
+          }
+        });
+
+        scene.add(fuelModel);
+        modelLoaded = true;
+      },
+      undefined,
+      (err) => {
+        console.warn('Failed to load GLB model:', err);
+      }
+    );
+
+    const difficultyDisplay = document.getElementById('difficulty-display');
+    const particleCountDisplay = document.getElementById('particle-count');
+    const tornadoHeightDisplay = document.getElementById('tornado-height');
+    const pauseIndicator = document.getElementById('pause-indicator');
+    const colorModeDisplay = document.getElementById('color-mode');
+
+    const MAX_PARTICLES = 2000;
+
+    const particleGeometry = new THREE.BufferGeometry();
+    const positions = new Float32Array(MAX_PARTICLES * 3);
+    const colors = new Float32Array(MAX_PARTICLES * 3);
+    const sizes = new Float32Array(MAX_PARTICLES);
+    const alphas = new Float32Array(MAX_PARTICLES);
+
+    const particleData = Array.from({ length: MAX_PARTICLES }, () => ({
+      pos: new THREE.Vector3(),
+      vel: new THREE.Vector3(),
+      age: 0,
+      lifetime: 1,
+      angle: 0,
+      radius: 0,
+      spinOffset: Math.random() * Math.PI * 2,
+      active: true
+    }));
+
+    particleGeometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    particleGeometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+    particleGeometry.setAttribute('aSize', new THREE.BufferAttribute(sizes, 1));
+    particleGeometry.setAttribute('aAlpha', new THREE.BufferAttribute(alphas, 1));
+
+    const particleMaterial = new THREE.ShaderMaterial({
+      transparent: true,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      vertexColors: true,
+      uniforms: {
+        uPixelRatio: { value: renderer.getPixelRatio() }
+      },
+      vertexShader: `
+        attribute float aSize;
+        attribute float aAlpha;
+        varying vec3 vColor;
+        varying float vAlpha;
+        uniform float uPixelRatio;
+
+        void main() {
+          vColor = color;
+          vAlpha = aAlpha;
+          vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+          gl_PointSize = aSize * uPixelRatio * (300.0 / -mvPosition.z);
+          gl_Position = projectionMatrix * mvPosition;
+        }
+      `,
+      fragmentShader: `
+        varying vec3 vColor;
+        varying float vAlpha;
+
+        void main() {
+          vec2 uv = gl_PointCoord - vec2(0.5);
+          float d = length(uv);
+          float glow = smoothstep(0.5, 0.0, d);
+          float core = smoothstep(0.18, 0.0, d);
+          vec3 col = vColor * glow + vColor * 1.4 * core;
+          gl_FragColor = vec4(col, vAlpha * glow);
+          if (gl_FragColor.a < 0.01) discard;
+        }
+      `
+    });
+
+    const particlePoints = new THREE.Points(particleGeometry, particleMaterial);
+    scene.add(particlePoints);
+
+    const DIFFICULTY_PRESETS = {
+      1: { rotation: 1, height: 10, radius: 3, activeParticles: 400 },
+      2: { rotation: 2, height: 15, radius: 3.75, activeParticles: 800 },
+      3: { rotation: 3, height: 20, radius: 4.5, activeParticles: 1200 },
+      4: { rotation: 4, height: 25, radius: 5.25, activeParticles: 1600 },
+      5: { rotation: 5, height: 30, radius: 6, activeParticles: 2000 }
+    };
+
+    const params = {
+      currentDifficultyFloat: 1,
+      currentDifficulty: 1,
+      targetDifficulty: 1,
+      transitionTime: 0,
+      transitionDuration: 0.5,
+      isPaused: false,
+      colorMode: 'fire',
+      burstActive: false,
+      burstTimeLeft: 0,
+      elapsedTime: 0
+    };
+
+    const tornado = {
+      rotationSpeed: 1,
+      maxHeight: 10,
+      maxRadius: 3,
+      activeParticles: 400,
+      buoyancy: 3.5,
+      turbulence: 0.3,
+      particleLifetime: 2.7
+    };
+
+    function lerp(a, b, t) {
+      return a + (b - a) * t;
+    }
+
+    function getColorGradient(normalizedY, mode) {
+      const c = new THREE.Color();
+
+      if (mode === 'ice') {
+        const bottom = new THREE.Color(0x00ffff);
+        const mid = new THREE.Color(0x0088ff);
+        const top = new THREE.Color(0x000088);
+
+        if (normalizedY < 0.5) {
+          c.copy(bottom).lerp(mid, normalizedY * 2.0);
+        } else {
+          c.copy(mid).lerp(top, (normalizedY - 0.5) * 2.0);
+        }
+      } else {
+        const bottom = new THREE.Color(0xffff00);
+        const mid = new THREE.Color(0xff4400);
+        const top = new THREE.Color(0x880000);
+
+        if (normalizedY < 0.5) {
+          c.copy(bottom).lerp(mid, normalizedY * 2.0);
+        } else {
+          c.copy(mid).lerp(top, (normalizedY - 0.5) * 2.0);
+        }
+      }
+
+      return c;
+    }
+
+    function respawnParticle(i) {
+      const p = particleData[i];
+      const baseRadius = THREE.MathUtils.lerp(2, 4, Math.random());
+      const angle = Math.random() * Math.PI * 2;
+
+      p.radius = baseRadius;
+      p.angle = angle;
+      p.age = 0;
+      p.lifetime = tornado.particleLifetime * THREE.MathUtils.lerp(0.8, 1.2, Math.random());
+
+      p.pos.set(
+        Math.cos(angle) * baseRadius,
+        Math.random() * 0.5,
+        Math.sin(angle) * baseRadius
+      );
+
+      p.vel.set(
+        0,
+        tornado.buoyancy * THREE.MathUtils.lerp(0.7, 1.2, Math.random()),
+        0
+      );
+
+      p.spinOffset = Math.random() * Math.PI * 2;
+
+      positions[i * 3] = p.pos.x;
+      positions[i * 3 + 1] = p.pos.y;
+      positions[i * 3 + 2] = p.pos.z;
+    }
+
+    function resetAllParticles() {
+      for (let i = 0; i < MAX_PARTICLES; i++) {
+        respawnParticle(i);
+      }
+    }
+
+    resetAllParticles();
+
+    function updateDifficulty(dt) {
+      if (params.transitionTime < params.transitionDuration) {
+        params.transitionTime += dt;
+      }
+
+      const t = Math.min(params.transitionTime / params.transitionDuration, 1);
+      const smoothT = t * t * (3 - 2 * t);
+
+      const startPreset = DIFFICULTY_PRESETS[Math.round(params.currentDifficultyFloat)];
+      const targetPreset = DIFFICULTY_PRESETS[params.targetDifficulty];
+
+      tornado.rotationSpeed = lerp(startPreset.rotation, targetPreset.rotation, smoothT);
+      tornado.maxHeight = lerp(startPreset.height, targetPreset.height, smoothT);
+      tornado.maxRadius = lerp(startPreset.radius, targetPreset.radius, smoothT);
+      tornado.activeParticles = Math.round(lerp(startPreset.activeParticles, targetPreset.activeParticles, smoothT));
+
+      const difficultyBlend = lerp(Math.round(params.currentDifficultyFloat), params.targetDifficulty, smoothT);
+      tornado.buoyancy = 2.0 + difficultyBlend * 1.5;
+      tornado.turbulence = 0.3 * difficultyBlend;
+      tornado.particleLifetime = Math.max(0.5, 3.0 - difficultyBlend * 0.3);
+
+      if (t >= 1) {
+        params.currentDifficultyFloat = params.targetDifficulty;
+        params.currentDifficulty = params.targetDifficulty;
+      } else {
+        params.currentDifficultyFloat = difficultyBlend;
+        params.currentDifficulty = Math.round(difficultyBlend);
+      }
+    }
+
+    function setDifficulty(level) {
+      const clamped = THREE.MathUtils.clamp(level, 1, 5);
+      params.currentDifficultyFloat = Math.max(1, Math.min(5, params.currentDifficultyFloat));
+      params.targetDifficulty = clamped;
+      params.transitionTime = 0;
+    }
+
+    document.addEventListener('keydown', (e) => {
+      const key = e.key.toLowerCase();
+
+      if (['1', '2', '3', '4', '5'].includes(key)) {
+        setDifficulty(parseInt(key, 10));
+      } else if (key === 'u') {
+        setDifficulty(params.targetDifficulty + 1);
+      } else if (key === 'd') {
+        setDifficulty(params.targetDifficulty - 1);
+      } else if (key === 'p') {
+        params.isPaused = !params.isPaused;
+      } else if (key === 'r') {
+        resetAllParticles();
+      } else if (key === 'c') {
+        params.colorMode = params.colorMode === 'fire' ? 'ice' : 'fire';
+      }
+    });
+
+    renderer.domElement.addEventListener('click', () => {
+      params.burstActive = true;
+      params.burstTimeLeft = 1.0;
+    });
+
+    const clock = new THREE.Clock();
+    const tmpColor = new THREE.Color();
+
+    function updateParticles(dt) {
+      const speedMultiplier = params.burstActive ? 2.0 : 1.0;
+
+      for (let i = 0; i < MAX_PARTICLES; i++) {
+        const p = particleData[i];
+        const isActive = i < tornado.activeParticles;
+        p.active = isActive;
+
+        if (!isActive) {
+          positions[i * 3] = 99999;
+          positions[i * 3 + 1] = 99999;
+          positions[i * 3 + 2] = 99999;
+          alphas[i] = 0;
+          sizes[i] = 0;
+          continue;
+        }
+
+        p.age += dt * speedMultiplier;
+
+        if (p.age >= p.lifetime || p.pos.y >= tornado.maxHeight) {
+          respawnParticle(i);
+        }
+
+        const normalizedY = THREE.MathUtils.clamp(p.pos.y / Math.max(tornado.maxHeight, 0.001), 0, 1);
+
+        p.vel.y += tornado.buoyancy * dt * 0.35 * speedMultiplier;
+        p.pos.y += p.vel.y * dt;
+
+        const currentRadiusTarget = THREE.MathUtils.lerp(p.radius * 0.5, tornado.maxRadius, normalizedY);
+        const angleStep = tornado.rotationSpeed * dt * speedMultiplier + p.spinOffset * 0.0005;
+
+        p.angle += angleStep;
+
+        const desiredX = Math.cos(p.angle) * currentRadiusTarget;
+        const desiredZ = Math.sin(p.angle) * currentRadiusTarget;
+
+        const centripetalStrength = 4.0 * dt * speedMultiplier;
+        p.pos.x = THREE.MathUtils.lerp(p.pos.x, desiredX, centripetalStrength);
+        p.pos.z = THREE.MathUtils.lerp(p.pos.z, desiredZ, centripetalStrength);
+
+        p.pos.x += (Math.random() - 0.5) * tornado.turbulence * dt;
+        p.pos.y += (Math.random() - 0.5) * tornado.turbulence * dt * 0.5;
+        p.pos.z += (Math.random() - 0.5) * tornado.turbulence * dt;
+
+        const lifeRatio = THREE.MathUtils.clamp(p.age / p.lifetime, 0, 1);
+        const alpha = 1.0 - lifeRatio;
+
+        tmpColor.copy(getColorGradient(normalizedY, params.colorMode));
+
+        positions[i * 3] = p.pos.x;
+        positions[i * 3 + 1] = p.pos.y;
+        positions[i * 3 + 2] = p.pos.z;
+
+        colors[i * 3] = tmpColor.r;
+        colors[i * 3 + 1] = tmpColor.g;
+        colors[i * 3 + 2] = tmpColor.b;
+
+        alphas[i] = alpha;
+        sizes[i] = THREE.MathUtils.lerp(10, 22, 1.0 - normalizedY) * THREE.MathUtils.lerp(0.8, 1.2, 1.0 - lifeRatio);
+      }
+
+      particleGeometry.attributes.position.needsUpdate = true;
+      particleGeometry.attributes.color.needsUpdate = true;
+      particleGeometry.attributes.aAlpha.needsUpdate = true;
+      particleGeometry.attributes.aSize.needsUpdate = true;
+    }
+
+    function updateHUD() {
+      difficultyDisplay.textContent = `Difficulty: ${params.targetDifficulty}`;
+      particleCountDisplay.textContent = `Particles: ${tornado.activeParticles}`;
+      tornadoHeightDisplay.textContent = `Height: ${tornado.maxHeight.toFixed(1)}`;
+      pauseIndicator.textContent = `Status: ${params.isPaused ? 'PAUSED' : 'RUNNING'}`;
+      colorModeDisplay.textContent = `Color: ${params.colorMode}`;
+    }
+
+    function updateState() {
+      window.__3D_STATE__ = {
+        difficulty: params.targetDifficulty,
+        particleCount: tornado.activeParticles,
+        tornadoHeight: tornado.maxHeight,
+        rotationSpeed: tornado.rotationSpeed,
+        isPaused: params.isPaused,
+        colorMode: params.colorMode,
+        burstActive: params.burstActive,
+        modelLoaded,
+        modelRotationY: fuelModel ? fuelModel.rotation.y : 0,
+        elapsedTime: params.elapsedTime,
+        lightIntensity: pointLight.intensity,
+        particleLifetime: tornado.particleLifetime
+      };
+    }
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      const dtRaw = clock.getDelta();
+      const dt = Math.min(dtRaw, 0.033);
+
+      controls.update();
+
+      if (!params.isPaused) {
+        params.elapsedTime += dt;
+        updateDifficulty(dt);
+
+        if (params.burstActive) {
+          params.burstTimeLeft -= dt;
+          if (params.burstTimeLeft <= 0) {
+            params.burstActive = false;
+            params.burstTimeLeft = 0;
+          }
+        }
+
+        updateParticles(dt);
+
+        pointLight.intensity = lerp(pointLight.intensity, 1.5 + params.currentDifficultyFloat * 0.7, 0.08);
+        baseGlow.material.emissiveIntensity = lerp(baseGlow.material.emissiveIntensity, 0.6 + params.currentDifficultyFloat * 0.35, 0.08);
+
+        if (fuelModel) {
+          fuelModel.rotation.y += 0.5 * dt;
+          fuelModel.traverse((child) => {
+            if (child.isMesh && child.material && 'emissiveIntensity' in child.material) {
+              child.material.emissiveIntensity = 0.2 + params.currentDifficultyFloat * 0.25;
+            }
+          });
+        }
+      }
+
+      updateHUD();
+      updateState();
+      renderer.render(scene, camera);
+    }
+
+    animate();
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      particleMaterial.uniforms.uPixelRatio.value = renderer.getPixelRatio();
+    });
+
+    window.__3D_STATE__ = {
+      difficulty: 1,
+      particleCount: 400,
+      tornadoHeight: 10,
+      rotationSpeed: 1,
+      isPaused: false,
+      colorMode: 'fire',
+      burstActive: false,
+      modelLoaded: false,
+      modelRotationY: 0,
+      elapsedTime: 0,
+      lightIntensity: pointLight.intensity,
+      particleLifetime: 2.7
+    };
+  </script>
+</body>
+</html>

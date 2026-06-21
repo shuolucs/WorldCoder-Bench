@@ -1,0 +1,655 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3D Water Surface Simulation</title>
+<script type="importmap">
+{ "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+} }
+</script>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { overflow: hidden; font-family: monospace; }
+canvas { display: block; }
+
+#hud {
+    position: absolute;
+    top: 10px;
+    left: 10px;
+    background: rgba(0, 0, 0, 0.6);
+    color: white;
+    padding: 12px;
+    font-family: monospace;
+    font-size: 14px;
+    border-radius: 8px;
+    pointer-events: none;
+    line-height: 1.6;
+    z-index: 10;
+}
+
+#controls {
+    position: absolute;
+    bottom: 10px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: rgba(0, 0, 0, 0.6);
+    color: white;
+    padding: 12px 20px;
+    font-family: monospace;
+    font-size: 13px;
+    border-radius: 8px;
+    display: flex;
+    gap: 16px;
+    align-items: center;
+    flex-wrap: wrap;
+    justify-content: center;
+    z-index: 10;
+}
+
+#controls label {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 2px;
+}
+
+#controls input[type="range"] {
+    width: 100px;
+}
+
+#controls button {
+    padding: 6px 14px;
+    border: 1px solid #aaa;
+    background: rgba(255,255,255,0.15);
+    color: white;
+    font-family: monospace;
+    font-size: 13px;
+    border-radius: 4px;
+    cursor: pointer;
+}
+
+#controls button:hover {
+    background: rgba(255,255,255,0.3);
+}
+
+#controls button.active {
+    background: rgba(0, 200, 100, 0.4);
+    border-color: #0c6;
+}
+</style>
+</head>
+<body>
+
+<div id="hud">
+    <div>Max Height: <span id="hud-maxheight">0.000</span></div>
+    <div>Ducks: <span id="hud-ducks">0</span></div>
+    <div>Rain: <span id="hud-rain">OFF</span></div>
+    <div>Wave Speed: <span id="hud-wavespeed">8.0</span></div>
+    <div>Damping: <span id="hud-damping">0.020</span></div>
+    <div>Ripples: <span id="hud-ripples">0</span></div>
+</div>
+
+<div id="controls">
+    <label>
+        Ripple Strength
+        <input type="range" id="slider-ripple" min="0.5" max="5.0" step="0.1" value="1.5">
+        <span id="val-ripple">1.5</span>
+    </label>
+    <label>
+        Wave Speed
+        <input type="range" id="slider-wavespeed" min="2.0" max="15.0" step="0.5" value="8.0">
+        <span id="val-wavespeed">8.0</span>
+    </label>
+    <label>
+        Damping
+        <input type="range" id="slider-damping" min="0.005" max="0.1" step="0.005" value="0.02">
+        <span id="val-damping">0.020</span>
+    </label>
+    <button id="btn-add-duck">Add Duck</button>
+    <button id="btn-rain">Rain: OFF</button>
+    <button id="btn-reset">Reset</button>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+// --- Scene Setup ---
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x87CEEB);
+scene.fog = new THREE.FogExp2(0x87CEEB, 0.015);
+
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 200);
+camera.position.set(0, 8, 12);
+camera.lookAt(0, 0, 0);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.05;
+controls.target.set(0, 0, 0);
+
+// Lights
+const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+dirLight.position.set(5, 10, 5);
+dirLight.castShadow = true;
+dirLight.shadow.mapSize.set(2048, 2048);
+dirLight.shadow.camera.left = -15;
+dirLight.shadow.camera.right = 15;
+dirLight.shadow.camera.top = 15;
+dirLight.shadow.camera.bottom = -15;
+scene.add(dirLight);
+
+const ambLight = new THREE.AmbientLight(0xffffff, 0.3);
+scene.add(ambLight);
+
+// Hemisphere light for sky effect
+const hemiLight = new THREE.HemisphereLight(0x87CEEB, 0x444444, 0.4);
+scene.add(hemiLight);
+
+// --- Water Surface ---
+const GRID_SIZE = 20;
+const SEGMENTS = 128;
+const VERTS = SEGMENTS + 1; // 129
+const dx = GRID_SIZE / SEGMENTS;
+
+// Height arrays
+let h_current = [];
+let h_previous = [];
+let h_new = [];
+
+function initHeightArrays() {
+    h_current = new Float32Array(VERTS * VERTS).fill(0);
+    h_previous = new Float32Array(VERTS * VERTS).fill(0);
+    h_new = new Float32Array(VERTS * VERTS).fill(0);
+}
+initHeightArrays();
+
+function idx(i, j) { return i * VERTS + j; }
+
+const waterGeometry = new THREE.PlaneGeometry(GRID_SIZE, GRID_SIZE, SEGMENTS, SEGMENTS);
+waterGeometry.rotateX(-Math.PI / 2);
+
+const waterMaterial = new THREE.MeshStandardMaterial({
+    color: 0x006994,
+    transparent: true,
+    opacity: 0.8,
+    metalness: 0.1,
+    roughness: 0.2,
+    side: THREE.DoubleSide,
+    envMapIntensity: 0.5,
+});
+
+// Try to load normal map but don't fail if unavailable
+const textureLoader = new THREE.TextureLoader();
+textureLoader.load('./water_normals.jpg', (tex) => {
+    tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+    tex.repeat.set(4, 4);
+    waterMaterial.normalMap = tex;
+    waterMaterial.normalScale.set(0.5, 0.5);
+    waterMaterial.needsUpdate = true;
+}, undefined, () => {
+    // Normal map not found, continue without it
+});
+
+const waterMesh = new THREE.Mesh(waterGeometry, waterMaterial);
+waterMesh.receiveShadow = true;
+scene.add(waterMesh);
+
+// Bottom plane for visual depth
+const bottomGeo = new THREE.PlaneGeometry(GRID_SIZE, GRID_SIZE);
+bottomGeo.rotateX(-Math.PI / 2);
+const bottomMat = new THREE.MeshStandardMaterial({ color: 0x1a3a4a, side: THREE.DoubleSide });
+const bottomMesh = new THREE.Mesh(bottomGeo, bottomMat);
+bottomMesh.position.y = -2;
+bottomMesh.receiveShadow = true;
+scene.add(bottomMesh);
+
+// --- Simulation Parameters ---
+let waveSpeed = 8.0;
+let damping = 0.02;
+let rippleStrength = 1.5;
+let isPaused = false;
+let rainMode = false;
+let totalRipples = 0;
+let frameCount = 0;
+let rainInterval = null;
+
+const dt = 1 / 60;
+
+function simulateWater() {
+    if (isPaused) return;
+
+    const c2dt2 = waveSpeed * waveSpeed * dt * dt;
+    const dx2 = dx * dx;
+
+    for (let i = 1; i < VERTS - 1; i++) {
+        for (let j = 1; j < VERTS - 1; j++) {
+            const id = idx(i, j);
+            const laplacian = (
+                h_current[idx(i + 1, j)] +
+                h_current[idx(i - 1, j)] +
+                h_current[idx(i, j + 1)] +
+                h_current[idx(i, j - 1)] -
+                4 * h_current[id]
+            ) / dx2;
+
+            h_new[id] = 2 * h_current[id] - h_previous[id]
+                + c2dt2 * laplacian
+                - damping * (h_current[id] - h_previous[id]);
+        }
+    }
+
+    // Boundary: zero height
+    for (let i = 0; i < VERTS; i++) {
+        h_new[idx(0, i)] = 0;
+        h_new[idx(VERTS - 1, i)] = 0;
+        h_new[idx(i, 0)] = 0;
+        h_new[idx(i, VERTS - 1)] = 0;
+    }
+
+    // Shift arrays
+    const temp = h_previous;
+    h_previous = h_current;
+    h_current = h_new;
+    h_new = temp;
+
+    // Update geometry
+    const positions = waterGeometry.attributes.position.array;
+    for (let i = 0; i < VERTS; i++) {
+        for (let j = 0; j < VERTS; j++) {
+            const vertIdx = i * VERTS + j;
+            positions[vertIdx * 3 + 1] = h_current[idx(i, j)];
+        }
+    }
+    waterGeometry.attributes.position.needsUpdate = true;
+    waterGeometry.computeVertexNormals();
+}
+
+function createRipple(worldX, worldZ, strength) {
+    // Convert world coords to grid indices
+    const gi = Math.round((worldX + GRID_SIZE / 2) / dx);
+    const gj = Math.round((worldZ + GRID_SIZE / 2) / dx);
+
+    const radius = 3;
+    for (let di = -radius; di <= radius; di++) {
+        for (let dj = -radius; dj <= radius; dj++) {
+            const ni = gi + di;
+            const nj = gj + dj;
+            if (ni >= 0 && ni < VERTS && nj >= 0 && nj < VERTS) {
+                const dist = Math.sqrt(di * di + dj * dj);
+                if (dist <= radius) {
+                    const factor = Math.cos((dist / radius) * Math.PI * 0.5);
+                    h_current[idx(ni, nj)] -= strength * factor;
+                }
+            }
+        }
+    }
+    totalRipples++;
+}
+
+// --- Raycasting for click ---
+const raycaster = new THREE.Raycaster();
+const mouse = new THREE.Vector2();
+
+renderer.domElement.addEventListener('click', (event) => {
+    mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+    mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+    raycaster.setFromCamera(mouse, camera);
+    const intersects = raycaster.intersectObject(waterMesh);
+    if (intersects.length > 0) {
+        const pt = intersects[0].point;
+        createRipple(pt.x, pt.z, rippleStrength);
+    }
+});
+
+// --- Duck Management ---
+const ducks = [];
+let duckTemplate = null;
+const loader = new GLTFLoader();
+
+function createFallbackDuck() {
+    const group = new THREE.Group();
+
+    // Body
+    const bodyGeo = new THREE.SphereGeometry(0.3, 16, 12);
+    bodyGeo.scale(1, 0.7, 1.2);
+    const bodyMat = new THREE.MeshStandardMaterial({ color: 0xFFD700 });
+    const body = new THREE.Mesh(bodyGeo, bodyMat);
+    body.castShadow = true;
+    group.add(body);
+
+    // Head
+    const headGeo = new THREE.SphereGeometry(0.18, 12, 10);
+    const headMat = new THREE.MeshStandardMaterial({ color: 0xFFD700 });
+    const head = new THREE.Mesh(headGeo, headMat);
+    head.position.set(0, 0.22, 0.22);
+    head.castShadow = true;
+    group.add(head);
+
+    // Beak
+    const beakGeo = new THREE.ConeGeometry(0.06, 0.15, 8);
+    const beakMat = new THREE.MeshStandardMaterial({ color: 0xFF6600 });
+    const beak = new THREE.Mesh(beakGeo, beakMat);
+    beak.rotation.x = -Math.PI / 2;
+    beak.position.set(0, 0.2, 0.4);
+    group.add(beak);
+
+    // Eyes
+    const eyeGeo = new THREE.SphereGeometry(0.03, 8, 8);
+    const eyeMat = new THREE.MeshStandardMaterial({ color: 0x000000 });
+    const eyeL = new THREE.Mesh(eyeGeo, eyeMat);
+    eyeL.position.set(-0.1, 0.3, 0.32);
+    group.add(eyeL);
+    const eyeR = new THREE.Mesh(eyeGeo, eyeMat);
+    eyeR.position.set(0.1, 0.3, 0.32);
+    group.add(eyeR);
+
+    return group;
+}
+
+// Try loading Duck.glb, fallback to procedural duck
+loader.load('./Duck.glb', (gltf) => {
+    duckTemplate = gltf.scene;
+    duckTemplate.scale.set(0.5, 0.5, 0.5);
+    duckTemplate.traverse((child) => {
+        if (child.isMesh) {
+            child.castShadow = true;
+            child.receiveShadow = true;
+        }
+    });
+    addDuck(0, 0);
+}, undefined, () => {
+    // Fallback
+    duckTemplate = createFallbackDuck();
+    addDuck(0, 0);
+});
+
+function addDuck(x, z) {
+    if (ducks.length >= 5) return;
+
+    let duckClone;
+    if (duckTemplate) {
+        duckClone = duckTemplate.clone();
+    } else {
+        duckClone = createFallbackDuck();
+    }
+
+    const duckData = {
+        mesh: duckClone,
+        x: x,
+        z: z,
+        vx: (Math.random() - 0.5) * 0.6,
+        vz: (Math.random() - 0.5) * 0.6,
+    };
+
+    // Normalize velocity to 0.3
+    const speed = 0.3;
+    const len = Math.sqrt(duckData.vx * duckData.vx + duckData.vz * duckData.vz);
+    if (len > 0) {
+        duckData.vx = (duckData.vx / len) * speed;
+        duckData.vz = (duckData.vz / len) * speed;
+    } else {
+        duckData.vx = speed;
+        duckData.vz = 0;
+    }
+
+    duckClone.position.set(x, 0, z);
+    scene.add(duckClone);
+    ducks.push(duckData);
+}
+
+function sampleHeight(wx, wz) {
+    const fi = (wx + GRID_SIZE / 2) / dx;
+    const fj = (wz + GRID_SIZE / 2) / dx;
+    const i = Math.floor(fi);
+    const j = Math.floor(fj);
+
+    if (i < 0 || i >= VERTS - 1 || j < 0 || j >= VERTS - 1) return 0;
+
+    const fx = fi - i;
+    const fz = fj - j;
+
+    const h00 = h_current[idx(i, j)];
+    const h10 = h_current[idx(i + 1, j)];
+    const h01 = h_current[idx(i, j + 1)];
+    const h11 = h_current[idx(i + 1, j + 1)];
+
+    return h00 * (1 - fx) * (1 - fz) + h10 * fx * (1 - fz) + h01 * (1 - fx) * fz + h11 * fx * fz;
+}
+
+function sampleGradient(wx, wz) {
+    const eps = dx;
+    const hx1 = sampleHeight(wx + eps, wz);
+    const hx0 = sampleHeight(wx - eps, wz);
+    const hz1 = sampleHeight(wx, wz + eps);
+    const hz0 = sampleHeight(wx, wz - eps);
+    return {
+        dhdx: (hx1 - hx0) / (2 * eps),
+        dhdz: (hz1 - hz0) / (2 * eps)
+    };
+}
+
+function updateDucks(deltaTime) {
+    for (const duck of ducks) {
+        if (!isPaused) {
+            duck.x += duck.vx * deltaTime;
+            duck.z += duck.vz * deltaTime;
+
+            // Bounce at edges
+            if (Math.abs(duck.x) > 9) {
+                duck.vx *= -1;
+                duck.x = Math.sign(duck.x) * 9;
+            }
+            if (Math.abs(duck.z) > 9) {
+                duck.vz *= -1;
+                duck.z = Math.sign(duck.z) * 9;
+            }
+        }
+
+        const h = sampleHeight(duck.x, duck.z);
+        const grad = sampleGradient(duck.x, duck.z);
+
+        duck.mesh.position.set(duck.x, h + 0.1, duck.z);
+
+        // Tilt based on gradient
+        duck.mesh.rotation.set(0, 0, 0);
+        duck.mesh.rotation.x = -Math.atan(grad.dhdz) * 0.5;
+        duck.mesh.rotation.z = Math.atan(grad.dhdx) * 0.5;
+    }
+}
+
+// --- Rain Mode ---
+function startRain() {
+    if (rainInterval) return;
+    rainInterval = setInterval(() => {
+        if (!isPaused) {
+            const rx = (Math.random() - 0.5) * 18;
+            const rz = (Math.random() - 0.5) * 18;
+            createRipple(rx, rz, 0.5);
+        }
+    }, 200);
+}
+
+function stopRain() {
+    if (rainInterval) {
+        clearInterval(rainInterval);
+        rainInterval = null;
+    }
+}
+
+// --- UI Controls ---
+const sliderRipple = document.getElementById('slider-ripple');
+const sliderWavespeed = document.getElementById('slider-wavespeed');
+const sliderDamping = document.getElementById('slider-damping');
+const btnAddDuck = document.getElementById('btn-add-duck');
+const btnRain = document.getElementById('btn-rain');
+const btnReset = document.getElementById('btn-reset');
+
+sliderRipple.addEventListener('input', () => {
+    rippleStrength = parseFloat(sliderRipple.value);
+    document.getElementById('val-ripple').textContent = rippleStrength.toFixed(1);
+});
+
+sliderWavespeed.addEventListener('input', () => {
+    waveSpeed = parseFloat(sliderWavespeed.value);
+    document.getElementById('val-wavespeed').textContent = waveSpeed.toFixed(1);
+});
+
+sliderDamping.addEventListener('input', () => {
+    damping = parseFloat(sliderDamping.value);
+    document.getElementById('val-damping').textContent = damping.toFixed(3);
+});
+
+btnAddDuck.addEventListener('click', () => {
+    const rx = (Math.random() - 0.5) * 16;
+    const rz = (Math.random() - 0.5) * 16;
+    addDuck(rx, rz);
+});
+
+btnRain.addEventListener('click', () => {
+    rainMode = !rainMode;
+    btnRain.textContent = `Rain: ${rainMode ? 'ON' : 'OFF'}`;
+    btnRain.classList.toggle('active', rainMode);
+    if (rainMode) startRain();
+    else stopRain();
+});
+
+btnReset.addEventListener('click', () => {
+    // Reset water
+    initHeightArrays();
+
+    // Remove extra ducks (keep first)
+    while (ducks.length > 1) {
+        const d = ducks.pop();
+        scene.remove(d.mesh);
+    }
+    if (ducks.length === 1) {
+        ducks[0].x = 0;
+        ducks[0].z = 0;
+        ducks[0].vx = 0.3;
+        ducks[0].vz = 0;
+    }
+
+    // Stop rain
+    rainMode = false;
+    stopRain();
+    btnRain.textContent = 'Rain: OFF';
+    btnRain.classList.remove('active');
+
+    totalRipples = 0;
+});
+
+// Keyboard
+document.addEventListener('keydown', (e) => {
+    if (e.key === 'p' || e.key === 'P') {
+        isPaused = !isPaused;
+    }
+    if (e.key === 'r' || e.key === 'R') {
+        rainMode = !rainMode;
+        btnRain.textContent = `Rain: ${rainMode ? 'ON' : 'OFF'}`;
+        btnRain.classList.toggle('active', rainMode);
+        if (rainMode) startRain();
+        else stopRain();
+    }
+});
+
+// --- HUD Update ---
+function updateHUD() {
+    let maxH = -Infinity, minH = Infinity, sumH = 0;
+    const total = VERTS * VERTS;
+    for (let k = 0; k < total; k++) {
+        const v = h_current[k];
+        if (v > maxH) maxH = v;
+        if (v < minH) minH = v;
+        sumH += v;
+    }
+    const avgH = sumH / total;
+
+    document.getElementById('hud-maxheight').textContent = maxH.toFixed(3);
+    document.getElementById('hud-ducks').textContent = ducks.length;
+    document.getElementById('hud-rain').textContent = rainMode ? 'ON' : 'OFF';
+    document.getElementById('hud-wavespeed').textContent = waveSpeed.toFixed(1);
+    document.getElementById('hud-damping').textContent = damping.toFixed(3);
+    document.getElementById('hud-ripples').textContent = totalRipples;
+
+    // Update state
+    window.__3D_STATE__ = {
+        frameCount: frameCount,
+        maxWaterHeight: maxH,
+        minWaterHeight: minH,
+        avgWaterHeight: avgH,
+        duckCount: ducks.length,
+        duckPositions: ducks.map(d => ({
+            x: d.mesh.position.x,
+            y: d.mesh.position.y,
+            z: d.mesh.position.z
+        })),
+        waveSpeed: waveSpeed,
+        dampingFactor: damping,
+        rippleStrength: rippleStrength,
+        totalRipples: totalRipples,
+        rainMode: rainMode,
+        waterValid: isFinite(maxH) && Math.abs(maxH) < 10 && ducks.length >= 1,
+        isPaused: isPaused,
+    };
+}
+
+// --- Window Resize ---
+window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// --- Init State ---
+window.__3D_STATE__ = {
+    frameCount: 0,
+    maxWaterHeight: 0,
+    minWaterHeight: 0,
+    avgWaterHeight: 0,
+    duckCount: 0,
+    duckPositions: [],
+    waveSpeed: waveSpeed,
+    dampingFactor: damping,
+    rippleStrength: rippleStrength,
+    totalRipples: 0,
+    rainMode: false,
+    waterValid: false,
+    isPaused: false,
+};
+
+// --- Animation Loop ---
+const clock = new THREE.Clock();
+
+function animate() {
+    requestAnimationFrame(animate);
+
+    const delta = Math.min(clock.getDelta(), 0.05);
+
+    simulateWater();
+    updateDucks(isPaused ? 0 : delta);
+
+    controls.update();
+
+    frameCount++;
+    updateHUD();
+
+    renderer.render(scene, camera);
+}
+
+animate();
+</script>
+</body>
+</html>

@@ -1,0 +1,585 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3D Car Suspension Spring-Damper Simulation</title>
+<script type="importmap">
+{ "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+} }
+</script>
+<style>
+body { margin: 0; overflow: hidden; font-family: monospace; }
+canvas { display: block; }
+#controls {
+    position: absolute; bottom: 10px; left: 10px;
+    background: rgba(0,0,0,0.7); padding: 12px; border-radius: 8px;
+    color: white; font-size: 13px; z-index: 10;
+}
+#controls label { display: block; margin: 6px 0 2px; }
+#controls input[type="range"] { width: 200px; }
+#controls select, #controls button { margin-top: 6px; padding: 4px 8px; }
+#hud {
+    position: absolute; top: 10px; left: 10px;
+    background: rgba(0,0,0,0.6); padding: 12px; border-radius: 8px;
+    color: white; font-size: 14px; font-family: monospace; z-index: 10;
+    line-height: 1.6;
+}
+</style>
+</head>
+<body>
+
+<div id="hud">
+    <div id="hud-speed">Speed: 0.0 m/s</div>
+    <div id="hud-fl">FL: 0.0 cm</div>
+    <div id="hud-fr">FR: 0.0 cm</div>
+    <div id="hud-rl">RL: 0.0 cm</div>
+    <div id="hud-rr">RR: 0.0 cm</div>
+    <div id="hud-pitch">Pitch: 0.0°</div>
+    <div id="hud-roll">Roll: 0.0°</div>
+</div>
+
+<div id="controls">
+    <label>Speed (m/s): <span id="lbl-speed">5</span></label>
+    <input type="range" id="slider-speed" min="0" max="20" step="0.5" value="5">
+    
+    <label>Stiffness k (N/m): <span id="lbl-stiffness">30000</span></label>
+    <input type="range" id="slider-stiffness" min="5000" max="100000" step="1000" value="30000">
+    
+    <label>Damping c (Ns/m): <span id="lbl-damping">3000</span></label>
+    <input type="range" id="slider-damping" min="500" max="10000" step="100" value="3000">
+    
+    <label>Terrain:</label>
+    <select id="select-terrain">
+        <option value="sine">sine</option>
+        <option value="step">step</option>
+        <option value="random">random</option>
+    </select>
+    
+    <br>
+    <button id="btn-reset">Reset</button>
+    <span style="font-size:11px; margin-left:10px;">[P] Pause</span>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// ============ SCENE SETUP ============
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x87CEEB);
+
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 500);
+camera.position.set(8, 6, 12);
+camera.lookAt(0, 1, 0);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 1, 0);
+controls.update();
+
+const dirLight = new THREE.DirectionalLight(0xffffff, 1.5);
+dirLight.position.set(5, 10, 5);
+dirLight.castShadow = true;
+dirLight.shadow.mapSize.set(2048, 2048);
+dirLight.shadow.camera.left = -20;
+dirLight.shadow.camera.right = 20;
+dirLight.shadow.camera.top = 20;
+dirLight.shadow.camera.bottom = -20;
+dirLight.shadow.camera.near = 0.1;
+dirLight.shadow.camera.far = 50;
+scene.add(dirLight);
+
+const ambLight = new THREE.AmbientLight(0xffffff, 0.4);
+scene.add(ambLight);
+
+// ============ GROUND ============
+const groundGeo = new THREE.PlaneGeometry(100, 100);
+const groundMat = new THREE.MeshStandardMaterial({ color: 0x556B2F });
+const ground = new THREE.Mesh(groundGeo, groundMat);
+ground.rotation.x = -Math.PI / 2;
+ground.receiveShadow = true;
+scene.add(ground);
+
+// ============ TERRAIN PROFILE ============
+let terrainType = 'sine';
+let randomHeights = [];
+
+// Generate random heights for 'random' terrain
+function generateRandomHeights() {
+    randomHeights = [];
+    const seed = 42;
+    let val = 0;
+    for (let i = 0; i < 1000; i++) {
+        val += (Math.sin(i * 0.7 + seed) * 0.5 + Math.sin(i * 1.3 + seed * 2) * 0.3 + Math.sin(i * 3.1 + seed * 0.5) * 0.2) * 0.05;
+        val *= 0.98;
+        randomHeights.push(val + Math.sin(i * 0.15) * 0.15 + Math.sin(i * 0.37) * 0.1);
+    }
+}
+generateRandomHeights();
+
+function getTerrainHeight(z) {
+    if (terrainType === 'sine') {
+        return 0.3 * Math.sin((2 * Math.PI / 4) * z);
+    } else if (terrainType === 'step') {
+        if (z >= -1 && z <= 1) return 0.4;
+        return 0;
+    } else if (terrainType === 'random') {
+        const idx = (z + 50) * 10;
+        const i0 = Math.floor(idx);
+        const frac = idx - i0;
+        const clamp = (v) => Math.max(0, Math.min(randomHeights.length - 1, v));
+        const h0 = randomHeights[clamp(i0)] || 0;
+        const h1 = randomHeights[clamp(i0 + 1)] || 0;
+        return h0 * (1 - frac) + h1 * frac;
+    }
+    return 0;
+}
+
+// ============ TERRAIN STRIP MESH ============
+let terrainStrip = null;
+
+function createTerrainStrip() {
+    if (terrainStrip) scene.remove(terrainStrip);
+
+    const stripWidth = 4;
+    const zMin = -50, zMax = 50;
+    const zSegments = 500;
+    const xSegments = 4;
+    const dz = (zMax - zMin) / zSegments;
+    const dx = stripWidth / xSegments;
+
+    const vertices = [];
+    const indices = [];
+    const normals = [];
+
+    for (let iz = 0; iz <= zSegments; iz++) {
+        const z = zMin + iz * dz;
+        const h = getTerrainHeight(z);
+        for (let ix = 0; ix <= xSegments; ix++) {
+            const x = -stripWidth / 2 + ix * dx;
+            // Taper edges to ground
+            const edgeFactor = 1 - Math.pow(Math.abs(x) / (stripWidth / 2), 2);
+            vertices.push(x, h * edgeFactor + 0.01, z);
+            normals.push(0, 1, 0);
+        }
+    }
+
+    for (let iz = 0; iz < zSegments; iz++) {
+        for (let ix = 0; ix < xSegments; ix++) {
+            const a = iz * (xSegments + 1) + ix;
+            const b = a + 1;
+            const c = a + (xSegments + 1);
+            const d = c + 1;
+            indices.push(a, c, b);
+            indices.push(b, c, d);
+        }
+    }
+
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3));
+    geo.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
+    geo.setIndex(indices);
+    geo.computeVertexNormals();
+
+    const mat = new THREE.MeshStandardMaterial({ color: 0x444444, side: THREE.DoubleSide });
+    terrainStrip = new THREE.Mesh(geo, mat);
+    terrainStrip.receiveShadow = true;
+    scene.add(terrainStrip);
+}
+createTerrainStrip();
+
+// ============ CAR BODY (simple box since ferrari.glb may not be available) ============
+const carGroup = new THREE.Group();
+scene.add(carGroup);
+
+// Car body mesh
+const bodyGeo = new THREE.BoxGeometry(1.8, 0.6, 4.0);
+const bodyMat = new THREE.MeshStandardMaterial({ color: 0xCC0000, metalness: 0.6, roughness: 0.3 });
+const bodyMesh = new THREE.Mesh(bodyGeo, bodyMat);
+bodyMesh.castShadow = true;
+carGroup.add(bodyMesh);
+
+// Hood / windshield shape
+const cabinGeo = new THREE.BoxGeometry(1.5, 0.5, 1.8);
+const cabinMat = new THREE.MeshStandardMaterial({ color: 0x222222, metalness: 0.8, roughness: 0.2 });
+const cabinMesh = new THREE.Mesh(cabinGeo, cabinMat);
+cabinMesh.position.set(0, 0.5, -0.3);
+cabinMesh.castShadow = true;
+carGroup.add(cabinMesh);
+
+// Try loading ferrari.glb
+let ferrariLoaded = false;
+try {
+    const { GLTFLoader } = await import('three/addons/loaders/GLTFLoader.js');
+    const loader = new GLTFLoader();
+    loader.load('./ferrari.glb', (gltf) => {
+        const model = gltf.scene;
+        // Compute bounding box to scale
+        const box = new THREE.Box3().setFromObject(model);
+        const size = box.getSize(new THREE.Vector3());
+        const maxDim = Math.max(size.x, size.y, size.z);
+        const scale = 4.0 / maxDim;
+        model.scale.setScalar(scale);
+        model.traverse((child) => {
+            if (child.isMesh) {
+                child.castShadow = true;
+                child.receiveShadow = true;
+            }
+        });
+        // Remove placeholder
+        carGroup.remove(bodyMesh);
+        carGroup.remove(cabinMesh);
+        carGroup.add(model);
+        ferrariLoaded = true;
+    }, undefined, (err) => {
+        console.log('ferrari.glb not found, using placeholder car body');
+    });
+} catch(e) {
+    console.log('GLTFLoader import issue, using placeholder');
+}
+
+// ============ WHEELS ============
+const wheelRadius = 0.25;
+const wheelWidth = 0.2;
+const wheelGeo = new THREE.CylinderGeometry(wheelRadius, wheelRadius, wheelWidth, 16);
+wheelGeo.rotateZ(Math.PI / 2);
+const wheelMat = new THREE.MeshStandardMaterial({ color: 0x222222 });
+
+const wheelPositions = [
+    { name: 'FL', localX: -0.8, localZ: 1.4 },
+    { name: 'FR', localX: 0.8, localZ: 1.4 },
+    { name: 'RL', localX: -0.8, localZ: -1.4 },
+    { name: 'RR', localX: 0.8, localZ: -1.4 }
+];
+
+const wheels = [];
+const springs = [];
+
+function createZigzagGeometry(topY, bottomY, segments = 8) {
+    const points = [];
+    const amplitude = 0.1;
+    for (let i = 0; i <= segments; i++) {
+        const t = i / segments;
+        const y = bottomY + (topY - bottomY) * t;
+        const xOff = (i % 2 === 0 ? -1 : 1) * amplitude * (i > 0 && i < segments ? 1 : 0);
+        points.push(new THREE.Vector3(xOff, y, 0));
+    }
+    const geo = new THREE.BufferGeometry().setFromPoints(points);
+    return geo;
+}
+
+wheelPositions.forEach((wp, idx) => {
+    // Wheel mesh
+    const wheel = new THREE.Mesh(wheelGeo, wheelMat);
+    wheel.castShadow = true;
+    scene.add(wheel);
+    
+    // Spring line
+    const springGeo = createZigzagGeometry(1, 0);
+    const springMat = new THREE.LineBasicMaterial({ color: 0xFFFF00, linewidth: 2 });
+    const springLine = new THREE.Line(springGeo, springMat);
+    scene.add(springLine);
+    
+    wheels.push(wheel);
+    springs.push(springLine);
+});
+
+// ============ PHYSICS STATE ============
+const L0 = 0.5; // rest length
+const mass = 1200; // kg
+const gravity = 9.81;
+
+// Moments of inertia (simplified)
+const Ipitch = mass * 2.0 * 2.0 / 3; // ~1600
+const Iroll = mass * 0.8 * 0.8 / 3; // ~256
+
+let carZ = -20;
+let carBodyY = L0 + wheelRadius; // rest height
+let carVelY = 0;
+let pitchAngle = 0; // rotation around x-axis
+let pitchVel = 0;
+let rollAngle = 0; // rotation around z-axis
+let rollVel = 0;
+
+let speed = 5;
+let stiffness = 30000;
+let damping = 3000;
+let isPaused = false;
+let frameCount = 0;
+
+let compressions = [0, 0, 0, 0]; // FL, FR, RL, RR
+let compressionVels = [0, 0, 0, 0];
+
+// ============ CONTROLS ============
+const sliderSpeed = document.getElementById('slider-speed');
+const sliderStiffness = document.getElementById('slider-stiffness');
+const sliderDamping = document.getElementById('slider-damping');
+const selectTerrain = document.getElementById('select-terrain');
+const btnReset = document.getElementById('btn-reset');
+
+sliderSpeed.addEventListener('input', () => {
+    speed = parseFloat(sliderSpeed.value);
+    document.getElementById('lbl-speed').textContent = speed;
+});
+
+sliderStiffness.addEventListener('input', () => {
+    stiffness = parseFloat(sliderStiffness.value);
+    document.getElementById('lbl-stiffness').textContent = stiffness;
+});
+
+sliderDamping.addEventListener('input', () => {
+    damping = parseFloat(sliderDamping.value);
+    document.getElementById('lbl-damping').textContent = damping;
+});
+
+selectTerrain.addEventListener('change', () => {
+    terrainType = selectTerrain.value;
+    createTerrainStrip();
+});
+
+btnReset.addEventListener('click', () => {
+    carZ = -20;
+    carBodyY = L0 + wheelRadius;
+    carVelY = 0;
+    pitchAngle = 0;
+    pitchVel = 0;
+    rollAngle = 0;
+    rollVel = 0;
+    compressions = [0, 0, 0, 0];
+    compressionVels = [0, 0, 0, 0];
+});
+
+document.addEventListener('keydown', (e) => {
+    if (e.key === 'p' || e.key === 'P') {
+        isPaused = !isPaused;
+    }
+});
+
+window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// ============ STATE ============
+window.__3D_STATE__ = {
+    frameCount: 0,
+    carZ: carZ,
+    carBodyY: carBodyY,
+    speed: speed,
+    stiffness: stiffness,
+    damping: damping,
+    compressionFL: 0,
+    compressionFR: 0,
+    compressionRL: 0,
+    compressionRR: 0,
+    pitchAngle: 0,
+    rollAngle: 0,
+    terrainType: terrainType,
+    suspensionValid: true,
+    isPaused: false
+};
+
+// ============ UPDATE SPRING VISUAL ============
+function updateSpringVisual(springLine, topPos, bottomPos) {
+    const segments = 10;
+    const points = [];
+    const dir = new THREE.Vector3().subVectors(topPos, bottomPos);
+    const length = dir.length();
+    dir.normalize();
+    
+    // Perpendicular direction
+    const perp = new THREE.Vector3(1, 0, 0);
+    if (Math.abs(dir.dot(perp)) > 0.9) perp.set(0, 0, 1);
+    const side = new THREE.Vector3().crossVectors(dir, perp).normalize();
+    
+    const amplitude = 0.08;
+    
+    for (let i = 0; i <= segments; i++) {
+        const t = i / segments;
+        const p = new THREE.Vector3().lerpVectors(bottomPos, topPos, t);
+        if (i > 0 && i < segments) {
+            const offset = (i % 2 === 0 ? -1 : 1) * amplitude;
+            p.x += side.x * offset;
+            p.z += side.z * offset;
+        }
+        points.push(p);
+    }
+    
+    const geo = new THREE.BufferGeometry().setFromPoints(points);
+    springLine.geometry.dispose();
+    springLine.geometry = geo;
+}
+
+// ============ ANIMATION LOOP ============
+const dt = 1 / 60;
+
+function animate() {
+    requestAnimationFrame(animate);
+    
+    if (!isPaused) {
+        // Move car forward
+        carZ += speed * dt;
+        if (carZ > 50) carZ = -50;
+        
+        // Compute body attach point heights at each wheel position considering pitch and roll
+        // Body center is at (0, carBodyY, carZ)
+        // Pitch rotates around x-axis at car center: front goes up/down
+        // Roll rotates around z-axis at car center: left/right goes up/down
+        
+        let totalForceY = -mass * gravity; // gravity
+        let totalTorquePitch = 0;
+        let totalTorqueRoll = 0;
+        
+        for (let i = 0; i < 4; i++) {
+            const wp = wheelPositions[i];
+            const worldZ = carZ + wp.localZ;
+            const worldX = wp.localX;
+            
+            // Height of body attach point due to pitch and roll
+            const bodyAttachY = carBodyY + wp.localZ * Math.sin(pitchAngle) + wp.localX * Math.sin(rollAngle);
+            
+            // Terrain height at wheel position
+            const hTerrain = getTerrainHeight(worldZ);
+            
+            // Wheel bottom at terrain, wheel center at hTerrain + wheelRadius
+            const wheelCenterY = hTerrain + wheelRadius;
+            
+            // Suspension length = bodyAttachY - wheelCenterY
+            const suspLength = bodyAttachY - wheelCenterY;
+            
+            // Compression (positive = compressed)
+            const x = L0 - suspLength;
+            
+            // Compression velocity
+            const prevX = compressions[i];
+            const v = (x - prevX) / dt;
+            
+            compressions[i] = x;
+            compressionVels[i] = v;
+            
+            // Spring force (positive = pushing body up)
+            let F_spring = stiffness * x;
+            let F_damper = damping * v;
+            let F_total = F_spring + F_damper;
+            
+            // Limit: spring can only push, not pull (unless we allow tension)
+            // Actually for a spring-damper, allow both push and pull within limits
+            // But prevent wheel from going below ground
+            if (suspLength > L0 + 0.1) {
+                // Fully extended, minimal force (just a bit to keep contact)
+                F_total = Math.min(F_total, 0);
+            }
+            
+            totalForceY += F_total;
+            totalTorquePitch += F_total * wp.localZ; // front positive z
+            totalTorqueRoll += F_total * wp.localX; // right positive x
+        }
+        
+        // Euler integration for vertical motion
+        const accY = totalForceY / mass;
+        carVelY += accY * dt;
+        carBodyY += carVelY * dt;
+        
+        // Prevent car from going below minimum height
+        const minBodyY = wheelRadius + 0.05;
+        if (carBodyY < minBodyY) {
+            carBodyY = minBodyY;
+            carVelY = Math.max(carVelY, 0);
+        }
+        
+        // Pitch dynamics
+        const pitchAcc = totalTorquePitch / Ipitch;
+        pitchVel += pitchAcc * dt;
+        pitchVel *= 0.98; // small angular damping
+        pitchAngle += pitchVel * dt;
+        
+        // Roll dynamics
+        const rollAcc = totalTorqueRoll / Iroll;
+        rollVel += rollAcc * dt;
+        rollVel *= 0.98;
+        rollAngle += rollVel * dt;
+        
+        // Clamp angles
+        pitchAngle = Math.max(-0.3, Math.min(0.3, pitchAngle));
+        rollAngle = Math.max(-0.3, Math.min(0.3, rollAngle));
+    }
+    
+    // Update car group position and rotation
+    carGroup.position.set(0, carBodyY, carZ);
+    carGroup.rotation.set(pitchAngle, 0, rollAngle);
+    
+    // Update wheels and springs
+    for (let i = 0; i < 4; i++) {
+        const wp = wheelPositions[i];
+        const worldZ = carZ + wp.localZ;
+        const worldX = wp.localX;
+        const hTerrain = getTerrainHeight(worldZ);
+        
+        const wheelCenterY = hTerrain + wheelRadius;
+        
+        wheels[i].position.set(worldX, wheelCenterY, worldZ);
+        // Rotate wheel based on travel
+        wheels[i].rotation.set(0, 0, Math.PI / 2);
+        const wheelRotation = (carZ + wp.localZ) / wheelRadius;
+        wheels[i].rotation.set(wheelRotation, 0, Math.PI / 2);
+        
+        // Body attach point in world space
+        const bodyAttachY = carBodyY + wp.localZ * Math.sin(pitchAngle) + wp.localX * Math.sin(rollAngle);
+        const topPos = new THREE.Vector3(worldX, bodyAttachY, worldZ);
+        const bottomPos = new THREE.Vector3(worldX, wheelCenterY + wheelRadius, worldZ);
+        
+        updateSpringVisual(springs[i], topPos, bottomPos);
+    }
+    
+    // Camera follow (smooth)
+    controls.target.lerp(new THREE.Vector3(0, carBodyY, carZ), 0.05);
+    controls.update();
+    
+    // Update HUD
+    document.getElementById('hud-speed').textContent = `Speed: ${speed.toFixed(1)} m/s`;
+    document.getElementById('hud-fl').textContent = `FL: ${(compressions[0] * 100).toFixed(1)} cm`;
+    document.getElementById('hud-fr').textContent = `FR: ${(compressions[1] * 100).toFixed(1)} cm`;
+    document.getElementById('hud-rl').textContent = `RL: ${(compressions[2] * 100).toFixed(1)} cm`;
+    document.getElementById('hud-rr').textContent = `RR: ${(compressions[3] * 100).toFixed(1)} cm`;
+    document.getElementById('hud-pitch').textContent = `Pitch: ${(pitchAngle * 180 / Math.PI).toFixed(2)}°`;
+    document.getElementById('hud-roll').textContent = `Roll: ${(rollAngle * 180 / Math.PI).toFixed(2)}°`;
+    
+    // Check suspension validity
+    const suspensionValid = compressions.every(c => isFinite(c) && c >= -0.5 && c <= 0.5);
+    
+    // Update state
+    frameCount++;
+    window.__3D_STATE__ = {
+        frameCount,
+        carZ,
+        carBodyY,
+        speed,
+        stiffness,
+        damping,
+        compressionFL: compressions[0],
+        compressionFR: compressions[1],
+        compressionRL: compressions[2],
+        compressionRR: compressions[3],
+        pitchAngle,
+        rollAngle,
+        terrainType,
+        suspensionValid,
+        isPaused
+    };
+    
+    renderer.render(scene, camera);
+}
+
+animate();
+</script>
+</body>
+</html>

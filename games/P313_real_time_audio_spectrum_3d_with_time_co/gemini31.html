@@ -1,0 +1,431 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Audio Spectrum Visualizer</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #0a0a1a;
+            font-family: monospace;
+            color: #ffffff;
+            user-select: none;
+        }
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+        }
+        #ui-panel {
+            position: absolute;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: rgba(10, 10, 26, 0.8);
+            padding: 15px 25px;
+            border-radius: 10px;
+            border: 1px solid #334466;
+            display: flex;
+            gap: 15px;
+            align-items: center;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.5);
+        }
+        button {
+            background: #334466;
+            color: white;
+            border: none;
+            padding: 8px 15px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-family: monospace;
+            font-size: 14px;
+            transition: background 0.2s;
+        }
+        button:hover {
+            background: #445577;
+        }
+        button:active {
+            background: #223355;
+        }
+        .slider-container {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        input[type="range"] {
+            cursor: pointer;
+        }
+        #time-display {
+            font-size: 16px;
+            font-weight: bold;
+            min-width: 80px;
+            text-align: right;
+        }
+        #hud {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            background: rgba(10, 10, 26, 0.8);
+            padding: 15px;
+            border-radius: 10px;
+            border: 1px solid #334466;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            pointer-events: none;
+        }
+        .hud-item {
+            display: flex;
+            justify-content: space-between;
+            gap: 20px;
+        }
+        .hud-label {
+            color: #8899bb;
+        }
+        .hud-value {
+            font-weight: bold;
+        }
+    </style>
+    <!-- Import maps polyfill -->
+    <script async src="https://unpkg.com/es-module-shims@1.8.0/dist/es-module-shims.js"></script>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="canvas-container"></div>
+
+    <div id="hud">
+        <div class="hud-item">
+            <span class="hud-label">Avg Amplitude:</span>
+            <span class="hud-value" id="hud-avg-amp">0.00</span>
+        </div>
+        <div class="hud-item">
+            <span class="hud-label">Peak Band:</span>
+            <span class="hud-value" id="hud-peak-band">0</span>
+        </div>
+        <div class="hud-item">
+            <span class="hud-label">Total Bars:</span>
+            <span class="hud-value" id="hud-bar-count">256</span>
+        </div>
+    </div>
+
+    <div id="ui-panel">
+        <button id="btn-play-pause">Pause</button>
+        <button id="btn-rewind">Rewind</button>
+        <div class="slider-container">
+            <label for="slider-speed">Speed:</label>
+            <input type="range" id="slider-speed" min="0.25" max="3.0" step="0.25" value="1.0">
+            <span id="speed-label">1.0x</span>
+        </div>
+        <button id="btn-reset">Reset</button>
+        <div id="time-display">T: 0.0s</div>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+        // --- State Management ---
+        window.__3D_STATE__ = {
+            playbackState: 'playing', // 'playing', 'paused', 'rewinding'
+            simTime: 0,
+            speed: 1.0,
+            avgAmplitude: 0,
+            peakBand: 0,
+            barCount: 256,
+            storkPosition: { x: 0, y: 7, z: 0 },
+            storkLoaded: false,
+            frontRowHeights: new Array(16).fill(0.1),
+            maxBarHeight: 5.0,
+            gridSize: 16,
+            isInitialized: false
+        };
+
+        const state = window.__3D_STATE__;
+
+        // --- Scene Setup ---
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x0a0a1a);
+
+        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.set(0, 8, 20);
+        camera.lookAt(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        container.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.05;
+
+        // Lights
+        const ambientLight = new THREE.AmbientLight(0x334466, 0.5);
+        scene.add(ambientLight);
+
+        const directionalLight = new THREE.DirectionalLight(0xffffff, 1.0);
+        directionalLight.position.set(5, 10, 7);
+        scene.add(directionalLight);
+
+        // --- Audio Spectrum Grid ---
+        const GRID_SIZE = 16;
+        const BAR_WIDTH = 0.4;
+        const BAR_SPACING = 0.6;
+        const SHIFT_INTERVAL = 0.2; // seconds
+
+        const bars = [];
+        const targetHeights = [];
+        
+        // Base geometry translated so origin is at the bottom
+        const barGeometry = new THREE.BoxGeometry(BAR_WIDTH, 1, BAR_WIDTH);
+        barGeometry.translate(0, 0.5, 0);
+        
+        const gridOffset = (GRID_SIZE - 1) * BAR_SPACING / 2;
+
+        for (let z = 0; z < GRID_SIZE; z++) {
+            const rowBars = [];
+            const rowHeights = [];
+            for (let x = 0; x < GRID_SIZE; x++) {
+                const material = new THREE.MeshStandardMaterial({ 
+                    color: 0xffffff,
+                    roughness: 0.2,
+                    metalness: 0.8
+                });
+                const mesh = new THREE.Mesh(barGeometry, material);
+                
+                mesh.position.x = x * BAR_SPACING - gridOffset;
+                mesh.position.z = z * BAR_SPACING - gridOffset;
+                mesh.scale.y = 0.1;
+                
+                scene.add(mesh);
+                rowBars.push(mesh);
+                rowHeights.push(0.1);
+            }
+            bars.push(rowBars);
+            targetHeights.push(rowHeights);
+        }
+
+        // --- Simulated Audio Data ---
+        function generateSpectrum(time) {
+            const values = [];
+            for (let i = 0; i < GRID_SIZE; i++) {
+                let val = Math.abs(Math.sin(time * (0.5 + i * 0.3)) * Math.cos(time * 0.2 + i)) * 3 + Math.sin(time * 0.1 + i * 0.5) * 2;
+                values.push(Math.max(0.1, Math.min(5.0, val)));
+            }
+            return values;
+        }
+
+        // --- Stork Model ---
+        let storkModel = null;
+        const loader = new GLTFLoader();
+        // Using standard three.js example stork model as requested by context of '._stork.glb'
+        loader.load('https://raw.githubusercontent.com/mrdoob/three.js/master/examples/models/gltf/Stork.glb', (gltf) => {
+            storkModel = gltf.scene;
+            
+            // Scale to approx 2 units tall
+            const box = new THREE.Box3().setFromObject(storkModel);
+            const size = box.getSize(new THREE.Vector3());
+            const scaleFactor = 2.0 / size.y;
+            storkModel.scale.set(scaleFactor, scaleFactor, scaleFactor);
+            
+            storkModel.position.set(0, 7, 0);
+            scene.add(storkModel);
+            state.storkLoaded = true;
+        });
+
+        // --- DOM Elements ---
+        const btnPlayPause = document.getElementById('btn-play-pause');
+        const btnRewind = document.getElementById('btn-rewind');
+        const sliderSpeed = document.getElementById('slider-speed');
+        const speedLabel = document.getElementById('speed-label');
+        const btnReset = document.getElementById('btn-reset');
+        const timeDisplay = document.getElementById('time-display');
+        
+        const hudAvgAmp = document.getElementById('hud-avg-amp');
+        const hudPeakBand = document.getElementById('hud-peak-band');
+
+        // --- Control Logic ---
+        function togglePlayPause() {
+            if (state.playbackState === 'playing') {
+                state.playbackState = 'paused';
+                btnPlayPause.textContent = 'Play';
+            } else {
+                state.playbackState = 'playing';
+                btnPlayPause.textContent = 'Pause';
+            }
+        }
+
+        function startRewind() {
+            state.playbackState = 'rewinding';
+            btnPlayPause.textContent = 'Play';
+        }
+
+        function resetSimulation() {
+            state.simTime = 0;
+            lastShiftSimTime = 0;
+            for (let z = 0; z < GRID_SIZE; z++) {
+                for (let x = 0; x < GRID_SIZE; x++) {
+                    targetHeights[z][x] = 0.1;
+                }
+            }
+        }
+
+        function updateSpeed() {
+            state.speed = parseFloat(sliderSpeed.value);
+            speedLabel.textContent = state.speed.toFixed(2) + 'x';
+        }
+
+        // Event Listeners
+        btnPlayPause.addEventListener('click', togglePlayPause);
+        btnRewind.addEventListener('click', startRewind);
+        btnReset.addEventListener('click', resetSimulation);
+        sliderSpeed.addEventListener('input', updateSpeed);
+
+        window.addEventListener('keydown', (e) => {
+            switch(e.code) {
+                case 'Space':
+                    togglePlayPause();
+                    break;
+                case 'KeyR':
+                    startRewind();
+                    break;
+                case 'KeyX':
+                    resetSimulation();
+                    break;
+                case 'ArrowUp':
+                    sliderSpeed.value = Math.min(3.0, parseFloat(sliderSpeed.value) + 0.25);
+                    updateSpeed();
+                    break;
+                case 'ArrowDown':
+                    sliderSpeed.value = Math.max(0.25, parseFloat(sliderSpeed.value) - 0.25);
+                    updateSpeed();
+                    break;
+            }
+        });
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // --- Animation Loop ---
+        const clock = new THREE.Clock();
+        let lastShiftSimTime = 0;
+
+        state.isInitialized = true;
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const realDt = clock.getDelta();
+            
+            // Update Sim Time
+            if (state.playbackState === 'playing') {
+                state.simTime += realDt * state.speed;
+            } else if (state.playbackState === 'rewinding') {
+                state.simTime -= realDt * state.speed * 2.0;
+                if (state.simTime < 0) state.simTime = 0;
+            }
+
+            // Handle Grid Shifting
+            if (state.playbackState === 'playing') {
+                if (state.simTime - lastShiftSimTime >= SHIFT_INTERVAL) {
+                    // Shift back
+                    for (let z = GRID_SIZE - 1; z > 0; z--) {
+                        for (let x = 0; x < GRID_SIZE; x++) {
+                            targetHeights[z][x] = targetHeights[z-1][x];
+                        }
+                    }
+                    // New front row
+                    const newRow = generateSpectrum(state.simTime);
+                    for (let x = 0; x < GRID_SIZE; x++) {
+                        targetHeights[0][x] = newRow[x];
+                    }
+                    lastShiftSimTime += SHIFT_INTERVAL;
+                }
+            } else if (state.playbackState === 'rewinding') {
+                if (lastShiftSimTime - state.simTime >= SHIFT_INTERVAL) {
+                    // Shift forward
+                    for (let z = 0; z < GRID_SIZE - 1; z++) {
+                        for (let x = 0; x < GRID_SIZE; x++) {
+                            targetHeights[z][x] = targetHeights[z+1][x];
+                        }
+                    }
+                    // Old back row
+                    const oldTime = Math.max(0, state.simTime - (GRID_SIZE - 1) * SHIFT_INTERVAL);
+                    const oldRow = generateSpectrum(oldTime);
+                    for (let x = 0; x < GRID_SIZE; x++) {
+                        targetHeights[GRID_SIZE - 1][x] = oldRow[x];
+                    }
+                    lastShiftSimTime -= SHIFT_INTERVAL;
+                }
+            }
+
+            // Update Bars (Lerp & Color)
+            let sumAmp = 0;
+            let maxAmp = -1;
+            let peakIdx = 0;
+
+            for (let z = 0; z < GRID_SIZE; z++) {
+                for (let x = 0; x < GRID_SIZE; x++) {
+                    const bar = bars[z][x];
+                    const targetH = targetHeights[z][x];
+                    
+                    // Lerp height
+                    bar.scale.y += (targetH - bar.scale.y) * 0.1;
+                    bar.scale.y = Math.max(0.01, bar.scale.y); // Prevent inversion/zero
+
+                    // Update Color (Hue based on height)
+                    const hue = (bar.scale.y / state.maxBarHeight) * 0.7;
+                    bar.material.color.setHSL(hue, 1.0, 0.5);
+
+                    // Stats for front row
+                    if (z === 0) {
+                        state.frontRowHeights[x] = bar.scale.y;
+                        sumAmp += bar.scale.y;
+                        if (bar.scale.y > maxAmp) {
+                            maxAmp = bar.scale.y;
+                            peakIdx = x;
+                        }
+                    }
+                }
+            }
+
+            state.avgAmplitude = sumAmp / GRID_SIZE;
+            state.peakBand = peakIdx;
+
+            // Update Stork
+            if (storkModel) {
+                storkModel.rotation.y += 0.5 * realDt;
+                storkModel.position.y = 7 + state.avgAmplitude * 0.5;
+                
+                state.storkPosition.x = storkModel.position.x;
+                state.storkPosition.y = storkModel.position.y;
+                state.storkPosition.z = storkModel.position.z;
+            }
+
+            // Update DOM
+            timeDisplay.textContent = `T: ${state.simTime.toFixed(1)}s`;
+            hudAvgAmp.textContent = state.avgAmplitude.toFixed(2);
+            hudPeakBand.textContent = state.peakBand;
+
+            controls.update();
+            renderer.render(scene, camera);
+        }
+
+        animate();
+    </script>
+</body>
+</html>

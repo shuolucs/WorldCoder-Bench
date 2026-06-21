@@ -1,0 +1,610 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Trebuchet Simulation</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #88aacc;
+            font-family: monospace;
+            color: #fff;
+        }
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+        }
+        #ui-container {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            pointer-events: none;
+            display: flex;
+            gap: 20px;
+        }
+        .panel {
+            background: rgba(0, 0, 0, 0.6);
+            padding: 15px;
+            border-radius: 8px;
+            pointer-events: auto;
+        }
+        h2 {
+            margin: 0 0 10px 0;
+            font-size: 16px;
+            color: #ffcc00;
+        }
+        .stat {
+            margin: 5px 0;
+            font-size: 14px;
+        }
+        .controls {
+            margin-top: 15px;
+            border-top: 1px solid #555;
+            padding-top: 10px;
+        }
+        .control-row {
+            margin: 10px 0;
+            display: flex;
+            flex-direction: column;
+        }
+        label {
+            margin-bottom: 5px;
+            font-size: 12px;
+            color: #aaa;
+        }
+        input[type=range] {
+            width: 150px;
+        }
+        .instructions {
+            margin-top: 10px;
+            font-size: 12px;
+            color: #88ff88;
+        }
+    </style>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+                "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="ui-container">
+        <div class="panel" id="hud">
+            <h2>Trebuchet Status</h2>
+            <div class="stat">State: <span id="hud-status">Loaded</span></div>
+            <div class="stat">Arm Angle: <span id="hud-arm">-120.0</span>&deg;</div>
+            <div class="stat">Distance: <span id="hud-dist">0.0</span> m</div>
+            <div class="stat">Max Height: <span id="hud-max-h">0.0</span> m</div>
+            <div class="stat">Hits: <span id="hud-hits">0</span></div>
+            <div class="stat">CW Mass: <span id="hud-cw">50</span> kg</div>
+            <div class="stat">Target Loaded: <span id="hud-model">No</span></div>
+            
+            <div class="controls">
+                <div class="control-row">
+                    <label for="slider-counterweight">Counterweight Mass (kg)</label>
+                    <input type="range" id="slider-counterweight" min="20" max="100" step="5" value="50">
+                </div>
+                <div class="control-row">
+                    <label for="slider-release-angle">Release Angle (&deg; past vertical)</label>
+                    <input type="range" id="slider-release-angle" min="20" max="70" step="5" value="45">
+                </div>
+            </div>
+            <div class="instructions">
+                [F] Fire | [R] Reset | [Space] Pause/Play
+            </div>
+        </div>
+    </div>
+    <div id="canvas-container"></div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+        // --- Global State ---
+        window.__3D_STATE__ = {
+            armAngle: 0,
+            projectileDistance: 0,
+            maxProjectileHeight: 0,
+            hits: 0,
+            counterweightMass: 50,
+            releaseAngle: 45,
+            status: 'Loaded',
+            modelLoaded: false,
+            isPaused: false,
+            frameCount: 0,
+            trebuchetValid: true
+        };
+
+        // --- Physics Constants & Variables ---
+        const g = 9.81;
+        const projMass = 5;
+        const L_long = 6;
+        const L_short = 2;
+        const I_arm = 100; // Base moment of inertia for the arm itself
+        const dt = 0.001;
+        const substeps = 10;
+
+        // Angle alpha: 0 is +X (horizontal right), 90 is +Y (vertical up)
+        // Loaded position: long arm points down-left -> alpha = 210 deg
+        const alpha_loaded = 210 * Math.PI / 180;
+        let alpha = alpha_loaded;
+        let omega = 0;
+
+        const pivot = new THREE.Vector3(0, 3.5, 0);
+        let P0 = new THREE.Vector3(); // Arm tip
+        let P1 = new THREE.Vector3(); // Sling mid
+        let P2 = new THREE.Vector3(); // Projectile
+        let P1_old = new THREE.Vector3();
+        let P2_old = new THREE.Vector3();
+
+        let state = 'LOADED'; // LOADED, FIRING, FLYING, HIT, MISS
+        let hits = 0;
+        let maxHeight = 0;
+        let shakeFrames = 0;
+
+        // --- Three.js Setup ---
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x88aacc);
+
+        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.set(10, 5, 15);
+        camera.lookAt(0, 3, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        container.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.target.set(0, 3, 0);
+        controls.update();
+
+        // Lights
+        const ambientLight = new THREE.AmbientLight(0x668877, 0.5);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+        dirLight.position.set(10, 15, 5);
+        dirLight.castShadow = true;
+        dirLight.shadow.camera.top = 20;
+        dirLight.shadow.camera.bottom = -20;
+        dirLight.shadow.camera.left = -20;
+        dirLight.shadow.camera.right = 40;
+        dirLight.shadow.mapSize.width = 2048;
+        dirLight.shadow.mapSize.height = 2048;
+        scene.add(dirLight);
+
+        // Ground
+        const groundGeo = new THREE.PlaneGeometry(60, 40);
+        const groundMat = new THREE.MeshStandardMaterial({ color: 0x558844, roughness: 0.8 });
+        const ground = new THREE.Mesh(groundGeo, groundMat);
+        ground.rotation.x = -Math.PI / 2;
+        ground.position.set(15, 0, 0); // Shifted slightly to cover target area better
+        ground.receiveShadow = true;
+        scene.add(ground);
+
+        // --- Trebuchet Construction ---
+        const woodMat = new THREE.MeshStandardMaterial({ color: 0x664422 });
+        const darkWoodMat = new THREE.MeshStandardMaterial({ color: 0x442211 });
+        const metalMat = new THREE.MeshStandardMaterial({ color: 0x888888, metalness: 0.8, roughness: 0.2 });
+
+        // Base
+        const base = new THREE.Mesh(new THREE.BoxGeometry(3, 0.5, 2), woodMat);
+        base.position.set(0, 0.25, 0);
+        base.castShadow = true;
+        base.receiveShadow = true;
+        scene.add(base);
+
+        // Uprights
+        const uprightGeo = new THREE.BoxGeometry(0.2, 4, 0.2);
+        const upright1 = new THREE.Mesh(uprightGeo, woodMat);
+        upright1.position.set(-0.8, 2, 0);
+        upright1.castShadow = true;
+        scene.add(upright1);
+        const upright2 = new THREE.Mesh(uprightGeo, woodMat);
+        upright2.position.set(0.8, 2, 0);
+        upright2.castShadow = true;
+        scene.add(upright2);
+
+        // Axle
+        const axle = new THREE.Mesh(new THREE.CylinderGeometry(0.1, 0.1, 2.2), metalMat);
+        axle.rotation.x = Math.PI / 2;
+        axle.position.copy(pivot);
+        axle.castShadow = true;
+        scene.add(axle);
+
+        // Arm Group (pivots at axle)
+        const armGroup = new THREE.Group();
+        armGroup.position.copy(pivot);
+        scene.add(armGroup);
+
+        // Arm Mesh (offset so pivot is at correct ratio)
+        // Length 8. Pivot is 2 from short end, 6 from long end.
+        // Center of box is at (6 - 2)/2 = 2 relative to pivot.
+        const armMesh = new THREE.Mesh(new THREE.BoxGeometry(8, 0.15, 0.15), darkWoodMat);
+        armMesh.position.set(2, 0, 0);
+        armMesh.castShadow = true;
+        armGroup.add(armMesh);
+
+        // Counterweight
+        const cwGeo = new THREE.BoxGeometry(0.8, 0.8, 0.8);
+        const cwMat = new THREE.MeshStandardMaterial({ color: 0x555555 });
+        const cwMesh = new THREE.Mesh(cwGeo, cwMat);
+        cwMesh.castShadow = true;
+        scene.add(cwMesh);
+
+        // CW Chain
+        const cwChainGeo = new THREE.BufferGeometry();
+        const cwChainPos = new Float32Array(6);
+        cwChainGeo.setAttribute('position', new THREE.BufferAttribute(cwChainPos, 3));
+        const cwChain = new THREE.Line(cwChainGeo, new THREE.LineBasicMaterial({ color: 0xaaaaaa }));
+        scene.add(cwChain);
+
+        // Sling
+        const slingGeo = new THREE.BufferGeometry();
+        const slingPos = new Float32Array(9);
+        slingGeo.setAttribute('position', new THREE.BufferAttribute(slingPos, 3));
+        const sling = new THREE.Line(slingGeo, new THREE.LineBasicMaterial({ color: 0xdddddd }));
+        scene.add(sling);
+
+        // Projectile
+        const projMesh = new THREE.Mesh(new THREE.SphereGeometry(0.2, 16, 16), new THREE.MeshStandardMaterial({ color: 0x886644 }));
+        projMesh.castShadow = true;
+        scene.add(projMesh);
+
+        // Trail
+        const maxTrail = 200;
+        const trailGeo = new THREE.BufferGeometry();
+        const trailPositions = new Float32Array(maxTrail * 3);
+        trailGeo.setAttribute('position', new THREE.BufferAttribute(trailPositions, 3));
+        const trailMat = new THREE.PointsMaterial({ color: 0xffffff, size: 0.15 });
+        const trailMesh = new THREE.Points(trailGeo, trailMat);
+        scene.add(trailMesh);
+        let trailIndex = 0;
+        let trailCount = 0;
+
+        // --- Target Setup ---
+        let targetModel = null;
+        const targetPos = new THREE.Vector3(25, 1, 0);
+        const loader = new GLTFLoader();
+        loader.load('https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Models/master/2.0/DamagedHelmet/glTF-Binary/DamagedHelmet.glb', (gltf) => {
+            targetModel = gltf.scene;
+            targetModel.scale.set(1.5, 1.5, 1.5);
+            targetModel.position.copy(targetPos);
+            targetModel.traverse((child) => {
+                if (child.isMesh) {
+                    child.castShadow = true;
+                    child.receiveShadow = true;
+                }
+            });
+            scene.add(targetModel);
+            window.__3D_STATE__.modelLoaded = true;
+            document.getElementById('hud-model').innerText = 'Yes';
+        }, undefined, (error) => {
+            console.error('Error loading model:', error);
+        });
+
+        // Castle Wall
+        const wallBoxes = [];
+        const stoneMat = new THREE.MeshStandardMaterial({ color: 0x888877, roughness: 0.9 });
+        const boxGeo = new THREE.BoxGeometry(4, 2, 1);
+        for (let i = 0; i < 3; i++) {
+            const mesh = new THREE.Mesh(boxGeo, stoneMat);
+            mesh.position.set(28, 1 + i * 2, 0);
+            mesh.castShadow = true;
+            mesh.receiveShadow = true;
+            scene.add(mesh);
+            wallBoxes.push({
+                mesh: mesh,
+                v: new THREE.Vector3(),
+                w: new THREE.Vector3(),
+                initialPos: new THREE.Vector3(28, 1 + i * 2, 0)
+            });
+        }
+
+        // --- Physics Functions ---
+
+        function getArmAcceleration(a) {
+            const m_cw = window.__3D_STATE__.counterweightMass;
+            // Torque = r x F. 
+            // CW is at r = -2. F = -m*g. tau = (-2*cos(a)) * (-m*g) = 2*m*g*cos(a)
+            const tau_cw = 2 * m_cw * g * Math.cos(a);
+            // Proj is at r = 6. F = -m*g. tau = (6*cos(a)) * (-m*g) = -6*m*g*cos(a)
+            const tau_proj = -6 * projMass * g * Math.cos(a);
+            
+            const tau_net = tau_cw + tau_proj;
+            const I_total = I_arm + m_cw * (L_short * L_short) + projMass * (L_long * L_long);
+            
+            return tau_net / I_total;
+        }
+
+        function verletStep(p, pOld, acc, dt) {
+            const tempX = p.x;
+            const tempY = p.y;
+            p.x = 2 * p.x - pOld.x + acc.x * dt * dt;
+            p.y = 2 * p.y - pOld.y + acc.y * dt * dt;
+            pOld.set(tempX, tempY, 0);
+        }
+
+        function satisfyConstraints() {
+            // P0 to P1 (length 1.0)
+            let dx = P1.x - P0.x;
+            let dy = P1.y - P0.y;
+            let d1 = Math.sqrt(dx*dx + dy*dy);
+            if (d1 > 0) {
+                let diff1 = (d1 - 1.0) / d1;
+                P1.x -= dx * 0.5 * diff1;
+                P1.y -= dy * 0.5 * diff1;
+            }
+
+            // P1 to P2 (length 1.0)
+            dx = P2.x - P1.x;
+            dy = P2.y - P1.y;
+            let d2 = Math.sqrt(dx*dx + dy*dy);
+            if (d2 > 0) {
+                let diff2 = (d2 - 1.0) / d2;
+                let offsetX = dx * 0.5 * diff2;
+                let offsetY = dy * 0.5 * diff2;
+                P1.x += offsetX;
+                P1.y += offsetY;
+                P2.x -= offsetX;
+                P2.y -= offsetY;
+            }
+
+            // Ground collision for sling
+            if (P1.y < 0.2) P1.y = 0.2;
+            if (P2.y < 0.2) P2.y = 0.2;
+        }
+
+        function resetTrebuchet() {
+            state = 'LOADED';
+            alpha = alpha_loaded;
+            omega = 0;
+            
+            P0.set(pivot.x + L_long * Math.cos(alpha), pivot.y + L_long * Math.sin(alpha), 0);
+            P1.set(P0.x, P0.y - 1, 0);
+            P2.set(P1.x, P1.y - 1, 0);
+            
+            if (P1.y < 0.2) P1.y = 0.2;
+            if (P2.y < 0.2) P2.y = 0.2;
+            
+            P1_old.copy(P1);
+            P2_old.copy(P2);
+            
+            maxHeight = 0;
+            trailIndex = 0;
+            trailCount = 0;
+            trailGeo.setDrawRange(0, 0);
+            
+            shakeFrames = 0;
+            if (targetModel) {
+                targetModel.position.copy(targetPos);
+                targetModel.rotation.set(0, 0, 0);
+            }
+            
+            wallBoxes.forEach(b => {
+                b.mesh.position.copy(b.initialPos);
+                b.mesh.rotation.set(0, 0, 0);
+                b.v.set(0, 0, 0);
+                b.w.set(0, 0, 0);
+            });
+
+            updateVisuals();
+            updateHUD();
+        }
+
+        function fire() {
+            if (state === 'LOADED') {
+                state = 'FIRING';
+            }
+        }
+
+        function scatterWall() {
+            wallBoxes.forEach(b => {
+                b.v.set((Math.random() - 0.2) * 15, Math.random() * 10 + 5, (Math.random() - 0.5) * 10);
+                b.w.set(Math.random() * 5, Math.random() * 5, Math.random() * 5);
+            });
+        }
+
+        // --- Input Handling ---
+        window.addEventListener('keydown', (e) => {
+            if (e.key.toLowerCase() === 'f') fire();
+            if (e.key.toLowerCase() === 'r') resetTrebuchet();
+            if (e.key === ' ') {
+                window.__3D_STATE__.isPaused = !window.__3D_STATE__.isPaused;
+            }
+        });
+
+        document.getElementById('slider-counterweight').addEventListener('input', (e) => {
+            window.__3D_STATE__.counterweightMass = parseFloat(e.target.value);
+            document.getElementById('hud-cw').innerText = e.target.value;
+        });
+
+        document.getElementById('slider-release-angle').addEventListener('input', (e) => {
+            window.__3D_STATE__.releaseAngle = parseFloat(e.target.value);
+        });
+
+        // --- Main Loop ---
+        resetTrebuchet();
+
+        function updateVisuals() {
+            // Arm
+            armGroup.rotation.z = alpha;
+
+            // CW
+            const sx = pivot.x - L_short * Math.cos(alpha);
+            const sy = pivot.y - L_short * Math.sin(alpha);
+            cwMesh.position.set(sx, sy - 1, 0);
+            
+            const chainPositions = cwChainGeo.attributes.position.array;
+            chainPositions[0] = sx; chainPositions[1] = sy; chainPositions[2] = 0;
+            chainPositions[3] = sx; chainPositions[4] = sy - 1; chainPositions[5] = 0;
+            cwChainGeo.attributes.position.needsUpdate = true;
+
+            // Sling & Projectile
+            const sPos = slingGeo.attributes.position.array;
+            sPos[0] = P0.x; sPos[1] = P0.y; sPos[2] = P0.z;
+            sPos[3] = P1.x; sPos[4] = P1.y; sPos[5] = P1.z;
+            sPos[6] = P2.x; sPos[7] = P2.y; sPos[8] = P2.z;
+            slingGeo.attributes.position.needsUpdate = true;
+
+            projMesh.position.copy(P2);
+        }
+
+        function updateHUD() {
+            // Angle from vertical (90 deg is vertical up)
+            let angleFromVertical = 90 - (alpha * 180 / Math.PI);
+            
+            document.getElementById('hud-status').innerText = state;
+            document.getElementById('hud-arm').innerText = angleFromVertical.toFixed(1);
+            document.getElementById('hud-dist').innerText = P2.x.toFixed(1);
+            document.getElementById('hud-max-h').innerText = maxHeight.toFixed(1);
+            document.getElementById('hud-hits').innerText = hits;
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            window.__3D_STATE__.frameCount++;
+
+            if (!window.__3D_STATE__.isPaused) {
+                for (let i = 0; i < substeps; i++) {
+                    if (state === 'FIRING') {
+                        // RK4 for arm
+                        let k1v = getArmAcceleration(alpha) * dt;
+                        let k1x = omega * dt;
+                        let k2v = getArmAcceleration(alpha + k1x/2) * dt;
+                        let k2x = (omega + k1v/2) * dt;
+                        let k3v = getArmAcceleration(alpha + k2x/2) * dt;
+                        let k3x = (omega + k2v/2) * dt;
+                        let k4v = getArmAcceleration(alpha + k3x) * dt;
+                        let k4x = (omega + k3v) * dt;
+
+                        alpha += (k1x + 2*k2x + 2*k3x + k4x) / 6;
+                        omega += (k1v + 2*k2v + 2*k3v + k4v) / 6;
+
+                        P0.set(pivot.x + L_long * Math.cos(alpha), pivot.y + L_long * Math.sin(alpha), 0);
+
+                        // Verlet for sling
+                        verletStep(P1, P1_old, {x:0, y:-g}, dt);
+                        verletStep(P2, P2_old, {x:0, y:-g}, dt);
+                        
+                        for(let j=0; j<3; j++) satisfyConstraints();
+
+                        // Check release
+                        // Release angle is defined as degrees past vertical (90 deg)
+                        // alpha is decreasing from 210 -> 90 -> 0
+                        let releaseAlpha = (90 - window.__3D_STATE__.releaseAngle) * Math.PI / 180;
+                        if (alpha <= releaseAlpha) {
+                            state = 'FLYING';
+                        }
+
+                    } else if (state === 'FLYING') {
+                        // Free projectile with drag
+                        let vx = (P2.x - P2_old.x) / dt;
+                        let vy = (P2.y - P2_old.y) / dt;
+                        let speed = Math.sqrt(vx*vx + vy*vy);
+                        
+                        let dragForce = 0.05 * speed * speed;
+                        let dragAcc = dragForce / projMass;
+                        
+                        let ax = speed > 0 ? -dragAcc * (vx / speed) : 0;
+                        let ay = -g - (speed > 0 ? dragAcc * (vy / speed) : 0);
+
+                        let tempX = P2.x, tempY = P2.y;
+                        P2.x = 2*P2.x - P2_old.x + ax * dt*dt;
+                        P2.y = 2*P2.y - P2_old.y + ay * dt*dt;
+                        P2_old.set(tempX, tempY, 0);
+
+                        if (P2.y > maxHeight) maxHeight = P2.y;
+
+                        // Hit detection
+                        if (P2.distanceTo(targetPos) < 2.0 && state !== 'HIT') {
+                            state = 'HIT';
+                            hits++;
+                            shakeFrames = 30;
+                            scatterWall();
+                        } else if (P2.y < 0.2) {
+                            P2.y = 0.2;
+                            state = 'MISS';
+                        }
+                    }
+                }
+
+                // Trail update (every few frames)
+                if ((state === 'FLYING' || state === 'FIRING') && window.__3D_STATE__.frameCount % 3 === 0) {
+                    trailPositions[trailIndex * 3] = P2.x;
+                    trailPositions[trailIndex * 3 + 1] = P2.y;
+                    trailPositions[trailIndex * 3 + 2] = P2.z;
+                    trailIndex = (trailIndex + 1) % maxTrail;
+                    if (trailCount < maxTrail) trailCount++;
+                    trailGeo.setDrawRange(0, trailCount);
+                    trailGeo.attributes.position.needsUpdate = true;
+                }
+
+                // Hit Animation
+                if (shakeFrames > 0 && targetModel) {
+                    targetModel.position.set(
+                        targetPos.x + (Math.random() - 0.5) * 0.5,
+                        targetPos.y + (Math.random() - 0.5) * 0.5,
+                        targetPos.z + (Math.random() - 0.5) * 0.5
+                    );
+                    shakeFrames--;
+                } else if (targetModel && state !== 'HIT') {
+                    targetModel.position.copy(targetPos);
+                }
+
+                // Wall Physics
+                wallBoxes.forEach(b => {
+                    if (b.v.lengthSq() > 0) {
+                        b.v.y -= g * 0.016; // approx frame dt
+                        b.mesh.position.addScaledVector(b.v, 0.016);
+                        b.mesh.rotation.x += b.w.x * 0.016;
+                        b.mesh.rotation.y += b.w.y * 0.016;
+                        b.mesh.rotation.z += b.w.z * 0.016;
+                        
+                        if (b.mesh.position.y < 1) {
+                            b.mesh.position.y = 1;
+                            b.v.y *= -0.5;
+                            b.v.x *= 0.8;
+                            b.v.z *= 0.8;
+                            b.w.multiplyScalar(0.8);
+                        }
+                    }
+                });
+
+                updateVisuals();
+                updateHUD();
+            }
+
+            // Update State Object
+            window.__3D_STATE__.armAngle = parseFloat((90 - (alpha * 180 / Math.PI)).toFixed(2));
+            window.__3D_STATE__.projectileDistance = parseFloat(P2.x.toFixed(2));
+            window.__3D_STATE__.maxProjectileHeight = parseFloat(maxHeight.toFixed(2));
+            window.__3D_STATE__.hits = hits;
+            window.__3D_STATE__.status = state;
+            window.__3D_STATE__.trebuchetValid = !isNaN(alpha) && !isNaN(P2.x);
+
+            renderer.render(scene, camera);
+        }
+
+        // Handle resize
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        animate();
+    </script>
+</body>
+</html>

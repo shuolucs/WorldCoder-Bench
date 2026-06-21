@@ -1,0 +1,435 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Three.js 3D Kaleidoscope with Undo/Redo</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      background: #000;
+      font-family: Arial, sans-serif;
+      color: #fff;
+    }
+
+    canvas {
+      display: block;
+    }
+
+    #controlPanel {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      z-index: 10;
+      background: rgba(20, 20, 20, 0.85);
+      border: 1px solid #444;
+      border-radius: 8px;
+      padding: 10px;
+      max-width: 360px;
+      box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+    }
+
+    #controlPanel .row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-bottom: 8px;
+    }
+
+    #controlPanel button {
+      background: #222;
+      color: #fff;
+      border: 1px solid #666;
+      border-radius: 4px;
+      padding: 6px 10px;
+      cursor: pointer;
+      font-size: 13px;
+    }
+
+    #controlPanel button:hover {
+      background: #333;
+    }
+
+    #controlPanel button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    #statusDisplay {
+      display: block;
+      margin-top: 6px;
+      font-size: 13px;
+      line-height: 1.4;
+      color: #ddd;
+      word-break: break-word;
+    }
+
+    #hint {
+      display: block;
+      margin-top: 8px;
+      font-size: 12px;
+      color: #aaa;
+    }
+  </style>
+</head>
+<body>
+  <div id="controlPanel">
+    <div class="row">
+      <button id="btnAddSegments">+Segments</button>
+      <button id="btnRemoveSegments">-Segments</button>
+      <button id="btnIncreaseRadius">+Radius</button>
+      <button id="btnDecreaseRadius">-Radius</button>
+    </div>
+    <div class="row">
+      <button id="btnIncreaseScale">+Scale</button>
+      <button id="btnDecreaseScale">-Scale</button>
+      <button id="btnToggleMirror">Toggle Mirror</button>
+      <button id="btnToggleRotation">Pause/Play</button>
+    </div>
+    <div class="row">
+      <button id="btnUndo">Undo</button>
+      <button id="btnRedo">Redo</button>
+    </div>
+    <span id="statusDisplay">Loading model...</span>
+    <span id="hint">Keys: Z=Undo, Y=Redo, R=Reset, Space=Pause/Play</span>
+  </div>
+
+  <script type="module">
+    import * as THREE from "https://unpkg.com/three@0.160.0/build/three.module.js";
+    import { GLTFLoader } from "https://unpkg.com/three@0.160.0/examples/jsm/loaders/GLTFLoader.js";
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x000000);
+
+    const camera = new THREE.PerspectiveCamera(
+      60,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      100
+    );
+    camera.position.set(0, 0, 5);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    document.body.appendChild(renderer.domElement);
+
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+    scene.add(ambientLight);
+
+    const directionalLight = new THREE.DirectionalLight(0xffffff, 1.0);
+    directionalLight.position.set(5, 5, 5);
+    scene.add(directionalLight);
+
+    const kaleidoscopeGroup = new THREE.Group();
+    scene.add(kaleidoscopeGroup);
+
+    const initialState = {
+      segments: 6,
+      radius: 2.0,
+      scale: 0.5,
+      mirrorMode: false
+    };
+
+    let state = { ...initialState };
+    let rotationSpeed = 0.01;
+    let rotationActive = true;
+    let modelLoaded = false;
+    let helmetTemplate = null;
+
+    let history = [{ ...state }];
+    let historyIndex = 0;
+
+    const btnAddSegments = document.getElementById("btnAddSegments");
+    const btnRemoveSegments = document.getElementById("btnRemoveSegments");
+    const btnIncreaseRadius = document.getElementById("btnIncreaseRadius");
+    const btnDecreaseRadius = document.getElementById("btnDecreaseRadius");
+    const btnIncreaseScale = document.getElementById("btnIncreaseScale");
+    const btnDecreaseScale = document.getElementById("btnDecreaseScale");
+    const btnToggleMirror = document.getElementById("btnToggleMirror");
+    const btnToggleRotation = document.getElementById("btnToggleRotation");
+    const btnUndo = document.getElementById("btnUndo");
+    const btnRedo = document.getElementById("btnRedo");
+    const statusDisplay = document.getElementById("statusDisplay");
+
+    function round1(v) {
+      return Math.round(v * 10) / 10;
+    }
+
+    function disposeHierarchy(obj) {
+      obj.traverse((child) => {
+        if (child.isMesh) {
+          if (child.geometry) child.geometry.dispose();
+          if (Array.isArray(child.material)) {
+            child.material.forEach((m) => m && m.dispose && m.dispose());
+          } else if (child.material) {
+            child.material.dispose && child.material.dispose();
+          }
+        }
+      });
+    }
+
+    function clearKaleidoscope() {
+      while (kaleidoscopeGroup.children.length > 0) {
+        const child = kaleidoscopeGroup.children.pop();
+        kaleidoscopeGroup.remove(child);
+        disposeHierarchy(child);
+      }
+    }
+
+    function createCloneFromTemplate() {
+      const clone = helmetTemplate.clone(true);
+      clone.traverse((child) => {
+        if (child.isMesh) {
+          child.castShadow = false;
+          child.receiveShadow = false;
+          child.material = Array.isArray(child.material)
+            ? child.material.map(m => m.clone())
+            : child.material.clone();
+        }
+      });
+      return clone;
+    }
+
+    function rebuildKaleidoscope() {
+      clearKaleidoscope();
+
+      if (!helmetTemplate) {
+        updateStatus();
+        update3DState();
+        return;
+      }
+
+      for (let i = 0; i < state.segments; i++) {
+        const angle = (Math.PI * 2 / state.segments) * i;
+        const clone = createCloneFromTemplate();
+
+        const scaleX = state.mirrorMode && (i % 2 === 1) ? -state.scale : state.scale;
+        clone.scale.set(scaleX, state.scale, state.scale);
+        clone.rotation.y = angle;
+        clone.position.set(
+          state.radius * Math.cos(angle),
+          0,
+          state.radius * Math.sin(angle)
+        );
+
+        kaleidoscopeGroup.add(clone);
+      }
+
+      updateStatus();
+      update3DState();
+    }
+
+    function pushHistorySnapshot() {
+      if (historyIndex < history.length - 1) {
+        history = history.slice(0, historyIndex + 1);
+      }
+      history.push({ ...state });
+      historyIndex = history.length - 1;
+      updateStatus();
+      update3DState();
+    }
+
+    function applyStateSnapshot(snapshot, shouldRebuild = true) {
+      state = {
+        segments: snapshot.segments,
+        radius: snapshot.radius,
+        scale: round1(snapshot.scale),
+        mirrorMode: snapshot.mirrorMode
+      };
+
+      if (shouldRebuild) {
+        rebuildKaleidoscope();
+      } else {
+        updateStatus();
+        update3DState();
+      }
+    }
+
+    function commitStateChange(mutator) {
+      const before = JSON.stringify(state);
+      mutator(state);
+      state.segments = Math.max(2, Math.min(12, Math.round(state.segments)));
+      state.radius = Math.max(0.5, Math.min(5.0, round1(state.radius)));
+      state.scale = Math.max(0.1, Math.min(2.0, round1(state.scale)));
+
+      const after = JSON.stringify(state);
+      if (before !== after) {
+        pushHistorySnapshot();
+        rebuildKaleidoscope();
+      } else {
+        updateStatus();
+        update3DState();
+      }
+    }
+
+    function undo() {
+      if (historyIndex > 0) {
+        historyIndex--;
+        applyStateSnapshot(history[historyIndex], true);
+      }
+    }
+
+    function redo() {
+      if (historyIndex < history.length - 1) {
+        historyIndex++;
+        applyStateSnapshot(history[historyIndex], true);
+      }
+    }
+
+    function resetState() {
+      state = { ...initialState };
+      history = [{ ...state }];
+      historyIndex = 0;
+      rebuildKaleidoscope();
+    }
+
+    function updateStatus() {
+      statusDisplay.textContent =
+        `Segments: ${state.segments} | Radius: ${state.radius.toFixed(1)} | Scale: ${state.scale.toFixed(1)} | Mirror: ${state.mirrorMode ? "ON" : "OFF"} | Rotation: ${rotationActive ? "ON" : "OFF"}`;
+
+      btnUndo.disabled = !(historyIndex > 0);
+      btnRedo.disabled = !(historyIndex < history.length - 1);
+    }
+
+    function update3DState() {
+      window.__3D_STATE__ = {
+        segments: state.segments,
+        radius: state.radius,
+        scale: round1(state.scale),
+        mirrorMode: state.mirrorMode,
+        rotationActive: rotationActive,
+        currentRotationY: kaleidoscopeGroup.rotation.y,
+        historyLength: history.length,
+        historyIndex: historyIndex,
+        cloneCount: kaleidoscopeGroup.children.length,
+        modelLoaded: modelLoaded,
+        canUndo: historyIndex > 0,
+        canRedo: historyIndex < history.length - 1
+      };
+    }
+
+    btnAddSegments.addEventListener("click", () => {
+      commitStateChange(s => { s.segments += 1; });
+    });
+
+    btnRemoveSegments.addEventListener("click", () => {
+      commitStateChange(s => { s.segments -= 1; });
+    });
+
+    btnIncreaseRadius.addEventListener("click", () => {
+      commitStateChange(s => { s.radius += 0.5; });
+    });
+
+    btnDecreaseRadius.addEventListener("click", () => {
+      commitStateChange(s => { s.radius -= 0.5; });
+    });
+
+    btnIncreaseScale.addEventListener("click", () => {
+      commitStateChange(s => { s.scale += 0.1; });
+    });
+
+    btnDecreaseScale.addEventListener("click", () => {
+      commitStateChange(s => { s.scale -= 0.1; });
+    });
+
+    btnToggleMirror.addEventListener("click", () => {
+      commitStateChange(s => { s.mirrorMode = !s.mirrorMode; });
+    });
+
+    btnToggleRotation.addEventListener("click", () => {
+      rotationActive = !rotationActive;
+      updateStatus();
+      update3DState();
+    });
+
+    btnUndo.addEventListener("click", undo);
+    btnRedo.addEventListener("click", redo);
+
+    window.addEventListener("keydown", (event) => {
+      if (event.target && ["INPUT", "TEXTAREA"].includes(event.target.tagName)) return;
+
+      if (event.code === "Space") {
+        event.preventDefault();
+        rotationActive = !rotationActive;
+        updateStatus();
+        update3DState();
+        return;
+      }
+
+      if (event.key === "z" && !event.ctrlKey && !event.metaKey && !event.altKey && !event.shiftKey) {
+        event.preventDefault();
+        undo();
+        return;
+      }
+
+      if (event.key === "y" && !event.ctrlKey && !event.metaKey && !event.altKey && !event.shiftKey) {
+        event.preventDefault();
+        redo();
+        return;
+      }
+
+      if (event.key === "r" && !event.ctrlKey && !event.metaKey && !event.altKey) {
+        event.preventDefault();
+        resetState();
+        return;
+      }
+    });
+
+    window.addEventListener("resize", () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    updateStatus();
+    update3DState();
+
+    const loader = new GLTFLoader();
+    loader.load(
+      "DamagedHelmet.glb",
+      (gltf) => {
+        helmetTemplate = gltf.scene;
+
+        const box = new THREE.Box3().setFromObject(helmetTemplate);
+        const center = new THREE.Vector3();
+        box.getCenter(center);
+        helmetTemplate.position.sub(center);
+
+        const size = new THREE.Vector3();
+        box.getSize(size);
+        const maxDim = Math.max(size.x, size.y, size.z);
+        if (maxDim > 0) {
+          const normalizeScale = 1.5 / maxDim;
+          helmetTemplate.scale.setScalar(normalizeScale);
+        }
+
+        modelLoaded = true;
+        rebuildKaleidoscope();
+      },
+      undefined,
+      (error) => {
+        console.error("Failed to load DamagedHelmet.glb:", error);
+        statusDisplay.textContent = "Failed to load DamagedHelmet.glb";
+        update3DState();
+      }
+    );
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      if (rotationActive) {
+        kaleidoscopeGroup.rotation.y += rotationSpeed;
+      }
+
+      update3DState();
+      renderer.render(scene, camera);
+    }
+
+    animate();
+  </script>
+</body>
+</html>

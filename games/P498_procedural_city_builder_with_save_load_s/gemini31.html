@@ -1,0 +1,455 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Procedural City Builder</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #87CEEB;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            user-select: none;
+        }
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+        }
+        #hud {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            background: rgba(30, 30, 30, 0.85);
+            color: #fff;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+            pointer-events: none;
+            z-index: 10;
+        }
+        #hud > * {
+            pointer-events: auto;
+        }
+        .btn-group {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 15px;
+        }
+        button {
+            background: #555;
+            color: white;
+            border: 2px solid transparent;
+            padding: 10px 15px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-weight: bold;
+            transition: all 0.2s;
+        }
+        button:hover {
+            background: #777;
+        }
+        .build-btn {
+            width: 80px;
+        }
+        .action-btn {
+            background: #2c3e50;
+        }
+        .action-btn:hover {
+            background: #34495e;
+        }
+        #btn-clear {
+            background: #c0392b;
+        }
+        #btn-clear:hover {
+            background: #e74c3c;
+        }
+        .stats {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            font-size: 15px;
+            margin-top: 10px;
+            padding-top: 10px;
+            border-top: 1px solid #666;
+        }
+        .instructions {
+            margin-top: 15px;
+            font-size: 12px;
+            color: #aaa;
+            line-height: 1.4;
+        }
+    </style>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="hud">
+        <div class="btn-group">
+            <button id="btn-house" class="build-btn">House</button>
+            <button id="btn-tower" class="build-btn">Tower</button>
+            <button id="btn-park" class="build-btn">Park</button>
+            <button id="btn-horse" class="build-btn">Horse</button>
+        </div>
+        <div class="btn-group">
+            <button id="btn-save" class="action-btn">Save (S)</button>
+            <button id="btn-load" class="action-btn">Load (L)</button>
+            <button id="btn-clear" class="action-btn">Clear (C)</button>
+        </div>
+        <div class="stats">
+            <div id="selected-type">Selected: house</div>
+            <div id="building-count">Buildings: 0</div>
+        </div>
+        <div class="instructions">
+            Left Click: Place building<br>
+            Right Click: Remove building<br>
+            Drag: Rotate camera | Scroll: Zoom
+        </div>
+    </div>
+    <div id="canvas-container"></div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+        // State Management
+        window.__3D_STATE__ = {
+            buildingCount: 0,
+            selectedType: 'house',
+            gridOccupancy: {},
+            lastPlacedType: null,
+            lastPlacedPosition: null,
+            savedStateExists: !!localStorage.getItem('cityBuilderState'),
+            horseModelLoaded: false,
+            totalHouses: 0,
+            totalTowers: 0,
+            totalParks: 0,
+            totalHorses: 0,
+            cleared: false
+        };
+
+        let horseModelPrefab = null;
+        let pendingHorses = [];
+
+        // Scene Setup
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x87CEEB);
+
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.set(15, 20, 15);
+        camera.lookAt(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        container.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.05;
+        controls.maxPolarAngle = Math.PI / 2 - 0.05; // Don't go below ground
+
+        // Lighting
+        const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+        dirLight.position.set(10, 20, 10);
+        scene.add(dirLight);
+
+        const ambLight = new THREE.AmbientLight(0xffffff, 0.4);
+        scene.add(ambLight);
+
+        // Grid & Ground
+        // Custom grid to perfectly align lines at odd coordinates and centers at even coordinates (-8 to 8)
+        const gridMaterial = new THREE.LineBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.2 });
+        const gridGeo = new THREE.BufferGeometry();
+        const gridPoints = [];
+        for (let i = -9; i <= 9; i += 2) {
+            gridPoints.push(new THREE.Vector3(i, 0, -9), new THREE.Vector3(i, 0, 9));
+            gridPoints.push(new THREE.Vector3(-9, 0, i), new THREE.Vector3(9, 0, i));
+        }
+        gridGeo.setFromPoints(gridPoints);
+        const gridLines = new THREE.LineSegments(gridGeo, gridMaterial);
+        scene.add(gridLines);
+
+        // Invisible plane for raycasting
+        const planeGeo = new THREE.PlaneGeometry(20, 20);
+        planeGeo.rotateX(-Math.PI / 2);
+        const groundPlane = new THREE.Mesh(planeGeo, new THREE.MeshBasicMaterial({ visible: false }));
+        scene.add(groundPlane);
+
+        const buildingsGroup = new THREE.Group();
+        scene.add(buildingsGroup);
+
+        // Materials
+        const mats = {
+            houseBase: new THREE.MeshStandardMaterial({ color: 0x8B4513 }),
+            houseRoof: new THREE.MeshStandardMaterial({ color: 0xCC0000 }),
+            tower: new THREE.MeshStandardMaterial({ color: 0x4169E1 }),
+            parkBase: new THREE.MeshStandardMaterial({ color: 0x228B22 }),
+            parkTree: new THREE.MeshStandardMaterial({ color: 0x228B22 })
+        };
+
+        // Asset Loading
+        const loader = new GLTFLoader();
+        loader.load('._horse.glb', (gltf) => {
+            const model = gltf.scene;
+            
+            // Calculate bounding box to scale to 1.5 units tall
+            const box = new THREE.Box3().setFromObject(model);
+            const height = box.max.y - box.min.y;
+            const scale = height > 0 ? 1.5 / height : 1;
+            model.scale.set(scale, scale, scale);
+            
+            // Center horizontally and set bottom to y=0
+            const center = box.getCenter(new THREE.Vector3());
+            model.position.set(-center.x * scale, -box.min.y * scale, -center.z * scale);
+
+            // Wrap in group to establish origin at bottom center
+            horseModelPrefab = new THREE.Group();
+            horseModelPrefab.add(model);
+            
+            window.__3D_STATE__.horseModelLoaded = true;
+
+            // Process any horses that were loaded from save before the model finished loading
+            if (pendingHorses.length > 0) {
+                pendingHorses.forEach(p => {
+                    const key = `${p.x}_${p.z}`;
+                    delete window.__3D_STATE__.gridOccupancy[key]; // Temp remove to allow placement
+                    placeBuilding('horse', p.x, p.z);
+                });
+                pendingHorses = [];
+            }
+        }, undefined, (error) => {
+            console.warn('Could not load ._horse.glb. Horse placement will be ignored.', error);
+        });
+
+        // Building Creators
+        function createHouse() {
+            const group = new THREE.Group();
+            const base = new THREE.Mesh(new THREE.BoxGeometry(1.5, 2, 1.5), mats.houseBase);
+            base.position.y = 1;
+            const roof = new THREE.Mesh(new THREE.ConeGeometry(1.2, 1.0, 4), mats.houseRoof);
+            roof.position.y = 2.5;
+            roof.rotation.y = Math.PI / 4;
+            group.add(base, roof);
+            group.userData.type = 'house';
+            return group;
+        }
+
+        function createTower() {
+            const group = new THREE.Group();
+            const mesh = new THREE.Mesh(new THREE.BoxGeometry(1.0, 5, 1.0), mats.tower);
+            mesh.position.y = 2.5;
+            group.add(mesh);
+            group.userData.type = 'tower';
+            return group;
+        }
+
+        function createPark() {
+            const group = new THREE.Group();
+            const base = new THREE.Mesh(new THREE.PlaneGeometry(1.8, 1.8), mats.parkBase);
+            base.rotation.x = -Math.PI / 2;
+            base.position.y = 0.01; // Prevent z-fighting
+            const tree = new THREE.Mesh(new THREE.SphereGeometry(0.5), mats.parkTree);
+            tree.position.y = 0.5;
+            group.add(base, tree);
+            group.userData.type = 'park';
+            return group;
+        }
+
+        function createHorse() {
+            if (!horseModelPrefab) return null;
+            const clone = horseModelPrefab.clone();
+            clone.userData.type = 'horse';
+            return clone;
+        }
+
+        // Logic
+        function updateUI() {
+            const state = window.__3D_STATE__;
+            document.getElementById('building-count').innerText = `Buildings: ${state.buildingCount}`;
+            document.getElementById('selected-type').innerText = `Selected: ${state.selectedType}`;
+            
+            document.querySelectorAll('.build-btn').forEach(btn => {
+                if (btn.id === `btn-${state.selectedType}`) {
+                    btn.style.border = '3px solid yellow';
+                } else {
+                    btn.style.border = '2px solid transparent';
+                }
+            });
+        }
+
+        function updateStateCounts() {
+            const state = window.__3D_STATE__;
+            state.buildingCount = buildingsGroup.children.length;
+            state.totalHouses = 0;
+            state.totalTowers = 0;
+            state.totalParks = 0;
+            state.totalHorses = 0;
+
+            for (const key in state.gridOccupancy) {
+                const type = state.gridOccupancy[key];
+                if (type === 'house') state.totalHouses++;
+                if (type === 'tower') state.totalTowers++;
+                if (type === 'park') state.totalParks++;
+                if (type === 'horse') state.totalHorses++;
+            }
+            updateUI();
+        }
+
+        function placeBuilding(type, x, z) {
+            const key = `${x}_${z}`;
+            if (window.__3D_STATE__.gridOccupancy[key]) return;
+
+            if (type === 'horse' && !horseModelPrefab) {
+                pendingHorses.push({x, z});
+                window.__3D_STATE__.gridOccupancy[key] = type;
+                return;
+            }
+
+            let building;
+            switch(type) {
+                case 'house': building = createHouse(); break;
+                case 'tower': building = createTower(); break;
+                case 'park': building = createPark(); break;
+                case 'horse': building = createHorse(); break;
+            }
+
+            if (!building) return;
+
+            building.position.set(x, 0, z);
+            buildingsGroup.add(building);
+
+            window.__3D_STATE__.gridOccupancy[key] = type;
+            window.__3D_STATE__.lastPlacedType = type;
+            window.__3D_STATE__.lastPlacedPosition = { x, z };
+            window.__3D_STATE__.cleared = false;
+
+            updateStateCounts();
+        }
+
+        function removeBuilding(object) {
+            let root = object;
+            while (root.parent && root.parent !== buildingsGroup) {
+                root = root.parent;
+            }
+            if (root.parent === buildingsGroup) {
+                const x = Math.round(root.position.x);
+                const z = Math.round(root.position.z);
+                const key = `${x}_${z}`;
+                buildingsGroup.remove(root);
+                delete window.__3D_STATE__.gridOccupancy[key];
+                
+                // Remove from pending if it was a horse that hasn't loaded yet
+                pendingHorses = pendingHorses.filter(p => p.x !== x || p.z !== z);
+                
+                updateStateCounts();
+            }
+        }
+
+        // Interaction
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+
+        window.addEventListener('pointerdown', (event) => {
+            if (event.target.tagName === 'BUTTON') return;
+
+            mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+            raycaster.setFromCamera(mouse, camera);
+
+            if (event.button === 0) { // Left click
+                const intersects = raycaster.intersectObject(groundPlane);
+                if (intersects.length > 0) {
+                    const point = intersects[0].point;
+                    // Snap to nearest even coordinate
+                    let x = Math.round(point.x / 2) * 2;
+                    let z = Math.round(point.z / 2) * 2;
+                    
+                    // Clamp to grid bounds (-8 to 8)
+                    x = Math.max(-8, Math.min(8, x));
+                    z = Math.max(-8, Math.min(8, z));
+
+                    placeBuilding(window.__3D_STATE__.selectedType, x, z);
+                }
+            } else if (event.button === 2) { // Right click
+                const intersects = raycaster.intersectObjects(buildingsGroup.children, true);
+                if (intersects.length > 0) {
+                    removeBuilding(intersects[0].object);
+                }
+            }
+        });
+
+        window.addEventListener('contextmenu', e => e.preventDefault());
+
+        // UI Event Listeners
+        document.getElementById('btn-house').addEventListener('click', () => { window.__3D_STATE__.selectedType = 'house'; updateUI(); });
+        document.getElementById('btn-tower').addEventListener('click', () => { window.__3D_STATE__.selectedType = 'tower'; updateUI(); });
+        document.getElementById('btn-park').addEventListener('click', () => { window.__3D_STATE__.selectedType = 'park'; updateUI(); });
+        document.getElementById('btn-horse').addEventListener('click', () => { window.__3D_STATE__.selectedType = 'horse'; updateUI(); });
+
+        function saveCity() {
+            localStorage.setItem('cityBuilderState', JSON.stringify(window.__3D_STATE__.gridOccupancy));
+            window.__3D_STATE__.savedStateExists = true;
+        }
+
+        function loadCity() {
+            const data = localStorage.getItem('cityBuilderState');
+            if (data) {
+                clearCity();
+                const occupancy = JSON.parse(data);
+                for (const key in occupancy) {
+                    const [x, z] = key.split('_').map(Number);
+                    placeBuilding(occupancy[key], x, z);
+                }
+            }
+        }
+
+        function clearCity() {
+            while(buildingsGroup.children.length > 0){
+                buildingsGroup.remove(buildingsGroup.children[0]);
+            }
+            window.__3D_STATE__.gridOccupancy = {};
+            pendingHorses = [];
+            window.__3D_STATE__.cleared = true;
+            updateStateCounts();
+        }
+
+        document.getElementById('btn-save').addEventListener('click', saveCity);
+        document.getElementById('btn-load').addEventListener('click', loadCity);
+        document.getElementById('btn-clear').addEventListener('click', clearCity);
+
+        window.addEventListener('keydown', (e) => {
+            if (e.key.toLowerCase() === 's') saveCity();
+            if (e.key.toLowerCase() === 'l') loadCity();
+            if (e.key.toLowerCase() === 'c') clearCity();
+        });
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // Init UI
+        updateUI();
+
+        // Animation Loop
+        function animate() {
+            requestAnimationFrame(animate);
+            controls.update();
+            renderer.render(scene, camera);
+        }
+        animate();
+    </script>
+</body>
+</html>

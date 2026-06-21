@@ -1,0 +1,517 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>3D Whack-a-Mole</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      background: #87ceeb;
+      font-family: Arial, sans-serif;
+    }
+
+    #ui {
+      position: fixed;
+      top: 12px;
+      left: 0;
+      width: 100%;
+      pointer-events: none;
+      z-index: 10;
+    }
+
+    #startBtn {
+      position: fixed;
+      top: 12px;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 20;
+      padding: 10px 18px;
+      font-size: 16px;
+      cursor: pointer;
+      pointer-events: auto;
+    }
+
+    #hud {
+      position: fixed;
+      top: 60px;
+      left: 12px;
+      z-index: 15;
+      color: white;
+      text-shadow: 1px 1px 3px rgba(0,0,0,0.8);
+      font-size: 20px;
+      line-height: 1.5;
+      pointer-events: none;
+    }
+
+    #gameOverMsg {
+      position: fixed;
+      top: 110px;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 20;
+      color: white;
+      background: rgba(0,0,0,0.65);
+      padding: 14px 20px;
+      border-radius: 8px;
+      font-size: 24px;
+      display: none;
+      pointer-events: none;
+    }
+
+    canvas {
+      display: block;
+    }
+  </style>
+</head>
+<body>
+  <button id="startBtn">Start Game</button>
+
+  <div id="ui">
+    <div id="hud">
+      <div id="scoreDisplay">Score: 0</div>
+      <div id="timerDisplay">Time: 30</div>
+      <div id="comboDisplay">Combo: 0</div>
+    </div>
+    <div id="gameOverMsg">Game Over! Final Score: 0</div>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
+    import { OrbitControls } from 'https://unpkg.com/three@0.160.0/examples/jsm/controls/OrbitControls.js';
+    import { GLTFLoader } from 'https://unpkg.com/three@0.160.0/examples/jsm/loaders/GLTFLoader.js';
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x87ceeb);
+
+    const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+    camera.position.set(0, 8, 10);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.shadowMap.enabled = true;
+    document.body.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.set(0, 0, 0);
+    controls.update();
+
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
+    scene.add(ambientLight);
+
+    const directionalLight = new THREE.DirectionalLight(0xffffff, 1.0);
+    directionalLight.position.set(5, 10, 5);
+    directionalLight.castShadow = true;
+    directionalLight.shadow.mapSize.set(1024, 1024);
+    scene.add(directionalLight);
+
+    const groundGeometry = new THREE.PlaneGeometry(20, 20);
+    const groundMaterial = new THREE.MeshStandardMaterial({ color: 0x228b22 });
+    const ground = new THREE.Mesh(groundGeometry, groundMaterial);
+    ground.rotation.x = -Math.PI / 2;
+    ground.position.y = 0;
+    ground.receiveShadow = true;
+    ground.name = 'ground';
+    scene.add(ground);
+
+    const holePositions = [];
+    const holes = [];
+    const holeX = [-3, 0, 3];
+    const holeZ = [-3, 0, 3];
+
+    const holeGeometry = new THREE.CylinderGeometry(0.6, 0.6, 0.3, 32);
+    const holeMaterial = new THREE.MeshStandardMaterial({ color: 0x8b4513 });
+
+    let holeIndex = 0;
+    for (let row = 0; row < 3; row++) {
+      for (let col = 0; col < 3; col++) {
+        const z = holeZ[row];
+        const x = holeX[col];
+        const hole = new THREE.Mesh(holeGeometry, holeMaterial);
+        hole.position.set(x, 0.15, z);
+        hole.receiveShadow = true;
+        hole.castShadow = false;
+        hole.userData.holeIndex = holeIndex;
+        scene.add(hole);
+        holes.push(hole);
+        holePositions.push({ x, y: 0.15, z, index: holeIndex });
+        holeIndex++;
+      }
+    }
+
+    const startBtn = document.getElementById('startBtn');
+    const scoreDisplay = document.getElementById('scoreDisplay');
+    const timerDisplay = document.getElementById('timerDisplay');
+    const comboDisplay = document.getElementById('comboDisplay');
+    const gameOverMsg = document.getElementById('gameOverMsg');
+
+    let gameState = 'waiting';
+    let score = 0;
+    let timeRemaining = 30;
+    let whackCount = 0;
+    let missCount = 0;
+    let currentCombo = 0;
+    let maxCombo = 0;
+    let totalParticlesSpawned = 0;
+    let molesPopulated = 0;
+
+    let gameStartTime = 0;
+    let lastSpawnTime = 0;
+
+    const raycaster = new THREE.Raycaster();
+    const mouse = new THREE.Vector2();
+
+    const moles = [];
+    let soldierTemplate = null;
+    let modelLoaded = false;
+
+    const particles = [];
+
+    function updateHUD() {
+      scoreDisplay.textContent = `Score: ${score}`;
+      timerDisplay.textContent = `Time: ${timeRemaining}`;
+      comboDisplay.textContent = `Combo: ${currentCombo}`;
+    }
+
+    function updateState() {
+      const activeMoles = moles.filter(m => m.isUp).length;
+      const particlesAlive = particles.length;
+
+      window.__3D_STATE__ = {
+        gameState,
+        score,
+        timeRemaining,
+        whackCount,
+        missCount,
+        currentCombo,
+        maxCombo,
+        activeMoles,
+        totalParticlesSpawned,
+        molesPopulated,
+        particlesAlive,
+        groundPlaneY: 0,
+        holeCount: 9
+      };
+    }
+
+    updateHUD();
+    updateState();
+
+    const loader = new GLTFLoader();
+    loader.load(
+      'soldier.glb',
+      (gltf) => {
+        soldierTemplate = gltf.scene;
+        soldierTemplate.traverse(obj => {
+          if (obj.isMesh) {
+            obj.castShadow = true;
+            obj.receiveShadow = true;
+          }
+        });
+
+        for (let i = 0; i < 9; i++) {
+          const mole = soldierTemplate.clone(true);
+          mole.scale.set(0.4, 0.4, 0.4);
+          mole.position.set(holePositions[i].x, -1.5, holePositions[i].z);
+          mole.userData = {
+            moleIndex: i,
+            isMoleRoot: true
+          };
+
+          mole.traverse(obj => {
+            if (obj.isMesh) {
+              obj.castShadow = true;
+              obj.receiveShadow = true;
+              obj.userData.moleIndex = i;
+              obj.userData.isMolePart = true;
+            }
+          });
+
+          scene.add(mole);
+
+          moles.push({
+            index: i,
+            object: mole,
+            hiddenY: -1.5,
+            upY: 0.5,
+            isUp: false,
+            isAnimating: false,
+            animationStart: 0,
+            animationDuration: 0,
+            startY: -1.5,
+            targetY: -1.5,
+            hideAt: 0
+          });
+        }
+
+        modelLoaded = true;
+      },
+      undefined,
+      (err) => {
+        console.error('Failed to load soldier.glb:', err);
+      }
+    );
+
+    function resetGame() {
+      gameState = 'playing';
+      score = 0;
+      timeRemaining = 30;
+      whackCount = 0;
+      missCount = 0;
+      currentCombo = 0;
+      maxCombo = 0;
+      totalParticlesSpawned = 0;
+      molesPopulated = 0;
+      gameStartTime = performance.now();
+      lastSpawnTime = gameStartTime;
+
+      gameOverMsg.style.display = 'none';
+      startBtn.style.display = 'none';
+
+      for (const mole of moles) {
+        mole.object.position.y = mole.hiddenY;
+        mole.isUp = false;
+        mole.isAnimating = false;
+        mole.animationStart = 0;
+        mole.animationDuration = 0;
+        mole.startY = mole.hiddenY;
+        mole.targetY = mole.hiddenY;
+        mole.hideAt = 0;
+      }
+
+      for (const p of particles) {
+        scene.remove(p.mesh);
+      }
+      particles.length = 0;
+
+      updateHUD();
+      updateState();
+    }
+
+    function endGame() {
+      gameState = 'gameover';
+      gameOverMsg.textContent = `Game Over! Final Score: ${score}`;
+      gameOverMsg.style.display = 'block';
+      startBtn.style.display = 'block';
+      currentCombo = 0;
+      updateHUD();
+      updateState();
+    }
+
+    function animateMoleTo(mole, targetY, duration) {
+      mole.isAnimating = true;
+      mole.animationStart = performance.now();
+      mole.animationDuration = duration;
+      mole.startY = mole.object.position.y;
+      mole.targetY = targetY;
+    }
+
+    function popUpMole(mole) {
+      if (mole.isUp || mole.isAnimating) return;
+      mole.isUp = true;
+      animateMoleTo(mole, mole.upY, 300);
+      mole.hideAt = performance.now() + 1200;
+      molesPopulated++;
+    }
+
+    function hideMole(mole) {
+      mole.isUp = false;
+      mole.hideAt = 0;
+      animateMoleTo(mole, mole.hiddenY, 200);
+    }
+
+    function spawnRandomMoles() {
+      if (gameState !== 'playing') return;
+
+      const available = moles.filter(m => !m.isUp && !m.isAnimating);
+      if (available.length === 0) return;
+
+      const count = Math.min(
+        available.length,
+        Math.floor(Math.random() * 3) + 1
+      );
+
+      for (let i = 0; i < count; i++) {
+        if (available.length === 0) break;
+        const idx = Math.floor(Math.random() * available.length);
+        const mole = available.splice(idx, 1)[0];
+        popUpMole(mole);
+      }
+    }
+
+    function spawnParticleBurst(position) {
+      const colors = [0xff0000, 0xffff00, 0xff8800, 0xffffff];
+      const particleGeometry = new THREE.SphereGeometry(0.05, 8, 8);
+
+      for (let i = 0; i < 20; i++) {
+        const color = colors[Math.floor(Math.random() * colors.length)];
+        const material = new THREE.MeshStandardMaterial({ color });
+        const mesh = new THREE.Mesh(particleGeometry, material);
+        mesh.position.copy(position);
+        scene.add(mesh);
+
+        particles.push({
+          mesh,
+          velocity: new THREE.Vector3(
+            THREE.MathUtils.randFloat(-3, 3),
+            THREE.MathUtils.randFloat(2, 6),
+            THREE.MathUtils.randFloat(-3, 3)
+          ),
+          age: 0,
+          lifetime: 1.5
+        });
+      }
+
+      totalParticlesSpawned += 20;
+    }
+
+    function handleWhack(mole) {
+      currentCombo += 1;
+      if (currentCombo > maxCombo) maxCombo = currentCombo;
+
+      if (currentCombo >= 3) {
+        score += 10 + (currentCombo * 5);
+      } else {
+        score += 10;
+      }
+
+      whackCount += 1;
+      spawnParticleBurst(mole.object.position.clone());
+      hideMole(mole);
+
+      updateHUD();
+    }
+
+    function handleMiss() {
+      missCount += 1;
+      currentCombo = 0;
+      updateHUD();
+    }
+
+    function onPointerDown(event) {
+      if (gameState !== 'playing') return;
+
+      const rect = renderer.domElement.getBoundingClientRect();
+      mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+      mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+
+      raycaster.setFromCamera(mouse, camera);
+
+      const moleObjects = [];
+      for (const mole of moles) {
+        if (mole.isUp) {
+          mole.object.traverse(obj => {
+            if (obj.isMesh) moleObjects.push(obj);
+          });
+        }
+      }
+
+      const intersects = raycaster.intersectObjects(moleObjects, true);
+
+      if (intersects.length > 0) {
+        let obj = intersects[0].object;
+        const moleIndex = obj.userData.moleIndex;
+        const mole = moles[moleIndex];
+        if (mole && mole.isUp) {
+          handleWhack(mole);
+          return;
+        }
+      }
+
+      const missIntersects = raycaster.intersectObjects([ground, ...holes], true);
+      if (missIntersects.length > 0) {
+        handleMiss();
+      }
+    }
+
+    renderer.domElement.addEventListener('pointerdown', onPointerDown);
+
+    startBtn.addEventListener('click', () => {
+      if (!modelLoaded) return;
+      resetGame();
+    });
+
+    const clock = new THREE.Clock();
+
+    function updateMoles(now) {
+      for (const mole of moles) {
+        if (mole.isAnimating) {
+          const elapsed = now - mole.animationStart;
+          const t = Math.min(elapsed / mole.animationDuration, 1);
+          mole.object.position.y = THREE.MathUtils.lerp(mole.startY, mole.targetY, t);
+          if (t >= 1) {
+            mole.isAnimating = false;
+            mole.object.position.y = mole.targetY;
+          }
+        }
+
+        if (gameState === 'playing' && mole.isUp && now >= mole.hideAt) {
+          hideMole(mole);
+        }
+      }
+    }
+
+    function updateParticles(delta) {
+      for (let i = particles.length - 1; i >= 0; i--) {
+        const p = particles[i];
+        p.age += delta;
+
+        p.velocity.y += -9.8 * delta;
+        p.mesh.position.x += p.velocity.x * delta;
+        p.mesh.position.y += p.velocity.y * delta;
+        p.mesh.position.z += p.velocity.z * delta;
+
+        if (p.age >= p.lifetime) {
+          scene.remove(p.mesh);
+          if (p.mesh.material) p.mesh.material.dispose();
+          if (p.mesh.geometry) p.mesh.geometry.dispose();
+          particles.splice(i, 1);
+        }
+      }
+    }
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      const now = performance.now();
+      const delta = clock.getDelta();
+
+      controls.enabled = gameState !== 'playing';
+      if (controls.enabled) controls.update();
+
+      if (gameState === 'playing') {
+        const elapsedSec = (now - gameStartTime) / 1000;
+        timeRemaining = Math.max(0, Math.ceil(30 - elapsedSec));
+
+        if (now - lastSpawnTime >= 1500) {
+          spawnRandomMoles();
+          lastSpawnTime = now;
+        }
+
+        if (elapsedSec >= 30) {
+          timeRemaining = 0;
+          endGame();
+        }
+      }
+
+      updateMoles(now);
+      updateParticles(delta);
+      updateHUD();
+      updateState();
+
+      renderer.render(scene, camera);
+    }
+
+    animate();
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+  </script>
+</body>
+</html>

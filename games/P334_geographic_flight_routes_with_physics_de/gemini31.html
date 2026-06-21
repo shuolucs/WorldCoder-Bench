@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Flight Routes</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #0a0a2e;
+        }
+        #debug-overlay {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            background: rgba(0, 0, 0, 0.8);
+            color: #00ff00;
+            font-family: monospace;
+            padding: 15px;
+            min-width: 280px;
+            z-index: 100;
+            pointer-events: none;
+        }
+        #btn-speed-up {
+            position: absolute;
+            bottom: 20px;
+            left: 20px;
+            padding: 10px 20px;
+            font-size: 16px;
+            z-index: 100;
+            cursor: pointer;
+        }
+    </style>
+</head>
+<body>
+    <div id="debug-overlay"></div>
+    <button id="btn-speed-up">Speed 2x</button>
+
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/GLTFLoader.js"></script>
+
+    <script>
+        // Scene Setup
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x0a0a2e);
+
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.set(0, 0, 15);
+        camera.lookAt(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        document.body.appendChild(renderer.domElement);
+
+        const controls = new THREE.OrbitControls(camera, renderer.domElement);
+
+        // Lights
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+        scene.add(ambientLight);
+
+        const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
+        directionalLight.position.set(5, 3, 5);
+        scene.add(directionalLight);
+
+        // Earth Globes
+        const wireframeGeo = new THREE.SphereGeometry(5, 32, 32);
+        const wireframeMat = new THREE.MeshBasicMaterial({ color: 0x1a3a5c, wireframe: true });
+        const wireframeGlobe = new THREE.Mesh(wireframeGeo, wireframeMat);
+        wireframeGlobe.name = 'wireframeGlobe';
+        scene.add(wireframeGlobe);
+
+        const solidGeo = new THREE.SphereGeometry(4.95, 32, 32);
+        const solidMat = new THREE.MeshPhongMaterial({ color: 0x0d1b2a });
+        const solidGlobe = new THREE.Mesh(solidGeo, solidMat);
+        scene.add(solidGlobe);
+
+        // Flight Routes
+        const routeData = [
+            { start: [-3.5, 2.5, 2.8], control: [0, 7, 2], end: [1.5, 3.2, 3.5], color: 0xff4444 },
+            { start: [-4.2, 1.8, -1.5], control: [-1, 7, -4], end: [3.8, 2.0, -2.5], color: 0x44ff44 },
+            { start: [2.5, 1.5, 3.8], control: [4, -3, 2], end: [3.5, -2.8, 2.2], color: 0x4488ff }
+        ];
+
+        const curves = [];
+        let routeCount = 0;
+
+        routeData.forEach(data => {
+            const curve = new THREE.QuadraticBezierCurve3(
+                new THREE.Vector3(...data.start),
+                new THREE.Vector3(...data.control),
+                new THREE.Vector3(...data.end)
+            );
+            curves.push(curve);
+
+            const tubeGeo = new THREE.TubeGeometry(curve, 64, 0.03, 8, false);
+            const tubeMat = new THREE.MeshBasicMaterial({ color: data.color });
+            const tube = new THREE.Mesh(tubeGeo, tubeMat);
+            tube.name = 'routeTube';
+            scene.add(tube);
+            routeCount++;
+
+            const sphereGeo = new THREE.SphereGeometry(0.15, 16, 16);
+            const sphereMat = new THREE.MeshBasicMaterial({ color: data.color });
+            
+            const startSphere = new THREE.Mesh(sphereGeo, sphereMat);
+            startSphere.position.set(...data.start);
+            scene.add(startSphere);
+
+            const endSphere = new THREE.Mesh(sphereGeo, sphereMat);
+            endSphere.position.set(...data.end);
+            scene.add(endSphere);
+        });
+
+        // State Variables
+        let t = 0;
+        let activeRouteIndex = 0;
+        let isPaused = false;
+        let speedMultiplier = 1;
+        let debugVisible = true;
+        let frameCount = 0;
+        
+        let parrotLoaded = false;
+        let parrot;
+        let mixer;
+        
+        let prevPosition = new THREE.Vector3();
+        let velocity = new THREE.Vector3();
+        let speed = 0;
+
+        const clock = new THREE.Clock();
+
+        // Load Parrot Model
+        const loader = new THREE.GLTFLoader();
+        loader.load('https://raw.githubusercontent.com/mrdoob/three.js/master/examples/models/gltf/Parrot.glb', (gltf) => {
+            parrot = gltf.scene;
+            parrot.scale.set(0.005, 0.005, 0.005);
+            scene.add(parrot);
+            
+            mixer = new THREE.AnimationMixer(parrot);
+            if (gltf.animations && gltf.animations.length > 0) {
+                mixer.clipAction(gltf.animations[0]).play();
+            }
+            
+            parrotLoaded = true;
+            const startPos = curves[activeRouteIndex].getPoint(0);
+            parrot.position.copy(startPos);
+            prevPosition.copy(startPos);
+        });
+
+        // Controls & Interactions
+        function switchRoute(index) {
+            activeRouteIndex = index;
+            t = 0;
+            if (parrotLoaded) {
+                const startPos = curves[activeRouteIndex].getPoint(0);
+                parrot.position.copy(startPos);
+                prevPosition.copy(startPos);
+                velocity.set(0, 0, 0);
+                speed = 0;
+            }
+        }
+
+        window.addEventListener('keydown', (e) => {
+            const key = e.key.toLowerCase();
+            if (key === 'd') {
+                debugVisible = !debugVisible;
+                document.getElementById('debug-overlay').style.display = debugVisible ? 'block' : 'none';
+            } else if (key === '1') {
+                switchRoute(0);
+            } else if (key === '2') {
+                switchRoute(1);
+            } else if (key === '3') {
+                switchRoute(2);
+            } else if (key === ' ') {
+                isPaused = !isPaused;
+            } else if (key === 'r') {
+                switchRoute(0);
+                speedMultiplier = 1;
+                isPaused = false;
+                document.getElementById('btn-speed-up').innerText = 'Speed 2x';
+            }
+        });
+
+        document.getElementById('btn-speed-up').addEventListener('click', () => {
+            if (speedMultiplier === 1) {
+                speedMultiplier = 2;
+                document.getElementById('btn-speed-up').innerText = 'Speed 1x';
+            } else {
+                speedMultiplier = 1;
+                document.getElementById('btn-speed-up').innerText = 'Speed 2x';
+            }
+        });
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // Animation Loop
+        function animate() {
+            requestAnimationFrame(animate);
+            
+            const delta = clock.getDelta();
+
+            if (mixer && !isPaused) {
+                mixer.update(delta);
+            }
+
+            if (parrotLoaded && !isPaused) {
+                t += 0.002 * speedMultiplier;
+                
+                if (t >= 1) {
+                    t = 0;
+                    prevPosition.copy(curves[activeRouteIndex].getPoint(0));
+                }
+
+                const curve = curves[activeRouteIndex];
+                const currentPos = curve.getPoint(t);
+                
+                parrot.position.copy(currentPos);
+                
+                const tangent = curve.getTangent(t).normalize();
+                parrot.lookAt(parrot.position.clone().add(tangent));
+
+                velocity.subVectors(currentPos, prevPosition);
+                speed = velocity.length();
+                prevPosition.copy(currentPos);
+            }
+
+            // Update Debug Overlay
+            if (debugVisible) {
+                const px = parrotLoaded ? parrot.position.x.toFixed(2) : "0.00";
+                const py = parrotLoaded ? parrot.position.y.toFixed(2) : "0.00";
+                const pz = parrotLoaded ? parrot.position.z.toFixed(2) : "0.00";
+                
+                document.getElementById('debug-overlay').innerHTML = `
+                    <div>Position: (${px}, ${py}, ${pz})</div>
+                    <div>Velocity: (${velocity.x.toFixed(3)}, ${velocity.y.toFixed(3)}, ${velocity.z.toFixed(3)})</div>
+                    <div>Speed: ${speed.toFixed(3)}</div>
+                    <div>Active Route: ${activeRouteIndex + 1}</div>
+                    <div>t: ${t.toFixed(3)}</div>
+                    <div>Frame: ${frameCount}</div>
+                `;
+            }
+
+            // Update State Object
+            window.__3D_STATE__ = {
+                globeExists: scene.getObjectByName('wireframeGlobe') !== undefined,
+                routeCount: routeCount,
+                activeRoute: activeRouteIndex + 1,
+                parrotLoaded: parrotLoaded,
+                parrotPosition: parrotLoaded ? { x: parrot.position.x, y: parrot.position.y, z: parrot.position.z } : { x: 0, y: 0, z: 0 },
+                paramT: t,
+                isPaused: isPaused,
+                speedMultiplier: speedMultiplier,
+                debugVisible: debugVisible,
+                frameCount: frameCount,
+                velocity: { x: velocity.x, y: velocity.y, z: velocity.z },
+                speed: speed
+            };
+
+            controls.update();
+            renderer.render(scene, camera);
+            frameCount++;
+        }
+
+        animate();
+    </script>
+</body>
+</html>

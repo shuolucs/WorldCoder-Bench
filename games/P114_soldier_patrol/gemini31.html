@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Soldier Patrol & Mine Strategy</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #000;
+            font-family: sans-serif;
+        }
+        #hud {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            color: white;
+            background: rgba(0, 0, 0, 0.6);
+            padding: 15px;
+            border-radius: 8px;
+            pointer-events: none;
+            user-select: none;
+        }
+        #hud h2 {
+            margin: 0 0 10px 0;
+            font-size: 18px;
+            color: #ffcc00;
+        }
+        .stat {
+            margin: 5px 0;
+            font-size: 14px;
+        }
+        #message {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: #ff3333;
+            font-size: 48px;
+            font-weight: bold;
+            text-shadow: 2px 2px 4px #000;
+            display: none;
+            pointer-events: none;
+        }
+    </style>
+    <script type="importmap">
+    { "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+    } }
+    </script>
+</head>
+<body>
+    <div id="hud">
+        <h2>战况面板</h2>
+        <div class="stat">存活士兵: <span id="soldiersAlive">3</span></div>
+        <div class="stat">已放地雷: <span id="minesPlaced">0</span>/10</div>
+        <div class="stat">爆炸次数: <span id="explosions">0</span></div>
+        <div class="stat">游戏状态: <span id="gameState">playing</span></div>
+    </div>
+    <div id="message">胜利！</div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import * as SkeletonUtils from 'three/addons/utils/SkeletonUtils.js';
+
+        // --- Global State ---
+        window.__3D_STATE__ = {
+            modelLoaded: false,
+            soldiersAlive: 3,
+            minesPlaced: 0,
+            explosions: 0,
+            gameState: 'playing',
+            soldierPositions: [],
+            minePositions: []
+        };
+
+        const state = {
+            soldiers: [],
+            mines: [],
+            particles: []
+        };
+
+        // --- Scene Setup ---
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x222222);
+
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.set(6, 12, 18);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.shadowMap.enabled = true;
+        document.body.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.target.set(6, 0, 6);
+        controls.update();
+
+        // --- Lighting ---
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 1.5);
+        dirLight.position.set(10, 20, 10);
+        dirLight.castShadow = true;
+        dirLight.shadow.camera.top = 15;
+        dirLight.shadow.camera.bottom = -15;
+        dirLight.shadow.camera.left = -15;
+        dirLight.shadow.camera.right = 15;
+        scene.add(dirLight);
+
+        // --- Grid Map ---
+        const planeGeo = new THREE.PlaneGeometry(12, 12);
+        const planeMat = new THREE.MeshStandardMaterial({ color: 0xaaaaaa });
+        const plane = new THREE.Mesh(planeGeo, planeMat);
+        plane.rotation.x = -Math.PI / 2;
+        plane.position.set(6, 0, 6);
+        plane.receiveShadow = true;
+        scene.add(plane);
+
+        const gridHelper = new THREE.GridHelper(12, 12, 0x444444, 0x444444);
+        gridHelper.position.set(6, 0.01, 6);
+        scene.add(gridHelper);
+
+        // --- Soldier Class ---
+        class Soldier {
+            constructor(mesh, animations, waypoints) {
+                this.mesh = mesh;
+                this.mixer = new THREE.AnimationMixer(mesh);
+                this.actions = {};
+                this.waypoints = waypoints;
+                this.currentWpIndex = 0;
+                this.status = 'moving'; // moving, waiting, dead, removing
+                this.waitTimer = 0;
+                this.speed = 2;
+                this.deathTimer = 0;
+
+                // Setup animations
+                animations.forEach(clip => {
+                    const name = clip.name.toLowerCase();
+                    const action = this.mixer.clipAction(clip);
+                    if (name.includes('walk') || name.includes('run')) this.actions['Walk'] = action;
+                    else if (name.includes('idle')) this.actions['Idle'] = action;
+                    else if (name.includes('death') || name.includes('die')) {
+                        action.setLoop(THREE.LoopOnce);
+                        action.clampWhenFinished = true;
+                        this.actions['Death'] = action;
+                    }
+                });
+
+                this.currentAction = null;
+                this.mesh.position.copy(this.waypoints[0]);
+                this.playAction('Walk');
+            }
+
+            playAction(name) {
+                const action = this.actions[name];
+                if (!action || this.currentAction === action) return;
+                if (this.currentAction) this.currentAction.crossFadeTo(action, 0.2, true);
+                action.reset().play();
+                this.currentAction = action;
+            }
+
+            update(dt) {
+                this.mixer.update(dt);
+
+                if (this.status === 'dead') {
+                    this.deathTimer -= dt;
+                    if (this.deathTimer <= 0) {
+                        this.status = 'removing';
+                        scene.remove(this.mesh);
+                    }
+                    return;
+                }
+
+                if (this.status === 'waiting') {
+                    this.waitTimer -= dt;
+                    if (this.waitTimer <= 0) {
+                        this.status = 'moving';
+                        this.currentWpIndex = (this.currentWpIndex + 1) % this.waypoints.length;
+                        this.playAction('Walk');
+                    }
+                } else if (this.status === 'moving') {
+                    const target = this.waypoints[this.currentWpIndex];
+                    const dir = new THREE.Vector3().subVectors(target, this.mesh.position);
+                    const dist = dir.length();
+
+                    if (dist < 0.05) {
+                        this.mesh.position.copy(target);
+                        this.status = 'waiting';
+                        this.waitTimer = 0.5;
+                        this.playAction('Idle');
+                    } else {
+                        dir.normalize();
+                        this.mesh.position.addScaledVector(dir, this.speed * dt);
+                        
+                        // Face direction
+                        const lookTarget = target.clone();
+                        lookTarget.y = this.mesh.position.y;
+                        this.mesh.lookAt(lookTarget);
+                    }
+                }
+            }
+
+            die() {
+                this.status = 'dead';
+                this.deathTimer = 1.5;
+                if (this.actions['Death']) {
+                    this.playAction('Death');
+                } else {
+                    this.mesh.rotation.x = -Math.PI / 2;
+                }
+            }
+        }
+
+        // --- Load Model ---
+        const loader = new GLTFLoader();
+        loader.load('assets/soldier.glb', (gltf) => {
+            const baseModel = gltf.scene;
+            baseModel.scale.set(0.6, 0.6, 0.6);
+            
+            baseModel.traverse((child) => {
+                if (child.isMesh) {
+                    child.castShadow = true;
+                    child.receiveShadow = true;
+                }
+            });
+
+            const routes = [
+                [new THREE.Vector3(1.5, 0, 1.5), new THREE.Vector3(1.5, 0, 6.5), new THREE.Vector3(6.5, 0, 6.5), new THREE.Vector3(6.5, 0, 1.5)],
+                [new THREE.Vector3(10.5, 0, 2.5), new THREE.Vector3(10.5, 0, 10.5), new THREE.Vector3(3.5, 0, 10.5)],
+                [new THREE.Vector3(5.5, 0, 5.5), new THREE.Vector3(5.5, 0, 11.5), new THREE.Vector3(11.5, 0, 11.5), new THREE.Vector3(11.5, 0, 5.5)]
+            ];
+
+            for (let i = 0; i < 3; i++) {
+                const clonedScene = SkeletonUtils.clone(baseModel);
+                scene.add(clonedScene);
+                const soldier = new Soldier(clonedScene, gltf.animations, routes[i]);
+                state.soldiers.push(soldier);
+            }
+
+            window.__3D_STATE__.modelLoaded = true;
+        });
+
+        // --- Mine System ---
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+        const mineGeo = new THREE.SphereGeometry(0.2, 16, 16);
+        const mineMat = new THREE.MeshStandardMaterial({ color: 0xff0000 });
+
+        window.addEventListener('pointerdown', (event) => {
+            if (window.__3D_STATE__.gameState === 'victory') return;
+
+            mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+            raycaster.setFromCamera(mouse, camera);
+            const intersects = raycaster.intersectObject(plane);
+
+            if (intersects.length > 0) {
+                const point = intersects[0].point;
+                const col = Math.floor(point.x);
+                const row = Math.floor(point.z);
+
+                if (col >= 0 && col < 12 && row >= 0 && row < 12) {
+                    if (state.mines.length >= 10) {
+                        alert("地雷已满！");
+                        return;
+                    }
+
+                    const cx = col + 0.5;
+                    const cz = row + 0.5;
+
+                    // Check if mine already exists here
+                    const exists = state.mines.some(m => Math.abs(m.mesh.position.x - cx) < 0.1 && Math.abs(m.mesh.position.z - cz) < 0.1);
+                    if (exists) return;
+
+                    const mineMesh = new THREE.Mesh(mineGeo, mineMat);
+                    mineMesh.position.set(cx, 0.2, cz);
+                    mineMesh.castShadow = true;
+                    scene.add(mineMesh);
+                    state.mines.push({ mesh: mineMesh, col, row });
+                    
+                    window.__3D_STATE__.minesPlaced = state.mines.length;
+                    document.getElementById('minesPlaced').innerText = state.mines.length;
+                }
+            }
+        });
+
+        // --- Explosion System ---
+        const particleGeo = new THREE.SphereGeometry(0.05, 8, 8);
+        const particleMat = new THREE.MeshBasicMaterial({ color: 0xffaa00, transparent: true });
+
+        function createExplosion(position) {
+            const count = 40;
+            for (let i = 0; i < count; i++) {
+                const p = new THREE.Mesh(particleGeo, particleMat.clone());
+                p.position.copy(position);
+                
+                const velocity = new THREE.Vector3(
+                    (Math.random() - 0.5) * 5,
+                    Math.random() * 5,
+                    (Math.random() - 0.5) * 5
+                );
+                
+                scene.add(p);
+                state.particles.push({ mesh: p, velocity: velocity, life: 1.0 });
+            }
+        }
+
+        // --- Main Loop ---
+        const clock = new THREE.Clock();
+
+        function animate() {
+            requestAnimationFrame(animate);
+            const dt = clock.getDelta();
+
+            // Update Soldiers
+            state.soldiers.forEach(s => s.update(dt));
+
+            // Collision Detection
+            for (let i = state.mines.length - 1; i >= 0; i--) {
+                const mine = state.mines[i];
+                let exploded = false;
+
+                for (let j = 0; j < state.soldiers.length; j++) {
+                    const soldier = state.soldiers[j];
+                    if (soldier.status === 'dead' || soldier.status === 'removing') continue;
+
+                    if (soldier.mesh.position.distanceTo(mine.mesh.position) < 1.5) {
+                        // Explode
+                        createExplosion(mine.mesh.position);
+                        scene.remove(mine.mesh);
+                        state.mines.splice(i, 1);
+                        exploded = true;
+
+                        soldier.die();
+                        
+                        window.__3D_STATE__.explosions++;
+                        window.__3D_STATE__.soldiersAlive--;
+                        document.getElementById('explosions').innerText = window.__3D_STATE__.explosions;
+                        document.getElementById('soldiersAlive').innerText = window.__3D_STATE__.soldiersAlive;
+                        
+                        break; // Mine is gone, stop checking other soldiers for this mine
+                    }
+                }
+                if (exploded) {
+                    window.__3D_STATE__.minesPlaced = state.mines.length;
+                    document.getElementById('minesPlaced').innerText = state.mines.length;
+                }
+            }
+
+            // Cleanup removed soldiers
+            state.soldiers = state.soldiers.filter(s => s.status !== 'removing');
+
+            // Check Victory
+            if (window.__3D_STATE__.modelLoaded && window.__3D_STATE__.soldiersAlive === 0 && window.__3D_STATE__.gameState !== 'victory') {
+                window.__3D_STATE__.gameState = 'victory';
+                document.getElementById('gameState').innerText = 'victory';
+                document.getElementById('message').style.display = 'block';
+            }
+
+            // Update Particles
+            for (let i = state.particles.length - 1; i >= 0; i--) {
+                const p = state.particles[i];
+                p.life -= dt;
+                if (p.life <= 0) {
+                    scene.remove(p.mesh);
+                    p.mesh.material.dispose();
+                    state.particles.splice(i, 1);
+                } else {
+                    p.mesh.position.addScaledVector(p.velocity, dt);
+                    p.mesh.scale.setScalar(p.life);
+                    p.mesh.material.opacity = p.life;
+                }
+            }
+
+            // Update State Exposure
+            window.__3D_STATE__.soldierPositions = state.soldiers
+                .filter(s => s.status !== 'removing')
+                .map(s => ({ x: s.mesh.position.x, z: s.mesh.position.z }));
+            window.__3D_STATE__.minePositions = state.mines.map(m => ({ x: m.mesh.position.x, z: m.mesh.position.z }));
+
+            renderer.render(scene, camera);
+        }
+
+        // Handle Resize
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        animate();
+    </script>
+</body>
+</html>

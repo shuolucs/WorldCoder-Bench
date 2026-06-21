@@ -1,0 +1,813 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>3D Elastic Band Slingshot</title>
+  <style>
+    html, body {
+      margin: 0;
+      overflow: hidden;
+      height: 100%;
+      background: #87CEEB;
+      font-family: monospace;
+    }
+    canvas { display: block; }
+
+    #hud {
+      position: fixed;
+      top: 12px;
+      left: 12px;
+      background: rgba(0,0,0,0.65);
+      color: white;
+      padding: 12px;
+      font: 13px monospace;
+      border-radius: 8px;
+      z-index: 1000;
+      min-width: 260px;
+      line-height: 1.45;
+    }
+    #hud input[type="range"] {
+      width: 160px;
+      vertical-align: middle;
+    }
+    #hud .row {
+      margin: 4px 0;
+    }
+  </style>
+
+  <script type="importmap">
+  { "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+  } }
+  </script>
+</head>
+<body>
+  <div id="hud">
+    <div class="row">Score: <span id="hud-score">0</span></div>
+    <div class="row">Hits: <span id="hud-hits">0</span></div>
+    <div class="row">Shots: <span id="hud-shots">0</span></div>
+    <div class="row">Pull distance: <span id="hud-pull">0.00</span></div>
+    <div class="row">PE: <span id="hud-pe">0.00</span></div>
+    <div class="row">Launch speed: <span id="hud-launch-speed">0.00</span></div>
+    <div class="row">Stiffness: <span id="hud-stiffness">80</span></div>
+    <div class="row">Status: <span id="hud-status">Ready</span></div>
+    <div class="row">Models loaded: <span id="hud-models">No</span></div>
+    <div class="row" style="margin-top:8px;">
+      k:
+      <input id="slider-stiffness" type="range" min="20" max="200" step="5" value="80">
+      <span id="label-stiffness">80</span>
+    </div>
+    <div class="row">
+      Rest length:
+      <input id="slider-band-length" type="range" min="0.3" max="1.0" step="0.05" value="0.50">
+      <span id="label-band-length">0.50</span>
+    </div>
+    <div class="row" style="margin-top:8px;">
+      Drag avocado. N = next projectile, R = reset, Space = pause
+    </div>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+    import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+    let scene, camera, renderer, controls, clock;
+    let raycaster, mouse;
+    let frameCount = 0;
+
+    const gravity = new THREE.Vector3(0, -9.81, 0);
+    const projectileMass = 0.2;
+    const dragCoeff = 0.05;
+    const maxPullDistance = 3.0;
+    let stiffnessK = 80;
+    let bandRestLength = 0.5;
+
+    let isPaused = false;
+    let modelsLoaded = false;
+
+    const slingCenter = new THREE.Vector3(0, 2.0, 0.3);
+    const forkCenter = new THREE.Vector3(0, 2.2, 0.0);
+    const leftTip = new THREE.Vector3(-0.5, 2.2, 0.0);
+    const rightTip = new THREE.Vector3(0.5, 2.2, 0.0);
+
+    let projectile = null;
+    let avocadoTemplate = null;
+    let duckTemplate = null;
+
+    let dragging = false;
+    let hasProjectile = false;
+    let projectileFlying = false;
+    let projectileLanded = false;
+
+    let projectileVelocity = new THREE.Vector3();
+    let lastLaunchSpeed = 0;
+
+    let score = 0;
+    let hits = 0;
+    let shots = 0;
+
+    const targets = [];
+    const targetData = [
+      { pos: new THREE.Vector3(-2, 0.4, -8),  points: 10, elevated: false },
+      { pos: new THREE.Vector3( 0, 0.4, -12), points: 20, elevated: false },
+      { pos: new THREE.Vector3( 2, 0.4, -8),  points: 10, elevated: false },
+      { pos: new THREE.Vector3(-1, 1.5, -15), points: 50, elevated: true  },
+      { pos: new THREE.Vector3( 1, 1.5, -15), points: 50, elevated: true  },
+    ];
+
+    let leftBand, rightBand;
+    let aimDots = [];
+    let trajectoryLine;
+    let trailPositions = [];
+
+    const hud = {
+      score: document.getElementById('hud-score'),
+      hits: document.getElementById('hud-hits'),
+      shots: document.getElementById('hud-shots'),
+      pull: document.getElementById('hud-pull'),
+      pe: document.getElementById('hud-pe'),
+      launchSpeed: document.getElementById('hud-launch-speed'),
+      stiffness: document.getElementById('hud-stiffness'),
+      status: document.getElementById('hud-status'),
+      models: document.getElementById('hud-models')
+    };
+
+    const sliderStiffness = document.getElementById('slider-stiffness');
+    const sliderBandLength = document.getElementById('slider-band-length');
+    const labelStiffness = document.getElementById('label-stiffness');
+    const labelBandLength = document.getElementById('label-band-length');
+
+    init();
+    animate();
+
+    function init() {
+      scene = new THREE.Scene();
+      scene.background = new THREE.Color(0x87CEEB);
+
+      camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 200);
+      camera.position.set(0, 3, 8);
+      camera.lookAt(0, 2, -5);
+
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+      renderer.shadowMap.enabled = true;
+      renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+      document.body.appendChild(renderer.domElement);
+
+      controls = new OrbitControls(camera, renderer.domElement);
+      controls.target.set(0, 2, -5);
+      controls.enableDamping = true;
+
+      clock = new THREE.Clock();
+      raycaster = new THREE.Raycaster();
+      mouse = new THREE.Vector2();
+
+      const ambient = new THREE.AmbientLight(0x88aacc, 0.5);
+      scene.add(ambient);
+
+      const dirLight = new THREE.DirectionalLight(0xffffff, 0.9);
+      dirLight.position.set(5, 10, 5);
+      dirLight.castShadow = true;
+      dirLight.shadow.mapSize.set(2048, 2048);
+      dirLight.shadow.camera.left = -25;
+      dirLight.shadow.camera.right = 25;
+      dirLight.shadow.camera.top = 25;
+      dirLight.shadow.camera.bottom = -25;
+      dirLight.shadow.camera.near = 0.5;
+      dirLight.shadow.camera.far = 60;
+      scene.add(dirLight);
+
+      const ground = new THREE.Mesh(
+        new THREE.PlaneGeometry(40, 40),
+        new THREE.MeshStandardMaterial({ color: 0x55aa44 })
+      );
+      ground.rotation.x = -Math.PI / 2;
+      ground.receiveShadow = true;
+      scene.add(ground);
+
+      createBrickWall();
+      createSlingshot();
+      createAimDots();
+      createTrail();
+
+      loadModels();
+
+      sliderStiffness.addEventListener('input', () => {
+        stiffnessK = parseFloat(sliderStiffness.value);
+        labelStiffness.textContent = stiffnessK.toFixed(0);
+      });
+
+      sliderBandLength.addEventListener('input', () => {
+        bandRestLength = parseFloat(sliderBandLength.value);
+        labelBandLength.textContent = bandRestLength.toFixed(2);
+      });
+
+      renderer.domElement.addEventListener('pointerdown', onPointerDown);
+      renderer.domElement.addEventListener('pointermove', onPointerMove);
+      renderer.domElement.addEventListener('pointerup', onPointerUp);
+      renderer.domElement.addEventListener('pointerleave', onPointerUp);
+
+      window.addEventListener('resize', onResize);
+      window.addEventListener('keydown', onKeyDown);
+
+      window.__3D_STATE__ = {};
+    }
+
+    function createBrickWall() {
+      const textureLoader = new THREE.TextureLoader();
+      const wallMat = new THREE.MeshStandardMaterial({ color: 0x884433 });
+      textureLoader.load(
+        'brick_diffuse.jpg',
+        (tex) => {
+          tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+          tex.repeat.set(4, 1.5);
+          wallMat.map = tex;
+          wallMat.needsUpdate = true;
+        },
+        undefined,
+        () => {}
+      );
+
+      const wall = new THREE.Mesh(
+        new THREE.BoxGeometry(20, 5, 0.5),
+        wallMat
+      );
+      wall.position.set(0, 2.5, -20);
+      wall.receiveShadow = true;
+      wall.castShadow = true;
+      scene.add(wall);
+    }
+
+    function createSlingshot() {
+      const woodMat1 = new THREE.MeshStandardMaterial({ color: 0x664422 });
+      const woodMat2 = new THREE.MeshStandardMaterial({ color: 0x553311 });
+
+      const leftFork = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.08, 0.08, 2.5, 16),
+        woodMat1
+      );
+      leftFork.position.set(-0.4, 1.25, 0);
+      leftFork.rotation.z = THREE.MathUtils.degToRad(10);
+      leftFork.castShadow = true;
+      scene.add(leftFork);
+
+      const rightFork = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.08, 0.08, 2.5, 16),
+        woodMat1
+      );
+      rightFork.position.set(0.4, 1.25, 0);
+      rightFork.rotation.z = THREE.MathUtils.degToRad(-10);
+      rightFork.castShadow = true;
+      scene.add(rightFork);
+
+      const base = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.15, 0.15, 0.3, 16),
+        woodMat2
+      );
+      base.position.set(0, 0.15, 0);
+      base.castShadow = true;
+      scene.add(base);
+
+      leftBand = createBandMesh();
+      rightBand = createBandMesh();
+      scene.add(leftBand);
+      scene.add(rightBand);
+      updateBands(slingCenter);
+    }
+
+    function createBandMesh() {
+      const geo = new THREE.CylinderGeometry(0.03, 0.03, 1, 10, 1, false);
+      const mat = new THREE.MeshStandardMaterial({ color: 0xcc3333 });
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.castShadow = true;
+      return mesh;
+    }
+
+    function updateBand(mesh, start, end) {
+      const dir = new THREE.Vector3().subVectors(end, start);
+      const len = dir.length();
+      const stretchFactor = Math.max(0.35, 1.0 - Math.max(0, len - bandRestLength) * 0.18);
+
+      mesh.position.copy(start).add(end).multiplyScalar(0.5);
+      mesh.scale.set(stretchFactor, 1, stretchFactor);
+
+      mesh.geometry.dispose();
+      mesh.geometry = new THREE.CylinderGeometry(0.03, 0.03, Math.max(len, 0.001), 10);
+
+      const up = new THREE.Vector3(0, 1, 0);
+      mesh.quaternion.setFromUnitVectors(up, dir.clone().normalize());
+    }
+
+    function updateBands(projectilePos) {
+      updateBand(leftBand, leftTip, projectilePos);
+      updateBand(rightBand, rightTip, projectilePos);
+    }
+
+    function createAimDots() {
+      const dotGeo = new THREE.SphereGeometry(0.05, 10, 10);
+      const dotMat = new THREE.MeshBasicMaterial({ color: 0xffff00 });
+      for (let i = 0; i < 20; i++) {
+        const dot = new THREE.Mesh(dotGeo, dotMat.clone());
+        dot.visible = false;
+        scene.add(dot);
+        aimDots.push(dot);
+      }
+    }
+
+    function createTrail() {
+      const geom = new THREE.BufferGeometry();
+      const positions = new Float32Array(150 * 3);
+      geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+      const mat = new THREE.LineBasicMaterial({
+        color: 0xff6600,
+        transparent: true,
+        opacity: 0.9
+      });
+      trajectoryLine = new THREE.Line(geom, mat);
+      scene.add(trajectoryLine);
+    }
+
+    function updateTrail() {
+      const arr = trajectoryLine.geometry.attributes.position.array;
+      for (let i = 0; i < 150; i++) {
+        const p = trailPositions[i];
+        if (p) {
+          arr[i * 3 + 0] = p.x;
+          arr[i * 3 + 1] = p.y;
+          arr[i * 3 + 2] = p.z;
+        } else {
+          arr[i * 3 + 0] = 0;
+          arr[i * 3 + 1] = -999;
+          arr[i * 3 + 2] = 0;
+        }
+      }
+      trajectoryLine.geometry.attributes.position.needsUpdate = true;
+    }
+
+    function clearTrail() {
+      trailPositions = [];
+      updateTrail();
+    }
+
+    function loadModels() {
+      const loader = new GLTFLoader();
+      let loadedCount = 0;
+
+      function checkLoaded() {
+        loadedCount++;
+        if (loadedCount === 2) {
+          modelsLoaded = true;
+          createTargets();
+          spawnProjectile();
+        }
+      }
+
+      loader.load(
+        'Avocado.glb',
+        (gltf) => {
+          avocadoTemplate = gltf.scene;
+          avocadoTemplate.traverse(obj => {
+            if (obj.isMesh) {
+              obj.castShadow = true;
+              obj.receiveShadow = true;
+            }
+          });
+          checkLoaded();
+        },
+        undefined,
+        () => {
+          avocadoTemplate = createFallbackAvocado();
+          checkLoaded();
+        }
+      );
+
+      loader.load(
+        'Duck.glb',
+        (gltf) => {
+          duckTemplate = gltf.scene;
+          duckTemplate.traverse(obj => {
+            if (obj.isMesh) {
+              obj.castShadow = true;
+              obj.receiveShadow = true;
+            }
+          });
+          checkLoaded();
+        },
+        undefined,
+        () => {
+          duckTemplate = createFallbackDuck();
+          checkLoaded();
+        }
+      );
+    }
+
+    function createFallbackAvocado() {
+      const g = new THREE.Group();
+      const body = new THREE.Mesh(
+        new THREE.SphereGeometry(1, 16, 16),
+        new THREE.MeshStandardMaterial({ color: 0x6faa44 })
+      );
+      body.scale.set(0.8, 1.0, 0.8);
+      body.castShadow = true;
+      g.add(body);
+      const pit = new THREE.Mesh(
+        new THREE.SphereGeometry(0.35, 12, 12),
+        new THREE.MeshStandardMaterial({ color: 0x774422 })
+      );
+      pit.position.set(0, -0.15, 0.7);
+      pit.castShadow = true;
+      g.add(pit);
+      return g;
+    }
+
+    function createFallbackDuck() {
+      const g = new THREE.Group();
+      const body = new THREE.Mesh(
+        new THREE.SphereGeometry(1, 16, 16),
+        new THREE.MeshStandardMaterial({ color: 0xffdd33 })
+      );
+      body.scale.set(1.2, 0.9, 0.9);
+      body.castShadow = true;
+      g.add(body);
+      const head = new THREE.Mesh(
+        new THREE.SphereGeometry(0.45, 16, 16),
+        new THREE.MeshStandardMaterial({ color: 0xffdd33 })
+      );
+      head.position.set(0.8, 0.6, 0);
+      head.castShadow = true;
+      g.add(head);
+      const beak = new THREE.Mesh(
+        new THREE.ConeGeometry(0.18, 0.4, 12),
+        new THREE.MeshStandardMaterial({ color: 0xff8833 })
+      );
+      beak.rotation.z = -Math.PI / 2;
+      beak.position.set(1.25, 0.55, 0);
+      beak.castShadow = true;
+      g.add(beak);
+      return g;
+    }
+
+    function spawnProjectile() {
+      if (!avocadoTemplate) return;
+
+      if (projectile) scene.remove(projectile);
+      projectile = avocadoTemplate.clone(true);
+      projectile.scale.setScalar(0.08);
+      projectile.position.copy(slingCenter);
+      projectile.rotation.set(0, 0, 0);
+      projectile.traverse(o => {
+        if (o.isMesh) {
+          o.castShadow = true;
+          o.receiveShadow = true;
+        }
+      });
+
+      scene.add(projectile);
+      projectileVelocity.set(0, 0, 0);
+      hasProjectile = true;
+      projectileFlying = false;
+      projectileLanded = false;
+      dragging = false;
+      clearAimDots();
+      clearTrail();
+      updateBands(projectile.position);
+    }
+
+    function createTargets() {
+      for (const t of targets) {
+        if (t.mesh) scene.remove(t.mesh);
+        if (t.pedestal) scene.remove(t.pedestal);
+      }
+      targets.length = 0;
+      hits = 0;
+
+      const pedestalMat = new THREE.MeshStandardMaterial({ color: 0x888888 });
+
+      for (const def of targetData) {
+        let pedestal = null;
+        if (def.elevated) {
+          pedestal = new THREE.Mesh(
+            new THREE.BoxGeometry(0.5, 1.1, 0.5),
+            pedestalMat
+          );
+          pedestal.position.set(def.pos.x, 0.55, def.pos.z);
+          pedestal.castShadow = true;
+          pedestal.receiveShadow = true;
+          scene.add(pedestal);
+        }
+
+        const duck = duckTemplate.clone(true);
+        duck.scale.setScalar(0.015);
+        duck.position.copy(def.pos);
+        duck.traverse(o => {
+          if (o.isMesh) {
+            o.castShadow = true;
+            o.receiveShadow = true;
+          }
+        });
+        scene.add(duck);
+
+        targets.push({
+          mesh: duck,
+          pedestal,
+          position: def.pos.clone(),
+          points: def.points,
+          radius: 0.8,
+          hit: false,
+          flyVelocity: new THREE.Vector3(),
+          spinVelocity: Math.random() * 8 + 4
+        });
+      }
+    }
+
+    function onResize() {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    }
+
+    function screenToNDC(event) {
+      const rect = renderer.domElement.getBoundingClientRect();
+      mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+      mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+    }
+
+    function onPointerDown(event) {
+      if (!hasProjectile || projectileFlying || projectileLanded || !projectile) return;
+      screenToNDC(event);
+      raycaster.setFromCamera(mouse, camera);
+      const intersects = raycaster.intersectObject(projectile, true);
+      if (intersects.length > 0) {
+        dragging = true;
+        controls.enabled = false;
+      }
+    }
+
+    function onPointerMove(event) {
+      if (!dragging || !projectile) return;
+
+      screenToNDC(event);
+      raycaster.setFromCamera(mouse, camera);
+
+      const plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -slingCenter.y);
+      const hit = new THREE.Vector3();
+      if (raycaster.ray.intersectPlane(plane, hit)) {
+        let desired = hit.clone();
+        desired.y = slingCenter.y;
+
+        const offset = desired.clone().sub(slingCenter);
+        offset.y = 0;
+
+        if (offset.z < 0) offset.z = 0;
+        if (offset.length() > maxPullDistance) offset.setLength(maxPullDistance);
+
+        projectile.position.set(
+          slingCenter.x + offset.x,
+          slingCenter.y,
+          slingCenter.z + offset.z
+        );
+
+        updateBands(projectile.position);
+        updateAimGuide();
+      }
+    }
+
+    function onPointerUp() {
+      if (!dragging || !projectile) {
+        controls.enabled = true;
+        return;
+      }
+      dragging = false;
+      controls.enabled = true;
+      launchProjectile();
+    }
+
+    function launchProjectile() {
+      const launch = computeLaunch();
+      if (launch.speed <= 0.001) {
+        clearAimDots();
+        return;
+      }
+
+      projectileVelocity.copy(launch.velocity);
+      lastLaunchSpeed = launch.speed;
+      projectileFlying = true;
+      projectileLanded = false;
+      shots++;
+      clearAimDots();
+    }
+
+    function computeElasticPE(pos) {
+      const d1 = pos.distanceTo(leftTip);
+      const d2 = pos.distanceTo(rightTip);
+      const x1 = Math.max(0, d1 - bandRestLength);
+      const x2 = Math.max(0, d2 - bandRestLength);
+      return 0.5 * stiffnessK * x1 * x1 + 0.5 * stiffnessK * x2 * x2;
+    }
+
+    function computeLaunch() {
+      if (!projectile) return { speed: 0, velocity: new THREE.Vector3() };
+
+      const pe = computeElasticPE(projectile.position);
+      const speed = Math.sqrt(Math.max(0, 2 * pe / projectileMass));
+
+      let dir = forkCenter.clone().sub(projectile.position).normalize();
+      dir.z -= 0.15;
+      dir.normalize();
+
+      const velocity = dir.multiplyScalar(speed);
+      return { speed, velocity };
+    }
+
+    function updateAimGuide() {
+      const launch = computeLaunch();
+      const p0 = projectile.position.clone();
+      const v0 = launch.velocity.clone();
+
+      for (let i = 0; i < aimDots.length; i++) {
+        const t = (i + 1) / 20;
+        const pos = p0.clone()
+          .add(v0.clone().multiplyScalar(t))
+          .add(gravity.clone().multiplyScalar(0.5 * t * t));
+        aimDots[i].position.copy(pos);
+        aimDots[i].visible = true;
+      }
+    }
+
+    function clearAimDots() {
+      for (const d of aimDots) d.visible = false;
+    }
+
+    function updateProjectile(dt) {
+      if (!projectile || !projectileFlying || isPaused) return;
+
+      const speed = projectileVelocity.length();
+      if (speed > 0) {
+        const drag = projectileVelocity.clone().normalize().multiplyScalar(-dragCoeff * speed * speed / projectileMass);
+        projectileVelocity.add(gravity.clone().add(drag).multiplyScalar(dt));
+      } else {
+        projectileVelocity.add(gravity.clone().multiplyScalar(dt));
+      }
+
+      projectile.position.add(projectileVelocity.clone().multiplyScalar(dt));
+
+      projectile.rotation.x += projectileVelocity.length() * dt * 1.5;
+      projectile.rotation.z += projectileVelocity.length() * dt * 0.8;
+
+      trailPositions.unshift(projectile.position.clone());
+      if (trailPositions.length > 150) trailPositions.pop();
+      updateTrail();
+
+      updateBands(projectile.position);
+      checkTargetHits();
+
+      if (projectile.position.y < 0.1) {
+        projectile.position.y = 0.1;
+
+        projectileVelocity.y = 0;
+        projectileVelocity.x *= 0.9;
+        projectileVelocity.z *= 0.9;
+
+        projectileVelocity.x *= 0.98;
+        projectileVelocity.z *= 0.98;
+
+        if (projectileVelocity.length() < 0.2) {
+          projectileVelocity.set(0, 0, 0);
+          projectileFlying = false;
+          projectileLanded = true;
+          hasProjectile = false;
+        }
+      }
+    }
+
+    function checkTargetHits() {
+      if (!projectile) return;
+      for (const target of targets) {
+        if (target.hit) continue;
+        const d = projectile.position.distanceTo(target.mesh.position);
+        if (d <= target.radius) {
+          target.hit = true;
+          score += target.points;
+          hits++;
+          target.flyVelocity.set(
+            (Math.random() - 0.5) * 5,
+            4 + Math.random() * 3,
+            -2 - Math.random() * 4
+          );
+        }
+      }
+    }
+
+    function updateTargets(dt) {
+      if (isPaused) return;
+      for (const target of targets) {
+        if (target.hit) {
+          target.flyVelocity.add(gravity.clone().multiplyScalar(dt * 0.6));
+          target.mesh.position.add(target.flyVelocity.clone().multiplyScalar(dt));
+          target.mesh.rotation.y += target.spinVelocity * dt;
+          target.mesh.rotation.x += target.spinVelocity * 0.6 * dt;
+        }
+      }
+    }
+
+    function onKeyDown(e) {
+      if (e.code === 'Space') {
+        isPaused = !isPaused;
+      } else if (e.key === 'n' || e.key === 'N') {
+        if (!projectileFlying) spawnProjectile();
+      } else if (e.key === 'r' || e.key === 'R') {
+        score = 0;
+        shots = 0;
+        lastLaunchSpeed = 0;
+        createTargets();
+        spawnProjectile();
+      }
+    }
+
+    function updateHUD() {
+      const pullDistance = projectile ? projectile.position.distanceTo(slingCenter) : 0;
+      const pe = projectile && !projectileFlying ? computeElasticPE(projectile.position) : 0;
+
+      let status = 'Ready';
+      if (dragging) status = 'Aiming';
+      else if (projectileFlying) status = 'Flying';
+      else if (projectileLanded) status = 'Landed';
+
+      hud.score.textContent = score;
+      hud.hits.textContent = `${hits} / 5`;
+      hud.shots.textContent = shots;
+      hud.pull.textContent = pullDistance.toFixed(2);
+      hud.pe.textContent = pe.toFixed(2);
+      hud.launchSpeed.textContent = lastLaunchSpeed.toFixed(2);
+      hud.stiffness.textContent = stiffnessK.toFixed(0);
+      hud.status.textContent = status;
+      hud.models.textContent = modelsLoaded ? 'Yes' : 'No';
+    }
+
+    function updateState() {
+      const pos = projectile ? projectile.position : slingCenter;
+      const pullDistance = projectile ? projectile.position.distanceTo(slingCenter) : 0;
+      const pe = (projectile && !projectileFlying) ? computeElasticPE(projectile.position) : 0;
+      const simValid =
+        Number.isFinite(pos.x) && Number.isFinite(pos.y) && Number.isFinite(pos.z) &&
+        Number.isFinite(projectileVelocity.x) && Number.isFinite(projectileVelocity.y) && Number.isFinite(projectileVelocity.z);
+
+      let status = 'Ready';
+      if (dragging) status = 'Aiming';
+      else if (projectileFlying) status = 'Flying';
+      else if (projectileLanded) status = 'Landed';
+
+      window.__3D_STATE__ = {
+        score,
+        hits,
+        shots,
+        pullDistance: round3(pullDistance),
+        elasticPE: round3(pe),
+        launchSpeed: round3(lastLaunchSpeed),
+        stiffness: stiffnessK,
+        bandRestLength: round2(bandRestLength),
+        status,
+        projectilePosition: {
+          x: round3(pos.x),
+          y: round3(pos.y),
+          z: round3(pos.z)
+        },
+        targetsRemaining: targets.filter(t => !t.hit).length,
+        modelsLoaded,
+        isPaused,
+        frameCount,
+        simValid
+      };
+    }
+
+    function round3(n) { return Math.round(n * 1000) / 1000; }
+    function round2(n) { return Math.round(n * 100) / 100; }
+
+    function animate() {
+      requestAnimationFrame(animate);
+      frameCount++;
+
+      const dt = Math.min(clock.getDelta(), 0.033);
+
+      controls.update();
+
+      if (!isPaused) {
+        updateProjectile(dt);
+        updateTargets(dt);
+      }
+
+      if (projectile && !projectileFlying && !dragging) {
+        updateBands(projectile.position);
+      }
+
+      updateHUD();
+      updateState(); // before render
+      renderer.render(scene, camera);
+    }
+  </script>
+</body>
+</html>

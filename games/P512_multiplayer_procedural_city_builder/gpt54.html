@@ -1,0 +1,544 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Procedural Multiplayer City Builder</title>
+  <style>
+    html, body {
+      margin: 0;
+      overflow: hidden;
+      background: #87CEEB;
+      font-family: Arial, sans-serif;
+    }
+
+    body.demolish {
+      box-sizing: border-box;
+      border: 6px solid #e74c3c;
+    }
+
+    #ui {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      z-index: 10;
+      color: #fff;
+      text-shadow: 0 1px 2px rgba(0,0,0,0.5);
+      user-select: none;
+    }
+
+    #hud {
+      margin-bottom: 10px;
+      padding: 10px 12px;
+      background: rgba(0,0,0,0.25);
+      border-radius: 8px;
+      line-height: 1.5;
+      min-width: 230px;
+    }
+
+    #buttons {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    button {
+      padding: 8px 12px;
+      font-size: 14px;
+      border-radius: 6px;
+      border: 2px solid transparent;
+      background: rgba(255,255,255,0.9);
+      cursor: pointer;
+      font-weight: bold;
+    }
+
+    button.selected {
+      border: 3px solid #f1c40f;
+    }
+
+    #help {
+      margin-top: 8px;
+      font-size: 12px;
+      color: #f0f0f0;
+      background: rgba(0,0,0,0.2);
+      padding: 6px 8px;
+      border-radius: 6px;
+      width: fit-content;
+    }
+  </style>
+</head>
+<body>
+  <div id="ui">
+    <div id="hud">
+      <div id="p1Budget">Player 1 Budget: $2000</div>
+      <div id="p2Budget">Player 2 Budget: $2000</div>
+      <div id="buildingCount">Buildings: 0</div>
+      <div id="population">Population: 0</div>
+      <div id="mode">Mode: Build</div>
+    </div>
+    <div id="buttons">
+      <button data-type="0" class="selected">House</button>
+      <button data-type="1">Office</button>
+      <button data-type="2">Factory</button>
+      <button data-type="3">Park</button>
+      <button id="resetBtn">Reset</button>
+    </div>
+    <div id="help">Keys: U = Undo, D = Toggle Demolish Mode</div>
+  </div>
+
+  <script type="module">
+    import * as THREE from "https://unpkg.com/three@0.160.0/build/three.module.js";
+    import { OrbitControls } from "https://unpkg.com/three@0.160.0/examples/jsm/controls/OrbitControls.js";
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color("#87CEEB");
+
+    const camera = new THREE.PerspectiveCamera(
+      60,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      1000
+    );
+    camera.position.set(30, 40, 30);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    document.body.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.set(0, 0, 0);
+    controls.enableDamping = true;
+
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+    scene.add(ambientLight);
+
+    const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+    dirLight.position.set(50, 80, 50);
+    scene.add(dirLight);
+
+    const groundGeo = new THREE.PlaneGeometry(100, 100);
+    const groundMat = new THREE.MeshLambertMaterial({ color: "#4a7c4f" });
+    const ground = new THREE.Mesh(groundGeo, groundMat);
+    ground.rotation.x = -Math.PI / 2;
+    ground.position.y = 0;
+    ground.receiveShadow = true;
+    scene.add(ground);
+
+    const gridHelper = new THREE.GridHelper(100, 10, 0x000000, 0x000000);
+    gridHelper.position.y = 0.05;
+    scene.add(gridHelper);
+
+    const BUILDINGS = [
+      { name: "House", width: 6, height: 8, depth: 6, color: "#c0392b", cost: 100, population: 10 },
+      { name: "Office", width: 8, height: 16, depth: 8, color: "#2980b9", cost: 250, population: 50 },
+      { name: "Factory", width: 12, height: 10, depth: 10, color: "#7f8c8d", cost: 400, population: 30 },
+      { name: "Park", width: 10, height: 1, depth: 10, color: "#27ae60", cost: 50, population: 5 }
+    ];
+
+    const GRID_SIZE = 10;
+    const CELL_SIZE = 10;
+    const HALF_GRID = 50;
+
+    const ui = {
+      p1Budget: document.getElementById("p1Budget"),
+      p2Budget: document.getElementById("p2Budget"),
+      buildingCount: document.getElementById("buildingCount"),
+      population: document.getElementById("population"),
+      mode: document.getElementById("mode"),
+      buttons: [...document.querySelectorAll("button[data-type]")],
+      reset: document.getElementById("resetBtn")
+    };
+
+    const state = {
+      player1Budget: 2000,
+      player2Budget: 2000,
+      selectedType: 0,
+      totalBuildings: 0,
+      player1Buildings: 0,
+      player2Buildings: 0,
+      population: 0,
+      demolishMode: false,
+      gridOccupied: {},
+      lastAction: "none",
+      undoStack: [],
+      aiPlacementCount: 0
+    };
+
+    window.__3D_STATE__ = state;
+
+    const raycaster = new THREE.Raycaster();
+    const mouse = new THREE.Vector2();
+
+    let hoveredCell = null;
+    let previewMesh = null;
+
+    const buildingGroup = new THREE.Group();
+    scene.add(buildingGroup);
+
+    function safeNumber(n) {
+      return Number.isFinite(n) ? n : 0;
+    }
+
+    function clampBudget(n) {
+      n = safeNumber(n);
+      return Math.max(0, Math.floor(n));
+    }
+
+    function gridKey(gx, gz) {
+      return `${gx}_${gz}`;
+    }
+
+    function gridToWorld(gx, gz) {
+      return {
+        x: -HALF_GRID + CELL_SIZE / 2 + gx * CELL_SIZE,
+        z: -HALF_GRID + CELL_SIZE / 2 + gz * CELL_SIZE
+      };
+    }
+
+    function worldToGrid(x, z) {
+      const gx = Math.floor((x + HALF_GRID) / CELL_SIZE);
+      const gz = Math.floor((z + HALF_GRID) / CELL_SIZE);
+      if (gx < 0 || gx >= GRID_SIZE || gz < 0 || gz >= GRID_SIZE) return null;
+      return { gx, gz };
+    }
+
+    function createBuildingMesh(type, player) {
+      const def = BUILDINGS[type];
+      const geom = new THREE.BoxGeometry(def.width, def.height, def.depth);
+
+      const baseColor = new THREE.Color(def.color);
+      if (player === 2) {
+        baseColor.lerp(new THREE.Color(0xffffff), 0.2);
+      }
+
+      const mat = new THREE.MeshLambertMaterial({ color: baseColor });
+      const mesh = new THREE.Mesh(geom, mat);
+      mesh.userData.type = type;
+      mesh.userData.player = player;
+      return mesh;
+    }
+
+    function createPreviewMesh(type) {
+      if (previewMesh) {
+        scene.remove(previewMesh);
+        previewMesh.geometry.dispose();
+        previewMesh.material.dispose();
+      }
+
+      const def = BUILDINGS[type];
+      const geom = new THREE.BoxGeometry(def.width, def.height, def.depth);
+      const mat = new THREE.MeshLambertMaterial({
+        color: def.color,
+        transparent: true,
+        opacity: 0.4
+      });
+
+      previewMesh = new THREE.Mesh(geom, mat);
+      previewMesh.visible = false;
+      scene.add(previewMesh);
+    }
+
+    function updatePreview() {
+      createPreviewMesh(state.selectedType);
+    }
+
+    function updateUI() {
+      state.player1Budget = clampBudget(state.player1Budget);
+      state.player2Budget = clampBudget(state.player2Budget);
+      state.population = safeNumber(state.population);
+      state.totalBuildings = safeNumber(state.totalBuildings);
+      state.player1Buildings = safeNumber(state.player1Buildings);
+      state.player2Buildings = safeNumber(state.player2Buildings);
+      state.aiPlacementCount = safeNumber(state.aiPlacementCount);
+
+      ui.p1Budget.textContent = `Player 1 Budget: $${state.player1Budget}`;
+      ui.p2Budget.textContent = `Player 2 Budget: $${state.player2Budget}`;
+      ui.buildingCount.textContent = `Buildings: ${state.totalBuildings}`;
+      ui.population.textContent = `Population: ${state.population}`;
+      ui.mode.textContent = `Mode: ${state.demolishMode ? "Demolish" : "Build"}`;
+
+      document.body.classList.toggle("demolish", state.demolishMode);
+
+      ui.buttons.forEach(btn => {
+        const isSelected = Number(btn.dataset.type) === state.selectedType;
+        btn.classList.toggle("selected", isSelected);
+      });
+    }
+
+    function recalcStats() {
+      let totalBuildings = 0;
+      let player1Buildings = 0;
+      let player2Buildings = 0;
+      let population = 0;
+
+      for (const key in state.gridOccupied) {
+        const item = state.gridOccupied[key];
+        if (!item) continue;
+        totalBuildings++;
+        if (item.player === 1) player1Buildings++;
+        if (item.player === 2) player2Buildings++;
+        const def = BUILDINGS[item.type];
+        population += def ? def.population : 0;
+      }
+
+      state.totalBuildings = safeNumber(totalBuildings);
+      state.player1Buildings = safeNumber(player1Buildings);
+      state.player2Buildings = safeNumber(player2Buildings);
+      state.population = safeNumber(population);
+    }
+
+    function placeBuilding(gx, gz, type, player, recordUndo = false) {
+      const key = gridKey(gx, gz);
+      if (state.gridOccupied[key]) return false;
+
+      const def = BUILDINGS[type];
+      if (!def) return false;
+
+      if (player === 1) {
+        if (state.player1Budget < def.cost) return false;
+      } else if (player === 2) {
+        if (state.player2Budget < def.cost) return false;
+      }
+
+      const mesh = createBuildingMesh(type, player);
+      const pos = gridToWorld(gx, gz);
+      mesh.position.set(pos.x, def.height / 2, pos.z);
+      mesh.userData.gridX = gx;
+      mesh.userData.gridZ = gz;
+      mesh.userData.cost = def.cost;
+
+      buildingGroup.add(mesh);
+
+      state.gridOccupied[key] = {
+        player,
+        type,
+        cost: def.cost,
+        mesh
+      };
+
+      if (player === 1) {
+        state.player1Budget = clampBudget(state.player1Budget - def.cost);
+        if (recordUndo) {
+          state.undoStack.push({
+            action: "place",
+            gx,
+            gz,
+            type,
+            cost: def.cost
+          });
+        }
+        state.lastAction = "place";
+      } else {
+        state.player2Budget = clampBudget(state.player2Budget - def.cost);
+        state.aiPlacementCount = safeNumber(state.aiPlacementCount) + 1;
+      }
+
+      recalcStats();
+      updateUI();
+      return true;
+    }
+
+    function removeBuilding(gx, gz, refund = 0, actionLabel = "none") {
+      const key = gridKey(gx, gz);
+      const entry = state.gridOccupied[key];
+      if (!entry) return false;
+
+      if (entry.mesh) {
+        buildingGroup.remove(entry.mesh);
+        entry.mesh.geometry.dispose();
+        entry.mesh.material.dispose();
+      }
+
+      delete state.gridOccupied[key];
+
+      if (entry.player === 1 && refund > 0) {
+        state.player1Budget = clampBudget(state.player1Budget + refund);
+      }
+      if (entry.player === 2 && refund > 0) {
+        state.player2Budget = clampBudget(state.player2Budget + refund);
+      }
+
+      state.lastAction = actionLabel;
+      recalcStats();
+      updateUI();
+      return true;
+    }
+
+    function undoLast() {
+      while (state.undoStack.length > 0) {
+        const last = state.undoStack.pop();
+        if (last.action === "place") {
+          const key = gridKey(last.gx, last.gz);
+          const entry = state.gridOccupied[key];
+          if (entry && entry.player === 1) {
+            removeBuilding(last.gx, last.gz, last.cost, "undo");
+            return;
+          }
+        }
+      }
+    }
+
+    function resetAll() {
+      const meshes = [];
+      for (const key in state.gridOccupied) {
+        const item = state.gridOccupied[key];
+        if (item && item.mesh) meshes.push(item.mesh);
+      }
+      meshes.forEach(mesh => {
+        buildingGroup.remove(mesh);
+        mesh.geometry.dispose();
+        mesh.material.dispose();
+      });
+
+      state.player1Budget = 2000;
+      state.player2Budget = 2000;
+      state.selectedType = 0;
+      state.totalBuildings = 0;
+      state.player1Buildings = 0;
+      state.player2Buildings = 0;
+      state.population = 0;
+      state.demolishMode = false;
+      state.gridOccupied = {};
+      state.lastAction = "reset";
+      state.undoStack = [];
+      state.aiPlacementCount = 0;
+
+      window.__3D_STATE__ = state;
+      updatePreview();
+      updateUI();
+    }
+
+    function getRandomEmptyCell() {
+      const empties = [];
+      for (let gx = 0; gx < GRID_SIZE; gx++) {
+        for (let gz = 0; gz < GRID_SIZE; gz++) {
+          const key = gridKey(gx, gz);
+          if (!state.gridOccupied[key]) empties.push({ gx, gz });
+        }
+      }
+      if (empties.length === 0) return null;
+      return empties[Math.floor(Math.random() * empties.length)];
+    }
+
+    function aiPlaceRandom() {
+      const affordableTypes = BUILDINGS
+        .map((b, i) => ({ ...b, type: i }))
+        .filter(b => state.player2Budget >= b.cost);
+
+      if (affordableTypes.length === 0) return;
+
+      const cell = getRandomEmptyCell();
+      if (!cell) return;
+
+      const choice = affordableTypes[Math.floor(Math.random() * affordableTypes.length)];
+      placeBuilding(cell.gx, cell.gz, choice.type, 2, false);
+    }
+
+    function updateHoverFromMouse(event) {
+      mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+      mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+      raycaster.setFromCamera(mouse, camera);
+      const intersects = raycaster.intersectObject(ground);
+
+      if (intersects.length === 0) {
+        hoveredCell = null;
+        if (previewMesh) previewMesh.visible = false;
+        return;
+      }
+
+      const p = intersects[0].point;
+      const cell = worldToGrid(p.x, p.z);
+
+      if (!cell) {
+        hoveredCell = null;
+        if (previewMesh) previewMesh.visible = false;
+        return;
+      }
+
+      hoveredCell = cell;
+
+      if (!previewMesh) updatePreview();
+
+      const def = BUILDINGS[state.selectedType];
+      const pos = gridToWorld(cell.gx, cell.gz);
+      previewMesh.position.set(pos.x, def.height / 2, pos.z);
+
+      const occupied = !!state.gridOccupied[gridKey(cell.gx, cell.gz)];
+      previewMesh.visible = !state.demolishMode && !occupied;
+    }
+
+    function onClick() {
+      if (!hoveredCell) return;
+
+      const key = gridKey(hoveredCell.gx, hoveredCell.gz);
+      const occupied = state.gridOccupied[key];
+
+      if (state.demolishMode) {
+        if (occupied && occupied.player === 1) {
+          const refund = Math.floor(safeNumber(occupied.cost) * 0.5);
+          removeBuilding(hoveredCell.gx, hoveredCell.gz, refund, "demolish");
+        }
+        return;
+      }
+
+      if (occupied) return;
+      placeBuilding(hoveredCell.gx, hoveredCell.gz, state.selectedType, 1, true);
+    }
+
+    ui.buttons.forEach(btn => {
+      btn.addEventListener("click", () => {
+        state.selectedType = Number(btn.dataset.type);
+        updatePreview();
+        updateUI();
+        if (hoveredCell && previewMesh) {
+          const def = BUILDINGS[state.selectedType];
+          const pos = gridToWorld(hoveredCell.gx, hoveredCell.gz);
+          previewMesh.position.set(pos.x, def.height / 2, pos.z);
+          previewMesh.visible = !state.demolishMode && !state.gridOccupied[gridKey(hoveredCell.gx, hoveredCell.gz)];
+        }
+      });
+    });
+
+    ui.reset.addEventListener("click", resetAll);
+
+    window.addEventListener("mousemove", updateHoverFromMouse);
+    window.addEventListener("click", onClick);
+
+    window.addEventListener("keydown", (e) => {
+      const key = e.key.toLowerCase();
+      if (key === "u") {
+        undoLast();
+      } else if (key === "d") {
+        state.demolishMode = !state.demolishMode;
+        state.lastAction = "none";
+        updateUI();
+        if (previewMesh) previewMesh.visible = !state.demolishMode && !!hoveredCell && !state.gridOccupied[gridKey(hoveredCell?.gx ?? -1, hoveredCell?.gz ?? -1)];
+      }
+    });
+
+    window.addEventListener("resize", () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    updatePreview();
+    updateUI();
+
+    setInterval(() => {
+      aiPlaceRandom();
+    }, 8000);
+
+    function animate() {
+      requestAnimationFrame(animate);
+      controls.update();
+      renderer.render(scene, camera);
+    }
+
+    animate();
+  </script>
+</body>
+</html>

@@ -1,0 +1,933 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3D Slider Puzzle - Hidden Duck</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { overflow: hidden; background: #1a1a2e; font-family: 'Segoe UI', sans-serif; }
+  canvas { display: block; }
+  #hud {
+    position: absolute; top: 20px; left: 20px;
+    background: rgba(0,0,0,0.75); color: #e0e0e0;
+    padding: 16px 24px; border-radius: 12px;
+    font-size: 14px; line-height: 2;
+    backdrop-filter: blur(10px);
+    border: 1px solid rgba(255,255,255,0.1);
+    min-width: 220px;
+  }
+  #hud .label { color: #888; font-size: 12px; text-transform: uppercase; letter-spacing: 1px; }
+  #hud .value { color: #4fc3f7; font-weight: bold; font-size: 16px; }
+  #hud .solved-true { color: #66bb6a; }
+  #hud .solved-false { color: #ef5350; }
+  #shuffleBtn {
+    position: absolute; bottom: 30px; left: 50%; transform: translateX(-50%);
+    padding: 14px 36px; font-size: 16px; font-weight: bold;
+    background: linear-gradient(135deg, #667eea, #764ba2);
+    color: white; border: none; border-radius: 30px;
+    cursor: pointer; letter-spacing: 1px;
+    box-shadow: 0 4px 20px rgba(102,126,234,0.4);
+    transition: all 0.3s;
+  }
+  #shuffleBtn:hover {
+    transform: translateX(-50%) scale(1.05);
+    box-shadow: 0 6px 30px rgba(102,126,234,0.6);
+  }
+  #completeBanner {
+    position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+    background: rgba(0,0,0,0.85); color: #ffd54f;
+    padding: 30px 50px; border-radius: 16px;
+    font-size: 28px; font-weight: bold; text-align: center;
+    display: none; backdrop-filter: blur(10px);
+    border: 2px solid #ffd54f;
+    animation: popIn 0.5s ease;
+  }
+  @keyframes popIn {
+    0% { transform: translate(-50%, -50%) scale(0.5); opacity: 0; }
+    100% { transform: translate(-50%, -50%) scale(1); opacity: 1; }
+  }
+</style>
+<script type="importmap">
+{ "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="hud">
+  <div><span class="label">Moves: </span><span class="value" id="moves">0</span></div>
+  <div><span class="label">Solved: </span><span class="value" id="solved">false</span></div>
+  <div><span class="label">Duck Revealed: </span><span class="value" id="duckRevealed">false</span></div>
+  <div><span class="label">Time: </span><span class="value" id="elapsed">0s</span></div>
+</div>
+<button id="shuffleBtn">🔀 Shuffle</button>
+<div id="completeBanner">🎉 Puzzle Solved! 🦆</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// ---- State ----
+let moveCount = 0;
+let solved = false;
+let duckRevealed = false;
+let modelLoaded = false;
+let startTime = Date.now();
+let elapsedSeconds = 0;
+let isAnimating = false;
+let puzzleActive = true;
+
+// Grid: 3x3, values 1-8 and 0 for empty
+// grid[row][col], row 0 = top, col 0 = left
+let grid = [
+  [1, 2, 3],
+  [4, 5, 6],
+  [7, 8, 0]
+];
+let emptyRow = 2, emptyCol = 2;
+
+// Block objects keyed by number
+const blocks = {};
+let duckModel = null;
+let duckMixer = null;
+let boxTemplate = null;
+let boxAnimations = [];
+const blockMixers = [];
+
+window.__3D_STATE__ = {
+  modelLoaded: false,
+  moveCount: 0,
+  solved: false,
+  duckRevealed: false,
+  elapsed: 0,
+  emptySlot: { row: 2, col: 2 }
+};
+
+// ---- Scene Setup ----
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x1a1a2e);
+scene.fog = new THREE.FogExp2(0x1a1a2e, 0.03);
+
+const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 100);
+camera.position.set(0, 8, 10);
+camera.lookAt(0, 0, 0);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.2;
+document.body.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+controls.minDistance = 5;
+controls.maxDistance = 20;
+controls.maxPolarAngle = Math.PI / 2.2;
+controls.target.set(0, 0, 0);
+
+// ---- Lights ----
+const ambientLight = new THREE.AmbientLight(0x404060, 0.8);
+scene.add(ambientLight);
+
+const dirLight = new THREE.DirectionalLight(0xffffff, 2.0);
+dirLight.position.set(5, 10, 7);
+dirLight.castShadow = true;
+dirLight.shadow.mapSize.set(2048, 2048);
+dirLight.shadow.camera.near = 0.5;
+dirLight.shadow.camera.far = 30;
+dirLight.shadow.camera.left = -8;
+dirLight.shadow.camera.right = 8;
+dirLight.shadow.camera.top = 8;
+dirLight.shadow.camera.bottom = -8;
+scene.add(dirLight);
+
+const pointLight = new THREE.PointLight(0x4fc3f7, 1, 20);
+pointLight.position.set(-3, 5, -3);
+scene.add(pointLight);
+
+const pointLight2 = new THREE.PointLight(0xff6f91, 0.5, 15);
+pointLight2.position.set(3, 4, 3);
+scene.add(pointLight2);
+
+// ---- Ground ----
+const groundGeo = new THREE.PlaneGeometry(20, 20);
+const groundMat = new THREE.MeshStandardMaterial({ color: 0x16213e, roughness: 0.8 });
+const ground = new THREE.Mesh(groundGeo, groundMat);
+ground.rotation.x = -Math.PI / 2;
+ground.position.y = -0.5;
+ground.receiveShadow = true;
+scene.add(ground);
+
+// Grid base plate
+const basePlateGeo = new THREE.BoxGeometry(5.2, 0.15, 5.2);
+const basePlateMat = new THREE.MeshStandardMaterial({ color: 0x0f3460, roughness: 0.5, metalness: 0.3 });
+const basePlate = new THREE.Mesh(basePlateGeo, basePlateMat);
+basePlate.position.y = -0.45;
+basePlate.receiveShadow = true;
+scene.add(basePlate);
+
+// ---- Spacing ----
+const SPACING = 1.7;
+
+function gridToWorld(row, col) {
+  return new THREE.Vector3(
+    (col - 1) * SPACING,
+    0,
+    (row - 1) * SPACING
+  );
+}
+
+// ---- Colors for blocks ----
+const blockColors = {
+  1: 0xe74c3c,
+  2: 0xe67e22,
+  3: 0xf1c40f,
+  4: 0x2ecc71,
+  5: 0x9b59b6,
+  6: 0x3498db,
+  7: 0x1abc9c,
+  8: 0xe91e63
+};
+
+// ---- Create fallback block ----
+function createFallbackBlock(num) {
+  const group = new THREE.Group();
+
+  // Main box
+  const boxGeo = new THREE.BoxGeometry(1.3, 1.0, 1.3);
+  const boxMat = new THREE.MeshStandardMaterial({
+    color: blockColors[num] || 0x888888,
+    roughness: 0.3,
+    metalness: 0.4
+  });
+  const box = new THREE.Mesh(boxGeo, boxMat);
+  box.castShadow = true;
+  box.receiveShadow = true;
+  box.position.y = 0.5;
+  group.add(box);
+
+  // Lid (for open animation)
+  const lidGeo = new THREE.BoxGeometry(1.3, 0.12, 1.3);
+  const lidMat = new THREE.MeshStandardMaterial({
+    color: blockColors[num] || 0x888888,
+    roughness: 0.2,
+    metalness: 0.5
+  });
+  const lid = new THREE.Mesh(lidGeo, lidMat);
+  lid.castShadow = true;
+  lid.position.set(0, 1.06, 0);
+  // Pivot for lid opening
+  const lidPivot = new THREE.Group();
+  lidPivot.position.set(0, 1.0, -0.65);
+  lid.position.set(0, 0.06, 0.65);
+  lidPivot.add(lid);
+  group.add(lidPivot);
+  group.userData.lidPivot = lidPivot;
+
+  // Number label
+  const canvas = document.createElement('canvas');
+  canvas.width = 128;
+  canvas.height = 128;
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = 'rgba(0,0,0,0.4)';
+  ctx.fillRect(0, 0, 128, 128);
+  ctx.fillStyle = '#ffffff';
+  ctx.font = 'bold 80px Arial';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(String(num), 64, 64);
+  const tex = new THREE.CanvasTexture(canvas);
+  const labelGeo = new THREE.PlaneGeometry(0.6, 0.6);
+  const labelMat = new THREE.MeshBasicMaterial({ map: tex, transparent: true });
+  const label = new THREE.Mesh(labelGeo, labelMat);
+  label.position.set(0, 1.07, 0);
+  label.rotation.x = -Math.PI / 2;
+  group.add(label);
+
+  return group;
+}
+
+// ---- Create block from GLTF or fallback ----
+function createBlock(num, gltfScene, animations) {
+  const group = new THREE.Group();
+  let mixer = null;
+  let openAction = null;
+
+  if (gltfScene) {
+    const clone = gltfScene.clone();
+    // Scale to fit grid
+    const bbox = new THREE.Box3().setFromObject(clone);
+    const size = bbox.getSize(new THREE.Vector3());
+    const maxDim = Math.max(size.x, size.y, size.z);
+    const scale = 1.2 / maxDim;
+    clone.scale.multiplyScalar(scale);
+
+    // Recalculate bbox after scale
+    const bbox2 = new THREE.Box3().setFromObject(clone);
+    const center = bbox2.getCenter(new THREE.Vector3());
+    clone.position.sub(center);
+    clone.position.y += bbox2.getSize(new THREE.Vector3()).y / 2;
+
+    clone.traverse(child => {
+      if (child.isMesh) {
+        child.castShadow = true;
+        child.receiveShadow = true;
+        if (child.material) {
+          child.material = child.material.clone();
+          child.material.color = new THREE.Color(blockColors[num] || 0x888888);
+        }
+      }
+    });
+
+    group.add(clone);
+
+    if (animations && animations.length > 0) {
+      mixer = new THREE.AnimationMixer(clone);
+      const clip = animations[0];
+      openAction = mixer.clipAction(clip);
+      openAction.setLoop(THREE.LoopOnce);
+      openAction.clampWhenFinished = true;
+      openAction.timeScale = 3;
+    }
+  } else {
+    const fallback = createFallbackBlock(num);
+    group.add(fallback);
+  }
+
+  // Number label on top
+  const canvas = document.createElement('canvas');
+  canvas.width = 128;
+  canvas.height = 128;
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, 128, 128);
+  ctx.fillStyle = 'rgba(0,0,0,0.5)';
+  ctx.beginPath();
+  ctx.arc(64, 64, 50, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = '#ffffff';
+  ctx.font = 'bold 72px Arial';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(String(num), 64, 64);
+  const tex = new THREE.CanvasTexture(canvas);
+  const labelGeo = new THREE.PlaneGeometry(0.5, 0.5);
+  const labelMat = new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthTest: false });
+  const label = new THREE.Mesh(labelGeo, labelMat);
+  label.position.set(0, 1.35, 0);
+  label.rotation.x = -Math.PI / 2;
+  label.renderOrder = 1;
+  group.add(label);
+
+  group.userData.num = num;
+  group.userData.mixer = mixer;
+  group.userData.openAction = openAction;
+
+  if (mixer) blockMixers.push(mixer);
+
+  return group;
+}
+
+// ---- Create Duck fallback ----
+function createFallbackDuck() {
+  const group = new THREE.Group();
+
+  // Body
+  const bodyGeo = new THREE.SphereGeometry(0.35, 16, 12);
+  const bodyMat = new THREE.MeshStandardMaterial({ color: 0xffd700, roughness: 0.4 });
+  const body = new THREE.Mesh(bodyGeo, bodyMat);
+  body.position.y = 0.35;
+  group.add(body);
+
+  // Head
+  const headGeo = new THREE.SphereGeometry(0.22, 16, 12);
+  const headMat = new THREE.MeshStandardMaterial({ color: 0xffd700, roughness: 0.4 });
+  const head = new THREE.Mesh(headGeo, headMat);
+  head.position.set(0, 0.7, 0.15);
+  group.add(head);
+
+  // Beak
+  const beakGeo = new THREE.ConeGeometry(0.08, 0.2, 8);
+  const beakMat = new THREE.MeshStandardMaterial({ color: 0xff8c00 });
+  const beak = new THREE.Mesh(beakGeo, beakMat);
+  beak.rotation.x = Math.PI / 2;
+  beak.position.set(0, 0.68, 0.38);
+  group.add(beak);
+
+  // Eyes
+  const eyeGeo = new THREE.SphereGeometry(0.04, 8, 8);
+  const eyeMat = new THREE.MeshStandardMaterial({ color: 0x000000 });
+  const eyeL = new THREE.Mesh(eyeGeo, eyeMat);
+  eyeL.position.set(-0.1, 0.76, 0.3);
+  group.add(eyeL);
+  const eyeR = new THREE.Mesh(eyeGeo, eyeMat);
+  eyeR.position.set(0.1, 0.76, 0.3);
+  group.add(eyeR);
+
+  return group;
+}
+
+// ---- Load models ----
+const loader = new GLTFLoader();
+let boxGLTF = null;
+let duckGLTF = null;
+let loadCount = 0;
+
+function onModelLoad() {
+  loadCount++;
+  if (loadCount >= 2) {
+    modelLoaded = true;
+    initPuzzle();
+  }
+}
+
+function initWithFallbacks() {
+  modelLoaded = true;
+  initPuzzle();
+}
+
+// Try loading models, use fallbacks if they fail
+let boxLoaded = false;
+let duckLoaded = false;
+let loadAttempts = 0;
+
+function checkAllLoaded() {
+  loadAttempts++;
+  if (loadAttempts >= 2) {
+    modelLoaded = true;
+    initPuzzle();
+  }
+}
+
+loader.load('assets/BoxAnimated.glb',
+  (gltf) => {
+    boxGLTF = gltf;
+    boxLoaded = true;
+    checkAllLoaded();
+  },
+  undefined,
+  (err) => {
+    console.warn('BoxAnimated.glb not found, using fallback', err);
+    checkAllLoaded();
+  }
+);
+
+loader.load('assets/Duck.glb',
+  (gltf) => {
+    duckGLTF = gltf;
+    duckLoaded = true;
+    checkAllLoaded();
+  },
+  undefined,
+  (err) => {
+    console.warn('Duck.glb not found, using fallback', err);
+    checkAllLoaded();
+  }
+);
+
+// Timeout fallback
+setTimeout(() => {
+  if (!modelLoaded) {
+    console.warn('Loading timeout, using fallbacks');
+    modelLoaded = true;
+    initPuzzle();
+  }
+}, 5000);
+
+let puzzleInitialized = false;
+
+function initPuzzle() {
+  if (puzzleInitialized) return;
+  puzzleInitialized = true;
+
+  // Create 8 blocks
+  for (let num = 1; num <= 8; num++) {
+    const blockScene = boxGLTF ? boxGLTF.scene : null;
+    const blockAnims = boxGLTF ? boxGLTF.animations : null;
+    const block = createBlock(num, blockScene, blockAnims);
+    blocks[num] = block;
+    scene.add(block);
+  }
+
+  // Create duck (hidden inside block 5)
+  if (duckGLTF) {
+    duckModel = duckGLTF.scene.clone();
+    const bbox = new THREE.Box3().setFromObject(duckModel);
+    const size = bbox.getSize(new THREE.Vector3());
+    const maxDim = Math.max(size.x, size.y, size.z);
+    const scale = 0.8 / maxDim;
+    duckModel.scale.multiplyScalar(scale);
+    const bbox2 = new THREE.Box3().setFromObject(duckModel);
+    const center = bbox2.getCenter(new THREE.Vector3());
+    duckModel.position.sub(center);
+    duckModel.position.y += 0.5;
+    duckModel.traverse(child => {
+      if (child.isMesh) {
+        child.castShadow = true;
+      }
+    });
+  } else {
+    duckModel = createFallbackDuck();
+  }
+  duckModel.visible = false;
+  scene.add(duckModel);
+
+  // Position blocks
+  updateBlockPositions();
+
+  // Shuffle
+  shufflePuzzle();
+
+  startTime = Date.now();
+}
+
+function updateBlockPositions() {
+  for (let r = 0; r < 3; r++) {
+    for (let c = 0; c < 3; c++) {
+      const num = grid[r][c];
+      if (num !== 0 && blocks[num]) {
+        const pos = gridToWorld(r, c);
+        blocks[num].position.copy(pos);
+      }
+    }
+  }
+}
+
+// ---- Find block position ----
+function findBlock(num) {
+  for (let r = 0; r < 3; r++) {
+    for (let c = 0; c < 3; c++) {
+      if (grid[r][c] === num) return { row: r, col: c };
+    }
+  }
+  return null;
+}
+
+// ---- Check adjacency ----
+function isAdjacentToEmpty(row, col) {
+  const dr = Math.abs(row - emptyRow);
+  const dc = Math.abs(col - emptyCol);
+  return (dr + dc === 1);
+}
+
+// ---- Move block ----
+function moveBlock(row, col, animate = true, callback = null) {
+  if (isAnimating && animate) return false;
+  if (!isAdjacentToEmpty(row, col)) return false;
+
+  const num = grid[row][col];
+  if (num === 0) return false;
+
+  const targetRow = emptyRow;
+  const targetCol = emptyCol;
+
+  // Update grid
+  grid[targetRow][targetCol] = num;
+  grid[row][col] = 0;
+  emptyRow = row;
+  emptyCol = col;
+
+  if (animate) {
+    isAnimating = true;
+    const block = blocks[num];
+    const targetPos = gridToWorld(targetRow, targetCol);
+    const startPos = block.position.clone();
+    const startTime = performance.now();
+    const duration = 300;
+
+    // Play box animation if available
+    if (block.userData.openAction) {
+      const action = block.userData.openAction;
+      action.reset();
+      action.play();
+    } else {
+      // Fallback lid animation
+      const lidPivot = block.children[0]?.userData?.lidPivot;
+      if (lidPivot) {
+        animateLid(lidPivot);
+      }
+    }
+
+    function animateSlide(now) {
+      const t = Math.min((now - startTime) / duration, 1);
+      const eased = 1 - Math.pow(1 - t, 3); // ease out cubic
+
+      block.position.lerpVectors(startPos, targetPos, eased);
+      // Add a little bounce in Y
+      block.position.y = Math.sin(eased * Math.PI) * 0.3;
+
+      if (t < 1) {
+        requestAnimationFrame(animateSlide);
+      } else {
+        block.position.copy(targetPos);
+        block.position.y = 0;
+        isAnimating = false;
+        moveCount++;
+        checkSolved();
+        if (callback) callback();
+      }
+    }
+    requestAnimationFrame(animateSlide);
+  } else {
+    const block = blocks[num];
+    const targetPos = gridToWorld(targetRow, targetCol);
+    block.position.copy(targetPos);
+  }
+
+  return true;
+}
+
+function animateLid(lidPivot) {
+  const startTime = performance.now();
+  const duration = 300;
+  function anim(now) {
+    const t = Math.min((now - startTime) / duration, 1);
+    // Open then close
+    if (t < 0.5) {
+      lidPivot.rotation.x = -(t * 2) * Math.PI * 0.4;
+    } else {
+      lidPivot.rotation.x = -((1 - t) * 2) * Math.PI * 0.4;
+    }
+    if (t < 1) requestAnimationFrame(anim);
+    else lidPivot.rotation.x = 0;
+  }
+  requestAnimationFrame(anim);
+}
+
+// ---- Check solved ----
+function checkSolved() {
+  const goal = [
+    [1, 2, 3],
+    [4, 5, 6],
+    [7, 8, 0]
+  ];
+  for (let r = 0; r < 3; r++) {
+    for (let c = 0; c < 3; c++) {
+      if (grid[r][c] !== goal[r][c]) {
+        solved = false;
+        return;
+      }
+    }
+  }
+  solved = true;
+  puzzleActive = false;
+  document.getElementById('completeBanner').style.display = 'block';
+  revealDuck();
+}
+
+// ---- Reveal Duck ----
+function revealDuck() {
+  if (duckRevealed) return;
+  duckRevealed = true;
+
+  const block5 = blocks[5];
+  const block5Pos = block5.position.clone();
+
+  // Play open animation on block 5
+  if (block5.userData.openAction) {
+    const action = block5.userData.openAction;
+    action.reset();
+    action.timeScale = 1;
+    action.play();
+  } else {
+    const lidPivot = block5.children[0]?.userData?.lidPivot;
+    if (lidPivot) {
+      // Open lid and keep open
+      const startTime = performance.now();
+      function openLid(now) {
+        const t = Math.min((now - startTime) / 500, 1);
+        lidPivot.rotation.x = -t * Math.PI * 0.6;
+        if (t < 1) requestAnimationFrame(openLid);
+      }
+      requestAnimationFrame(openLid);
+    }
+  }
+
+  // Duck rises from block 5
+  duckModel.visible = true;
+  duckModel.position.set(block5Pos.x, 0, block5Pos.z);
+
+  const riseStart = performance.now();
+  const riseDuration = 1500;
+  const startY = 0;
+  const endY = 2.5;
+
+  function riseDuck(now) {
+    const t = Math.min((now - riseStart) / riseDuration, 1);
+    const eased = 1 - Math.pow(1 - t, 3);
+    duckModel.position.y = startY + (endY - startY) * eased;
+    duckModel.rotation.y = t * Math.PI * 2;
+
+    if (t < 1) {
+      requestAnimationFrame(riseDuck);
+    } else {
+      // Start continuous rotation
+      duckModel.userData.spinning = true;
+    }
+  }
+
+  setTimeout(() => requestAnimationFrame(riseDuck), 500);
+}
+
+// ---- Shuffle ----
+function shufflePuzzle() {
+  // Reset
+  grid = [
+    [1, 2, 3],
+    [4, 5, 6],
+    [7, 8, 0]
+  ];
+  emptyRow = 2;
+  emptyCol = 2;
+
+  const numMoves = 30 + Math.floor(Math.random() * 21); // 30-50
+  let lastMove = null;
+
+  for (let i = 0; i < numMoves; i++) {
+    const neighbors = [];
+    const dirs = [[-1, 0], [1, 0], [0, -1], [0, 1]];
+    for (const [dr, dc] of dirs) {
+      const nr = emptyRow + dr;
+      const nc = emptyCol + dc;
+      if (nr >= 0 && nr < 3 && nc >= 0 && nc < 3) {
+        // Don't reverse last move
+        if (lastMove && nr === lastMove.row && nc === lastMove.col) continue;
+        neighbors.push({ row: nr, col: nc });
+      }
+    }
+    const choice = neighbors[Math.floor(Math.random() * neighbors.length)];
+    lastMove = { row: emptyRow, col: emptyCol };
+
+    // Swap
+    const num = grid[choice.row][choice.col];
+    grid[emptyRow][emptyCol] = num;
+    grid[choice.row][choice.col] = 0;
+    emptyRow = choice.row;
+    emptyCol = choice.col;
+  }
+
+  updateBlockPositions();
+  moveCount = 0;
+  solved = false;
+  duckRevealed = false;
+  puzzleActive = true;
+  startTime = Date.now();
+  document.getElementById('completeBanner').style.display = 'none';
+
+  if (duckModel) {
+    duckModel.visible = false;
+    duckModel.userData.spinning = false;
+  }
+
+  // Reset lid animations
+  for (let num = 1; num <= 8; num++) {
+    if (blocks[num]) {
+      const lidPivot = blocks[num].children[0]?.userData?.lidPivot;
+      if (lidPivot) lidPivot.rotation.x = 0;
+      if (blocks[num].userData.openAction) {
+        blocks[num].userData.openAction.reset();
+        blocks[num].userData.openAction.stop();
+      }
+    }
+  }
+}
+
+// ---- Shuffle button ----
+document.getElementById('shuffleBtn').addEventListener('click', () => {
+  if (!modelLoaded || !puzzleInitialized) return;
+  shufflePuzzle();
+});
+
+// ---- Raycasting for click ----
+const raycaster = new THREE.Raycaster();
+const mouse = new THREE.Vector2();
+
+renderer.domElement.addEventListener('click', (event) => {
+  if (!puzzleActive || isAnimating || !puzzleInitialized) return;
+
+  mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+  mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+  raycaster.setFromCamera(mouse, camera);
+
+  // Check intersection with all blocks
+  const blockObjects = Object.values(blocks);
+  const intersects = raycaster.intersectObjects(blockObjects, true);
+
+  if (intersects.length > 0) {
+    // Find which block was clicked
+    let clickedBlock = intersects[0].object;
+    while (clickedBlock.parent && !clickedBlock.userData.num) {
+      clickedBlock = clickedBlock.parent;
+    }
+    const num = clickedBlock.userData.num;
+    if (num) {
+      const pos = findBlock(num);
+      if (pos && isAdjacentToEmpty(pos.row, pos.col)) {
+        moveBlock(pos.row, pos.col, true);
+      }
+    }
+  }
+});
+
+// ---- HUD Update ----
+function updateHUD() {
+  if (puzzleActive && puzzleInitialized && !solved) {
+    elapsedSeconds = Math.floor((Date.now() - startTime) / 1000);
+  }
+
+  document.getElementById('moves').textContent = moveCount;
+  const solvedEl = document.getElementById('solved');
+  solvedEl.textContent = solved ? 'true' : 'false';
+  solvedEl.className = 'value ' + (solved ? 'solved-true' : 'solved-false');
+  document.getElementById('duckRevealed').textContent = duckRevealed ? 'true' : 'false';
+  document.getElementById('elapsed').textContent = elapsedSeconds + 's';
+
+  window.__3D_STATE__ = {
+    modelLoaded,
+    moveCount,
+    solved,
+    duckRevealed,
+    elapsed: elapsedSeconds,
+    emptySlot: { row: emptyRow, col: emptyCol }
+  };
+}
+
+// ---- Particles for celebration ----
+let particles = null;
+
+function createParticles() {
+  const count = 200;
+  const geo = new THREE.BufferGeometry();
+  const positions = new Float32Array(count * 3);
+  const colors = new Float32Array(count * 3);
+  const velocities = [];
+
+  for (let i = 0; i < count; i++) {
+    positions[i * 3] = (Math.random() - 0.5) * 0.5;
+    positions[i * 3 + 1] = 2 + Math.random() * 2;
+    positions[i * 3 + 2] = (Math.random() - 0.5) * 0.5;
+
+    const color = new THREE.Color().setHSL(Math.random(), 0.8, 0.6);
+    colors[i * 3] = color.r;
+    colors[i * 3 + 1] = color.g;
+    colors[i * 3 + 2] = color.b;
+
+    velocities.push(new THREE.Vector3(
+      (Math.random() - 0.5) * 0.05,
+      Math.random() * 0.03 + 0.01,
+      (Math.random() - 0.5) * 0.05
+    ));
+  }
+
+  geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+  const mat = new THREE.PointsMaterial({
+    size: 0.08,
+    vertexColors: true,
+    transparent: true,
+    opacity: 0.8
+  });
+
+  particles = new THREE.Points(geo, mat);
+  particles.userData.velocities = velocities;
+  scene.add(particles);
+}
+
+function updateParticles() {
+  if (!particles) return;
+  const positions = particles.geometry.attributes.position.array;
+  const velocities = particles.userData.velocities;
+
+  for (let i = 0; i < velocities.length; i++) {
+    positions[i * 3] += velocities[i].x;
+    positions[i * 3 + 1] += velocities[i].y;
+    positions[i * 3 + 2] += velocities[i].z;
+
+    velocities[i].y -= 0.0005; // gravity
+
+    if (positions[i * 3 + 1] < 0) {
+      positions[i * 3 + 1] = 2 + Math.random();
+      velocities[i].y = Math.random() * 0.03 + 0.01;
+    }
+  }
+  particles.geometry.attributes.position.needsUpdate = true;
+}
+
+let particlesCreated = false;
+
+// ---- Animation Loop ----
+const clock = new THREE.Clock();
+
+function animate() {
+  requestAnimationFrame(animate);
+
+  const delta = clock.getDelta();
+
+  controls.update();
+
+  // Update block mixers
+  for (const mixer of blockMixers) {
+    mixer.update(delta);
+  }
+
+  // Spin duck
+  if (duckModel && duckModel.userData.spinning) {
+    duckModel.rotation.y += delta * 2;
+    // Gentle bob
+    duckModel.position.y = 2.5 + Math.sin(performance.now() * 0.002) * 0.15;
+  }
+
+  // Celebration particles
+  if (solved && duckRevealed) {
+    if (!particlesCreated) {
+      createParticles();
+      particlesCreated = true;
+    }
+    updateParticles();
+  } else if (particlesCreated && particles) {
+    scene.remove(particles);
+    particles.geometry.dispose();
+    particles.material.dispose();
+    particles = null;
+    particlesCreated = false;
+  }
+
+  // Subtle block hover animation
+  if (puzzleActive && puzzleInitialized) {
+    for (let num = 1; num <= 8; num++) {
+      if (blocks[num] && !isAnimating) {
+        const pos = findBlock(num);
+        if (pos && isAdjacentToEmpty(pos.row, pos.col)) {
+          // Subtle pulse for movable blocks
+          const pulse = 1 + Math.sin(performance.now() * 0.004 + num) * 0.02;
+          blocks[num].scale.setScalar(pulse);
+        } else {
+          blocks[num].scale.setScalar(1);
+        }
+      }
+    }
+  }
+
+  updateHUD();
+  renderer.render(scene, camera);
+}
+
+animate();
+
+// ---- Resize ----
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,567 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Network Topology</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #0a0a1a;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            color: white;
+        }
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+        }
+        #ui-panel {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            background: rgba(10, 10, 26, 0.8);
+            border: 1px solid #444466;
+            padding: 15px;
+            border-radius: 8px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.5);
+            backdrop-filter: blur(5px);
+            width: 200px;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            z-index: 10;
+        }
+        h2 {
+            margin: 0 0 10px 0;
+            font-size: 16px;
+            text-align: center;
+            color: #00ffaa;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+        button {
+            background: #222244;
+            color: white;
+            border: 1px solid #444466;
+            padding: 8px;
+            border-radius: 4px;
+            cursor: pointer;
+            transition: all 0.2s;
+            font-weight: bold;
+        }
+        button:hover {
+            background: #333366;
+            border-color: #00ffaa;
+        }
+        button:active {
+            background: #00ffaa;
+            color: #0a0a1a;
+        }
+        #statusLabel {
+            text-align: center;
+            font-size: 12px;
+            color: #aaaaaa;
+            min-height: 15px;
+            margin-top: 5px;
+        }
+        #instructions {
+            position: absolute;
+            bottom: 20px;
+            left: 20px;
+            background: rgba(10, 10, 26, 0.7);
+            padding: 15px;
+            border-radius: 8px;
+            border: 1px solid #333344;
+            pointer-events: none;
+            font-size: 13px;
+            line-height: 1.5;
+            color: #cccccc;
+        }
+        .key {
+            background: #333;
+            padding: 2px 6px;
+            border-radius: 3px;
+            color: #fff;
+            font-family: monospace;
+        }
+    </style>
+    <!-- Import maps polyfill -->
+    <script async src="https://unpkg.com/es-module-shims@1.8.0/dist/es-module-shims.js"></script>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="canvas-container"></div>
+    
+    <div id="ui-panel">
+        <h2>Network State</h2>
+        <button id="saveBtn">Save State</button>
+        <button id="loadBtn">Load State</button>
+        <button id="resetBtn">Reset</button>
+        <div id="statusLabel">Ready</div>
+    </div>
+
+    <div id="instructions">
+        <strong>Controls:</strong><br>
+        Left Click: Select Node<br>
+        <span class="key">D</span>: Toggle Active Status<br>
+        <span class="key">A</span>: Add Edge (between last 2 selected)<br>
+        <span class="key">R</span>: Remove Edges (from selected)
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+        // --- STATE MANAGEMENT ---
+        const DEFAULT_EDGES = [
+            [0, 1], [0, 2], [0, 7], [1, 3], [1, 5], [2, 4], [2, 6], [7, 1], [7, 2]
+        ];
+
+        window.__3D_STATE__ = {
+            nodeCount: 8,
+            edgeCount: 9,
+            selectedNodeIndex: -1,
+            lastSelectedNodeIndex: -1,
+            nodesActive: Array(8).fill(true),
+            edgeList: JSON.parse(JSON.stringify(DEFAULT_EDGES)),
+            activePacketCount: 0,
+            stateSaved: false,
+            stateLoaded: false,
+            mobileNodeLoaded: false,
+            cameraDistance: 0
+        };
+
+        // --- SCENE SETUP ---
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x0a0a1a);
+
+        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.set(0, 15, 25);
+        camera.lookAt(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        container.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.05;
+
+        // Lights
+        const ambientLight = new THREE.AmbientLight(0x404060, 0.5);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+        dirLight.position.set(10, 20, 10);
+        scene.add(dirLight);
+
+        // Grid
+        const gridHelper = new THREE.GridHelper(40, 20, 0x222244, 0x222244);
+        scene.add(gridHelper);
+
+        // --- DATA STRUCTURES ---
+        const nodes = []; // Array of objects containing mesh, group, originalColor
+        const edgeLines = []; // Array of visual line objects
+        const packets = []; // Array of packet objects
+        
+        // Materials
+        const activeEdgeMat = new THREE.LineBasicMaterial({ color: 0x00ffaa, transparent: true, opacity: 0.6 });
+        const inactiveEdgeMat = new THREE.LineDashedMaterial({ color: 0x555555, dashSize: 0.5, gapSize: 0.5, transparent: true, opacity: 0.3 });
+        const packetMat = new THREE.MeshBasicMaterial({ color: 0x00ffff });
+        const packetGeo = new THREE.SphereGeometry(0.15, 8, 8);
+
+        // --- NODE CREATION ---
+        const nodeDefinitions = [
+            { id: 0, name: 'Router', type: 'sphere', r: 0.8, pos: [0, 3, 0], color: 0xff4444 },
+            { id: 1, name: 'Server-1', type: 'box', size: [1, 1.5, 1], pos: [-5, 2, -3], color: 0x44ff44 },
+            { id: 2, name: 'Server-2', type: 'box', size: [1, 1.5, 1], pos: [5, 2, -3], color: 0x44ff44 },
+            { id: 3, name: 'WS-1', type: 'sphere', r: 0.5, pos: [-7, 1, 3], color: 0x4488ff },
+            { id: 4, name: 'WS-2', type: 'sphere', r: 0.5, pos: [7, 1, 3], color: 0x4488ff },
+            { id: 5, name: 'WS-3', type: 'sphere', r: 0.5, pos: [-3, 1, 7], color: 0x4488ff },
+            { id: 6, name: 'Mobile', type: 'gltf', pos: [3, 0, 7], color: 0xaaaaaa }, // Fallback color
+            { id: 7, name: 'Firewall', type: 'octahedron', r: 0.7, pos: [0, 2, -6], color: 0xffaa00 }
+        ];
+
+        function createTextSprite(message) {
+            const canvas = document.createElement('canvas');
+            const context = canvas.getContext('2d');
+            canvas.width = 256;
+            canvas.height = 64;
+            context.font = "Bold 24px Arial";
+            context.fillStyle = "rgba(0,0,0,0)";
+            context.fillRect(0, 0, canvas.width, canvas.height);
+            context.fillStyle = "white";
+            context.textAlign = "center";
+            context.fillText(message, 128, 40);
+            
+            const texture = new THREE.CanvasTexture(canvas);
+            const spriteMaterial = new THREE.SpriteMaterial({ map: texture, depthTest: false });
+            const sprite = new THREE.Sprite(spriteMaterial);
+            sprite.scale.set(4, 1, 1);
+            return sprite;
+        }
+
+        function initNodes() {
+            const loader = new GLTFLoader();
+
+            nodeDefinitions.forEach(def => {
+                const group = new THREE.Group();
+                group.position.set(...def.pos);
+                group.userData.id = def.id;
+
+                let mesh;
+                const material = new THREE.MeshStandardMaterial({ color: def.color });
+
+                if (def.type === 'sphere') {
+                    mesh = new THREE.Mesh(new THREE.SphereGeometry(def.r, 32, 16), material);
+                } else if (def.type === 'box') {
+                    mesh = new THREE.Mesh(new THREE.BoxGeometry(...def.size), material);
+                } else if (def.type === 'octahedron') {
+                    mesh = new THREE.Mesh(new THREE.OctahedronGeometry(def.r), material);
+                } else if (def.type === 'gltf') {
+                    // Placeholder until loaded
+                    mesh = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), material);
+                    mesh.visible = false; 
+                    
+                    loader.load('https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Models/master/2.0/ToyCar/glTF-Binary/ToyCar.glb', (gltf) => {
+                        const model = gltf.scene;
+                        model.scale.set(2.0, 2.0, 2.0);
+                        
+                        // Store original materials for state toggling
+                        model.traverse((child) => {
+                            if (child.isMesh) {
+                                child.userData.originalMaterial = child.material.clone();
+                                // Ensure material can have emissive
+                                if(child.material.emissive === undefined) {
+                                    const newMat = new THREE.MeshStandardMaterial({
+                                        color: child.material.color,
+                                        map: child.material.map
+                                    });
+                                    child.material = newMat;
+                                    child.userData.originalMaterial = newMat.clone();
+                                }
+                            }
+                        });
+
+                        group.add(model);
+                        group.userData.isGltf = true;
+                        group.userData.gltfScene = model;
+                        window.__3D_STATE__.mobileNodeLoaded = true;
+                        updateNodeVisuals(def.id); // Apply current state
+                    });
+                }
+
+                if (mesh) {
+                    group.add(mesh);
+                    group.userData.mainMesh = mesh;
+                }
+
+                // Invisible hit sphere for consistent raycasting
+                const hitGeo = new THREE.SphereGeometry(1.2, 8, 8);
+                const hitMat = new THREE.MeshBasicMaterial({ visible: false });
+                const hitMesh = new THREE.Mesh(hitGeo, hitMat);
+                hitMesh.userData.isHitMesh = true;
+                hitMesh.userData.nodeId = def.id;
+                group.add(hitMesh);
+
+                // Label
+                const sprite = createTextSprite(def.name);
+                sprite.position.y = 2.0;
+                group.add(sprite);
+
+                scene.add(group);
+                nodes.push({
+                    id: def.id,
+                    group: group,
+                    originalColor: def.color,
+                    pos: new THREE.Vector3(...def.pos)
+                });
+            });
+        }
+
+        // --- EDGE MANAGEMENT ---
+        function buildVisualEdges() {
+            // Clear existing
+            edgeLines.forEach(line => scene.remove(line));
+            edgeLines.length = 0;
+
+            window.__3D_STATE__.edgeList.forEach(edge => {
+                const sourceNode = nodes[edge[0]];
+                const targetNode = nodes[edge[1]];
+                
+                if(!sourceNode || !targetNode) return;
+
+                const points = [sourceNode.pos, targetNode.pos];
+                const geometry = new THREE.BufferGeometry().setFromPoints(points);
+                
+                const isActive = window.__3D_STATE__.nodesActive[edge[0]] && window.__3D_STATE__.nodesActive[edge[1]];
+                const material = isActive ? activeEdgeMat : inactiveEdgeMat;
+                
+                const line = new THREE.Line(geometry, material);
+                if (!isActive) line.computeLineDistances();
+                
+                line.userData = { source: edge[0], target: edge[1] };
+                scene.add(line);
+                edgeLines.push(line);
+            });
+            window.__3D_STATE__.edgeCount = window.__3D_STATE__.edgeList.length;
+        }
+
+        // --- VISUAL UPDATES ---
+        function updateNodeVisuals(nodeId) {
+            const node = nodes[nodeId];
+            const isActive = window.__3D_STATE__.nodesActive[nodeId];
+            const isSelected = window.__3D_STATE__.selectedNodeIndex === nodeId;
+
+            const applyMaterial = (mesh, origColor, origMat) => {
+                if (!mesh.material) return;
+                
+                if (!isActive) {
+                    mesh.material.color.setHex(0x555555);
+                } else {
+                    if (origMat && origMat.color) {
+                        mesh.material.color.copy(origMat.color);
+                    } else {
+                        mesh.material.color.setHex(origColor);
+                    }
+                }
+
+                if (isSelected) {
+                    mesh.material.emissive.setHex(0x444444);
+                } else {
+                    mesh.material.emissive.setHex(0x000000);
+                }
+            };
+
+            if (node.group.userData.isGltf && node.group.userData.gltfScene) {
+                node.group.userData.gltfScene.traverse((child) => {
+                    if (child.isMesh) {
+                        applyMaterial(child, null, child.userData.originalMaterial);
+                    }
+                });
+            } else if (node.group.userData.mainMesh) {
+                applyMaterial(node.group.userData.mainMesh, node.originalColor, null);
+            }
+        }
+
+        function updateAllVisuals() {
+            for (let i = 0; i < nodes.length; i++) {
+                updateNodeVisuals(i);
+            }
+            buildVisualEdges();
+        }
+
+        // --- INTERACTION ---
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+
+        window.addEventListener('pointerdown', (event) => {
+            if(event.target.tagName !== 'CANVAS') return;
+
+            mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+            raycaster.setFromCamera(mouse, camera);
+            
+            // Raycast against hit meshes
+            const hitMeshes = nodes.map(n => n.group.children.find(c => c.userData.isHitMesh));
+            const intersects = raycaster.intersectObjects(hitMeshes);
+
+            const prevState = window.__3D_STATE__.selectedNodeIndex;
+
+            if (intersects.length > 0) {
+                const clickedId = intersects[0].object.userData.nodeId;
+                window.__3D_STATE__.lastSelectedNodeIndex = window.__3D_STATE__.selectedNodeIndex;
+                window.__3D_STATE__.selectedNodeIndex = clickedId;
+            } else {
+                window.__3D_STATE__.lastSelectedNodeIndex = window.__3D_STATE__.selectedNodeIndex;
+                window.__3D_STATE__.selectedNodeIndex = -1;
+            }
+
+            if (prevState !== window.__3D_STATE__.selectedNodeIndex) {
+                if (prevState !== -1) updateNodeVisuals(prevState);
+                if (window.__3D_STATE__.selectedNodeIndex !== -1) updateNodeVisuals(window.__3D_STATE__.selectedNodeIndex);
+            }
+        });
+
+        window.addEventListener('keydown', (event) => {
+            const key = event.key.toLowerCase();
+            const selIdx = window.__3D_STATE__.selectedNodeIndex;
+            const lastSelIdx = window.__3D_STATE__.lastSelectedNodeIndex;
+
+            if (key === 'd' && selIdx !== -1) {
+                // Toggle active
+                window.__3D_STATE__.nodesActive[selIdx] = !window.__3D_STATE__.nodesActive[selIdx];
+                updateNodeVisuals(selIdx);
+                buildVisualEdges(); // Rebuild to update dashed/solid state
+            } 
+            else if (key === 'a') {
+                // Add edge
+                if (selIdx !== -1 && lastSelIdx !== -1 && selIdx !== lastSelIdx) {
+                    // Check if exists
+                    const exists = window.__3D_STATE__.edgeList.some(e => 
+                        (e[0] === selIdx && e[1] === lastSelIdx) || 
+                        (e[0] === lastSelIdx && e[1] === selIdx)
+                    );
+                    if (!exists) {
+                        window.__3D_STATE__.edgeList.push([lastSelIdx, selIdx]);
+                        buildVisualEdges();
+                    }
+                }
+            }
+            else if (key === 'r' && selIdx !== -1) {
+                // Remove edges
+                window.__3D_STATE__.edgeList = window.__3D_STATE__.edgeList.filter(e => e[0] !== selIdx && e[1] !== selIdx);
+                buildVisualEdges();
+            }
+        });
+
+        // --- SAVE / LOAD ---
+        const statusLabel = document.getElementById('statusLabel');
+        function showStatus(msg) {
+            statusLabel.textContent = msg;
+            setTimeout(() => { statusLabel.textContent = 'Ready'; }, 2000);
+        }
+
+        document.getElementById('saveBtn').addEventListener('click', () => {
+            const stateToSave = {
+                nodesActive: window.__3D_STATE__.nodesActive,
+                edgeList: window.__3D_STATE__.edgeList,
+                selectedNodeIndex: window.__3D_STATE__.selectedNodeIndex
+            };
+            const json = JSON.stringify(stateToSave);
+            window.__3D_SAVED_STATE__ = json;
+            localStorage.setItem('networkTopology', json);
+            window.__3D_STATE__.stateSaved = true;
+            showStatus('Saved!');
+        });
+
+        document.getElementById('loadBtn').addEventListener('click', () => {
+            let json = window.__3D_SAVED_STATE__ || localStorage.getItem('networkTopology');
+            if (json) {
+                try {
+                    const loadedState = JSON.parse(json);
+                    window.__3D_STATE__.nodesActive = loadedState.nodesActive;
+                    window.__3D_STATE__.edgeList = loadedState.edgeList;
+                    
+                    const prevSel = window.__3D_STATE__.selectedNodeIndex;
+                    window.__3D_STATE__.selectedNodeIndex = loadedState.selectedNodeIndex;
+                    window.__3D_STATE__.lastSelectedNodeIndex = -1;
+
+                    updateAllVisuals();
+                    window.__3D_STATE__.stateLoaded = true;
+                    showStatus('Loaded!');
+                } catch (e) {
+                    showStatus('Load Error');
+                }
+            } else {
+                showStatus('No saved state');
+            }
+        });
+
+        document.getElementById('resetBtn').addEventListener('click', () => {
+            window.__3D_STATE__.nodesActive = Array(8).fill(true);
+            window.__3D_STATE__.edgeList = JSON.parse(JSON.stringify(DEFAULT_EDGES));
+            window.__3D_STATE__.selectedNodeIndex = -1;
+            window.__3D_STATE__.lastSelectedNodeIndex = -1;
+            updateAllVisuals();
+            showStatus('Reset!');
+        });
+
+        // --- PACKET ANIMATION ---
+        let lastPacketTime = 0;
+        function spawnPacket() {
+            // Find active edges
+            const activeEdges = window.__3D_STATE__.edgeList.filter(e => 
+                window.__3D_STATE__.nodesActive[e[0]] && window.__3D_STATE__.nodesActive[e[1]]
+            );
+
+            if (activeEdges.length === 0) return;
+
+            const randomEdge = activeEdges[Math.floor(Math.random() * activeEdges.length)];
+            const startNode = nodes[randomEdge[0]];
+            const endNode = nodes[randomEdge[1]];
+
+            // Randomize direction
+            const [startPos, endPos] = Math.random() > 0.5 ? [startNode.pos, endNode.pos] : [endNode.pos, startNode.pos];
+
+            const packet = new THREE.Mesh(packetGeo, packetMat);
+            packet.position.copy(startPos);
+            scene.add(packet);
+
+            packets.push({
+                mesh: packet,
+                start: startPos.clone(),
+                end: endPos.clone(),
+                progress: 0
+            });
+            window.__3D_STATE__.activePacketCount++;
+        }
+
+        function updatePackets(delta) {
+            for (let i = packets.length - 1; i >= 0; i--) {
+                const p = packets[i];
+                p.progress += delta; // 1 second duration
+
+                if (p.progress >= 1) {
+                    scene.remove(p.mesh);
+                    packets.splice(i, 1);
+                    window.__3D_STATE__.activePacketCount--;
+                } else {
+                    p.mesh.position.lerpVectors(p.start, p.end, p.progress);
+                }
+            }
+        }
+
+        // --- RESIZE ---
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // --- INIT & LOOP ---
+        initNodes();
+        buildVisualEdges();
+
+        const clock = new THREE.Clock();
+
+        function animate() {
+            requestAnimationFrame(animate);
+            
+            const delta = clock.getDelta();
+            const time = clock.getElapsedTime();
+
+            controls.update();
+            window.__3D_STATE__.cameraDistance = camera.position.distanceTo(new THREE.Vector3(0,0,0));
+
+            // Pulse active edges
+            const pulseOpacity = 0.3 + (Math.sin(time * 3) + 1) / 2 * 0.5;
+            activeEdgeMat.opacity = pulseOpacity;
+
+            // Spawn packets every 2 seconds
+            if (time - lastPacketTime > 2) {
+                spawnPacket();
+                lastPacketTime = time;
+            }
+            updatePackets(delta);
+
+            renderer.render(scene, camera);
+        }
+
+        animate();
+    </script>
+</body>
+</html>

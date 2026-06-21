@@ -1,0 +1,597 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3D Rope Swing Simulation</title>
+<script type="importmap">
+{ "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+} }
+</script>
+<style>
+body { margin: 0; overflow: hidden; font-family: Arial, sans-serif; }
+canvas { display: block; }
+#hud {
+    position: absolute; top: 10px; left: 10px;
+    background: rgba(0,0,0,0.7); color: #fff; padding: 12px 16px;
+    border-radius: 8px; font-size: 13px; line-height: 1.6;
+    pointer-events: none; min-width: 200px;
+}
+#hud span { color: #adf; }
+#controls {
+    position: absolute; bottom: 10px; left: 10px;
+    background: rgba(0,0,0,0.7); color: #fff; padding: 12px 16px;
+    border-radius: 8px; font-size: 13px; pointer-events: auto;
+}
+#controls label { display: block; margin: 6px 0; }
+#controls input[type=range] { width: 160px; vertical-align: middle; }
+#keys {
+    position: absolute; top: 10px; right: 10px;
+    background: rgba(0,0,0,0.7); color: #fff; padding: 12px 16px;
+    border-radius: 8px; font-size: 13px; line-height: 1.8;
+    pointer-events: none;
+}
+#keys kbd { background: #555; padding: 2px 6px; border-radius: 3px; }
+</style>
+</head>
+<body>
+
+<div id="hud">
+    <div>Tension: <span id="hud-tension">0.000</span></div>
+    <div>Swing Angle: <span id="hud-angle">0</span>°</div>
+    <div>Character Y: <span id="hud-char-y">0.00</span></div>
+    <div>Attached: <span id="hud-attached">Yes</span></div>
+    <div>Speed: <span id="hud-speed">0.00</span></div>
+    <div>Model Loaded: <span id="hud-model">No</span></div>
+</div>
+
+<div id="controls">
+    <label>Rope Length: <input type="range" id="slider-rope-length" min="2" max="8" step="0.5" value="5"> <span id="rope-len-val">5</span></label>
+    <label>Damping: <input type="range" id="slider-damping" min="0.9" max="1.0" step="0.005" value="0.99"> <span id="damp-val">0.99</span></label>
+</div>
+
+<div id="keys">
+    <kbd>S</kbd> Start Swing<br>
+    <kbd>K</kbd> Kick Boost<br>
+    <kbd>L</kbd> Let Go<br>
+    <kbd>R</kbd> Reset<br>
+    <kbd>Space</kbd> Pause/Play
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+// State
+window.__3D_STATE__ = {
+    maxTension: 0,
+    swingAngle: 0,
+    characterY: 0,
+    isAttached: true,
+    characterSpeed: 0,
+    modelLoaded: false,
+    ropeLength: 5,
+    damping: 0.99,
+    isPaused: false,
+    frameCount: 0,
+    ropeValid: true,
+    segmentCount: 20
+};
+
+// Scene setup
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x88bbdd);
+
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+camera.position.set(8, 6, 12);
+camera.lookAt(0, 4, 0);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 4, 0);
+controls.update();
+
+// Lights
+const ambientLight = new THREE.AmbientLight(0x668877, 0.5);
+scene.add(ambientLight);
+
+const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+dirLight.position.set(5, 15, 8);
+dirLight.castShadow = true;
+dirLight.shadow.mapSize.set(2048, 2048);
+dirLight.shadow.camera.left = -15;
+dirLight.shadow.camera.right = 15;
+dirLight.shadow.camera.top = 15;
+dirLight.shadow.camera.bottom = -15;
+dirLight.shadow.camera.near = 0.5;
+dirLight.shadow.camera.far = 50;
+scene.add(dirLight);
+
+// Ground
+const groundGeo = new THREE.PlaneGeometry(30, 30);
+const groundMat = new THREE.MeshStandardMaterial({ color: 0x44aa44 });
+const ground = new THREE.Mesh(groundGeo, groundMat);
+ground.rotation.x = -Math.PI / 2;
+ground.position.y = 0;
+ground.receiveShadow = true;
+scene.add(ground);
+
+// Tree
+const treeGroup = new THREE.Group();
+
+// Trunk
+const trunkGeo = new THREE.CylinderGeometry(0.3, 0.35, 6, 12);
+const trunkMat = new THREE.MeshStandardMaterial({ color: 0x664422 });
+const trunk = new THREE.Mesh(trunkGeo, trunkMat);
+trunk.position.set(0, 3, 0);
+trunk.castShadow = true;
+treeGroup.add(trunk);
+
+// Branch from (0,6,0) to (3,7,0)
+const branchStart = new THREE.Vector3(0, 6, 0);
+const branchEnd = new THREE.Vector3(3, 7, 0);
+const branchDir = new THREE.Vector3().subVectors(branchEnd, branchStart);
+const branchLen = branchDir.length();
+const branchGeo = new THREE.CylinderGeometry(0.08, 0.15, branchLen, 8);
+const branchMat = new THREE.MeshStandardMaterial({ color: 0x664422 });
+const branch = new THREE.Mesh(branchGeo, branchMat);
+const branchMid = new THREE.Vector3().addVectors(branchStart, branchEnd).multiplyScalar(0.5);
+branch.position.copy(branchMid);
+const up = new THREE.Vector3(0, 1, 0);
+const branchAxis = new THREE.Vector3().copy(branchDir).normalize();
+const quat = new THREE.Quaternion().setFromUnitVectors(up, branchAxis);
+branch.quaternion.copy(quat);
+branch.castShadow = true;
+treeGroup.add(branch);
+
+// Foliage - 3 cones
+const foliageMat = new THREE.MeshStandardMaterial({ color: 0x338833 });
+const foliagePositions = [
+    { x: 0, y: 7.5, z: 0, r: 2.2, h: 3.5 },
+    { x: 0.5, y: 8.5, z: 0.3, r: 1.8, h: 3 },
+    { x: -0.3, y: 9.2, z: -0.2, r: 1.4, h: 2.5 }
+];
+foliagePositions.forEach(fp => {
+    const coneGeo = new THREE.ConeGeometry(fp.r, fp.h, 8);
+    const cone = new THREE.Mesh(coneGeo, foliageMat);
+    cone.position.set(fp.x, fp.y, fp.z);
+    cone.castShadow = true;
+    treeGroup.add(cone);
+});
+
+scene.add(treeGroup);
+
+// Anchor point
+const anchorPoint = new THREE.Vector3(3, 7, 0);
+
+// Verlet rope
+const SEGMENT_COUNT = 20;
+let ropeLength = 5;
+let damping = 0.99;
+let segmentLength = ropeLength / SEGMENT_COUNT;
+
+class VerletPoint {
+    constructor(x, y, z, pinned = false) {
+        this.pos = new THREE.Vector3(x, y, z);
+        this.oldPos = new THREE.Vector3(x, y, z);
+        this.pinned = pinned;
+    }
+}
+
+let points = [];
+let isAttached = true;
+let characterDetached = false;
+let characterPos = new THREE.Vector3();
+let characterVel = new THREE.Vector3();
+let isPaused = false;
+let frameCount = 0;
+
+function initRope() {
+    points = [];
+    segmentLength = ropeLength / SEGMENT_COUNT;
+    for (let i = 0; i <= SEGMENT_COUNT; i++) {
+        const t = i / SEGMENT_COUNT;
+        const x = anchorPoint.x;
+        const y = anchorPoint.y - t * ropeLength;
+        const z = anchorPoint.z;
+        const p = new VerletPoint(x, y, z, i === 0);
+        points.push(p);
+    }
+    isAttached = true;
+    characterDetached = false;
+    characterVel.set(0, 0, 0);
+}
+
+initRope();
+
+// Rope visual
+let ropeMesh = null;
+const ropeMaterialLow = new THREE.MeshStandardMaterial({ color: 0x886644 });
+const ropeMaterialHigh = new THREE.MeshStandardMaterial({ color: 0xff4444 });
+
+function updateRopeVisual(tensionRatio) {
+    if (ropeMesh) {
+        scene.remove(ropeMesh);
+        ropeMesh.geometry.dispose();
+    }
+    const curvePoints = points.map(p => p.pos.clone());
+    if (curvePoints.length < 2) return;
+    const curve = new THREE.CatmullRomCurve3(curvePoints);
+    const tubeGeo = new THREE.TubeGeometry(curve, 40, 0.03, 8, false);
+
+    // Lerp color based on tension
+    const t = Math.min(tensionRatio * 5, 1);
+    const color = new THREE.Color(0x886644).lerp(new THREE.Color(0xff4444), t);
+    const mat = new THREE.MeshStandardMaterial({ color: color });
+    ropeMesh = new THREE.Mesh(tubeGeo, mat);
+    ropeMesh.castShadow = true;
+    scene.add(ropeMesh);
+}
+
+// Character (procedural fallback + GLTF attempt)
+let characterGroup = new THREE.Group();
+let modelLoaded = false;
+let mixer = null;
+
+// Procedural character
+function createProceduralCharacter() {
+    const group = new THREE.Group();
+
+    // Body
+    const bodyGeo = new THREE.CylinderGeometry(0.15, 0.12, 0.5, 8);
+    const bodyMat = new THREE.MeshStandardMaterial({ color: 0x3366aa });
+    const body = new THREE.Mesh(bodyGeo, bodyMat);
+    body.position.y = -0.45;
+    body.castShadow = true;
+    group.add(body);
+
+    // Head
+    const headGeo = new THREE.SphereGeometry(0.12, 8, 8);
+    const headMat = new THREE.MeshStandardMaterial({ color: 0xffcc99 });
+    const head = new THREE.Mesh(headGeo, headMat);
+    head.position.y = -0.1;
+    head.castShadow = true;
+    group.add(head);
+
+    // Arms
+    const armGeo = new THREE.CylinderGeometry(0.03, 0.03, 0.35, 6);
+    const armMat = new THREE.MeshStandardMaterial({ color: 0xffcc99 });
+
+    const leftArm = new THREE.Mesh(armGeo, armMat);
+    leftArm.position.set(-0.18, -0.15, 0);
+    leftArm.rotation.z = Math.PI * 0.15;
+    group.add(leftArm);
+
+    const rightArm = new THREE.Mesh(armGeo, armMat);
+    rightArm.position.set(0.18, -0.15, 0);
+    rightArm.rotation.z = -Math.PI * 0.15;
+    group.add(rightArm);
+
+    // Legs
+    const legGeo = new THREE.CylinderGeometry(0.05, 0.04, 0.4, 6);
+    const legMat = new THREE.MeshStandardMaterial({ color: 0x444466 });
+
+    const leftLeg = new THREE.Mesh(legGeo, legMat);
+    leftLeg.position.set(-0.08, -0.9, 0);
+    group.add(leftLeg);
+
+    const rightLeg = new THREE.Mesh(legGeo, legMat);
+    rightLeg.position.set(0.08, -0.9, 0);
+    group.add(rightLeg);
+
+    return group;
+}
+
+characterGroup = createProceduralCharacter();
+scene.add(characterGroup);
+
+// Try loading GLTF model
+const loader = new GLTFLoader();
+loader.load(
+    'https://threejs.org/examples/models/gltf/Soldier.glb',
+    (gltf) => {
+        scene.remove(characterGroup);
+        characterGroup = gltf.scene;
+        characterGroup.scale.set(0.9, 0.9, 0.9);
+        characterGroup.traverse(child => {
+            if (child.isMesh) {
+                child.castShadow = true;
+            }
+        });
+        scene.add(characterGroup);
+        modelLoaded = true;
+
+        if (gltf.animations && gltf.animations.length > 0) {
+            mixer = new THREE.AnimationMixer(characterGroup);
+            // Try to find idle animation
+            let idleClip = gltf.animations.find(a => a.name.toLowerCase().includes('idle'));
+            if (!idleClip) idleClip = gltf.animations[0];
+            const action = mixer.clipAction(idleClip);
+            action.play();
+        }
+    },
+    undefined,
+    (err) => {
+        console.log('GLTF load failed, using procedural character');
+        modelLoaded = false;
+    }
+);
+
+// Physics
+const gravity = new THREE.Vector3(0, -9.81, 0);
+const dt = 1 / 60;
+const constraintIterations = 10;
+const stiffness = 0.8;
+
+function verletIntegrate() {
+    for (let i = 0; i < points.length; i++) {
+        if (points[i].pinned) continue;
+        const p = points[i];
+        const vel = new THREE.Vector3().subVectors(p.pos, p.oldPos).multiplyScalar(damping);
+        p.oldPos.copy(p.pos);
+        p.pos.add(vel);
+        p.pos.add(gravity.clone().multiplyScalar(dt * dt));
+    }
+}
+
+function solveConstraints() {
+    for (let iter = 0; iter < constraintIterations; iter++) {
+        // Pin first point
+        points[0].pos.copy(anchorPoint);
+
+        for (let i = 0; i < SEGMENT_COUNT; i++) {
+            const a = points[i];
+            const b = points[i + 1];
+            const diff = new THREE.Vector3().subVectors(b.pos, a.pos);
+            const dist = diff.length();
+            if (dist === 0) continue;
+            const error = (dist - segmentLength) / dist;
+            const correction = diff.multiplyScalar(error * stiffness * 0.5);
+
+            if (!a.pinned) a.pos.add(correction);
+            if (!b.pinned) b.pos.sub(correction);
+        }
+
+        // Ground collision for rope points
+        for (let i = 1; i < points.length; i++) {
+            if (points[i].pos.y < 0.05) {
+                points[i].pos.y = 0.05;
+            }
+        }
+    }
+}
+
+function calculateMaxTension() {
+    let maxT = 0;
+    for (let i = 0; i < SEGMENT_COUNT; i++) {
+        const dist = points[i].pos.distanceTo(points[i + 1].pos);
+        const tension = Math.abs(dist - segmentLength) / segmentLength;
+        if (tension > maxT) maxT = tension;
+    }
+    return maxT;
+}
+
+function calculateSwingAngle() {
+    const bottom = points[points.length - 1].pos;
+    const top = points[0].pos;
+    const ropeVec = new THREE.Vector3().subVectors(bottom, top);
+    const downVec = new THREE.Vector3(0, -1, 0);
+    const angle = ropeVec.angleTo(downVec);
+    return THREE.MathUtils.radToDeg(angle);
+}
+
+function getCharacterSpeed() {
+    if (characterDetached) {
+        return characterVel.length();
+    }
+    const last = points[points.length - 1];
+    const vel = new THREE.Vector3().subVectors(last.pos, last.oldPos).divideScalar(dt);
+    return vel.length();
+}
+
+// Input
+document.addEventListener('keydown', (e) => {
+    const key = e.key.toLowerCase();
+
+    if (key === 's') {
+        // Start swing - give initial velocity
+        if (isAttached && !characterDetached) {
+            const last = points[points.length - 1];
+            const impulse = new THREE.Vector3(0, 0, -8).multiplyScalar(dt);
+            last.pos.add(impulse);
+            // Also push nearby points for smoother motion
+            for (let i = Math.max(1, points.length - 5); i < points.length; i++) {
+                points[i].pos.add(impulse.clone().multiplyScalar(0.5));
+            }
+        }
+    }
+
+    if (key === 'k') {
+        // Kick - add tangential velocity
+        if (isAttached && !characterDetached) {
+            const last = points[points.length - 1];
+            const ropeDir = new THREE.Vector3().subVectors(last.pos, points[0].pos).normalize();
+            // Tangential direction (perpendicular to rope in the swing plane)
+            const vel = new THREE.Vector3().subVectors(last.pos, last.oldPos);
+            let tangent;
+            if (vel.length() > 0.001) {
+                tangent = vel.normalize();
+            } else {
+                tangent = new THREE.Vector3(0, 0, -1);
+            }
+            // Project out the rope direction component
+            tangent.sub(ropeDir.clone().multiplyScalar(tangent.dot(ropeDir))).normalize();
+            if (tangent.length() < 0.01) tangent.set(0, 0, -1);
+            const boost = tangent.multiplyScalar(3 * dt);
+            last.pos.add(boost);
+        }
+    }
+
+    if (key === 'l') {
+        // Let go
+        if (isAttached && !characterDetached) {
+            const last = points[points.length - 1];
+            characterPos.copy(last.pos);
+            characterVel.copy(new THREE.Vector3().subVectors(last.pos, last.oldPos).divideScalar(dt));
+            characterDetached = true;
+            isAttached = false;
+        }
+    }
+
+    if (key === 'r') {
+        // Reset
+        initRope();
+    }
+
+    if (key === ' ') {
+        e.preventDefault();
+        isPaused = !isPaused;
+    }
+});
+
+// Sliders
+const ropeLenSlider = document.getElementById('slider-rope-length');
+const dampSlider = document.getElementById('slider-damping');
+const ropeLenVal = document.getElementById('rope-len-val');
+const dampVal = document.getElementById('damp-val');
+
+ropeLenSlider.addEventListener('input', () => {
+    ropeLength = parseFloat(ropeLenSlider.value);
+    ropeLenVal.textContent = ropeLength;
+    segmentLength = ropeLength / SEGMENT_COUNT;
+    // Redistribute segments
+    for (let i = 0; i <= SEGMENT_COUNT; i++) {
+        const t = i / SEGMENT_COUNT;
+        // Interpolate from anchor downward along current rope direction
+        const dir = new THREE.Vector3().subVectors(
+            points[points.length - 1].pos, points[0].pos
+        ).normalize();
+        points[i].pos.copy(anchorPoint).add(dir.multiplyScalar(t * ropeLength));
+        points[i].oldPos.copy(points[i].pos);
+    }
+    points[0].pos.copy(anchorPoint);
+});
+
+dampSlider.addEventListener('input', () => {
+    damping = parseFloat(dampSlider.value);
+    dampVal.textContent = damping;
+});
+
+// HUD elements
+const hudTension = document.getElementById('hud-tension');
+const hudAngle = document.getElementById('hud-angle');
+const hudCharY = document.getElementById('hud-char-y');
+const hudAttached = document.getElementById('hud-attached');
+const hudSpeed = document.getElementById('hud-speed');
+const hudModel = document.getElementById('hud-model');
+
+// Check rope validity
+function isRopeValid() {
+    for (const p of points) {
+        if (isNaN(p.pos.x) || isNaN(p.pos.y) || isNaN(p.pos.z)) return false;
+    }
+    return true;
+}
+
+// Animation loop
+const clock = new THREE.Clock();
+
+function animate() {
+    requestAnimationFrame(animate);
+
+    const delta = clock.getDelta();
+
+    if (!isPaused) {
+        // Verlet physics
+        verletIntegrate();
+        solveConstraints();
+
+        // Character update
+        if (characterDetached) {
+            characterVel.add(gravity.clone().multiplyScalar(dt));
+            characterPos.add(characterVel.clone().multiplyScalar(dt));
+            // Ground collision
+            if (characterPos.y < 0.5) {
+                characterPos.y = 0.5;
+                characterVel.set(0, 0, 0);
+            }
+            characterGroup.position.copy(characterPos);
+            characterGroup.position.y -= 0.5; // offset so feet on ground
+        } else if (isAttached) {
+            const lastPos = points[points.length - 1].pos;
+            characterGroup.position.copy(lastPos);
+            characterGroup.position.y -= 0.5; // offset hands at rope
+
+            // Face swing direction
+            const vel = new THREE.Vector3().subVectors(lastPos, points[points.length - 1].oldPos);
+            if (vel.length() > 0.001) {
+                const lookTarget = lastPos.clone().add(vel.normalize());
+                lookTarget.y = characterGroup.position.y;
+                characterGroup.lookAt(lookTarget);
+            }
+        }
+
+        // Update mixer
+        if (mixer) mixer.update(dt);
+
+        frameCount++;
+    }
+
+    // Update rope visual
+    const maxTension = calculateMaxTension();
+    updateRopeVisual(maxTension);
+
+    // Calculate values
+    const swingAngle = calculateSwingAngle();
+    const charY = characterDetached ? characterPos.y : (isAttached ? points[points.length - 1].pos.y : 0);
+    const speed = getCharacterSpeed();
+    const ropeValid = isRopeValid();
+
+    // Update HUD
+    hudTension.textContent = maxTension.toFixed(3);
+    hudAngle.textContent = Math.round(swingAngle);
+    hudCharY.textContent = charY.toFixed(2);
+    hudAttached.textContent = isAttached ? 'Yes' : 'No';
+    hudSpeed.textContent = speed.toFixed(2);
+    hudModel.textContent = modelLoaded ? 'Yes' : 'No';
+
+    // Update state
+    window.__3D_STATE__ = {
+        maxTension: parseFloat(maxTension.toFixed(4)),
+        swingAngle: parseFloat(swingAngle.toFixed(1)),
+        characterY: parseFloat(charY.toFixed(3)),
+        isAttached: isAttached,
+        characterSpeed: parseFloat(speed.toFixed(3)),
+        modelLoaded: modelLoaded,
+        ropeLength: ropeLength,
+        damping: damping,
+        isPaused: isPaused,
+        frameCount: frameCount,
+        ropeValid: ropeValid,
+        segmentCount: SEGMENT_COUNT
+    };
+
+    controls.update();
+    renderer.render(scene, camera);
+}
+
+// Handle resize
+window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+animate();
+</script>
+</body>
+</html>

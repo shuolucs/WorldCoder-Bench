@@ -1,0 +1,435 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>3D Audio Spectrum Visualizer</title>
+  <style>
+    html, body {
+      margin: 0;
+      overflow: hidden;
+      background: #000;
+      font-family: Arial, sans-serif;
+      color: #fff;
+    }
+
+    canvas {
+      display: block;
+    }
+
+    #hud {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      padding: 12px 14px;
+      background: rgba(20, 20, 20, 0.75);
+      border: 1px solid rgba(255,255,255,0.15);
+      border-radius: 8px;
+      line-height: 1.5;
+      min-width: 220px;
+      z-index: 10;
+      user-select: none;
+    }
+
+    #hud button {
+      margin-top: 8px;
+      padding: 6px 10px;
+      border: none;
+      border-radius: 4px;
+      background: #2e2e2e;
+      color: #fff;
+      cursor: pointer;
+    }
+
+    #hud button:hover {
+      background: #444;
+    }
+
+    .hint {
+      margin-top: 8px;
+      font-size: 12px;
+      color: #bbb;
+    }
+  </style>
+</head>
+<body>
+  <div id="hud">
+    <div>Mode: <span id="hud-mode">circular</span></div>
+    <div>Status: <span id="hud-playing">Paused</span></div>
+    <div>Gain: <span id="hud-gain">0.3</span></div>
+    <div>Frequency: <span id="hud-freq">220 Hz</span></div>
+    <div>Auto-Rotate: <span id="hud-rotate">ON</span></div>
+    <div>Bars: <span id="hud-barcount">64</span></div>
+    <button id="btn-reset">Reset</button>
+    <div class="hint">
+      Space: Play/Pause<br>
+      1/2/3: Modes<br>
+      R: Rotate toggle<br>
+      ↑/↓: Gain<br>
+      ←/→: Frequency
+    </div>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
+    import { OrbitControls } from 'https://unpkg.com/three@0.160.0/examples/jsm/controls/OrbitControls.js';
+
+    // ----------------------------
+    // Scene Setup
+    // ----------------------------
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x000000);
+
+    const camera = new THREE.PerspectiveCamera(
+      60,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      1000
+    );
+    camera.position.set(0, 30, 60);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    document.body.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.set(0, 0, 0);
+    controls.enableDamping = true;
+
+    const ambientLight = new THREE.AmbientLight(0x404040);
+    scene.add(ambientLight);
+
+    const directionalLight = new THREE.DirectionalLight(0xffffff, 1.0);
+    directionalLight.position.set(10, 40, 20);
+    scene.add(directionalLight);
+
+    const grid = new THREE.GridHelper(80, 40, 0x444444, 0x222222);
+    grid.position.y = 0;
+    scene.add(grid);
+
+    // ----------------------------
+    // Audio System
+    // ----------------------------
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    const audioContext = new AudioContextClass();
+
+    const analyser = audioContext.createAnalyser();
+    analyser.fftSize = 256;
+
+    const gainNode = audioContext.createGain();
+    gainNode.gain.value = 0.3;
+
+    let oscillator = null;
+    let oscillatorStarted = false;
+    let isPlaying = false;
+    let currentFrequency = 220;
+
+    function createOscillator() {
+      const osc = audioContext.createOscillator();
+      osc.type = 'sawtooth';
+      osc.frequency.value = currentFrequency;
+      osc.connect(gainNode);
+      return osc;
+    }
+
+    gainNode.connect(analyser);
+    analyser.connect(audioContext.destination);
+
+    const frequencyData = new Uint8Array(analyser.frequencyBinCount); // 128 bins
+
+    function startOscillator() {
+      if (oscillatorStarted) return;
+      oscillator = createOscillator();
+      oscillator.start();
+      oscillatorStarted = true;
+      isPlaying = true;
+    }
+
+    function stopOscillator() {
+      if (!oscillatorStarted || !oscillator) return;
+      try {
+        oscillator.stop();
+        oscillator.disconnect();
+      } catch (e) {}
+      oscillator = null;
+      oscillatorStarted = false;
+      isPlaying = false;
+    }
+
+    function togglePlayPause() {
+      if (audioContext.state === 'suspended') {
+        audioContext.resume();
+      }
+      if (isPlaying) {
+        stopOscillator();
+      } else {
+        startOscillator();
+      }
+      updateHUD();
+    }
+
+    // ----------------------------
+    // Bars
+    // ----------------------------
+    const BAR_COUNT = 64;
+    const bars = [];
+    const barGroup = new THREE.Group();
+    scene.add(barGroup);
+
+    const barGeometry = new THREE.BoxGeometry(1, 1, 1);
+
+    for (let i = 0; i < BAR_COUNT; i++) {
+      const color = new THREE.Color().setHSL(i / BAR_COUNT, 1.0, 0.5);
+      const material = new THREE.MeshStandardMaterial({ color });
+      const bar = new THREE.Mesh(barGeometry, material);
+      bar.scale.set(1, 0.5, 1);
+      bar.position.set(0, 0.25, 0);
+      bars.push(bar);
+      barGroup.add(bar);
+    }
+
+    // ----------------------------
+    // Modes
+    // ----------------------------
+    let mode = 'circular';
+    let autoRotate = true;
+    let frameCount = 0;
+
+    function applyLayout() {
+      for (let i = 0; i < BAR_COUNT; i++) {
+        const bar = bars[i];
+
+        if (mode === 'circular') {
+          const radius = 20;
+          const angle = i * (Math.PI * 2 / BAR_COUNT);
+          bar.position.x = radius * Math.cos(angle);
+          bar.position.z = radius * Math.sin(angle);
+          bar.lookAt(0, bar.position.y, 0);
+        } else if (mode === 'linear') {
+          bar.position.x = -32 + i;
+          bar.position.z = 0;
+          bar.rotation.set(0, 0, 0);
+        } else if (mode === 'wave') {
+          const x = -32 + i;
+          bar.position.x = x;
+          bar.position.z = 10 * Math.sin(x * Math.PI / 32);
+          bar.rotation.set(0, 0, 0);
+        }
+      }
+    }
+
+    // ----------------------------
+    // HUD
+    // ----------------------------
+    const hudMode = document.getElementById('hud-mode');
+    const hudPlaying = document.getElementById('hud-playing');
+    const hudGain = document.getElementById('hud-gain');
+    const hudFreq = document.getElementById('hud-freq');
+    const hudRotate = document.getElementById('hud-rotate');
+    const hudBarCount = document.getElementById('hud-barcount');
+    const btnReset = document.getElementById('btn-reset');
+
+    function updateHUD() {
+      hudMode.textContent = mode;
+      hudPlaying.textContent = isPlaying ? 'Playing' : 'Paused';
+      hudGain.textContent = gainNode.gain.value.toFixed(1);
+      hudFreq.textContent = `${Math.round(currentFrequency)} Hz`;
+      hudRotate.textContent = autoRotate ? 'ON' : 'OFF';
+      hudBarCount.textContent = String(BAR_COUNT);
+    }
+
+    // ----------------------------
+    // Reset
+    // ----------------------------
+    function resetState() {
+      mode = 'circular';
+      autoRotate = true;
+      currentFrequency = 220;
+      gainNode.gain.value = 0.3;
+
+      if (oscillatorStarted && oscillator) {
+        try {
+          oscillator.stop();
+          oscillator.disconnect();
+        } catch (e) {}
+      }
+      oscillator = null;
+      oscillatorStarted = false;
+      isPlaying = false;
+
+      barGroup.rotation.y = 0;
+      applyLayout();
+      updateHUD();
+    }
+
+    btnReset.addEventListener('click', async () => {
+      if (audioContext.state === 'suspended') {
+        await audioContext.resume();
+      }
+      resetState();
+    });
+
+    // ----------------------------
+    // Input
+    // ----------------------------
+    window.addEventListener('keydown', async (e) => {
+      if (audioContext.state === 'suspended') {
+        await audioContext.resume();
+      }
+
+      switch (e.code) {
+        case 'Digit1':
+          mode = 'circular';
+          applyLayout();
+          break;
+        case 'Digit2':
+          mode = 'linear';
+          applyLayout();
+          break;
+        case 'Digit3':
+          mode = 'wave';
+          applyLayout();
+          break;
+        case 'KeyR':
+          autoRotate = !autoRotate;
+          break;
+        case 'Space':
+          e.preventDefault();
+          togglePlayPause();
+          break;
+        case 'ArrowUp':
+          e.preventDefault();
+          gainNode.gain.value = Math.min(1.0, +(gainNode.gain.value + 0.1).toFixed(1));
+          break;
+        case 'ArrowDown':
+          e.preventDefault();
+          gainNode.gain.value = Math.max(0.0, +(gainNode.gain.value - 0.1).toFixed(1));
+          break;
+        case 'ArrowRight':
+          e.preventDefault();
+          currentFrequency = Math.min(2000, currentFrequency + 50);
+          if (oscillatorStarted && oscillator) oscillator.frequency.value = currentFrequency;
+          break;
+        case 'ArrowLeft':
+          e.preventDefault();
+          currentFrequency = Math.max(50, currentFrequency - 50);
+          if (oscillatorStarted && oscillator) oscillator.frequency.value = currentFrequency;
+          break;
+      }
+
+      updateHUD();
+    });
+
+    // ----------------------------
+    // State Management
+    // ----------------------------
+    window.__3D_STATE__ = {
+      mode: 'circular',
+      isPlaying: false,
+      gain: 0.3,
+      frequency: 220,
+      autoRotate: true,
+      barCount: 64,
+      groupRotationY: 0,
+      maxBarHeight: 0.5,
+      minBarHeight: 0.5,
+      avgBarHeight: 0.5,
+      cameraDistance: 0,
+      frameCount: 0,
+      barsValid: true,
+      analyserFFTSize: 256
+    };
+
+    function updateState(maxH, minH, avgH, barsValid) {
+      window.__3D_STATE__.mode = mode;
+      window.__3D_STATE__.isPlaying = isPlaying;
+      window.__3D_STATE__.gain = +gainNode.gain.value.toFixed(1);
+      window.__3D_STATE__.frequency = Math.round(currentFrequency);
+      window.__3D_STATE__.autoRotate = autoRotate;
+      window.__3D_STATE__.barCount = BAR_COUNT;
+      window.__3D_STATE__.groupRotationY = +barGroup.rotation.y;
+      window.__3D_STATE__.maxBarHeight = +maxH.toFixed(2);
+      window.__3D_STATE__.minBarHeight = +minH.toFixed(2);
+      window.__3D_STATE__.avgBarHeight = +avgH.toFixed(2);
+      window.__3D_STATE__.cameraDistance = +camera.position.length().toFixed(1);
+      window.__3D_STATE__.frameCount = frameCount;
+      window.__3D_STATE__.barsValid = barsValid;
+      window.__3D_STATE__.analyserFFTSize = analyser.fftSize;
+    }
+
+    // ----------------------------
+    // Animation
+    // ----------------------------
+    function animate() {
+      requestAnimationFrame(animate);
+      frameCount++;
+
+      controls.update();
+
+      if (autoRotate) {
+        barGroup.rotation.y += 0.005;
+      }
+
+      if (isPlaying) {
+        analyser.getByteFrequencyData(frequencyData);
+      } else {
+        frequencyData.fill(0);
+      }
+
+      let maxH = -Infinity;
+      let minH = Infinity;
+      let sumH = 0;
+      let barsValid = true;
+
+      for (let i = 0; i < BAR_COUNT; i++) {
+        const bar = bars[i];
+        const value = frequencyData[i] || 0;
+
+        let targetHeight;
+        if (isPlaying) {
+          targetHeight = 0.5 + (value / 255) * (30 - 0.5);
+        } else {
+          targetHeight = 0.5;
+        }
+
+        const currentHeight = bar.scale.y;
+        const nextHeight = THREE.MathUtils.lerp(currentHeight, targetHeight, isPlaying ? 0.35 : 0.15);
+
+        bar.scale.y = nextHeight;
+        bar.position.y = nextHeight / 2;
+
+        if (!Number.isFinite(bar.position.x) ||
+            !Number.isFinite(bar.position.y) ||
+            !Number.isFinite(bar.position.z) ||
+            !Number.isFinite(bar.scale.y)) {
+          barsValid = false;
+        }
+
+        maxH = Math.max(maxH, nextHeight);
+        minH = Math.min(minH, nextHeight);
+        sumH += nextHeight;
+      }
+
+      const avgH = sumH / BAR_COUNT;
+
+      updateState(maxH, minH, avgH, barsValid);
+      renderer.render(scene, camera);
+    }
+
+    // ----------------------------
+    // Resize
+    // ----------------------------
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    applyLayout();
+    updateHUD();
+    animate();
+  </script>
+</body>
+</html>

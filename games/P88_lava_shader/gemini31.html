@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Procedural Lava Shader</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #000000;
+            color: #ffffff;
+            font-family: monospace;
+        }
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+        }
+        #ui-panel {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 15px 20px;
+            border-radius: 8px;
+            border: 1px solid #333;
+            z-index: 10;
+            user-select: none;
+        }
+        .control-group {
+            margin-bottom: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            width: 300px;
+        }
+        .control-group:last-child {
+            margin-bottom: 0;
+        }
+        label {
+            font-size: 12px;
+            width: 120px;
+        }
+        input[type="range"] {
+            flex: 1;
+            margin: 0 10px;
+            cursor: pointer;
+        }
+        .value-display {
+            width: 30px;
+            text-align: right;
+            font-size: 12px;
+        }
+    </style>
+    <script type="importmap">
+    { "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+    } }
+    </script>
+</head>
+<body>
+    <div id="ui-panel">
+        <div class="control-group">
+            <label for="noiseScale">Noise Scale</label>
+            <input type="range" id="noiseScale" min="1" max="10" step="0.1" value="3.0">
+            <span class="value-display" id="noiseScaleVal">3.0</span>
+        </div>
+        <div class="control-group">
+            <label for="speed">Speed</label>
+            <input type="range" id="speed" min="0.1" max="3.0" step="0.1" value="1.0">
+            <span class="value-display" id="speedVal">1.0</span>
+        </div>
+        <div class="control-group">
+            <label for="intensity">Color Intensity</label>
+            <input type="range" id="intensity" min="0.5" max="2.0" step="0.1" value="1.0">
+            <span class="value-display" id="intensityVal">1.0</span>
+        </div>
+        <div class="control-group">
+            <label for="displacement">Displacement</label>
+            <input type="range" id="displacement" min="0" max="2.0" step="0.1" value="0.5">
+            <span class="value-display" id="displacementVal">0.5</span>
+        </div>
+        <div class="control-group">
+            <label for="bloomStrength">Bloom Strength</label>
+            <input type="range" id="bloomStrength" min="0" max="3" step="0.1" value="1.5">
+            <span class="value-display" id="bloomStrengthVal">1.5</span>
+        </div>
+        <div class="control-group">
+            <label for="bloomThreshold">Bloom Threshold</label>
+            <input type="range" id="bloomThreshold" min="0" max="1" step="0.05" value="0.3">
+            <span class="value-display" id="bloomThresholdVal">0.3</span>
+        </div>
+    </div>
+    <div id="canvas-container"></div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+        import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+        import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+
+        // --- Scene Setup ---
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x000000);
+
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+        camera.position.set(0, 0, 6);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: false });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        container.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+
+        // --- Starfield Background ---
+        const starsGeometry = new THREE.BufferGeometry();
+        const starsCount = 800;
+        const posArray = new Float32Array(starsCount * 3);
+        for(let i = 0; i < starsCount * 3; i+=3) {
+            const r = 40 + Math.random() * 20;
+            const theta = 2 * Math.PI * Math.random();
+            const phi = Math.acos(2 * Math.random() - 1);
+            posArray[i] = r * Math.sin(phi) * Math.cos(theta);
+            posArray[i+1] = r * Math.sin(phi) * Math.sin(theta);
+            posArray[i+2] = r * Math.cos(phi);
+        }
+        starsGeometry.setAttribute('position', new THREE.BufferAttribute(posArray, 3));
+        const starsMaterial = new THREE.PointsMaterial({size: 0.05, color: 0xffffff, transparent: true, opacity: 0.8});
+        const starMesh = new THREE.Points(starsGeometry, starsMaterial);
+        scene.add(starMesh);
+
+        // --- Shader Code ---
+        const snoiseGLSL = `
+            // Simplex 3D Noise by Ian McEwan, Ashima Arts
+            vec4 permute(vec4 x){return mod(((x*34.0)+1.0)*x, 289.0);}
+            vec4 taylorInvSqrt(vec4 r){return 1.79284291400159 - 0.85373472095314 * r;}
+
+            float snoise(vec3 v){
+                const vec2  C = vec2(1.0/6.0, 1.0/3.0) ;
+                const vec4  D = vec4(0.0, 0.5, 1.0, 2.0);
+                vec3 i  = floor(v + dot(v, C.yyy) );
+                vec3 x0 = v - i + dot(i, C.xxx) ;
+                vec3 g = step(x0.yzx, x0.xyz);
+                vec3 l = 1.0 - g;
+                vec3 i1 = min( g.xyz, l.zxy );
+                vec3 i2 = max( g.xyz, l.zxy );
+                vec3 x1 = x0 - i1 + 1.0 * C.xxx;
+                vec3 x2 = x0 - i2 + 2.0 * C.xxx;
+                vec3 x3 = x0 - 1.0 + 3.0 * C.xxx;
+                i = mod(i, 289.0 );
+                vec4 p = permute( permute( permute(
+                            i.z + vec4(0.0, i1.z, i2.z, 1.0 ))
+                        + i.y + vec4(0.0, i1.y, i2.y, 1.0 ))
+                        + i.x + vec4(0.0, i1.x, i2.x, 1.0 ));
+                float n_ = 1.0/7.0;
+                vec3  ns = n_ * D.wyz - D.xzx;
+                vec4 j = p - 49.0 * floor(p * ns.z *ns.z);
+                vec4 x_ = floor(j * ns.z);
+                vec4 y_ = floor(j - 7.0 * x_ );
+                vec4 x = x_ *ns.x + ns.yyyy;
+                vec4 y = y_ *ns.x + ns.yyyy;
+                vec4 h = 1.0 - abs(x) - abs(y);
+                vec4 b0 = vec4( x.xy, y.xy );
+                vec4 b1 = vec4( x.zw, y.zw );
+                vec4 s0 = floor(b0)*2.0 + 1.0;
+                vec4 s1 = floor(b1)*2.0 + 1.0;
+                vec4 sh = -step(h, vec4(0.0));
+                vec4 a0 = b0.xzyw + s0.xzyw*sh.xxyy ;
+                vec4 a1 = b1.xzyw + s1.xzyw*sh.zzww ;
+                vec3 p0 = vec3(a0.xy,h.x);
+                vec3 p1 = vec3(a0.zw,h.y);
+                vec3 p2 = vec3(a1.xy,h.z);
+                vec3 p3 = vec3(a1.zw,h.w);
+                vec4 norm = taylorInvSqrt(vec4(dot(p0,p0), dot(p1,p1), dot(p2, p2), dot(p3,p3)));
+                p0 *= norm.x;
+                p1 *= norm.y;
+                p2 *= norm.z;
+                p3 *= norm.w;
+                vec4 m = max(0.6 - vec4(dot(x0,x0), dot(x1,x1), dot(x2,x2), dot(x3,x3)), 0.0);
+                m = m * m;
+                return 42.0 * dot( m*m, vec4( dot(p0,x0), dot(p1,x1), dot(p2,x2), dot(p3,x3) ) );
+            }
+        `;
+
+        const vertexShader = `
+            uniform float time;
+            uniform float noiseScale;
+            uniform float displacement;
+
+            varying vec3 vWorldPosition;
+            varying vec3 vNormal;
+
+            ${snoiseGLSL}
+
+            void main() {
+                vec3 pos = position;
+                
+                // Calculate displacement for current vertex
+                float d = snoise(pos * noiseScale + time * 0.5) * displacement;
+                vec3 displacedPos = pos + normal * d;
+
+                // Estimate new normal using finite difference
+                vec3 t = normalize(cross(normal, vec3(0.0, 1.0, 0.0)));
+                if(length(t) < 0.01) t = normalize(cross(normal, vec3(1.0, 0.0, 0.0)));
+                vec3 b = normalize(cross(normal, t));
+
+                float eps = 0.01;
+                vec3 posT = pos + t * eps;
+                vec3 posB = pos + b * eps;
+
+                float dT = snoise(posT * noiseScale + time * 0.5) * displacement;
+                float dB = snoise(posB * noiseScale + time * 0.5) * displacement;
+
+                vec3 displacedT = posT + normal * dT;
+                vec3 displacedB = posB + normal * dB;
+
+                vec3 newNormal = normalize(cross(displacedT - displacedPos, displacedB - displacedPos));
+
+                vNormal = normalMatrix * newNormal;
+                vec4 worldPosition = modelMatrix * vec4(displacedPos, 1.0);
+                vWorldPosition = worldPosition.xyz;
+                
+                gl_Position = projectionMatrix * viewMatrix * worldPosition;
+            }
+        `;
+
+        const fragmentShader = `
+            uniform float time;
+            uniform float noiseScale;
+            uniform float speed;
+            uniform float colorIntensity;
+
+            varying vec3 vWorldPosition;
+            varying vec3 vNormal;
+
+            ${snoiseGLSL}
+
+            void main() {
+                float layer1 = snoise(vWorldPosition * noiseScale * 2.0 + time * speed * 0.3);
+                float layer2 = snoise(vWorldPosition * noiseScale * 4.0 - time * speed * 0.2);
+                
+                // combined is roughly in [-1, 1]
+                float combined = (layer1 + layer2 * 0.5) * 0.667;
+                
+                // Map to [0, 1]
+                float t = combined * 0.5 + 0.5;
+
+                vec3 c1 = vec3(0.1, 0.0, 0.0); // Dark Red
+                vec3 c2 = vec3(0.8, 0.0, 0.0); // Red
+                vec3 c3 = vec3(1.0, 0.5, 0.0); // Orange
+                vec3 c4 = vec3(1.0, 1.0, 0.0); // Yellow
+                vec3 c5 = vec3(1.0, 1.0, 1.0); // White
+
+                vec3 color;
+                if (t < 0.25) {
+                    color = mix(c1, c2, t / 0.25);
+                } else if (t < 0.5) {
+                    color = mix(c2, c3, (t - 0.25) / 0.25);
+                } else if (t < 0.75) {
+                    color = mix(c3, c4, (t - 0.5) / 0.25);
+                } else {
+                    color = mix(c4, c5, (t - 0.75) / 0.25);
+                }
+
+                gl_FragColor = vec4(color * colorIntensity, 1.0);
+            }
+        `;
+
+        // --- Mesh Setup ---
+        const geometry = new THREE.TorusKnotGeometry(1, 0.4, 256, 64);
+        const uniforms = {
+            time: { value: 0.0 },
+            noiseScale: { value: 3.0 },
+            speed: { value: 1.0 },
+            colorIntensity: { value: 1.0 },
+            displacement: { value: 0.5 }
+        };
+
+        const material = new THREE.ShaderMaterial({
+            vertexShader,
+            fragmentShader,
+            uniforms,
+            wireframe: false
+        });
+
+        const lavaMesh = new THREE.Mesh(geometry, material);
+        scene.add(lavaMesh);
+
+        // --- Post-processing (UnrealBloomPass) ---
+        const renderScene = new RenderPass(scene, camera);
+        const bloomPass = new UnrealBloomPass(
+            new THREE.Vector2(window.innerWidth, window.innerHeight),
+            1.5, // strength
+            0.5, // radius
+            0.3  // threshold
+        );
+
+        const composer = new EffectComposer(renderer);
+        composer.addPass(renderScene);
+        composer.addPass(bloomPass);
+
+        // --- UI Binding ---
+        const bindSlider = (id, uniformKey, isBloom = false) => {
+            const el = document.getElementById(id);
+            const valEl = document.getElementById(id + 'Val');
+            el.addEventListener('input', (e) => {
+                const val = parseFloat(e.target.value);
+                valEl.textContent = val.toFixed(id === 'bloomThreshold' ? 2 : 1);
+                if (isBloom) {
+                    bloomPass[uniformKey] = val;
+                } else {
+                    uniforms[uniformKey].value = val;
+                }
+            });
+        };
+
+        bindSlider('noiseScale', 'noiseScale');
+        bindSlider('speed', 'speed');
+        bindSlider('intensity', 'colorIntensity');
+        bindSlider('displacement', 'displacement');
+        bindSlider('bloomStrength', 'strength', true);
+        bindSlider('bloomThreshold', 'threshold', true);
+
+        // --- Resize Handler ---
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            composer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // --- Animation Loop & State Exposure ---
+        const clock = new THREE.Clock();
+        let frames = 0;
+        let prevTime = performance.now();
+        let currentFps = 0;
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const delta = clock.getDelta();
+            uniforms.time.value += delta;
+
+            // Object rotation
+            lavaMesh.rotation.y += 0.005;
+
+            controls.update();
+
+            // FPS Calculation
+            frames++;
+            const timeNow = performance.now();
+            if (timeNow >= prevTime + 1000) {
+                currentFps = Math.round((frames * 1000) / (timeNow - prevTime));
+                frames = 0;
+                prevTime = timeNow;
+            }
+
+            // Expose State
+            window.__3D_STATE__ = {
+                noiseScale: uniforms.noiseScale.value,
+                speed: uniforms.speed.value,
+                colorIntensity: uniforms.colorIntensity.value,
+                displacement: uniforms.displacement.value,
+                bloomStrength: bloomPass.strength,
+                bloomThreshold: bloomPass.threshold,
+                fps: currentFps,
+                time: uniforms.time.value
+            };
+
+            composer.render();
+        }
+
+        animate();
+    </script>
+</body>
+</html>

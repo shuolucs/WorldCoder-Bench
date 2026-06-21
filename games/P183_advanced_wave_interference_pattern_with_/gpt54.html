@@ -1,0 +1,511 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>3D Wave Interference - Amber Specimen</title>
+  <style>
+    html, body {
+      margin: 0;
+      overflow: hidden;
+      background: #0a0a2a;
+      font-family: Arial, sans-serif;
+    }
+
+    #hud {
+      position: absolute;
+      top: 16px;
+      right: 16px;
+      color: white;
+      z-index: 10;
+      text-align: right;
+      pointer-events: none;
+    }
+
+    #hud div {
+      font-size: 24px;
+      margin-bottom: 6px;
+      text-shadow: 0 0 8px rgba(255,255,255,0.25);
+    }
+
+    #pauseIndicator {
+      color: #ffcc66;
+      display: none;
+      font-weight: bold;
+    }
+
+    #clearBtn {
+      position: absolute;
+      top: 16px;
+      left: 16px;
+      z-index: 20;
+      padding: 10px 16px;
+      font-size: 16px;
+      border: none;
+      border-radius: 8px;
+      background: rgba(255, 180, 60, 0.9);
+      color: #111;
+      cursor: pointer;
+      box-shadow: 0 0 12px rgba(255, 180, 60, 0.35);
+    }
+
+    #clearBtn:hover {
+      background: rgba(255, 200, 90, 1);
+    }
+
+    #info {
+      position: absolute;
+      left: 16px;
+      bottom: 16px;
+      z-index: 10;
+      color: #cfd8ff;
+      font-size: 14px;
+      background: rgba(10,10,42,0.5);
+      padding: 10px 12px;
+      border-radius: 8px;
+      line-height: 1.5;
+      max-width: 320px;
+    }
+  </style>
+</head>
+<body>
+  <button id="clearBtn">Clear Waves</button>
+
+  <div id="hud">
+    <div id="scoreDisplay">Score: 0</div>
+    <div id="comboDisplay">Combo: 1x</div>
+    <div id="sourceCount">Sources: 0/5</div>
+    <div id="centerDisplacement">Center Δ: 0.00</div>
+    <div id="pauseIndicator">PAUSED</div>
+  </div>
+
+  <div id="info">
+    Left Click: Place wave source<br>
+    F/D: Increase/Decrease last source frequency<br>
+    A: Increase last source amplitude<br>
+    P: Pause/Resume<br>
+    R: Reset score/combo and remove all waves
+  </div>
+
+  <script type="module">
+    import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js';
+    import { OrbitControls } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js';
+    import { GLTFLoader } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/GLTFLoader.js';
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color('#0a0a2a');
+
+    const camera = new THREE.PerspectiveCamera(
+      60,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      1000
+    );
+    camera.position.set(0, 25, 30);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    document.body.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.set(0, 0, 0);
+    controls.enableDamping = true;
+
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+    scene.add(ambientLight);
+
+    const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+    dirLight.position.set(10, 20, 10);
+    scene.add(dirLight);
+
+    const clock = new THREE.Clock();
+
+    const scoreDisplay = document.getElementById('scoreDisplay');
+    const comboDisplay = document.getElementById('comboDisplay');
+    const sourceCountDisplay = document.getElementById('sourceCount');
+    const pauseIndicator = document.getElementById('pauseIndicator');
+    const centerDisplacementDisplay = document.getElementById('centerDisplacement');
+    const clearBtn = document.getElementById('clearBtn');
+
+    const MAX_SOURCES = 5;
+    const WAVELENGTH = 2.0;
+    const DAMPING = 0.05;
+    const K = 2 * Math.PI / WAVELENGTH;
+
+    let score = 0;
+    let combo = 1;
+    let paused = false;
+    let elapsedTime = 0;
+    let centerDisplacement = 0;
+    let amberLoaded = false;
+    let amberEmissiveIntensity = 0;
+    let wavesCleared = false;
+
+    let amberModel = null;
+    const amberEmissiveMaterials = [];
+
+    const waveSources = [];
+    const sourceMarkers = [];
+    const pulseRings = [];
+
+    const planeGeo = new THREE.PlaneGeometry(40, 40, 200, 200);
+    planeGeo.rotateX(-Math.PI / 2);
+
+    const totalVertices = planeGeo.attributes.position.count;
+
+    const colors = new Float32Array(totalVertices * 3);
+    planeGeo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+    const waterMat = new THREE.MeshPhongMaterial({
+      color: '#2244aa',
+      transparent: true,
+      opacity: 0.7,
+      side: THREE.DoubleSide,
+      shininess: 100,
+      vertexColors: true
+    });
+
+    const water = new THREE.Mesh(planeGeo, waterMat);
+    water.position.y = 0;
+    scene.add(water);
+
+    const basePositions = planeGeo.attributes.position.array.slice();
+    const positions = planeGeo.attributes.position.array;
+    const colorAttr = planeGeo.attributes.color;
+
+    const raycaster = new THREE.Raycaster();
+    const mouse = new THREE.Vector2();
+
+    function update3DState() {
+      const last = waveSources[waveSources.length - 1];
+      window.__3D_STATE__ = {
+        score,
+        combo,
+        sourceCount: waveSources.length,
+        paused,
+        centerDisplacement,
+        lastSourceFrequency: last ? last.frequency : 0,
+        lastSourceAmplitude: last ? last.amplitude : 0,
+        totalVertices,
+        amberLoaded,
+        amberEmissiveIntensity,
+        maxSourcesReached: waveSources.length >= MAX_SOURCES,
+        elapsedTime,
+        wavesCleared
+      };
+    }
+
+    function updateHUD() {
+      scoreDisplay.textContent = `Score: ${score}`;
+      comboDisplay.textContent = `Combo: ${combo}x`;
+      sourceCountDisplay.textContent = `Sources: ${waveSources.length}/${MAX_SOURCES}`;
+      centerDisplacementDisplay.textContent = `Center Δ: ${centerDisplacement.toFixed(2)}`;
+      pauseIndicator.style.display = paused ? 'block' : 'none';
+    }
+
+    function setAmberGlow() {
+      amberEmissiveIntensity = Math.min(score / 500, 2.0);
+      for (const mat of amberEmissiveMaterials) {
+        mat.emissive = new THREE.Color('#ff8800');
+        mat.emissiveIntensity = amberEmissiveIntensity;
+      }
+    }
+
+    function collectEmissiveMaterials(obj) {
+      obj.traverse((child) => {
+        if (child.isMesh) {
+          if (Array.isArray(child.material)) {
+            child.material.forEach((mat) => {
+              if ('emissive' in mat) amberEmissiveMaterials.push(mat);
+            });
+          } else if (child.material && 'emissive' in child.material) {
+            amberEmissiveMaterials.push(child.material);
+          }
+        }
+      });
+    }
+
+    const gltfLoader = new GLTFLoader();
+    gltfLoader.load(
+      'MosquitoInAmber.glb',
+      (gltf) => {
+        amberModel = gltf.scene;
+        amberModel.position.set(0, 8, 0);
+        amberModel.scale.set(3, 3, 3);
+        scene.add(amberModel);
+        collectEmissiveMaterials(amberModel);
+        setAmberGlow();
+        amberLoaded = true;
+        update3DState();
+      },
+      undefined,
+      () => {
+        const fallbackGeo = new THREE.IcosahedronGeometry(2, 2);
+        const fallbackMat = new THREE.MeshPhongMaterial({
+          color: 0xcc7722,
+          transparent: true,
+          opacity: 0.9,
+          shininess: 120,
+          emissive: new THREE.Color('#ff8800'),
+          emissiveIntensity: 0
+        });
+        amberModel = new THREE.Mesh(fallbackGeo, fallbackMat);
+        amberModel.position.set(0, 8, 0);
+        amberModel.scale.set(3, 3, 3);
+        scene.add(amberModel);
+        amberEmissiveMaterials.push(fallbackMat);
+        setAmberGlow();
+        amberLoaded = true;
+        update3DState();
+      }
+    );
+
+    function createSourceMarker(x, z) {
+      const geo = new THREE.SphereGeometry(0.3, 16, 16);
+      const mat = new THREE.MeshPhongMaterial({
+        color: 0xffee66,
+        emissive: 0xffdd33,
+        emissiveIntensity: 1.5,
+        shininess: 100
+      });
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.position.set(x, 0.3, z);
+      scene.add(mesh);
+      return mesh;
+    }
+
+    function createPulseRing(x, z) {
+      const geo = new THREE.RingGeometry(0.2, 0.28, 48);
+      const mat = new THREE.MeshBasicMaterial({
+        color: 0x99ccff,
+        transparent: true,
+        opacity: 0.85,
+        side: THREE.DoubleSide
+      });
+      const ring = new THREE.Mesh(geo, mat);
+      ring.rotation.x = -Math.PI / 2;
+      ring.position.set(x, 0.03, z);
+      ring.userData.life = 1.0;
+      ring.userData.growth = 0.35;
+      scene.add(ring);
+      pulseRings.push(ring);
+    }
+
+    function computeDisplacementAt(x, z, time) {
+      let y = 0;
+      for (const src of waveSources) {
+        const dx = x - src.x;
+        const dz = z - src.z;
+        const r = Math.sqrt(dx * dx + dz * dz);
+        const omega = 2 * Math.PI * src.frequency;
+        y += src.amplitude * Math.sin(K * r - omega * time + src.phase) * Math.exp(-DAMPING * r);
+      }
+      return y;
+    }
+
+    function addWaveSource(x, z, frequency = 1.5, amplitude = 0.8) {
+      if (waveSources.length >= MAX_SOURCES) return;
+
+      wavesCleared = false;
+
+      const before = computeDisplacementAt(0, 0, elapsedTime);
+
+      const marker = createSourceMarker(x, z);
+      const source = {
+        x,
+        z,
+        frequency,
+        amplitude,
+        phase: 0,
+        createdAt: elapsedTime,
+        marker
+      };
+
+      waveSources.push(source);
+      sourceMarkers.push(marker);
+      createPulseRing(x, z);
+
+      const after = computeDisplacementAt(0, 0, elapsedTime);
+
+      if (Math.abs(after) > Math.abs(before)) {
+        combo = Math.min(combo + 1, 5);
+      } else {
+        combo = 1;
+      }
+
+      const deltaScore = Math.round(Math.abs(after) * 100) * combo;
+      score += deltaScore;
+
+      setAmberGlow();
+      updateHUD();
+      update3DState();
+    }
+
+    function removeAllWaves(resetScore = false) {
+      while (waveSources.length > 0) {
+        const src = waveSources.pop();
+        if (src.marker) scene.remove(src.marker);
+      }
+
+      sourceMarkers.length = 0;
+
+      if (resetScore) {
+        score = 0;
+        combo = 1;
+        setAmberGlow();
+      }
+
+      centerDisplacement = 0;
+      wavesCleared = true;
+      updateHUD();
+      update3DState();
+    }
+
+    function removeExpiredSources(deltaTime) {
+      for (let i = waveSources.length - 1; i >= 0; i--) {
+        const src = waveSources[i];
+        src.amplitude *= Math.pow(0.98, deltaTime);
+        if (src.amplitude < 0.01) {
+          if (src.marker) scene.remove(src.marker);
+          waveSources.splice(i, 1);
+        } else if (src.marker) {
+          src.marker.material.emissiveIntensity = 0.8 + src.amplitude;
+        }
+      }
+    }
+
+    function updatePulseRings(deltaTime) {
+      for (let i = pulseRings.length - 1; i >= 0; i--) {
+        const ring = pulseRings[i];
+        ring.userData.life -= deltaTime * 1.5;
+        const s = 1 + (1 - ring.userData.life) * 6.0;
+        ring.scale.set(s, s, s);
+        ring.material.opacity = Math.max(0, ring.userData.life);
+        if (ring.userData.life <= 0) {
+          scene.remove(ring);
+          pulseRings.splice(i, 1);
+        }
+      }
+    }
+
+    function updateWaterSurface(time) {
+      for (let i = 0; i < totalVertices; i++) {
+        const ix = i * 3;
+        const x = basePositions[ix];
+        const z = basePositions[ix + 2];
+
+        let y = 0;
+        for (const src of waveSources) {
+          const dx = x - src.x;
+          const dz = z - src.z;
+          const r = Math.sqrt(dx * dx + dz * dz);
+          const omega = 2 * Math.PI * src.frequency;
+          y += src.amplitude * Math.sin(K * r - omega * time + src.phase) * Math.exp(-DAMPING * r);
+        }
+
+        positions[ix + 1] = basePositions[ix + 1] + y;
+
+        const normalized = THREE.MathUtils.clamp((y + 2.0) / 4.0, 0, 1);
+        let rCol, gCol, bCol;
+
+        if (y >= 0) {
+          rCol = THREE.MathUtils.lerp(0.13, 0.85, normalized);
+          gCol = THREE.MathUtils.lerp(0.27, 0.92, normalized);
+          bCol = THREE.MathUtils.lerp(0.67, 1.00, normalized);
+        } else {
+          const n = THREE.MathUtils.clamp((-y) / 2.0, 0, 1);
+          rCol = THREE.MathUtils.lerp(0.13, 0.02, n);
+          gCol = THREE.MathUtils.lerp(0.27, 0.05, n);
+          bCol = THREE.MathUtils.lerp(0.67, 0.18, n);
+        }
+
+        colors[ix] = rCol;
+        colors[ix + 1] = gCol;
+        colors[ix + 2] = bCol;
+      }
+
+      planeGeo.attributes.position.needsUpdate = true;
+      colorAttr.needsUpdate = true;
+      planeGeo.computeVertexNormals();
+
+      centerDisplacement = computeDisplacementAt(0, 0, time);
+    }
+
+    renderer.domElement.addEventListener('pointerdown', (event) => {
+      if (event.button !== 0) return;
+
+      mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+      mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+      raycaster.setFromCamera(mouse, camera);
+      const intersects = raycaster.intersectObject(water);
+
+      if (intersects.length > 0) {
+        const p = intersects[0].point;
+        addWaveSource(p.x, p.z, 1.5, 0.8);
+      }
+    });
+
+    window.addEventListener('keydown', (event) => {
+      const last = waveSources[waveSources.length - 1];
+      const key = event.key.toLowerCase();
+
+      if (key === 'f' && last) {
+        last.frequency = Math.min(3.0, last.frequency + 0.25);
+      } else if (key === 'd' && last) {
+        last.frequency = Math.max(0.5, last.frequency - 0.25);
+      } else if (key === 'a' && last) {
+        last.amplitude = Math.min(1.0, last.amplitude + 0.1);
+      } else if (key === 'r') {
+        removeAllWaves(true);
+      } else if (key === 'p') {
+        paused = !paused;
+      }
+
+      updateHUD();
+      update3DState();
+    });
+
+    clearBtn.addEventListener('click', () => {
+      removeAllWaves(false);
+    });
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      const deltaTime = clock.getDelta();
+      if (!paused) {
+        elapsedTime += deltaTime;
+        removeExpiredSources(deltaTime);
+        updateWaterSurface(elapsedTime);
+        updatePulseRings(deltaTime);
+      } else {
+        updatePulseRings(deltaTime);
+      }
+
+      if (amberModel) {
+        amberModel.rotation.y += 0.005;
+      }
+
+      controls.update();
+      updateHUD();
+      setAmberGlow();
+      update3DState();
+      renderer.render(scene, camera);
+    }
+
+    updateWaterSurface(0);
+    updateHUD();
+    update3DState();
+    animate();
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,539 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Three.js Fishing Mini-Game</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #87CEEB;
+            font-family: monospace;
+            user-select: none;
+        }
+        canvas {
+            display: block;
+        }
+        #hud {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            color: white;
+            background: rgba(0, 0, 0, 0.6);
+            padding: 10px;
+            border-radius: 5px;
+            pointer-events: none;
+        }
+        #resetBtn {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            padding: 8px 16px;
+            background: #ff4444;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-family: monospace;
+            font-size: 14px;
+        }
+        #resetBtn:hover {
+            background: #ff6666;
+        }
+        #debugInfo {
+            position: absolute;
+            bottom: 10px;
+            left: 10px;
+            color: #00ff00;
+            background: rgba(0, 0, 0, 0.8);
+            padding: 10px;
+            border-radius: 5px;
+            pointer-events: none;
+            display: none;
+            white-space: pre-wrap;
+        }
+        .controls-hint {
+            position: absolute;
+            bottom: 10px;
+            right: 10px;
+            color: white;
+            background: rgba(0, 0, 0, 0.4);
+            padding: 10px;
+            border-radius: 5px;
+            pointer-events: none;
+            text-align: right;
+        }
+    </style>
+    <!-- Import maps polyfill -->
+    <script async src="https://unpkg.com/es-module-shims@1.8.0/dist/es-module-shims.js"></script>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="hud">
+        Score: <span id="scoreVal">0</span><br>
+        State: <span id="stateVal">idle</span><br>
+        Rod Angle: <span id="angleVal">0</span>°
+    </div>
+    <button id="resetBtn">Reset</button>
+    <div id="debugInfo"></div>
+    <div class="controls-hint">
+        Space: Cast / Reel<br>
+        Left/Right: Aim<br>
+        D: Toggle Debug
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+        // --- State Management ---
+        window.__3D_STATE__ = {
+            score: 0,
+            gameState: 'idle', // 'idle'|'casting'|'waiting'|'reeling'|'fish_on'
+            hookPosition: { x: 0, y: 0, z: 0 },
+            hookSubmerged: false,
+            rodAngle: 0,
+            fishCount: 5,
+            fishStates: [],
+            debugOverlay: false,
+            castCount: 0,
+            modelLoaded: false,
+            waterAnimationTime: 0,
+            attractedFishCount: 0
+        };
+
+        // --- Scene Setup ---
+        const scene = new THREE.Scene();
+        scene.fog = new THREE.FogExp2(0x87CEEB, 0.02);
+
+        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+        camera.position.set(0, 8, 15);
+        camera.lookAt(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        document.body.appendChild(renderer.domElement);
+
+        // --- Lighting ---
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+        dirLight.position.set(10, 20, 10);
+        dirLight.castShadow = true;
+        dirLight.shadow.camera.top = 15;
+        dirLight.shadow.camera.bottom = -15;
+        dirLight.shadow.camera.left = -15;
+        dirLight.shadow.camera.right = 15;
+        dirLight.shadow.mapSize.width = 1024;
+        dirLight.shadow.mapSize.height = 1024;
+        scene.add(dirLight);
+
+        // --- Environment ---
+        const loader = new GLTFLoader();
+        loader.load('collision-world.glb', (gltf) => {
+            const model = gltf.scene;
+            model.scale.set(0.5, 0.5, 0.5);
+            model.position.set(0, -2, 0);
+            model.traverse((child) => {
+                if (child.isMesh) {
+                    child.receiveShadow = true;
+                    child.castShadow = true;
+                }
+            });
+            scene.add(model);
+            window.__3D_STATE__.modelLoaded = true;
+        }, undefined, (error) => {
+            console.warn("Could not load collision-world.glb. Proceeding without environment model.", error);
+        });
+
+        // --- Water ---
+        const waterGeo = new THREE.PlaneGeometry(20, 20, 64, 64);
+        waterGeo.rotateX(-Math.PI / 2);
+        const waterMat = new THREE.MeshStandardMaterial({
+            color: 0x2288cc,
+            transparent: true,
+            opacity: 0.6,
+            roughness: 0.1,
+            metalness: 0.1,
+            side: THREE.DoubleSide
+        });
+        const water = new THREE.Mesh(waterGeo, waterMat);
+        water.receiveShadow = true;
+        scene.add(water);
+
+        // Store original vertices for animation
+        const posAttr = waterGeo.attributes.position;
+        const origWaterPos = [];
+        for (let i = 0; i < posAttr.count; i++) {
+            origWaterPos.push(new THREE.Vector3(posAttr.getX(i), posAttr.getY(i), posAttr.getZ(i)));
+        }
+
+        // --- Fishing Rod & Line ---
+        const rodGroup = new THREE.Group();
+        rodGroup.position.set(0, 1, 5);
+        scene.add(rodGroup);
+
+        const rodGeo = new THREE.CylinderGeometry(0.05, 0.05, 3, 8);
+        rodGeo.translate(0, 1.5, 0); // Pivot at base
+        const rodMat = new THREE.MeshStandardMaterial({ color: 0x8B4513 });
+        const rodMesh = new THREE.Mesh(rodGeo, rodMat);
+        rodMesh.rotation.x = -Math.PI / 4; // Tilt forward
+        rodMesh.castShadow = true;
+        rodGroup.add(rodMesh);
+
+        const rodTip = new THREE.Object3D();
+        rodTip.position.set(0, 3, 0);
+        rodMesh.add(rodTip);
+
+        const lineGeo = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3()]);
+        const lineMat = new THREE.LineBasicMaterial({ color: 0xffffff });
+        const line = new THREE.Line(lineGeo, lineMat);
+        scene.add(line);
+
+        let hookPos = new THREE.Vector3();
+        let castStartPos = new THREE.Vector3();
+        let castTargetPos = new THREE.Vector3();
+        let castProgress = 0;
+        let caughtFish = null;
+
+        // --- Fish ---
+        const fishList = [];
+        const fishColors = [0xff0000, 0x00ff00, 0x0000ff, 0xffff00, 0xff00ff];
+        
+        // Debug Group
+        const debugGroup = new THREE.Group();
+        debugGroup.visible = false;
+        scene.add(debugGroup);
+
+        // Hook Debug Sphere
+        const hookDebugGeo = new THREE.SphereGeometry(3, 16, 16);
+        const hookDebugMat = new THREE.MeshBasicMaterial({ color: 0x00ffff, wireframe: true, transparent: true, opacity: 0.3 });
+        const hookDebugMesh = new THREE.Mesh(hookDebugGeo, hookDebugMat);
+        debugGroup.add(hookDebugMesh);
+
+        function createTextSprite() {
+            const canvas = document.createElement('canvas');
+            canvas.width = 128;
+            canvas.height = 64;
+            const ctx = canvas.getContext('2d');
+            const tex = new THREE.CanvasTexture(canvas);
+            const mat = new THREE.SpriteMaterial({ map: tex, depthTest: false });
+            const sprite = new THREE.Sprite(mat);
+            sprite.scale.set(1.5, 0.75, 1);
+            sprite.renderOrder = 999;
+            return { sprite, canvas, ctx, tex };
+        }
+
+        function updateTextSprite(spriteObj, text, colorStr) {
+            const { ctx, tex } = spriteObj;
+            ctx.clearRect(0, 0, 128, 64);
+            ctx.fillStyle = colorStr;
+            ctx.font = 'bold 24px monospace';
+            ctx.textAlign = 'center';
+            ctx.fillText(text, 64, 40);
+            tex.needsUpdate = true;
+        }
+
+        function initFish() {
+            for (let i = 0; i < 5; i++) {
+                const geo = new THREE.SphereGeometry(1, 16, 16);
+                const mat = new THREE.MeshStandardMaterial({ color: fishColors[i % fishColors.length] });
+                const mesh = new THREE.Mesh(geo, mat);
+                mesh.scale.set(0.5, 0.2, 0.3);
+                mesh.castShadow = true;
+                
+                // Random position
+                mesh.position.set(
+                    (Math.random() - 0.5) * 16,
+                    -0.5 - Math.random() * 1.5,
+                    (Math.random() - 0.5) * 16
+                );
+                scene.add(mesh);
+
+                // Debug visuals
+                const debugSphere = new THREE.Mesh(
+                    new THREE.SphereGeometry(0.6, 8, 8),
+                    new THREE.MeshBasicMaterial({ color: 0x00ff00, wireframe: true })
+                );
+                debugGroup.add(debugSphere);
+
+                const debugArrow = new THREE.ArrowHelper(new THREE.Vector3(1,0,0), mesh.position, 1, 0x00ff00);
+                debugGroup.add(debugArrow);
+
+                const textSpriteObj = createTextSprite();
+                debugGroup.add(textSpriteObj.sprite);
+
+                fishList.push({
+                    id: i,
+                    mesh: mesh,
+                    velocity: new THREE.Vector3(),
+                    speed: 0.5 + Math.random(),
+                    state: 'swimming', // swimming, attracted, caught
+                    timer: Math.random() * 2,
+                    debugSphere: debugSphere,
+                    debugArrow: debugArrow,
+                    textSpriteObj: textSpriteObj,
+                    active: true
+                });
+            }
+        }
+        initFish();
+
+        // --- Input Handling ---
+        const keys = { ArrowLeft: false, ArrowRight: false };
+        
+        window.addEventListener('keydown', (e) => {
+            if (keys.hasOwnProperty(e.code)) keys[e.code] = true;
+            
+            if (e.code === 'Space') {
+                const state = window.__3D_STATE__;
+                if (state.gameState === 'idle') {
+                    // Cast
+                    state.gameState = 'casting';
+                    state.castCount++;
+                    castProgress = 0;
+                    rodTip.getWorldPosition(castStartPos);
+                    
+                    // Target 5 units in front of rod
+                    const forward = new THREE.Vector3(0, 0, -1).applyAxisAngle(new THREE.Vector3(0,1,0), rodGroup.rotation.y);
+                    castTargetPos.copy(rodGroup.position).add(forward.multiplyScalar(5));
+                    castTargetPos.y = -1.5;
+                } else if (state.gameState === 'waiting' || state.gameState === 'fish_on') {
+                    // Reel
+                    state.gameState = 'reeling';
+                    castProgress = 0;
+                    castStartPos.copy(hookPos);
+                }
+            }
+
+            if (e.code === 'KeyD') {
+                window.__3D_STATE__.debugOverlay = !window.__3D_STATE__.debugOverlay;
+                debugGroup.visible = window.__3D_STATE__.debugOverlay;
+                document.getElementById('debugInfo').style.display = debugGroup.visible ? 'block' : 'none';
+            }
+        });
+
+        window.addEventListener('keyup', (e) => {
+            if (keys.hasOwnProperty(e.code)) keys[e.code] = false;
+        });
+
+        document.getElementById('resetBtn').addEventListener('click', () => {
+            const state = window.__3D_STATE__;
+            state.score = 0;
+            state.gameState = 'idle';
+            state.fishCount = 5;
+            caughtFish = null;
+            
+            fishList.forEach(f => {
+                f.active = true;
+                f.mesh.visible = true;
+                f.state = 'swimming';
+                f.mesh.position.set(
+                    (Math.random() - 0.5) * 16,
+                    -0.5 - Math.random() * 1.5,
+                    (Math.random() - 0.5) * 16
+                );
+                f.timer = 0;
+            });
+        });
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // --- Main Loop ---
+        const clock = new THREE.Clock();
+
+        function animate() {
+            requestAnimationFrame(animate);
+            const delta = clock.getDelta();
+            const time = clock.getElapsedTime();
+            const state = window.__3D_STATE__;
+
+            // Water Animation
+            state.waterAnimationTime = time;
+            for (let i = 0; i < posAttr.count; i++) {
+                const orig = origWaterPos[i];
+                const zOffset = Math.sin(orig.x * 1.5 + time * 2) * 0.1 + Math.cos(orig.y * 1.5 + time * 2) * 0.1;
+                posAttr.setZ(i, orig.z + zOffset);
+            }
+            posAttr.needsUpdate = true;
+
+            // Rod Rotation
+            if (keys.ArrowLeft) rodGroup.rotation.y += 0.05;
+            if (keys.ArrowRight) rodGroup.rotation.y -= 0.05;
+            state.rodAngle = rodGroup.rotation.y;
+
+            // Fishing Logic
+            const tipPos = new THREE.Vector3();
+            rodTip.getWorldPosition(tipPos);
+
+            if (state.gameState === 'idle') {
+                hookPos.copy(tipPos);
+            } else if (state.gameState === 'casting') {
+                castProgress += delta; // 1 second cast
+                if (castProgress >= 1) {
+                    castProgress = 1;
+                    state.gameState = 'waiting';
+                }
+                hookPos.lerpVectors(castStartPos, castTargetPos, castProgress);
+            } else if (state.gameState === 'waiting' || state.gameState === 'fish_on') {
+                // Hook stays at target
+                hookPos.copy(castTargetPos);
+            } else if (state.gameState === 'reeling') {
+                castProgress += delta / 1.5; // 1.5 second reel
+                if (castProgress >= 1) {
+                    castProgress = 1;
+                    state.gameState = 'idle';
+                    if (caughtFish) {
+                        state.score++;
+                        state.fishCount--;
+                        caughtFish.active = false;
+                        caughtFish.mesh.visible = false;
+                        caughtFish.debugSphere.visible = false;
+                        caughtFish.debugArrow.visible = false;
+                        caughtFish.textSpriteObj.sprite.visible = false;
+                        caughtFish = null;
+                    }
+                }
+                hookPos.lerpVectors(castStartPos, tipPos, castProgress);
+            }
+
+            state.hookPosition = { x: hookPos.x, y: hookPos.y, z: hookPos.z };
+            state.hookSubmerged = hookPos.y < 0;
+
+            // Update Line
+            line.geometry.setFromPoints([tipPos, hookPos]);
+
+            // Fish AI & Physics
+            state.attractedFishCount = 0;
+            state.fishStates = [];
+
+            fishList.forEach(f => {
+                if (!f.active) return;
+
+                const distToHook = f.mesh.position.distanceTo(hookPos);
+
+                if (f.state === 'caught') {
+                    f.mesh.position.copy(hookPos);
+                    f.mesh.position.y -= 0.2; // Hang slightly below hook
+                } else {
+                    // AI Timer
+                    f.timer -= delta;
+                    if (f.timer <= 0) {
+                        f.timer = 2 + Math.random() * 2;
+                        f.velocity.set(Math.random() - 0.5, 0, Math.random() - 0.5).normalize().multiplyScalar(f.speed);
+                    }
+
+                    // Attraction & Bite
+                    if (state.gameState === 'waiting' && state.hookSubmerged && distToHook < 3) {
+                        f.state = 'attracted';
+                        state.attractedFishCount++;
+                        
+                        // Steer towards hook
+                        const dirToHook = new THREE.Vector3().subVectors(hookPos, f.mesh.position);
+                        dirToHook.y = 0; // Keep horizontal movement mostly
+                        dirToHook.normalize();
+                        f.velocity.lerp(dirToHook.multiplyScalar(f.speed), 0.02);
+
+                        // Bite
+                        if (distToHook < 0.3 && !caughtFish) {
+                            f.state = 'caught';
+                            caughtFish = f;
+                            state.gameState = 'fish_on';
+                        }
+                    } else {
+                        f.state = 'swimming';
+                    }
+
+                    // Move
+                    f.mesh.position.addScaledVector(f.velocity, delta);
+
+                    // Bounds Check
+                    if (f.mesh.position.x < -8 || f.mesh.position.x > 8) {
+                        f.velocity.x *= -1;
+                        f.mesh.position.x = THREE.MathUtils.clamp(f.mesh.position.x, -8, 8);
+                    }
+                    if (f.mesh.position.z < -8 || f.mesh.position.z > 8) {
+                        f.velocity.z *= -1;
+                        f.mesh.position.z = THREE.MathUtils.clamp(f.mesh.position.z, -8, 8);
+                    }
+                    f.mesh.position.y = THREE.MathUtils.clamp(f.mesh.position.y, -2, -0.5);
+
+                    // Orient
+                    if (f.velocity.lengthSq() > 0.001) {
+                        const targetRot = Math.atan2(f.velocity.x, f.velocity.z);
+                        f.mesh.rotation.y = targetRot;
+                    }
+                }
+
+                // Debug Updates
+                if (state.debugOverlay) {
+                    f.debugSphere.position.copy(f.mesh.position);
+                    f.debugArrow.position.copy(f.mesh.position);
+                    
+                    if (f.velocity.lengthSq() > 0.001) {
+                        f.debugArrow.setDirection(f.velocity.clone().normalize());
+                        f.debugArrow.setLength(f.speed * 1.5);
+                    }
+
+                    f.textSpriteObj.sprite.position.copy(f.mesh.position).add(new THREE.Vector3(0, 0.8, 0));
+                    
+                    let colorHex, colorStr;
+                    if (f.state === 'swimming') { colorHex = 0x00ff00; colorStr = '#00ff00'; }
+                    else if (f.state === 'attracted') { colorHex = 0xff0000; colorStr = '#ff0000'; }
+                    else if (f.state === 'caught') { colorHex = 0xffff00; colorStr = '#ffff00'; }
+
+                    f.debugSphere.material.color.setHex(colorHex);
+                    f.debugArrow.setColor(colorHex);
+                    updateTextSprite(f.textSpriteObj, distToHook.toFixed(1), colorStr);
+                }
+
+                state.fishStates.push({
+                    id: f.id,
+                    state: f.state,
+                    distToHook: distToHook,
+                    speed: f.speed
+                });
+            });
+
+            if (state.debugOverlay) {
+                hookDebugMesh.position.copy(hookPos);
+                hookDebugMesh.visible = state.hookSubmerged;
+            }
+
+            // Update DOM HUD
+            document.getElementById('scoreVal').innerText = state.score;
+            document.getElementById('stateVal').innerText = state.gameState;
+            document.getElementById('angleVal').innerText = (state.rodAngle * 180 / Math.PI).toFixed(1);
+
+            if (state.debugOverlay) {
+                const vels = fishList.filter(f=>f.active).map(f => f.speed.toFixed(2)).join(', ');
+                document.getElementById('debugInfo').innerText = 
+`Debug: ON
+Fish Alive: ${state.fishCount}
+Speeds: [${vels}]
+Hook Pos: ${hookPos.x.toFixed(2)}, ${hookPos.y.toFixed(2)}, ${hookPos.z.toFixed(2)}
+Attracted: ${state.attractedFishCount}`;
+            }
+
+            renderer.render(scene, camera);
+        }
+
+        animate();
+    </script>
+</body>
+</html>

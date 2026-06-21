@@ -1,0 +1,561 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3D L-System Plant Growth</title>
+<style>
+body {
+    margin: 0;
+    overflow: hidden;
+    font-family: monospace;
+    background: #1a1a2e;
+}
+canvas { display: block; }
+#ui-panel {
+    position: absolute;
+    top: 10px;
+    left: 10px;
+    background: rgba(0, 0, 0, 0.7);
+    padding: 15px;
+    border-radius: 8px;
+    color: white;
+    z-index: 100;
+    min-width: 220px;
+}
+#ui-panel button {
+    display: inline-block;
+    margin: 4px 4px 4px 0;
+    padding: 8px 16px;
+    background: #2d5a27;
+    color: white;
+    border: 1px solid #4a8a3a;
+    border-radius: 4px;
+    cursor: pointer;
+    font-family: monospace;
+    font-size: 13px;
+}
+#ui-panel button:hover:not(:disabled) {
+    background: #3a7a32;
+}
+#ui-panel button:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+.info-line {
+    margin: 6px 0;
+    font-size: 13px;
+    color: #ccc;
+}
+.info-line span {
+    color: #7fff7f;
+}
+#instructions {
+    margin-top: 10px;
+    font-size: 11px;
+    color: #888;
+    border-top: 1px solid #444;
+    padding-top: 8px;
+}
+</style>
+</head>
+<body>
+
+<div id="ui-panel">
+    <div style="margin-bottom: 10px; font-size: 16px; color: #7fff7f; font-weight: bold;">🌿 L-System Plant</div>
+    <div>
+        <button id="growBtn">🌱 Grow</button>
+        <button id="pruneBtn">✂️ Prune</button>
+        <button id="windBtn">💨 Wind: OFF</button>
+    </div>
+    <div class="info-line">Generation: <span id="genDisplay">0</span> / 4</div>
+    <div class="info-line">Segments: <span id="segmentDisplay">0</span></div>
+    <div class="info-line">Angle: <span id="angleDisplay">25</span>°</div>
+    <div class="info-line">Color: <span id="colorDisplay">natural</span></div>
+    <div id="instructions">
+        [R] Randomize angle<br>
+        [C] Toggle color mode<br>
+        Drag to orbit
+    </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<script>
+(function() {
+    // State
+    const state = {
+        generation: 0,
+        maxGeneration: 4,
+        totalSegments: 0,
+        leafCount: 0,
+        branchAngle: 25,
+        colorMode: 'natural',
+        windActive: false,
+        isAnimating: false,
+        plantHeight: 0,
+        segmentsPerGeneration: []
+    };
+    window.__3D_STATE__ = state;
+
+    // Scene setup
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x1a1a2e);
+
+    const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+    camera.position.set(0, 8, 20);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.shadowMap.enabled = true;
+    document.body.appendChild(renderer.domElement);
+
+    const controls = new THREE.OrbitControls(camera, renderer.domElement);
+    controls.target.set(0, 4, 0);
+    controls.update();
+
+    // Lights
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+    scene.add(ambientLight);
+
+    const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+    dirLight.position.set(5, 15, 10);
+    dirLight.castShadow = true;
+    scene.add(dirLight);
+
+    // Ground
+    const groundGeo = new THREE.PlaneGeometry(30, 30);
+    const groundMat = new THREE.MeshLambertMaterial({ color: 0x1a4a1a });
+    const ground = new THREE.Mesh(groundGeo, groundMat);
+    ground.rotation.x = -Math.PI / 2;
+    ground.position.y = 0;
+    ground.receiveShadow = true;
+    scene.add(ground);
+
+    // Plant group
+    let plantGroup = new THREE.Group();
+    scene.add(plantGroup);
+
+    // L-System
+    function generateLString(axiom, rules, generations) {
+        let current = axiom;
+        for (let i = 0; i < generations; i++) {
+            let next = '';
+            for (let ch of current) {
+                next += (rules[ch] !== undefined) ? rules[ch] : ch;
+            }
+            current = next;
+        }
+        return current;
+    }
+
+    const rules = { 'F': 'FF+[+F-F-F]-[-F+F+F]' };
+
+    // Precompute segment counts for each generation
+    function computeSegmentsPerGeneration() {
+        state.segmentsPerGeneration = [];
+        for (let g = 0; g <= state.maxGeneration; g++) {
+            const lstr = generateLString('F', rules, g);
+            let count = 0;
+            for (let ch of lstr) {
+                if (ch === 'F') count++;
+            }
+            state.segmentsPerGeneration.push(count);
+        }
+    }
+    computeSegmentsPerGeneration();
+
+    // Interpret L-string and create geometry data
+    function interpretLSystem(lString, angle, segmentLength) {
+        const segments = [];
+        const leaves = [];
+        const stack = [];
+        let pos = new THREE.Vector3(0, 0, 0);
+        let dir = new THREE.Vector3(0, 1, 0);
+        let right = new THREE.Vector3(1, 0, 0);
+        let up = new THREE.Vector3(0, 0, 1);
+        let depth = 0;
+        let segIndex = 0;
+
+        const angleRad = THREE.MathUtils.degToRad(angle);
+
+        for (let i = 0; i < lString.length; i++) {
+            const ch = lString[i];
+            if (ch === 'F') {
+                const start = pos.clone();
+                const end = pos.clone().add(dir.clone().multiplyScalar(segmentLength));
+
+                // Check if this F is a terminal (next meaningful char is ']' or end)
+                let isTerminal = false;
+                let j = i + 1;
+                while (j < lString.length && lString[j] !== 'F' && lString[j] !== '[') {
+                    if (lString[j] === ']') {
+                        isTerminal = true;
+                        break;
+                    }
+                    j++;
+                }
+                if (j >= lString.length) isTerminal = true;
+
+                segments.push({
+                    start: start,
+                    end: end,
+                    dir: dir.clone(),
+                    depth: depth,
+                    index: segIndex,
+                    isTerminal: isTerminal
+                });
+                segIndex++;
+                pos = end;
+            } else if (ch === '+') {
+                // Rotate right around 'up' axis (Z-like)
+                const axis = up.clone().normalize();
+                dir.applyAxisAngle(axis, angleRad);
+                right.applyAxisAngle(axis, angleRad);
+            } else if (ch === '-') {
+                const axis = up.clone().normalize();
+                dir.applyAxisAngle(axis, -angleRad);
+                right.applyAxisAngle(axis, -angleRad);
+            } else if (ch === '[') {
+                stack.push({
+                    pos: pos.clone(),
+                    dir: dir.clone(),
+                    right: right.clone(),
+                    up: up.clone(),
+                    depth: depth
+                });
+                depth++;
+                // Add slight random rotation for 3D effect
+                const randAxis = new THREE.Vector3(
+                    Math.sin(segIndex * 1.7),
+                    0,
+                    Math.cos(segIndex * 2.3)
+                ).normalize();
+                dir.applyAxisAngle(randAxis, 0.1 * (segIndex % 3 - 1));
+                right.applyAxisAngle(randAxis, 0.1 * (segIndex % 3 - 1));
+                up.applyAxisAngle(randAxis, 0.1 * (segIndex % 3 - 1));
+            } else if (ch === ']') {
+                if (stack.length > 0) {
+                    const s = stack.pop();
+                    pos = s.pos;
+                    dir = s.dir;
+                    right = s.right;
+                    up = s.up;
+                    depth = s.depth;
+                }
+            }
+        }
+
+        // Identify terminal segments for leaves
+        for (const seg of segments) {
+            if (seg.isTerminal && seg.depth >= 1) {
+                leaves.push({
+                    position: seg.end.clone(),
+                    index: seg.index
+                });
+            }
+        }
+
+        return { segments, leaves };
+    }
+
+    // Build meshes
+    let allMeshes = [];
+    let allLeafMeshes = [];
+    let windTargets = [];
+
+    function getSegmentColor(seg, index, total) {
+        if (state.colorMode === 'rainbow') {
+            const hue = (index / Math.max(total, 1)) * 360;
+            return new THREE.Color().setHSL(hue / 360, 0.8, 0.5);
+        }
+        // Natural
+        if (seg.depth >= 2) {
+            return new THREE.Color(0x228B22);
+        }
+        return new THREE.Color(0x8B4513);
+    }
+
+    function getLeafColor(index, total) {
+        if (state.colorMode === 'rainbow') {
+            const hue = (index / Math.max(total, 1)) * 360;
+            return new THREE.Color().setHSL(hue / 360, 0.9, 0.6);
+        }
+        return new THREE.Color(0x228B22);
+    }
+
+    function buildPlant(generation, animate) {
+        // Clear old
+        while (plantGroup.children.length > 0) {
+            const child = plantGroup.children[0];
+            plantGroup.remove(child);
+            if (child.geometry) child.geometry.dispose();
+            if (child.material) child.material.dispose();
+        }
+        allMeshes = [];
+        allLeafMeshes = [];
+        windTargets = [];
+
+        const lString = generateLString('F', rules, generation);
+        const segLen = 1.0 / Math.max(1, generation * 0.7 + 0.3);
+        const data = interpretLSystem(lString, state.branchAngle, segLen);
+
+        const totalSegs = data.segments.length;
+        const totalLeaves = data.leaves.length;
+
+        state.totalSegments = totalSegs;
+        state.leafCount = totalLeaves;
+
+        let maxY = 0;
+
+        // Create segment meshes
+        for (let i = 0; i < data.segments.length; i++) {
+            const seg = data.segments[i];
+            const start = seg.start;
+            const end = seg.end;
+            const length = start.distanceTo(end);
+            const baseRadius = 0.05 * Math.pow(0.8, seg.depth);
+            const color = getSegmentColor(seg, i, totalSegs);
+
+            const geo = new THREE.CylinderGeometry(baseRadius * 0.8, baseRadius, length, 6, 1);
+            const mat = new THREE.MeshLambertMaterial({ color: color, transparent: true, opacity: animate ? 0 : 1 });
+            const mesh = new THREE.Mesh(geo, mat);
+
+            // Position and orient
+            const mid = new THREE.Vector3().addVectors(start, end).multiplyScalar(0.5);
+            mesh.position.copy(mid);
+
+            const direction = new THREE.Vector3().subVectors(end, start).normalize();
+            const quaternion = new THREE.Quaternion();
+            quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), direction);
+            mesh.quaternion.copy(quaternion);
+
+            mesh.userData = {
+                segData: seg,
+                index: i,
+                baseQuaternion: quaternion.clone(),
+                basePosition: mid.clone(),
+                depth: seg.depth
+            };
+
+            plantGroup.add(mesh);
+            allMeshes.push(mesh);
+            windTargets.push(mesh);
+
+            maxY = Math.max(maxY, end.y, start.y);
+        }
+
+        // Create leaf meshes
+        for (let i = 0; i < data.leaves.length; i++) {
+            const leaf = data.leaves[i];
+            const color = getLeafColor(i, totalLeaves);
+            const geo = new THREE.SphereGeometry(0.15, 6, 6);
+            const mat = new THREE.MeshLambertMaterial({ color: color, transparent: true, opacity: animate ? 0 : 1 });
+            const mesh = new THREE.Mesh(geo, mat);
+            mesh.position.copy(leaf.position);
+            mesh.userData = {
+                isLeaf: true,
+                index: leaf.index + data.segments.length,
+                basePosition: leaf.position.clone(),
+                depth: 99
+            };
+
+            plantGroup.add(mesh);
+            allLeafMeshes.push(mesh);
+            windTargets.push(mesh);
+
+            maxY = Math.max(maxY, leaf.position.y);
+        }
+
+        state.plantHeight = maxY || 0;
+
+        if (animate) {
+            animateGrowth();
+        }
+
+        updateUI();
+    }
+
+    // Animation
+    let animationQueue = [];
+    let animStartTime = 0;
+
+    function animateGrowth() {
+        state.isAnimating = true;
+        updateButtonStates();
+
+        const allItems = [...allMeshes, ...allLeafMeshes];
+        const totalItems = allItems.length;
+        const totalDuration = 2000; // 2 seconds
+        const delayPerItem = totalItems > 0 ? totalDuration / totalItems : 0;
+
+        animStartTime = performance.now();
+        animationQueue = allItems.map((mesh, i) => ({
+            mesh: mesh,
+            startTime: animStartTime + i * delayPerItem,
+            duration: Math.max(delayPerItem * 2, 100)
+        }));
+    }
+
+    function updateAnimations(now) {
+        if (animationQueue.length === 0) return;
+
+        let allDone = true;
+        for (const item of animationQueue) {
+            if (now < item.startTime) {
+                item.mesh.material.opacity = 0;
+                allDone = false;
+            } else if (now < item.startTime + item.duration) {
+                const t = (now - item.startTime) / item.duration;
+                item.mesh.material.opacity = Math.min(1, t);
+                allDone = false;
+            } else {
+                item.mesh.material.opacity = 1;
+            }
+        }
+
+        if (allDone) {
+            animationQueue = [];
+            state.isAnimating = false;
+            updateButtonStates();
+        }
+    }
+
+    // Wind animation
+    function updateWind(time) {
+        if (!state.windActive) return;
+
+        for (const mesh of windTargets) {
+            const ud = mesh.userData;
+            if (!ud.baseQuaternion && !ud.isLeaf) continue;
+
+            const depth = ud.depth || 0;
+            const idx = ud.index || 0;
+            const windStrength = Math.min(depth * 0.015, 0.08);
+            const windAngle = Math.sin(time * 2 + idx * 0.5) * THREE.MathUtils.degToRad(5) * windStrength * 10;
+
+            if (ud.isLeaf) {
+                const offset = new THREE.Vector3(
+                    Math.sin(time * 2.5 + idx * 0.7) * 0.05 * Math.min(depth, 3),
+                    0,
+                    Math.cos(time * 1.8 + idx * 0.3) * 0.05 * Math.min(depth, 3)
+                );
+                mesh.position.copy(ud.basePosition).add(offset);
+            } else if (ud.baseQuaternion) {
+                const windQuat = new THREE.Quaternion();
+                windQuat.setFromAxisAngle(new THREE.Vector3(0, 0, 1), windAngle);
+                mesh.quaternion.copy(ud.baseQuaternion).multiply(windQuat);
+            }
+        }
+    }
+
+    function resetWind() {
+        for (const mesh of windTargets) {
+            const ud = mesh.userData;
+            if (ud.isLeaf && ud.basePosition) {
+                mesh.position.copy(ud.basePosition);
+            } else if (ud.baseQuaternion) {
+                mesh.quaternion.copy(ud.baseQuaternion);
+            }
+        }
+    }
+
+    // UI
+    function updateUI() {
+        document.getElementById('genDisplay').textContent = state.generation;
+        document.getElementById('segmentDisplay').textContent = state.totalSegments;
+        document.getElementById('angleDisplay').textContent = state.branchAngle.toFixed(1);
+        document.getElementById('colorDisplay').textContent = state.colorMode;
+        updateButtonStates();
+    }
+
+    function updateButtonStates() {
+        const growBtn = document.getElementById('growBtn');
+        const pruneBtn = document.getElementById('pruneBtn');
+        growBtn.disabled = state.generation >= state.maxGeneration || state.isAnimating;
+        pruneBtn.disabled = state.generation <= 0 || state.isAnimating;
+    }
+
+    function updateColors() {
+        const totalSegs = allMeshes.length;
+        const totalLeaves = allLeafMeshes.length;
+
+        for (let i = 0; i < allMeshes.length; i++) {
+            const mesh = allMeshes[i];
+            const seg = mesh.userData.segData;
+            const color = getSegmentColor(seg, i, totalSegs);
+            mesh.material.color.copy(color);
+        }
+
+        for (let i = 0; i < allLeafMeshes.length; i++) {
+            const mesh = allLeafMeshes[i];
+            const color = getLeafColor(i, totalLeaves);
+            mesh.material.color.copy(color);
+        }
+    }
+
+    // Button handlers
+    document.getElementById('growBtn').addEventListener('click', () => {
+        if (state.generation < state.maxGeneration && !state.isAnimating) {
+            state.generation++;
+            buildPlant(state.generation, true);
+        }
+    });
+
+    document.getElementById('pruneBtn').addEventListener('click', () => {
+        if (state.generation > 0 && !state.isAnimating) {
+            state.generation--;
+            buildPlant(state.generation, true);
+        }
+    });
+
+    document.getElementById('windBtn').addEventListener('click', () => {
+        state.windActive = !state.windActive;
+        document.getElementById('windBtn').textContent = '💨 Wind: ' + (state.windActive ? 'ON' : 'OFF');
+        if (!state.windActive) {
+            resetWind();
+        }
+    });
+
+    // Keyboard
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'r' || e.key === 'R') {
+            state.branchAngle = 15 + Math.random() * 20;
+            computeSegmentsPerGeneration();
+            buildPlant(state.generation, false);
+        } else if (e.key === 'c' || e.key === 'C') {
+            state.colorMode = state.colorMode === 'natural' ? 'rainbow' : 'natural';
+            updateColors();
+            updateUI();
+        }
+    });
+
+    // Resize
+    window.addEventListener('resize', () => {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    // Initial build
+    buildPlant(0, false);
+
+    // Render loop
+    function animate() {
+        requestAnimationFrame(animate);
+
+        const now = performance.now();
+        const time = now * 0.001;
+
+        updateAnimations(now);
+        updateWind(time);
+        controls.update();
+        renderer.render(scene, camera);
+    }
+
+    animate();
+})();
+</script>
+</body>
+</html>

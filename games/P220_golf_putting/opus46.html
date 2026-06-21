@@ -1,0 +1,829 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3D Golf Putting Game</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { overflow: hidden; background: #1a1a2e; font-family: 'Segoe UI', Arial, sans-serif; }
+canvas { display: block; }
+
+#hud {
+    position: absolute;
+    top: 0; left: 0; right: 0; bottom: 0;
+    pointer-events: none;
+}
+
+#strokeCount {
+    position: absolute;
+    top: 20px; left: 20px;
+    color: white;
+    font-size: 24px;
+    font-weight: bold;
+    text-shadow: 2px 2px 4px rgba(0,0,0,0.7);
+}
+
+#scoreDisplay {
+    position: absolute;
+    top: 20px; right: 20px;
+    color: white;
+    font-size: 24px;
+    font-weight: bold;
+    text-shadow: 2px 2px 4px rgba(0,0,0,0.7);
+}
+
+#powerBarContainer {
+    position: absolute;
+    bottom: 40px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 200px;
+    height: 20px;
+    border: 2px solid white;
+    border-radius: 10px;
+    overflow: hidden;
+    background: rgba(0,0,0,0.5);
+}
+
+#powerBar {
+    width: 0%;
+    height: 100%;
+    background: #2ecc71;
+    transition: background-color 0.1s;
+}
+
+#messageDisplay {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    color: #ffd700;
+    font-size: 42px;
+    font-weight: bold;
+    text-shadow: 3px 3px 6px rgba(0,0,0,0.8);
+    display: none;
+    text-align: center;
+    animation: popIn 0.5s ease-out;
+}
+
+@keyframes popIn {
+    0% { transform: translate(-50%, -50%) scale(0.3); opacity: 0; }
+    50% { transform: translate(-50%, -50%) scale(1.1); }
+    100% { transform: translate(-50%, -50%) scale(1); opacity: 1; }
+}
+
+#instructions {
+    position: absolute;
+    bottom: 80px;
+    left: 50%;
+    transform: translateX(-50%);
+    color: rgba(255,255,255,0.7);
+    font-size: 14px;
+    text-align: center;
+    text-shadow: 1px 1px 2px rgba(0,0,0,0.5);
+}
+
+#gameStateDisplay {
+    position: absolute;
+    top: 60px;
+    left: 20px;
+    color: rgba(255,255,255,0.6);
+    font-size: 14px;
+    text-shadow: 1px 1px 2px rgba(0,0,0,0.5);
+}
+</style>
+</head>
+<body>
+
+<div id="hud">
+    <div id="strokeCount">Strokes: 0</div>
+    <div id="scoreDisplay">Score: 0</div>
+    <div id="gameStateDisplay">State: aiming</div>
+    <div id="messageDisplay"></div>
+    <div id="instructions">← → Aim | SPACE Hold to charge, release to putt | R Reset ball | N New game</div>
+    <div id="powerBarContainer">
+        <div id="powerBar"></div>
+    </div>
+</div>
+
+<script type="importmap">
+{
+    "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.163.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.163.0/examples/jsm/"
+    }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'https://cdn.jsdelivr.net/npm/three@0.163.0/examples/jsm/loaders/GLTFLoader.js';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// ============ STATE ============
+const TEE_POSITION = { x: 0, y: 0.15, z: 8 };
+const HOLE_POSITION = { x: 2, y: 0.01, z: -10 };
+const GREEN_LENGTH = 30;
+const GREEN_WIDTH = 10;
+const WALL_HEIGHT = 0.3;
+const BALL_RADIUS = 0.15;
+const HOLE_RADIUS = 0.4;
+const FRICTION = 0.985;
+const WALL_RESTITUTION = 0.7;
+const MODEL_RESTITUTION = 0.5;
+const MAX_POWER = 12.0;
+const CHARGE_TIME = 2.0; // seconds
+
+let ballPosition = { x: TEE_POSITION.x, y: TEE_POSITION.y, z: TEE_POSITION.z };
+let ballVelocity = { x: 0, z: 0 };
+let aimAngle = Math.PI; // pointing toward hole (negative z)
+let power = 0;
+let isCharging = false;
+let chargeStartTime = 0;
+let strokeCount = 0;
+let score = 0;
+let ballSunk = false;
+let modelLoaded = false;
+let wallBounceCount = 0;
+let modelBounceCount = 0;
+let gameState = 'aiming';
+let messageTimeout = null;
+
+let modelBoundingBox = null;
+let loadedModel = null;
+
+// Keys
+const keys = { left: false, right: false, space: false };
+
+// Initialize global state
+window.__3D_STATE__ = {
+    ballPosition: { ...ballPosition },
+    ballVelocity: { ...ballVelocity },
+    ballSpeed: 0,
+    ballStopped: true,
+    ballSunk: false,
+    aimAngle: aimAngle,
+    power: 0,
+    isCharging: false,
+    strokeCount: 0,
+    score: 0,
+    modelLoaded: false,
+    wallBounceCount: 0,
+    modelBounceCount: 0,
+    gameState: 'aiming'
+};
+
+// ============ SCENE SETUP ============
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x1a1a2e);
+scene.fog = new THREE.Fog(0x1a1a2e, 30, 60);
+
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+camera.position.set(0, 12, 15);
+camera.lookAt(0, 0, 0);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.2;
+document.body.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.05;
+controls.target.set(0, 0, 0);
+controls.update();
+
+// ============ LIGHTS ============
+const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+scene.add(ambientLight);
+
+const dirLight = new THREE.DirectionalLight(0xffffff, 1.2);
+dirLight.position.set(5, 10, 5);
+dirLight.castShadow = true;
+dirLight.shadow.mapSize.width = 2048;
+dirLight.shadow.mapSize.height = 2048;
+dirLight.shadow.camera.near = 0.5;
+dirLight.shadow.camera.far = 50;
+dirLight.shadow.camera.left = -20;
+dirLight.shadow.camera.right = 20;
+dirLight.shadow.camera.top = 20;
+dirLight.shadow.camera.bottom = -20;
+scene.add(dirLight);
+
+const hemiLight = new THREE.HemisphereLight(0x87ceeb, 0x2d5a27, 0.3);
+scene.add(hemiLight);
+
+// ============ PUTTING GREEN ============
+const greenGeometry = new THREE.BoxGeometry(GREEN_WIDTH, 0.2, GREEN_LENGTH);
+const greenMaterial = new THREE.MeshStandardMaterial({
+    color: 0x2d8a4e,
+    roughness: 0.8,
+    metalness: 0.0
+});
+const green = new THREE.Mesh(greenGeometry, greenMaterial);
+green.position.set(0, -0.1, 0);
+green.receiveShadow = true;
+scene.add(green);
+
+// Subtle green stripes
+const stripeGeometry = new THREE.PlaneGeometry(GREEN_WIDTH, GREEN_LENGTH);
+const stripeCanvas = document.createElement('canvas');
+stripeCanvas.width = 256;
+stripeCanvas.height = 512;
+const stripeCtx = stripeCanvas.getContext('2d');
+stripeCtx.fillStyle = '#2d8a4e';
+stripeCtx.fillRect(0, 0, 256, 512);
+for (let i = 0; i < 512; i += 32) {
+    stripeCtx.fillStyle = i % 64 === 0 ? '#2f9050' : '#2b8048';
+    stripeCtx.fillRect(0, i, 256, 16);
+}
+const stripeTexture = new THREE.CanvasTexture(stripeCanvas);
+stripeTexture.wrapS = THREE.RepeatWrapping;
+stripeTexture.wrapT = THREE.RepeatWrapping;
+const stripeMaterial = new THREE.MeshStandardMaterial({
+    map: stripeTexture,
+    roughness: 0.9,
+    metalness: 0.0
+});
+const stripeOverlay = new THREE.Mesh(stripeGeometry, stripeMaterial);
+stripeOverlay.rotation.x = -Math.PI / 2;
+stripeOverlay.position.y = 0.01;
+scene.add(stripeOverlay);
+
+// ============ WALLS ============
+const wallMaterial = new THREE.MeshStandardMaterial({ color: 0x3a7d44, roughness: 0.6 });
+const walls = [];
+
+// Left wall
+const leftWall = new THREE.Mesh(new THREE.BoxGeometry(0.2, WALL_HEIGHT, GREEN_LENGTH), wallMaterial);
+leftWall.position.set(-GREEN_WIDTH / 2, WALL_HEIGHT / 2, 0);
+leftWall.castShadow = true;
+leftWall.receiveShadow = true;
+scene.add(leftWall);
+walls.push({ mesh: leftWall, normal: { x: 1, z: 0 }, type: 'left' });
+
+// Right wall
+const rightWall = new THREE.Mesh(new THREE.BoxGeometry(0.2, WALL_HEIGHT, GREEN_LENGTH), wallMaterial);
+rightWall.position.set(GREEN_WIDTH / 2, WALL_HEIGHT / 2, 0);
+rightWall.castShadow = true;
+rightWall.receiveShadow = true;
+scene.add(rightWall);
+walls.push({ mesh: rightWall, normal: { x: -1, z: 0 }, type: 'right' });
+
+// Far wall (negative z)
+const farWall = new THREE.Mesh(new THREE.BoxGeometry(GREEN_WIDTH + 0.4, WALL_HEIGHT, 0.2), wallMaterial);
+farWall.position.set(0, WALL_HEIGHT / 2, -GREEN_LENGTH / 2);
+farWall.castShadow = true;
+farWall.receiveShadow = true;
+scene.add(farWall);
+walls.push({ mesh: farWall, normal: { x: 0, z: 1 }, type: 'far' });
+
+// Near wall (positive z)
+const nearWall = new THREE.Mesh(new THREE.BoxGeometry(GREEN_WIDTH + 0.4, WALL_HEIGHT, 0.2), wallMaterial);
+nearWall.position.set(0, WALL_HEIGHT / 2, GREEN_LENGTH / 2);
+nearWall.castShadow = true;
+nearWall.receiveShadow = true;
+scene.add(nearWall);
+walls.push({ mesh: nearWall, normal: { x: 0, z: -1 }, type: 'near' });
+
+// ============ GOLF BALL ============
+const ballGeometry = new THREE.SphereGeometry(BALL_RADIUS, 32, 32);
+const ballMaterial = new THREE.MeshStandardMaterial({
+    color: 0xffffff,
+    roughness: 0.3,
+    metalness: 0.1
+});
+const ball = new THREE.Mesh(ballGeometry, ballMaterial);
+ball.position.set(ballPosition.x, ballPosition.y, ballPosition.z);
+ball.castShadow = true;
+scene.add(ball);
+
+// Ball shadow
+const shadowGeometry = new THREE.CircleGeometry(BALL_RADIUS * 1.5, 32);
+const shadowMaterial = new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.3 });
+const ballShadow = new THREE.Mesh(shadowGeometry, shadowMaterial);
+ballShadow.rotation.x = -Math.PI / 2;
+ballShadow.position.set(ballPosition.x, 0.005, ballPosition.z);
+scene.add(ballShadow);
+
+// ============ HOLE ============
+const holeGeometry = new THREE.CircleGeometry(HOLE_RADIUS, 32);
+const holeMaterial = new THREE.MeshStandardMaterial({ color: 0x111111, roughness: 1.0 });
+const hole = new THREE.Mesh(holeGeometry, holeMaterial);
+hole.rotation.x = -Math.PI / 2;
+hole.position.set(HOLE_POSITION.x, HOLE_POSITION.y, HOLE_POSITION.z);
+scene.add(hole);
+
+// Hole rim
+const rimGeometry = new THREE.RingGeometry(HOLE_RADIUS, HOLE_RADIUS + 0.05, 32);
+const rimMaterial = new THREE.MeshStandardMaterial({ color: 0x222222, roughness: 0.5 });
+const rim = new THREE.Mesh(rimGeometry, rimMaterial);
+rim.rotation.x = -Math.PI / 2;
+rim.position.set(HOLE_POSITION.x, HOLE_POSITION.y + 0.005, HOLE_POSITION.z);
+scene.add(rim);
+
+// Flag pole
+const poleGeometry = new THREE.CylinderGeometry(0.02, 0.02, 1.5, 8);
+const poleMaterial = new THREE.MeshStandardMaterial({ color: 0xcccccc, metalness: 0.5 });
+const pole = new THREE.Mesh(poleGeometry, poleMaterial);
+pole.position.set(HOLE_POSITION.x, 0.75, HOLE_POSITION.z);
+pole.castShadow = true;
+scene.add(pole);
+
+// Flag (triangle)
+const flagShape = new THREE.Shape();
+flagShape.moveTo(0, 0);
+flagShape.lineTo(0.6, 0.15);
+flagShape.lineTo(0, 0.3);
+flagShape.lineTo(0, 0);
+const flagGeometry = new THREE.ShapeGeometry(flagShape);
+const flagMaterial = new THREE.MeshStandardMaterial({ color: 0xff2222, side: THREE.DoubleSide });
+const flag = new THREE.Mesh(flagGeometry, flagMaterial);
+flag.position.set(HOLE_POSITION.x + 0.02, 1.2, HOLE_POSITION.z);
+flag.castShadow = true;
+scene.add(flag);
+
+// ============ AIM LINE ============
+const aimLineGeometry = new THREE.BufferGeometry();
+const aimLinePositions = new Float32Array(6);
+aimLineGeometry.setAttribute('position', new THREE.BufferAttribute(aimLinePositions, 3));
+const aimLineMaterial = new THREE.LineBasicMaterial({ color: 0xff6600, linewidth: 2 });
+const aimLine = new THREE.Line(aimLineGeometry, aimLineMaterial);
+scene.add(aimLine);
+
+// Aim arrow head (small cone)
+const arrowGeometry = new THREE.ConeGeometry(0.08, 0.2, 8);
+const arrowMaterial = new THREE.MeshBasicMaterial({ color: 0xff6600 });
+const aimArrow = new THREE.Mesh(arrowGeometry, arrowMaterial);
+scene.add(aimArrow);
+
+// Aim dots for better visibility
+const aimDots = [];
+for (let i = 0; i < 5; i++) {
+    const dotGeo = new THREE.SphereGeometry(0.03, 8, 8);
+    const dotMat = new THREE.MeshBasicMaterial({ color: 0xff6600, transparent: true, opacity: 1 - i * 0.15 });
+    const dot = new THREE.Mesh(dotGeo, dotMat);
+    scene.add(dot);
+    aimDots.push(dot);
+}
+
+// ============ LOAD MODEL ============
+const loader = new GLTFLoader();
+loader.load(
+    'ABeautifulGame.glb',
+    (gltf) => {
+        loadedModel = gltf.scene;
+        loadedModel.scale.set(0.5, 0.5, 0.5);
+        loadedModel.position.set(0, 0, -5);
+        loadedModel.traverse((child) => {
+            if (child.isMesh) {
+                child.castShadow = true;
+                child.receiveShadow = true;
+            }
+        });
+        scene.add(loadedModel);
+
+        // Compute bounding box
+        const box = new THREE.Box3().setFromObject(loadedModel);
+        modelBoundingBox = box;
+        modelLoaded = true;
+        console.log('Model loaded. Bounding box:', box.min, box.max);
+    },
+    (progress) => {
+        console.log('Loading model...', Math.round((progress.loaded / progress.total) * 100) + '%');
+    },
+    (error) => {
+        console.warn('Could not load ABeautifulGame.glb, creating placeholder:', error);
+        // Create placeholder obstacle
+        const placeholderGroup = new THREE.Group();
+
+        // Base platform
+        const baseGeo = new THREE.CylinderGeometry(1.5, 1.5, 0.2, 32);
+        const baseMat = new THREE.MeshStandardMaterial({ color: 0x8B4513, roughness: 0.4, metalness: 0.2 });
+        const base = new THREE.Mesh(baseGeo, baseMat);
+        base.position.y = 0.1;
+        base.castShadow = true;
+        placeholderGroup.add(base);
+
+        // Chess-like pieces as obstacles
+        const pieceMat = new THREE.MeshStandardMaterial({ color: 0xf5f5dc, roughness: 0.3, metalness: 0.1 });
+        const darkMat = new THREE.MeshStandardMaterial({ color: 0x2c2c2c, roughness: 0.3, metalness: 0.2 });
+
+        for (let i = 0; i < 6; i++) {
+            const angle = (i / 6) * Math.PI * 2;
+            const r = 1.0;
+            const pieceGeo = new THREE.CylinderGeometry(0.12, 0.15, 0.6 + Math.random() * 0.4, 8);
+            const piece = new THREE.Mesh(pieceGeo, i % 2 === 0 ? pieceMat : darkMat);
+            piece.position.set(Math.cos(angle) * r, 0.5, Math.sin(angle) * r);
+            piece.castShadow = true;
+            placeholderGroup.add(piece);
+        }
+
+        // Center king piece
+        const kingGeo = new THREE.CylinderGeometry(0.15, 0.2, 1.2, 8);
+        const king = new THREE.Mesh(kingGeo, pieceMat);
+        king.position.y = 0.8;
+        king.castShadow = true;
+        placeholderGroup.add(king);
+
+        // Cross on top
+        const crossV = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.25, 0.06), pieceMat);
+        crossV.position.y = 1.5;
+        placeholderGroup.add(crossV);
+        const crossH = new THREE.Mesh(new THREE.BoxGeometry(0.2, 0.06, 0.06), pieceMat);
+        crossH.position.y = 1.45;
+        placeholderGroup.add(crossH);
+
+        placeholderGroup.position.set(0, 0, -5);
+        scene.add(placeholderGroup);
+        loadedModel = placeholderGroup;
+
+        const box = new THREE.Box3().setFromObject(placeholderGroup);
+        modelBoundingBox = box;
+        modelLoaded = true;
+    }
+);
+
+// ============ GROUND PLANE (surrounding area) ============
+const groundGeo = new THREE.PlaneGeometry(60, 60);
+const groundMat = new THREE.MeshStandardMaterial({ color: 0x1a3d1a, roughness: 1.0 });
+const ground = new THREE.Mesh(groundGeo, groundMat);
+ground.rotation.x = -Math.PI / 2;
+ground.position.y = -0.15;
+ground.receiveShadow = true;
+scene.add(ground);
+
+// ============ INPUT HANDLING ============
+document.addEventListener('keydown', (e) => {
+    if (e.code === 'ArrowLeft') keys.left = true;
+    if (e.code === 'ArrowRight') keys.right = true;
+    if (e.code === 'Space') {
+        e.preventDefault();
+        if (!keys.space && gameState === 'aiming' && !ballSunk) {
+            keys.space = true;
+            isCharging = true;
+            chargeStartTime = performance.now();
+            gameState = 'charging';
+        }
+    }
+    if (e.code === 'KeyR') {
+        resetBall();
+    }
+    if (e.code === 'KeyN') {
+        resetGame();
+    }
+});
+
+document.addEventListener('keyup', (e) => {
+    if (e.code === 'ArrowLeft') keys.left = false;
+    if (e.code === 'ArrowRight') keys.right = false;
+    if (e.code === 'Space') {
+        e.preventDefault();
+        if (keys.space && isCharging) {
+            keys.space = false;
+            shoot();
+        }
+    }
+});
+
+// ============ GAME FUNCTIONS ============
+function resetBall() {
+    ballPosition.x = TEE_POSITION.x;
+    ballPosition.y = TEE_POSITION.y;
+    ballPosition.z = TEE_POSITION.z;
+    ballVelocity.x = 0;
+    ballVelocity.z = 0;
+    power = 0;
+    isCharging = false;
+    keys.space = false;
+    wallBounceCount = 0;
+    modelBounceCount = 0;
+    if (!ballSunk) {
+        strokeCount++;
+    }
+    ballSunk = false;
+    gameState = 'aiming';
+    hideMessage();
+    updateBallMesh();
+}
+
+function resetGame() {
+    ballPosition.x = TEE_POSITION.x;
+    ballPosition.y = TEE_POSITION.y;
+    ballPosition.z = TEE_POSITION.z;
+    ballVelocity.x = 0;
+    ballVelocity.z = 0;
+    power = 0;
+    isCharging = false;
+    keys.space = false;
+    strokeCount = 0;
+    score = 0;
+    ballSunk = false;
+    wallBounceCount = 0;
+    modelBounceCount = 0;
+    gameState = 'aiming';
+    aimAngle = Math.PI;
+    hideMessage();
+    updateBallMesh();
+}
+
+function shoot() {
+    if (ballSunk) return;
+    const velocity = power * MAX_POWER;
+    ballVelocity.x = Math.sin(aimAngle) * velocity;
+    ballVelocity.z = Math.cos(aimAngle) * velocity;
+    strokeCount++;
+    wallBounceCount = 0;
+    modelBounceCount = 0;
+    power = 0;
+    isCharging = false;
+    gameState = 'rolling';
+}
+
+function showMessage(text) {
+    const msgEl = document.getElementById('messageDisplay');
+    msgEl.textContent = text;
+    msgEl.style.display = 'block';
+    msgEl.style.animation = 'none';
+    msgEl.offsetHeight; // trigger reflow
+    msgEl.style.animation = 'popIn 0.5s ease-out';
+
+    if (messageTimeout) clearTimeout(messageTimeout);
+    messageTimeout = setTimeout(() => {
+        msgEl.style.display = 'none';
+    }, 4000);
+}
+
+function hideMessage() {
+    const msgEl = document.getElementById('messageDisplay');
+    msgEl.style.display = 'none';
+    if (messageTimeout) clearTimeout(messageTimeout);
+}
+
+function updateBallMesh() {
+    ball.position.set(ballPosition.x, ballPosition.y, ballPosition.z);
+    ballShadow.position.set(ballPosition.x, 0.005, ballPosition.z);
+}
+
+// ============ PHYSICS ============
+function getBallSpeed() {
+    return Math.sqrt(ballVelocity.x * ballVelocity.x + ballVelocity.z * ballVelocity.z);
+}
+
+function updatePhysics() {
+    if (ballSunk || gameState === 'aiming' || gameState === 'charging') return;
+
+    // Apply velocity
+    ballPosition.x += ballVelocity.x * 0.016; // ~60fps timestep
+    ballPosition.z += ballVelocity.z * 0.016;
+
+    // Apply friction
+    ballVelocity.x *= FRICTION;
+    ballVelocity.z *= FRICTION;
+
+    // Wall collisions
+    const halfW = GREEN_WIDTH / 2 - BALL_RADIUS - 0.1;
+    const halfL = GREEN_LENGTH / 2 - BALL_RADIUS - 0.1;
+
+    if (ballPosition.x < -halfW) {
+        ballPosition.x = -halfW;
+        ballVelocity.x = Math.abs(ballVelocity.x) * WALL_RESTITUTION;
+        wallBounceCount++;
+    }
+    if (ballPosition.x > halfW) {
+        ballPosition.x = halfW;
+        ballVelocity.x = -Math.abs(ballVelocity.x) * WALL_RESTITUTION;
+        wallBounceCount++;
+    }
+    if (ballPosition.z < -halfL) {
+        ballPosition.z = -halfL;
+        ballVelocity.z = Math.abs(ballVelocity.z) * WALL_RESTITUTION;
+        wallBounceCount++;
+    }
+    if (ballPosition.z > halfL) {
+        ballPosition.z = halfL;
+        ballVelocity.z = -Math.abs(ballVelocity.z) * WALL_RESTITUTION;
+        wallBounceCount++;
+    }
+
+    // Model bounding box collision
+    if (modelBoundingBox) {
+        const expandedBox = modelBoundingBox.clone();
+        expandedBox.expandByScalar(BALL_RADIUS);
+
+        if (expandedBox.containsPoint(new THREE.Vector3(ballPosition.x, ballPosition.y, ballPosition.z))) {
+            // Find closest face and reflect
+            const center = new THREE.Vector3();
+            modelBoundingBox.getCenter(center);
+
+            const dx = ballPosition.x - center.x;
+            const dz = ballPosition.z - center.z;
+
+            const halfSizeX = (modelBoundingBox.max.x - modelBoundingBox.min.x) / 2 + BALL_RADIUS;
+            const halfSizeZ = (modelBoundingBox.max.z - modelBoundingBox.min.z) / 2 + BALL_RADIUS;
+
+            const overlapX = halfSizeX - Math.abs(dx);
+            const overlapZ = halfSizeZ - Math.abs(dz);
+
+            if (overlapX < overlapZ) {
+                ballPosition.x = center.x + Math.sign(dx) * halfSizeX;
+                ballVelocity.x = -ballVelocity.x * MODEL_RESTITUTION;
+            } else {
+                ballPosition.z = center.z + Math.sign(dz) * halfSizeZ;
+                ballVelocity.z = -ballVelocity.z * MODEL_RESTITUTION;
+            }
+            modelBounceCount++;
+        }
+    }
+
+    // Check hole
+    const distToHole = Math.sqrt(
+        (ballPosition.x - HOLE_POSITION.x) ** 2 +
+        (ballPosition.z - HOLE_POSITION.z) ** 2
+    );
+    const speed = getBallSpeed();
+
+    if (distToHole < 0.5 && speed < 3.0 && !ballSunk) {
+        ballSunk = true;
+        ballPosition.x = HOLE_POSITION.x;
+        ballPosition.y = -0.1;
+        ballPosition.z = HOLE_POSITION.z;
+        ballVelocity.x = 0;
+        ballVelocity.z = 0;
+        score++;
+        gameState = 'sunk';
+
+        if (strokeCount === 1) {
+            showMessage('🏆 HOLE IN ONE! 🏆');
+        } else if (strokeCount <= 3) {
+            showMessage('👏 Nice Putt! 👏');
+        } else {
+            showMessage(`⛳ Ball Sunk in ${strokeCount} strokes!`);
+        }
+    }
+
+    // Stop ball if very slow
+    if (speed < 0.005 && !ballSunk) {
+        ballVelocity.x = 0;
+        ballVelocity.z = 0;
+        gameState = 'aiming';
+    }
+
+    ballPosition.y = ballSunk ? -0.1 : TEE_POSITION.y;
+    updateBallMesh();
+}
+
+// ============ UPDATE HUD ============
+function updateHUD() {
+    document.getElementById('strokeCount').textContent = `Strokes: ${strokeCount}`;
+    document.getElementById('scoreDisplay').textContent = `Score: ${score}`;
+    document.getElementById('gameStateDisplay').textContent = `State: ${gameState}`;
+
+    const powerBar = document.getElementById('powerBar');
+    const pct = power * 100;
+    powerBar.style.width = pct + '%';
+
+    if (power < 0.33) {
+        powerBar.style.background = '#2ecc71';
+    } else if (power < 0.66) {
+        powerBar.style.background = '#f1c40f';
+    } else {
+        powerBar.style.background = '#e74c3c';
+    }
+}
+
+// ============ UPDATE AIM LINE ============
+function updateAimLine() {
+    const show = (gameState === 'aiming' || gameState === 'charging') && !ballSunk;
+
+    aimLine.visible = show;
+    aimArrow.visible = show;
+    aimDots.forEach(d => d.visible = show);
+
+    if (!show) return;
+
+    const startX = ballPosition.x;
+    const startZ = ballPosition.z;
+    const lineLength = 3.0;
+    const endX = startX + Math.sin(aimAngle) * lineLength;
+    const endZ = startZ + Math.cos(aimAngle) * lineLength;
+
+    const positions = aimLine.geometry.attributes.position.array;
+    positions[0] = startX;
+    positions[1] = 0.05;
+    positions[2] = startZ;
+    positions[3] = endX;
+    positions[4] = 0.05;
+    positions[5] = endZ;
+    aimLine.geometry.attributes.position.needsUpdate = true;
+
+    // Arrow
+    aimArrow.position.set(endX, 0.05, endZ);
+    aimArrow.rotation.set(Math.PI / 2, 0, 0);
+    aimArrow.rotation.y = -aimAngle;
+    aimArrow.rotation.x = Math.PI / 2;
+
+    // Dots
+    for (let i = 0; i < aimDots.length; i++) {
+        const t = (i + 1) / (aimDots.length + 1);
+        aimDots[i].position.set(
+            startX + Math.sin(aimAngle) * lineLength * t,
+            0.05,
+            startZ + Math.cos(aimAngle) * lineLength * t
+        );
+    }
+
+    // Color based on charging
+    const color = isCharging ? new THREE.Color(0xff0000).lerp(new THREE.Color(0xff6600), Math.cos(performance.now() * 0.01) * 0.5 + 0.5) : new THREE.Color(0xff6600);
+    aimLineMaterial.color = color;
+    arrowMaterial.color = color;
+}
+
+// ============ UPDATE STATE ============
+function updateGlobalState() {
+    const speed = getBallSpeed();
+    window.__3D_STATE__ = {
+        ballPosition: { x: ballPosition.x, y: ballPosition.y, z: ballPosition.z },
+        ballVelocity: { x: ballVelocity.x, z: ballVelocity.z },
+        ballSpeed: speed,
+        ballStopped: speed < 0.005,
+        ballSunk: ballSunk,
+        aimAngle: aimAngle,
+        power: power,
+        isCharging: isCharging,
+        strokeCount: strokeCount,
+        score: score,
+        modelLoaded: modelLoaded,
+        wallBounceCount: wallBounceCount,
+        modelBounceCount: modelBounceCount,
+        gameState: gameState
+    };
+}
+
+// ============ FLAG ANIMATION ============
+let flagTime = 0;
+function animateFlag() {
+    flagTime += 0.03;
+    flag.rotation.y = Math.sin(flagTime) * 0.1;
+    flag.position.x = HOLE_POSITION.x + 0.02 + Math.sin(flagTime * 1.5) * 0.02;
+}
+
+// ============ ANIMATION LOOP ============
+function animate() {
+    requestAnimationFrame(animate);
+
+    // Handle aim rotation
+    if ((gameState === 'aiming' || gameState === 'charging') && !ballSunk) {
+        if (keys.left) aimAngle -= 0.03;
+        if (keys.right) aimAngle += 0.03;
+    }
+
+    // Handle power charging
+    if (isCharging && keys.space) {
+        const elapsed = (performance.now() - chargeStartTime) / 1000;
+        power = Math.min(elapsed / CHARGE_TIME, 1.0);
+    }
+
+    // Physics
+    updatePhysics();
+
+    // Update model bounding box if model moves (it doesn't, but just in case)
+    if (loadedModel && modelLoaded) {
+        modelBoundingBox = new THREE.Box3().setFromObject(loadedModel);
+    }
+
+    // Visuals
+    updateAimLine();
+    animateFlag();
+    updateHUD();
+    updateGlobalState();
+
+    // Ball rotation visual (rolling effect)
+    if (gameState === 'rolling') {
+        const speed = getBallSpeed();
+        ball.rotation.x += ballVelocity.z * 0.5;
+        ball.rotation.z -= ballVelocity.x * 0.5;
+    }
+
+    controls.update();
+    renderer.render(scene, camera);
+}
+
+// ============ RESIZE ============
+window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// ============ START ============
+animate();
+
+</script>
+</body>
+</html>

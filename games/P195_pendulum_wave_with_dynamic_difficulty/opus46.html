@@ -1,0 +1,482 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pendulum Wave Simulation</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { overflow: hidden; background: #000; font-family: monospace; }
+  canvas { display: block; }
+
+  #buttons {
+    position: absolute;
+    top: 10px;
+    left: 10px;
+    z-index: 10;
+    display: flex;
+    gap: 8px;
+  }
+
+  #buttons button {
+    padding: 8px 18px;
+    font-family: monospace;
+    font-size: 14px;
+    border: 2px solid #555;
+    background: rgba(0,0,0,0.7);
+    color: #fff;
+    cursor: pointer;
+    border-radius: 4px;
+    transition: all 0.2s;
+  }
+
+  #buttons button:hover {
+    background: rgba(80,80,80,0.8);
+  }
+
+  #buttons button.active {
+    border-color: #0f0;
+    background: rgba(0,100,0,0.5);
+  }
+
+  #hud {
+    position: absolute;
+    top: 10px;
+    right: 10px;
+    z-index: 10;
+    background: rgba(0,0,0,0.7);
+    color: #fff;
+    font-size: 16px;
+    font-family: monospace;
+    padding: 12px 16px;
+    border-radius: 6px;
+    line-height: 1.6;
+    min-width: 300px;
+    border: 1px solid #444;
+  }
+
+  #hud .label { color: #aaa; }
+  #hud .value { color: #0f0; }
+  #hud .section-title { color: #ff0; margin-top: 8px; }
+</style>
+</head>
+<body>
+
+<div id="buttons">
+  <button id="btn-easy" class="active" onclick="setDifficulty(1)">Easy</button>
+  <button id="btn-medium" onclick="setDifficulty(2)">Medium</button>
+  <button id="btn-hard" onclick="setDifficulty(3)">Hard</button>
+</div>
+
+<div id="hud"></div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+// ============ STATE ============
+const gravityValues = [9.81, 4.9, 1.62];
+const gravityLabels = ['Earth (9.81)', 'Half (4.9)', 'Moon (1.62)'];
+
+let state = {
+  difficulty: 1,
+  numPendulums: 5,
+  gravity: 9.81,
+  thetaMax: 0.5,
+  paused: false,
+  elapsedTime: 0,
+  dampingCoeff: 0,
+  pendulumAngles: [],
+  pendulumLengths: [],
+  selectedBobIndex: -1,
+  parrotLoaded: false,
+  parrotY: 13,
+  energySum: 0,
+  gravityCycleIndex: 0,
+  frameCount: 0
+};
+
+window.__3D_STATE__ = state;
+
+const difficultyConfigs = {
+  1: { name: 'Easy', count: 5, minLen: 4.0, maxLen: 6.0, damping: 0 },
+  2: { name: 'Medium', count: 10, minLen: 3.0, maxLen: 7.0, damping: 0.001 },
+  3: { name: 'Hard', count: 15, minLen: 2.5, maxLen: 8.0, damping: 0.005 }
+};
+
+// ============ THREE.JS SETUP ============
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x111111);
+scene.fog = new THREE.FogExp2(0x111111, 0.015);
+
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+camera.position.set(0, 8, 20);
+camera.lookAt(0, 0, 0);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.05;
+controls.target.set(0, 5, 0);
+controls.update();
+
+// ============ LIGHTS ============
+const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
+scene.add(ambientLight);
+
+const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+dirLight.position.set(5, 15, 10);
+dirLight.castShadow = true;
+dirLight.shadow.mapSize.width = 2048;
+dirLight.shadow.mapSize.height = 2048;
+dirLight.shadow.camera.near = 0.5;
+dirLight.shadow.camera.far = 50;
+dirLight.shadow.camera.left = -15;
+dirLight.shadow.camera.right = 15;
+dirLight.shadow.camera.top = 15;
+dirLight.shadow.camera.bottom = -5;
+scene.add(dirLight);
+
+// ============ GROUND ============
+const groundGeo = new THREE.PlaneGeometry(50, 50);
+const groundMat = new THREE.MeshStandardMaterial({ color: 0x2a2a2a, roughness: 0.9 });
+const ground = new THREE.Mesh(groundGeo, groundMat);
+ground.rotation.x = -Math.PI / 2;
+ground.position.y = 0;
+ground.receiveShadow = true;
+scene.add(ground);
+
+// ============ FRAME ============
+const frameMaterial = new THREE.MeshStandardMaterial({ color: 0x888888, metalness: 0.5, roughness: 0.4 });
+
+// Horizontal bar
+const barGeo = new THREE.CylinderGeometry(0.15, 0.15, 20, 16);
+barGeo.rotateZ(Math.PI / 2);
+const bar = new THREE.Mesh(barGeo, frameMaterial);
+bar.position.set(0, 12, 0);
+bar.castShadow = true;
+scene.add(bar);
+
+// Left post
+const postGeo = new THREE.CylinderGeometry(0.15, 0.2, 12, 16);
+const leftPost = new THREE.Mesh(postGeo, frameMaterial);
+leftPost.position.set(-10, 6, 0);
+leftPost.castShadow = true;
+scene.add(leftPost);
+
+// Right post
+const rightPost = new THREE.Mesh(postGeo, frameMaterial);
+rightPost.position.set(10, 6, 0);
+rightPost.castShadow = true;
+scene.add(rightPost);
+
+// ============ PARROT ============
+let parrot = null;
+let parrotMixer = null;
+
+const gltfLoader = new GLTFLoader();
+gltfLoader.load(
+  'https://threejs.org/examples/models/gltf/Parrot.glb',
+  (gltf) => {
+    parrot = gltf.scene;
+    parrot.scale.set(0.02, 0.02, 0.02);
+    parrot.position.set(0, 13, 0);
+    parrot.castShadow = true;
+    parrot.traverse((child) => {
+      if (child.isMesh) {
+        child.castShadow = true;
+      }
+    });
+    scene.add(parrot);
+    state.parrotLoaded = true;
+
+    if (gltf.animations && gltf.animations.length > 0) {
+      parrotMixer = new THREE.AnimationMixer(parrot);
+      const action = parrotMixer.clipAction(gltf.animations[0]);
+      action.play();
+    }
+  },
+  undefined,
+  (error) => {
+    console.warn('Could not load Parrot.glb:', error);
+  }
+);
+
+// ============ PENDULUMS ============
+let pendulumGroup = new THREE.Group();
+scene.add(pendulumGroup);
+
+let pendulums = [];
+
+function createPendulums() {
+  // Clear existing
+  while (pendulumGroup.children.length > 0) {
+    const child = pendulumGroup.children[0];
+    pendulumGroup.remove(child);
+    child.traverse((c) => {
+      if (c.geometry) c.geometry.dispose();
+      if (c.material) {
+        if (Array.isArray(c.material)) c.material.forEach(m => m.dispose());
+        else c.material.dispose();
+      }
+    });
+  }
+  pendulums = [];
+
+  const config = difficultyConfigs[state.difficulty];
+  const count = config.count;
+  state.numPendulums = count;
+  state.dampingCoeff = config.damping;
+  state.pendulumLengths = [];
+  state.pendulumAngles = [];
+
+  const barLength = 18;
+  const spacing = count > 1 ? barLength / (count - 1) : 0;
+  const startX = count > 1 ? -barLength / 2 : 0;
+
+  for (let i = 0; i < count; i++) {
+    const t = count > 1 ? i / (count - 1) : 0.5;
+    const length = config.minLen + t * (config.maxLen - config.minLen);
+    const x = startX + i * spacing;
+
+    // Color interpolation red to blue
+    const r = 1 - t;
+    const b = t;
+    const bobColor = new THREE.Color(r, 0, b);
+
+    // String (thin cylinder)
+    const stringGeo = new THREE.CylinderGeometry(0.02, 0.02, length, 8);
+    stringGeo.translate(0, -length / 2, 0);
+    const stringMat = new THREE.MeshStandardMaterial({ color: 0xcccccc });
+    const stringMesh = new THREE.Mesh(stringGeo, stringMat);
+
+    // Bob
+    const bobGeo = new THREE.SphereGeometry(0.3, 24, 24);
+    const bobMat = new THREE.MeshStandardMaterial({
+      color: bobColor,
+      metalness: 0.3,
+      roughness: 0.4,
+      emissive: new THREE.Color(0, 0, 0),
+      emissiveIntensity: 0
+    });
+    const bobMesh = new THREE.Mesh(bobGeo, bobMat);
+    bobMesh.position.set(0, -length, 0);
+    bobMesh.castShadow = true;
+    bobMesh.userData.pendulumIndex = i;
+
+    // Pivot group
+    const pivotGroup = new THREE.Group();
+    pivotGroup.position.set(x, 12, 0);
+    pivotGroup.add(stringMesh);
+    pivotGroup.add(bobMesh);
+
+    pendulumGroup.add(pivotGroup);
+
+    pendulums.push({
+      pivot: pivotGroup,
+      string: stringMesh,
+      bob: bobMesh,
+      bobMat: bobMat,
+      length: length,
+      x: x,
+      index: i
+    });
+
+    state.pendulumLengths.push(length);
+    state.pendulumAngles.push(state.thetaMax);
+  }
+
+  state.selectedBobIndex = -1;
+}
+
+// ============ DIFFICULTY ============
+window.setDifficulty = function(level) {
+  state.difficulty = level;
+  state.elapsedTime = 0;
+  state.gravityCycleIndex = 0;
+  state.gravity = gravityValues[0];
+
+  document.getElementById('btn-easy').classList.toggle('active', level === 1);
+  document.getElementById('btn-medium').classList.toggle('active', level === 2);
+  document.getElementById('btn-hard').classList.toggle('active', level === 3);
+
+  createPendulums();
+};
+
+// ============ RAYCASTER ============
+const raycaster = new THREE.Raycaster();
+const mouse = new THREE.Vector2();
+
+renderer.domElement.addEventListener('click', (event) => {
+  mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+  mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+  raycaster.setFromCamera(mouse, camera);
+
+  const bobs = pendulums.map(p => p.bob);
+  const intersects = raycaster.intersectObjects(bobs, false);
+
+  // Deselect all
+  pendulums.forEach(p => {
+    p.bobMat.emissive.set(0, 0, 0);
+    p.bobMat.emissiveIntensity = 0;
+  });
+
+  if (intersects.length > 0) {
+    const idx = intersects[0].object.userData.pendulumIndex;
+    state.selectedBobIndex = idx;
+    pendulums[idx].bobMat.emissive.set(1, 1, 0);
+    pendulums[idx].bobMat.emissiveIntensity = 0.5;
+  } else {
+    state.selectedBobIndex = -1;
+  }
+});
+
+// ============ KEYBOARD ============
+document.addEventListener('keydown', (event) => {
+  const key = event.code;
+
+  if (key === 'Space') {
+    event.preventDefault();
+    state.paused = !state.paused;
+  }
+
+  if (key === 'KeyR') {
+    state.elapsedTime = 0;
+  }
+
+  if (key === 'KeyG' && state.difficulty === 3) {
+    state.gravityCycleIndex = (state.gravityCycleIndex + 1) % 3;
+    state.gravity = gravityValues[state.gravityCycleIndex];
+  }
+
+  if (key === 'ArrowUp') {
+    event.preventDefault();
+    state.thetaMax = Math.min(1.2, state.thetaMax + 0.1);
+  }
+
+  if (key === 'ArrowDown') {
+    event.preventDefault();
+    state.thetaMax = Math.max(0.1, state.thetaMax - 0.1);
+  }
+});
+
+// ============ RESIZE ============
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// ============ HUD ============
+const hudEl = document.getElementById('hud');
+
+function updateHUD() {
+  const config = difficultyConfigs[state.difficulty];
+  let html = '';
+  html += `<div><span class="label">Difficulty: </span><span class="value">${config.name} (Level ${state.difficulty})</span></div>`;
+  html += `<div><span class="label">Pendulums: </span><span class="value">${state.numPendulums}</span></div>`;
+  html += `<div><span class="label">Gravity:   </span><span class="value">${state.gravity.toFixed(2)} m/s²</span></div>`;
+  html += `<div><span class="label">θ_max:     </span><span class="value">${state.thetaMax.toFixed(2)} rad</span></div>`;
+  html += `<div><span class="label">Time:      </span><span class="value">${state.elapsedTime.toFixed(2)} s</span></div>`;
+  html += `<div><span class="label">Paused:    </span><span class="value">${state.paused ? 'YES' : 'NO'}</span></div>`;
+  html += `<div><span class="label">Damping:   </span><span class="value">${state.dampingCoeff}</span></div>`;
+  html += `<div><span class="label">Energy:    </span><span class="value">${state.energySum.toFixed(3)}</span></div>`;
+
+  if (state.selectedBobIndex >= 0 && state.selectedBobIndex < pendulums.length) {
+    const idx = state.selectedBobIndex;
+    const p = pendulums[idx];
+    const angle = state.pendulumAngles[idx] || 0;
+    const omega = Math.sqrt(state.gravity / p.length);
+    html += `<div class="section-title">── Selected Bob ──</div>`;
+    html += `<div><span class="label">Index:     </span><span class="value">${idx}</span></div>`;
+    html += `<div><span class="label">Length:    </span><span class="value">${p.length.toFixed(3)} m</span></div>`;
+    html += `<div><span class="label">Angle:     </span><span class="value">${(angle * 180 / Math.PI).toFixed(2)}°</span></div>`;
+    html += `<div><span class="label">ω (rad/s): </span><span class="value">${omega.toFixed(3)}</span></div>`;
+  }
+
+  hudEl.innerHTML = html;
+}
+
+// ============ ANIMATION ============
+const clock = new THREE.Clock();
+let lastTime = 0;
+
+createPendulums();
+
+function animate() {
+  requestAnimationFrame(animate);
+
+  const delta = clock.getDelta();
+  state.frameCount++;
+
+  // Parrot bobbing
+  if (parrot) {
+    const bobOffset = Math.sin(performance.now() * 0.001 * Math.PI) * 0.3;
+    parrot.position.y = 13 + bobOffset;
+    state.parrotY = parrot.position.y;
+
+    if (parrotMixer) {
+      parrotMixer.update(delta);
+    }
+  }
+
+  // Update simulation time
+  if (!state.paused) {
+    state.elapsedTime += delta;
+  }
+
+  const t = state.elapsedTime;
+  const g = state.gravity;
+  const thetaMax = state.thetaMax;
+  const damping = state.dampingCoeff;
+
+  let energySum = 0;
+
+  for (let i = 0; i < pendulums.length; i++) {
+    const p = pendulums[i];
+    const L = p.length;
+    const omega = Math.sqrt(g / L);
+    const theta = thetaMax * Math.cos(omega * t) * Math.exp(-damping * t);
+
+    state.pendulumAngles[i] = theta;
+
+    // Rotate pivot around z-axis
+    p.pivot.rotation.z = theta;
+
+    // Energy calculation: KE + PE
+    // angular velocity: dtheta/dt = -thetaMax * (omega * sin(omega*t) * exp(-d*t) + damping * cos(omega*t) * exp(-d*t))
+    const dtheta = -thetaMax * (omega * Math.sin(omega * t) + damping * Math.cos(omega * t)) * Math.exp(-damping * t);
+    const m = 1;
+    const KE = 0.5 * m * L * L * dtheta * dtheta;
+    const PE = m * g * L * (1 - Math.cos(theta));
+    energySum += KE + PE;
+  }
+
+  state.energySum = energySum;
+
+  controls.update();
+  updateHUD();
+  renderer.render(scene, camera);
+}
+
+animate();
+</script>
+</body>
+</html>

@@ -1,0 +1,546 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Bioluminescent Ocean Scene</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      background: #050510;
+      font-family: monospace;
+    }
+
+    canvas {
+      display: block;
+    }
+
+    #hud {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      z-index: 10;
+      color: white;
+      background: rgba(0, 0, 0, 0.45);
+      padding: 12px 14px;
+      border-radius: 8px;
+      line-height: 1.5;
+      min-width: 220px;
+      white-space: pre-line;
+      user-select: none;
+    }
+
+    #controls {
+      position: absolute;
+      top: 12px;
+      right: 12px;
+      z-index: 10;
+      display: flex;
+      gap: 8px;
+    }
+
+    button {
+      background: rgba(20, 20, 40, 0.85);
+      color: white;
+      border: 1px solid rgba(255,255,255,0.2);
+      padding: 10px 14px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-family: monospace;
+    }
+
+    button:hover {
+      background: rgba(40, 40, 80, 0.95);
+    }
+  </style>
+</head>
+<body>
+  <div id="hud">Loading...</div>
+  <div id="controls">
+    <button id="btn-save">Save State</button>
+    <button id="btn-load">Load State</button>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
+    import { GLTFLoader } from 'https://unpkg.com/three@0.160.0/examples/jsm/loaders/GLTFLoader.js';
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color('#050510');
+
+    const camera = new THREE.PerspectiveCamera(
+      60,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      500
+    );
+    camera.position.set(0, 8, 20);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    document.body.appendChild(renderer.domElement);
+
+    const clock = new THREE.Clock();
+    const raycaster = new THREE.Raycaster();
+    const mouse = new THREE.Vector2();
+
+    const colorSchemes = {
+      deep_blue: '#020830',
+      emerald: '#021a08',
+      violet: '#100228'
+    };
+    const colorSchemeNames = ['deep_blue', 'emerald', 'violet'];
+
+    const ambientLight = new THREE.AmbientLight('#0a0a2e', 0.3);
+    scene.add(ambientLight);
+
+    const directionalLight = new THREE.DirectionalLight('#1a1a4e', 0.4);
+    directionalLight.position.set(0, 15, 5);
+    scene.add(directionalLight);
+
+    window.__3D_STATE__ = {
+      sceneReady: false,
+      lanternLoaded: false,
+      lanternPosition: { x: 0, y: 3, z: 0 },
+      glowEnabled: false,
+      clickCount: 0,
+      lanternMoveCount: 0,
+      colorScheme: 'deep_blue',
+      totalParticles: 500,
+      savedStateExists: !!localStorage.getItem('bioOceanState'),
+      stateLoaded: false,
+      elapsedTime: 0,
+      ambientIntensity: ambientLight.intensity,
+      lanternLightIntensity: 0
+    };
+
+    const hud = document.getElementById('hud');
+    const btnSave = document.getElementById('btn-save');
+    const btnLoad = document.getElementById('btn-load');
+
+    function updateHUD() {
+      const s = window.__3D_STATE__;
+      hud.textContent =
+`Click Count: ${s.clickCount}
+Lantern Moves: ${s.lanternMoveCount}
+Color Scheme: ${s.colorScheme}
+Glow: ${s.glowEnabled ? 'ON' : 'OFF'}
+Particles: ${s.totalParticles}`;
+    }
+
+    const oceanUniforms = {
+      uTime: { value: 0 },
+      uColor: { value: new THREE.Color(colorSchemes.deep_blue) },
+      uGlowBoost: { value: 1.0 }
+    };
+
+    const oceanGeometry = new THREE.PlaneGeometry(100, 100, 64, 64);
+    const oceanMaterial = new THREE.ShaderMaterial({
+      uniforms: oceanUniforms,
+      side: THREE.DoubleSide,
+      transparent: false,
+      vertexShader: `
+        uniform float uTime;
+        varying vec2 vUv;
+        varying float vWave;
+
+        void main() {
+          vUv = uv;
+          vec3 pos = position;
+
+          float wave1 = sin(pos.x * 0.35 + uTime * 1.4) * 0.25;
+          float wave2 = cos(pos.y * 0.28 + uTime * 1.1) * 0.2;
+          float wave3 = sin((pos.x + pos.y) * 0.2 + uTime * 0.8) * 0.15;
+
+          pos.z += wave1 + wave2 + wave3;
+          vWave = pos.z;
+
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(pos, 1.0);
+        }
+      `,
+      fragmentShader: `
+        uniform vec3 uColor;
+        uniform float uTime;
+        uniform float uGlowBoost;
+        varying vec2 vUv;
+        varying float vWave;
+
+        float hash(vec2 p) {
+          return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123);
+        }
+
+        void main() {
+          vec3 base = uColor;
+
+          vec2 gv = vUv * 30.0;
+          vec2 id = floor(gv);
+          vec2 f = fract(gv) - 0.5;
+
+          float rnd = hash(id);
+          float spot = smoothstep(0.16, 0.0, length(f)) * step(0.82, rnd);
+          float pulse = 0.5 + 0.5 * sin(uTime * 2.0 + rnd * 6.2831);
+
+          vec3 glowA = vec3(0.0, 1.0, 1.0);
+          vec3 glowB = vec3(0.0, 0.4, 1.0);
+          vec3 glow = mix(glowA, glowB, rnd) * spot * pulse * 0.9 * uGlowBoost;
+
+          float waveShade = vWave * 0.15;
+          vec3 color = base + glow + vec3(waveShade * 0.2, waveShade * 0.35, waveShade * 0.6);
+
+          gl_FragColor = vec4(color, 1.0);
+        }
+      `
+    });
+
+    const ocean = new THREE.Mesh(oceanGeometry, oceanMaterial);
+    ocean.rotation.x = -Math.PI / 2;
+    ocean.position.y = 0;
+    scene.add(ocean);
+
+    const particleCount = 500;
+    const particleGeometry = new THREE.BufferGeometry();
+    const particlePositions = new Float32Array(particleCount * 3);
+    const particleColors = new Float32Array(particleCount * 3);
+    const particleSizes = new Float32Array(particleCount);
+    const particleSeeds = new Float32Array(particleCount);
+
+    const palette = [
+      new THREE.Color('#00ffff'),
+      new THREE.Color('#0066ff'),
+      new THREE.Color('#00ff66')
+    ];
+
+    function randomPaletteColor() {
+      return palette[Math.floor(Math.random() * palette.length)];
+    }
+
+    for (let i = 0; i < particleCount; i++) {
+      const ix = i * 3;
+      particlePositions[ix] = (Math.random() - 0.5) * 90;
+      particlePositions[ix + 1] = 0.05 + Math.random() * 0.6;
+      particlePositions[ix + 2] = (Math.random() - 0.5) * 90;
+
+      const c = randomPaletteColor();
+      particleColors[ix] = c.r;
+      particleColors[ix + 1] = c.g;
+      particleColors[ix + 2] = c.b;
+
+      particleSizes[i] = 6 + Math.random() * 8;
+      particleSeeds[i] = Math.random() * Math.PI * 2;
+    }
+
+    particleGeometry.setAttribute('position', new THREE.BufferAttribute(particlePositions, 3));
+    particleGeometry.setAttribute('color', new THREE.BufferAttribute(particleColors, 3));
+    particleGeometry.setAttribute('aSize', new THREE.BufferAttribute(particleSizes, 1));
+    particleGeometry.setAttribute('aSeed', new THREE.BufferAttribute(particleSeeds, 1));
+
+    const particleUniforms = {
+      uTime: { value: 0 },
+      uGlowBoost: { value: 1.0 }
+    };
+
+    const particleMaterial = new THREE.ShaderMaterial({
+      uniforms: particleUniforms,
+      transparent: true,
+      depthWrite: false,
+      vertexColors: true,
+      blending: THREE.AdditiveBlending,
+      vertexShader: `
+        attribute float aSize;
+        attribute float aSeed;
+        varying vec3 vColor;
+        varying float vPulse;
+
+        uniform float uTime;
+        uniform float uGlowBoost;
+
+        void main() {
+          vec3 pos = position;
+          pos.x += sin(uTime * 0.25 + aSeed) * 0.08;
+          pos.z += cos(uTime * 0.2 + aSeed * 1.7) * 0.08;
+          pos.y += sin(uTime * 1.5 + aSeed * 3.0) * 0.03;
+
+          vColor = color;
+          vPulse = 0.5 + 0.5 * sin(uTime * 2.5 + aSeed * 4.0);
+
+          vec4 mvPosition = modelViewMatrix * vec4(pos, 1.0);
+          gl_PointSize = aSize * (1.0 + vPulse * 0.8 * uGlowBoost) * (300.0 / -mvPosition.z);
+          gl_Position = projectionMatrix * mvPosition;
+        }
+      `,
+      fragmentShader: `
+        varying vec3 vColor;
+        varying float vPulse;
+        uniform float uGlowBoost;
+
+        void main() {
+          vec2 uv = gl_PointCoord - 0.5;
+          float d = length(uv);
+          float alpha = smoothstep(0.5, 0.0, d);
+          float core = smoothstep(0.18, 0.0, d);
+          vec3 col = vColor * (0.6 + vPulse * 0.8) * uGlowBoost + core * 0.5;
+          gl_FragColor = vec4(col, alpha * (0.45 + vPulse * 0.5));
+        }
+      `
+    });
+
+    const particlePoints = new THREE.Points(particleGeometry, particleMaterial);
+    scene.add(particlePoints);
+
+    const burstParticles = [];
+    function spawnBurst(position) {
+      const count = 20;
+      for (let i = 0; i < count; i++) {
+        const geo = new THREE.SphereGeometry(0.08 + Math.random() * 0.05, 8, 8);
+        const color = randomPaletteColor();
+        const mat = new THREE.MeshBasicMaterial({
+          color,
+          transparent: true,
+          opacity: 0.95
+        });
+        const mesh = new THREE.Mesh(geo, mat);
+        mesh.position.copy(position);
+        mesh.position.y = 0.15 + Math.random() * 0.2;
+        mesh.userData.velocity = new THREE.Vector3(
+          (Math.random() - 0.5) * 0.8,
+          Math.random() * 0.35 + 0.05,
+          (Math.random() - 0.5) * 0.8
+        );
+        mesh.userData.life = 1.2 + Math.random() * 0.8;
+        mesh.userData.maxLife = mesh.userData.life;
+        scene.add(mesh);
+        burstParticles.push(mesh);
+      }
+      window.__3D_STATE__.totalParticles += count;
+    }
+
+    let lantern = null;
+    let lanternLight = null;
+    let lanternBaseX = 0;
+
+    const loader = new GLTFLoader();
+    loader.load(
+      '._Lantern.glb',
+      (gltf) => {
+        lantern = gltf.scene;
+        lantern.position.set(0, 3, 0);
+        lantern.scale.setScalar(1.5);
+
+        lantern.traverse((child) => {
+          if (child.isMesh) {
+            child.castShadow = false;
+            child.receiveShadow = false;
+          }
+        });
+
+        lanternLight = new THREE.PointLight('#ffaa33', 2, 15);
+        lanternLight.position.set(0, 0.8, 0);
+        lantern.add(lanternLight);
+
+        scene.add(lantern);
+
+        window.__3D_STATE__.lanternLoaded = true;
+        window.__3D_STATE__.lanternLightIntensity = lanternLight.intensity;
+      },
+      undefined,
+      () => {
+        const fallback = new THREE.Group();
+
+        const frame = new THREE.Mesh(
+          new THREE.BoxGeometry(1, 1.6, 1),
+          new THREE.MeshStandardMaterial({
+            color: '#553311',
+            emissive: '#221100',
+            metalness: 0.2,
+            roughness: 0.8
+          })
+        );
+        const inner = new THREE.Mesh(
+          new THREE.BoxGeometry(0.65, 1.2, 0.65),
+          new THREE.MeshBasicMaterial({
+            color: '#ffcc66'
+          })
+        );
+        fallback.add(frame);
+        fallback.add(inner);
+        fallback.position.set(0, 3, 0);
+        fallback.scale.setScalar(1.5);
+
+        lanternLight = new THREE.PointLight('#ffaa33', 2, 15);
+        lanternLight.position.set(0, 0.8, 0);
+        fallback.add(lanternLight);
+
+        lantern = fallback;
+        scene.add(lantern);
+
+        window.__3D_STATE__.lanternLoaded = true;
+        window.__3D_STATE__.lanternLightIntensity = lanternLight.intensity;
+      }
+    );
+
+    function applyGlow(enabled) {
+      window.__3D_STATE__.glowEnabled = enabled;
+      particleUniforms.uGlowBoost.value = enabled ? 2.0 : 1.0;
+      oceanUniforms.uGlowBoost.value = enabled ? 2.0 : 1.0;
+      ambientLight.intensity = enabled ? 0.6 : 0.3;
+      window.__3D_STATE__.ambientIntensity = ambientLight.intensity;
+    }
+
+    function applyColorScheme(name) {
+      if (!colorSchemes[name]) return;
+      window.__3D_STATE__.colorScheme = name;
+      oceanUniforms.uColor.value.set(colorSchemes[name]);
+    }
+
+    function cycleColorScheme() {
+      const current = window.__3D_STATE__.colorScheme;
+      const idx = colorSchemeNames.indexOf(current);
+      const next = colorSchemeNames[(idx + 1) % colorSchemeNames.length];
+      applyColorScheme(next);
+    }
+
+    renderer.domElement.addEventListener('click', (event) => {
+      const rect = renderer.domElement.getBoundingClientRect();
+      mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+      mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+
+      raycaster.setFromCamera(mouse, camera);
+      const hits = raycaster.intersectObject(ocean);
+
+      if (hits.length > 0) {
+        spawnBurst(hits[0].point);
+        window.__3D_STATE__.clickCount += 1;
+        updateHUD();
+      }
+    });
+
+    window.addEventListener('keydown', (event) => {
+      const key = event.key.toLowerCase();
+
+      if (key === 'g') {
+        applyGlow(!window.__3D_STATE__.glowEnabled);
+      }
+
+      if (key === 'l') {
+        lanternBaseX = THREE.MathUtils.randFloat(-15, 15);
+        if (lantern) lantern.position.x = lanternBaseX;
+        window.__3D_STATE__.lanternMoveCount += 1;
+      }
+
+      if (key === 'c') {
+        cycleColorScheme();
+      }
+
+      updateHUD();
+    });
+
+    btnSave.addEventListener('click', () => {
+      const state = {
+        lanternPosition: lantern
+          ? { x: lantern.position.x, y: lantern.position.y, z: lantern.position.z }
+          : { ...window.__3D_STATE__.lanternPosition },
+        glowEnabled: window.__3D_STATE__.glowEnabled,
+        clickCount: window.__3D_STATE__.clickCount,
+        lanternMoveCount: window.__3D_STATE__.lanternMoveCount,
+        colorScheme: window.__3D_STATE__.colorScheme,
+        totalParticles: window.__3D_STATE__.totalParticles
+      };
+
+      localStorage.setItem('bioOceanState', JSON.stringify(state));
+      window.__3D_STATE__.savedStateExists = true;
+      updateHUD();
+    });
+
+    btnLoad.addEventListener('click', () => {
+      const raw = localStorage.getItem('bioOceanState');
+      if (!raw) return;
+
+      try {
+        const state = JSON.parse(raw);
+
+        window.__3D_STATE__.clickCount = state.clickCount ?? 0;
+        window.__3D_STATE__.lanternMoveCount = state.lanternMoveCount ?? 0;
+        window.__3D_STATE__.totalParticles = state.totalParticles ?? 500;
+
+        applyGlow(!!state.glowEnabled);
+        applyColorScheme(state.colorScheme ?? 'deep_blue');
+
+        if (state.lanternPosition) {
+          lanternBaseX = state.lanternPosition.x ?? 0;
+          if (lantern) {
+            lantern.position.set(
+              state.lanternPosition.x ?? 0,
+              state.lanternPosition.y ?? 3,
+              state.lanternPosition.z ?? 0
+            );
+          }
+        }
+
+        window.__3D_STATE__.savedStateExists = true;
+        window.__3D_STATE__.stateLoaded = true;
+        updateHUD();
+      } catch (e) {
+        console.error('Failed to load saved state:', e);
+      }
+    });
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      const elapsed = clock.getElapsedTime();
+      window.__3D_STATE__.elapsedTime = elapsed;
+
+      oceanUniforms.uTime.value = elapsed;
+      particleUniforms.uTime.value = elapsed;
+
+      for (let i = burstParticles.length - 1; i >= 0; i--) {
+        const p = burstParticles[i];
+        p.userData.life -= 0.016;
+        p.position.addScaledVector(p.userData.velocity, 0.016);
+        p.userData.velocity.multiplyScalar(0.985);
+        p.material.opacity = Math.max(0, p.userData.life / p.userData.maxLife);
+
+        if (p.userData.life <= 0) {
+          scene.remove(p);
+          p.geometry.dispose();
+          p.material.dispose();
+          burstParticles.splice(i, 1);
+        }
+      }
+
+      if (lantern) {
+        lantern.position.y = 3 + Math.sin(elapsed * 1.2) * 0.5;
+        lantern.position.x = lanternBaseX;
+        lantern.position.z = 0;
+        lantern.rotation.y += 0.003;
+
+        window.__3D_STATE__.lanternPosition = {
+          x: lantern.position.x,
+          y: lantern.position.y,
+          z: lantern.position.z
+        };
+      }
+
+      window.__3D_STATE__.ambientIntensity = ambientLight.intensity;
+      window.__3D_STATE__.lanternLightIntensity = lanternLight ? lanternLight.intensity : 0;
+      window.__3D_STATE__.sceneReady = true;
+
+      updateHUD();
+      renderer.render(scene, camera);
+    }
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    updateHUD();
+    animate();
+  </script>
+</body>
+</html>

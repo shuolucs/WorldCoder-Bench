@@ -1,0 +1,503 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3D Gas Pressure Simulation</title>
+<style>
+  body { margin: 0; overflow: hidden; background: #000; }
+  canvas { display: block; }
+  #hud {
+    position: absolute;
+    top: 10px;
+    left: 10px;
+    background: rgba(0, 0, 0, 0.75);
+    color: #ffffff;
+    font-family: 'Courier New', monospace;
+    font-size: 14px;
+    padding: 15px 20px;
+    border-radius: 8px;
+    border: 1px solid rgba(68, 136, 255, 0.4);
+    line-height: 1.8;
+    pointer-events: none;
+    z-index: 10;
+  }
+  #hud .label { color: #88bbff; }
+  #hud .value { color: #ffffff; font-weight: bold; }
+  #controls {
+    position: absolute;
+    bottom: 10px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: rgba(0, 0, 0, 0.75);
+    color: #aaa;
+    font-family: 'Courier New', monospace;
+    font-size: 12px;
+    padding: 10px 20px;
+    border-radius: 8px;
+    border: 1px solid rgba(68, 136, 255, 0.3);
+    pointer-events: none;
+    z-index: 10;
+    text-align: center;
+  }
+</style>
+</head>
+<body>
+
+<div id="hud">
+  <div><span class="label">Pressure:    </span><span class="value" id="pressureDisplay">0.000</span></div>
+  <div><span class="label">Temperature: </span><span class="value" id="temperatureDisplay">0.000</span></div>
+  <div><span class="label">Volume:      </span><span class="value" id="volumeDisplay">0.000</span></div>
+  <div><span class="label">Piston Y:    </span><span class="value" id="pistonDisplay">4.000</span></div>
+  <div><span class="label">Particles:   </span><span class="value" id="particleDisplay">50</span></div>
+  <div><span class="label">Status:      </span><span class="value" id="statusDisplay">Running</span></div>
+  <div><span class="label">Heat Boost:  </span><span class="value" id="heatDisplay">Off</span></div>
+</div>
+
+<div id="controls">
+  ↑/↓: Move Piston &nbsp;|&nbsp; H: Toggle Heat &nbsp;|&nbsp; R: Reset &nbsp;|&nbsp; Click: Pause/Resume
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+(function() {
+  // ============ CONSTANTS ============
+  const PARTICLE_COUNT = 50;
+  const PARTICLE_RADIUS = 0.15;
+  const CONTAINER_SIZE = 8;
+  const HALF = CONTAINER_SIZE / 2; // 4
+  const PISTON_MIN = 2;
+  const PISTON_MAX = 7;
+  const PISTON_HEIGHT = 0.3;
+  const PISTON_STEP = 0.5;
+  const WARM_COLORS = [
+    0xff4444, 0xff6633, 0xff8822, 0xffaa00, 0xffcc11,
+    0xff5555, 0xff7744, 0xff9933, 0xffbb22, 0xffdd44,
+    0xe83030, 0xf06020, 0xf09010, 0xf0b000, 0xf0d020,
+    0xff3322, 0xff5500, 0xff7700, 0xff9900, 0xffbb00
+  ];
+
+  // ============ SCENE SETUP ============
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x111122);
+
+  const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+  camera.position.set(0, 5, 15);
+  camera.lookAt(0, 0, 0);
+
+  const renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.setPixelRatio(window.devicePixelRatio);
+  document.body.appendChild(renderer.domElement);
+
+  // Lights
+  const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+  scene.add(ambientLight);
+
+  const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+  dirLight.position.set(5, 10, 7);
+  scene.add(dirLight);
+
+  // ============ CONTAINER ============
+  // Wireframe edges
+  const containerGeo = new THREE.BoxGeometry(CONTAINER_SIZE, CONTAINER_SIZE, CONTAINER_SIZE);
+  const edgesGeo = new THREE.EdgesGeometry(containerGeo);
+  const edgesMat = new THREE.LineBasicMaterial({ color: 0x4488ff, linewidth: 2 });
+  const containerEdges = new THREE.LineSegments(edgesGeo, edgesMat);
+  scene.add(containerEdges);
+
+  // Semi-transparent faces
+  const containerMat = new THREE.MeshPhongMaterial({
+    color: 0x4488ff,
+    transparent: true,
+    opacity: 0.15,
+    side: THREE.DoubleSide,
+    depthWrite: false
+  });
+  const containerMesh = new THREE.Mesh(containerGeo, containerMat);
+  scene.add(containerMesh);
+
+  // ============ PISTON ============
+  const pistonGeo = new THREE.BoxGeometry(CONTAINER_SIZE, PISTON_HEIGHT, CONTAINER_SIZE);
+  const pistonMat = new THREE.MeshStandardMaterial({
+    color: 0x888888,
+    metalness: 0.8,
+    roughness: 0.3
+  });
+  const pistonMesh = new THREE.Mesh(pistonGeo, pistonMat);
+  scene.add(pistonMesh);
+
+  // ============ STATE ============
+  let pistonY = 4;
+  let isPaused = false;
+  let heatBoost = false;
+  let simTime = 0;
+  let accumulatedImpulse = 0;
+  let lastPressureTime = 0;
+  let currentPressure = 0;
+
+  // ============ PARTICLES ============
+  let particles = [];
+  const particleGroup = new THREE.Group();
+  scene.add(particleGroup);
+
+  function randomRange(min, max) {
+    return Math.random() * (max - min) + min;
+  }
+
+  function createParticles() {
+    // Clear existing
+    while (particleGroup.children.length > 0) {
+      const child = particleGroup.children[0];
+      particleGroup.remove(child);
+      child.geometry.dispose();
+      child.material.dispose();
+    }
+    particles = [];
+
+    const geo = new THREE.SphereGeometry(PARTICLE_RADIUS, 12, 8);
+
+    for (let i = 0; i < PARTICLE_COUNT; i++) {
+      const color = WARM_COLORS[Math.floor(Math.random() * WARM_COLORS.length)];
+      const mat = new THREE.MeshPhongMaterial({
+        color: color,
+        emissive: color,
+        emissiveIntensity: 0.3,
+        shininess: 80
+      });
+      const mesh = new THREE.Mesh(geo.clone(), mat);
+
+      const px = randomRange(-HALF + PARTICLE_RADIUS, HALF - PARTICLE_RADIUS);
+      const py = randomRange(-HALF + PARTICLE_RADIUS, pistonY - PARTICLE_RADIUS);
+      const pz = randomRange(-HALF + PARTICLE_RADIUS, HALF - PARTICLE_RADIUS);
+      mesh.position.set(px, py, pz);
+
+      const vx = randomRange(-3, 3);
+      const vy = randomRange(-3, 3);
+      const vz = randomRange(-3, 3);
+      // Ensure magnitude is between 1 and 3 per axis (re-scale)
+      const speed = Math.sqrt(vx*vx + vy*vy + vz*vz);
+      const targetSpeed = randomRange(1, 3) * Math.sqrt(3); // total speed
+      const scale = targetSpeed / (speed || 1);
+
+      const particle = {
+        mesh: mesh,
+        vx: vx * (Math.abs(vx) < 1 ? (1/Math.abs(vx||0.5)) : 1),
+        vy: vy * (Math.abs(vy) < 1 ? (1/Math.abs(vy||0.5)) : 1),
+        vz: vz * (Math.abs(vz) < 1 ? (1/Math.abs(vz||0.5)) : 1)
+      };
+
+      // Ensure each component is between 1 and 3 in magnitude
+      particle.vx = Math.sign(particle.vx || 1) * randomRange(1, 3);
+      particle.vy = Math.sign(particle.vy || 1) * randomRange(1, 3);
+      particle.vz = Math.sign(particle.vz || 1) * randomRange(1, 3);
+
+      particles.push(particle);
+      particleGroup.add(mesh);
+    }
+  }
+
+  function resetSimulation() {
+    pistonY = 4;
+    isPaused = false;
+    heatBoost = false;
+    simTime = 0;
+    accumulatedImpulse = 0;
+    lastPressureTime = 0;
+    currentPressure = 0;
+    createParticles();
+  }
+
+  createParticles();
+
+  // ============ PISTON POSITION UPDATE ============
+  function updatePiston() {
+    pistonMesh.position.y = pistonY;
+  }
+  updatePiston();
+
+  // ============ PHYSICS ============
+  function updatePhysics(dt) {
+    if (dt <= 0 || dt > 0.1) dt = 0.016; // clamp
+
+    const xMin = -HALF + PARTICLE_RADIUS;
+    const xMax = HALF - PARTICLE_RADIUS;
+    const yMin = -HALF + PARTICLE_RADIUS;
+    const yMax = pistonY - PARTICLE_RADIUS;
+    const zMin = -HALF + PARTICLE_RADIUS;
+    const zMax = HALF - PARTICLE_RADIUS;
+
+    for (let i = 0; i < particles.length; i++) {
+      const p = particles[i];
+
+      // Update position
+      p.mesh.position.x += p.vx * dt;
+      p.mesh.position.y += p.vy * dt;
+      p.mesh.position.z += p.vz * dt;
+
+      // Bounce off walls - X
+      if (p.mesh.position.x < xMin) {
+        p.mesh.position.x = xMin;
+        accumulatedImpulse += Math.abs(2 * 1.0 * p.vx);
+        p.vx = Math.abs(p.vx);
+      } else if (p.mesh.position.x > xMax) {
+        p.mesh.position.x = xMax;
+        accumulatedImpulse += Math.abs(2 * 1.0 * p.vx);
+        p.vx = -Math.abs(p.vx);
+      }
+
+      // Bounce off walls - Y (bottom and piston)
+      if (p.mesh.position.y < yMin) {
+        p.mesh.position.y = yMin;
+        accumulatedImpulse += Math.abs(2 * 1.0 * p.vy);
+        p.vy = Math.abs(p.vy);
+      } else if (p.mesh.position.y > yMax) {
+        p.mesh.position.y = yMax;
+        accumulatedImpulse += Math.abs(2 * 1.0 * p.vy);
+        p.vy = -Math.abs(p.vy);
+      }
+
+      // Bounce off walls - Z
+      if (p.mesh.position.z < zMin) {
+        p.mesh.position.z = zMin;
+        accumulatedImpulse += Math.abs(2 * 1.0 * p.vz);
+        p.vz = Math.abs(p.vz);
+      } else if (p.mesh.position.z > zMax) {
+        p.mesh.position.z = zMax;
+        accumulatedImpulse += Math.abs(2 * 1.0 * p.vz);
+        p.vz = -Math.abs(p.vz);
+      }
+    }
+  }
+
+  function computeTemperature() {
+    let totalKE = 0;
+    for (let i = 0; i < particles.length; i++) {
+      const p = particles[i];
+      const v2 = p.vx * p.vx + p.vy * p.vy + p.vz * p.vz;
+      totalKE += 0.5 * 1.0 * v2;
+    }
+    const avgKE = totalKE / particles.length;
+    return (2 / 3) * avgKE;
+  }
+
+  function computeAvgSpeed() {
+    let totalSpeed = 0;
+    for (let i = 0; i < particles.length; i++) {
+      const p = particles[i];
+      totalSpeed += Math.sqrt(p.vx * p.vx + p.vy * p.vy + p.vz * p.vz);
+    }
+    return totalSpeed / particles.length;
+  }
+
+  function computeVolume() {
+    return CONTAINER_SIZE * (pistonY + HALF) * CONTAINER_SIZE;
+  }
+
+  function computeTotalWallArea() {
+    const height = pistonY + HALF;
+    // Bottom: 8x8, Top (piston): 8x8, 4 sides: 2*(8*height) + 2*(8*height)
+    const bottom = CONTAINER_SIZE * CONTAINER_SIZE;
+    const top = CONTAINER_SIZE * CONTAINER_SIZE;
+    const sides = 4 * CONTAINER_SIZE * height;
+    return bottom + top + sides;
+  }
+
+  function checkParticlesValid() {
+    for (let i = 0; i < particles.length; i++) {
+      const p = particles[i];
+      if (isNaN(p.mesh.position.x) || isNaN(p.mesh.position.y) || isNaN(p.mesh.position.z) ||
+          isNaN(p.vx) || isNaN(p.vy) || isNaN(p.vz)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  function checkAllInBounds() {
+    for (let i = 0; i < particles.length; i++) {
+      const p = particles[i];
+      const margin = PARTICLE_RADIUS + 0.01;
+      if (p.mesh.position.x < -HALF - margin || p.mesh.position.x > HALF + margin ||
+          p.mesh.position.y < -HALF - margin || p.mesh.position.y > pistonY + margin ||
+          p.mesh.position.z < -HALF - margin || p.mesh.position.z > HALF + margin) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  // ============ PISTON MOVEMENT ============
+  function movePiston(newY) {
+    newY = Math.max(PISTON_MIN, Math.min(PISTON_MAX, newY));
+    pistonY = newY;
+    updatePiston();
+
+    // Push particles below piston
+    for (let i = 0; i < particles.length; i++) {
+      const p = particles[i];
+      if (p.mesh.position.y > pistonY - PARTICLE_RADIUS) {
+        p.mesh.position.y = pistonY - PARTICLE_RADIUS - 0.05;
+        if (p.vy > 0) {
+          p.vy = -p.vy;
+        }
+      }
+    }
+  }
+
+  // ============ HEAT TOGGLE ============
+  function toggleHeat() {
+    if (!heatBoost) {
+      // Heat up
+      for (let i = 0; i < particles.length; i++) {
+        particles[i].vx *= 1.5;
+        particles[i].vy *= 1.5;
+        particles[i].vz *= 1.5;
+      }
+      heatBoost = true;
+    } else {
+      // Cool down
+      for (let i = 0; i < particles.length; i++) {
+        particles[i].vx /= 1.5;
+        particles[i].vy /= 1.5;
+        particles[i].vz /= 1.5;
+      }
+      heatBoost = false;
+    }
+  }
+
+  // ============ INPUT HANDLING ============
+  document.addEventListener('keydown', function(e) {
+    switch(e.key) {
+      case 'ArrowUp':
+        e.preventDefault();
+        movePiston(pistonY + PISTON_STEP);
+        break;
+      case 'ArrowDown':
+        e.preventDefault();
+        movePiston(pistonY - PISTON_STEP);
+        break;
+      case 'h':
+      case 'H':
+        toggleHeat();
+        break;
+      case 'r':
+      case 'R':
+        resetSimulation();
+        break;
+    }
+  });
+
+  renderer.domElement.addEventListener('click', function() {
+    isPaused = !isPaused;
+  });
+
+  // ============ WINDOW RESIZE ============
+  window.addEventListener('resize', function() {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  });
+
+  // ============ HUD UPDATE ============
+  const pressureDisplay = document.getElementById('pressureDisplay');
+  const temperatureDisplay = document.getElementById('temperatureDisplay');
+  const volumeDisplay = document.getElementById('volumeDisplay');
+  const pistonDisplay = document.getElementById('pistonDisplay');
+  const particleDisplay = document.getElementById('particleDisplay');
+  const statusDisplay = document.getElementById('statusDisplay');
+  const heatDisplay = document.getElementById('heatDisplay');
+
+  function updateHUD() {
+    pressureDisplay.textContent = currentPressure.toFixed(4);
+    temperatureDisplay.textContent = computeTemperature().toFixed(4);
+    volumeDisplay.textContent = computeVolume().toFixed(2);
+    pistonDisplay.textContent = pistonY.toFixed(3);
+    particleDisplay.textContent = PARTICLE_COUNT;
+    statusDisplay.textContent = isPaused ? 'Paused' : 'Running';
+    statusDisplay.style.color = isPaused ? '#ff6644' : '#44ff66';
+    heatDisplay.textContent = heatBoost ? 'On' : 'Off';
+    heatDisplay.style.color = heatBoost ? '#ffaa00' : '#ffffff';
+  }
+
+  // ============ STATE OBJECT ============
+  window.__3D_STATE__ = {};
+
+  function updateState() {
+    window.__3D_STATE__.particleCount = PARTICLE_COUNT;
+    window.__3D_STATE__.pistonY = pistonY;
+    window.__3D_STATE__.volume = computeVolume();
+    window.__3D_STATE__.pressure = currentPressure;
+    window.__3D_STATE__.temperature = computeTemperature();
+    window.__3D_STATE__.isPaused = isPaused;
+    window.__3D_STATE__.heatBoost = heatBoost;
+    window.__3D_STATE__.avgSpeed = computeAvgSpeed();
+    window.__3D_STATE__.simTime = simTime;
+    window.__3D_STATE__.particlesValid = checkParticlesValid();
+    window.__3D_STATE__.allParticlesInBounds = checkAllInBounds();
+    window.__3D_STATE__.pistonClamped = (pistonY >= PISTON_MIN && pistonY <= PISTON_MAX);
+  }
+
+  // ============ PARTICLE GLOW / TRAIL EFFECT ============
+  function updateParticleVisuals() {
+    for (let i = 0; i < particles.length; i++) {
+      const p = particles[i];
+      const speed = Math.sqrt(p.vx * p.vx + p.vy * p.vy + p.vz * p.vz);
+      const intensity = Math.min(speed / 8, 1.0);
+      p.mesh.material.emissiveIntensity = 0.2 + intensity * 0.6;
+    }
+  }
+
+  // ============ SIMPLE ORBIT (auto-rotate camera slightly) ============
+  let cameraAngle = 0;
+
+  // ============ ANIMATION LOOP ============
+  let lastTime = performance.now();
+  let pressureAccumStart = 0;
+
+  function animate(currentTime) {
+    requestAnimationFrame(animate);
+
+    const dt = Math.min((currentTime - lastTime) / 1000, 0.05);
+    lastTime = currentTime;
+
+    if (!isPaused) {
+      simTime += dt;
+      updatePhysics(dt);
+
+      // Compute pressure every second
+      const elapsed = simTime - lastPressureTime;
+      if (elapsed >= 1.0) {
+        const totalArea = computeTotalWallArea();
+        currentPressure = accumulatedImpulse / (totalArea * elapsed);
+        accumulatedImpulse = 0;
+        lastPressureTime = simTime;
+      }
+
+      updateParticleVisuals();
+    }
+
+    // Gentle camera auto-rotation (very subtle)
+    // cameraAngle += dt * 0.05;
+    // camera.position.x = 15 * Math.sin(cameraAngle);
+    // camera.position.z = 15 * Math.cos(cameraAngle);
+    // camera.lookAt(0, 0, 0);
+
+    updateHUD();
+    updateState();
+    renderer.render(scene, camera);
+  }
+
+  // Add a subtle grid floor
+  const gridHelper = new THREE.GridHelper(20, 20, 0x333355, 0x222244);
+  gridHelper.position.y = -HALF;
+  scene.add(gridHelper);
+
+  // Add some ambient fog for depth
+  scene.fog = new THREE.FogExp2(0x111122, 0.015);
+
+  animate(performance.now());
+})();
+</script>
+</body>
+</html>

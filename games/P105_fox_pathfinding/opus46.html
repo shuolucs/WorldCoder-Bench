@@ -1,0 +1,584 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3D A* Pathfinding with Fox</title>
+<style>
+  body { margin: 0; overflow: hidden; font-family: Arial, sans-serif; }
+  canvas { display: block; }
+  #hud {
+    position: absolute; top: 10px; left: 10px;
+    background: rgba(0,0,0,0.7); color: #fff;
+    padding: 15px 20px; border-radius: 8px;
+    font-size: 14px; line-height: 1.8;
+    pointer-events: none; min-width: 220px;
+  }
+  #hud .label { color: #aaa; }
+  #hud .value { color: #4FC3F7; font-weight: bold; }
+  #toast {
+    position: absolute; top: 50%; left: 50%;
+    transform: translate(-50%, -50%);
+    background: rgba(244,67,54,0.9); color: #fff;
+    padding: 15px 30px; border-radius: 8px;
+    font-size: 18px; font-weight: bold;
+    display: none; pointer-events: none;
+    z-index: 100;
+  }
+</style>
+<script type="importmap">
+{ "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="hud">
+  <div><span class="label">Fox Position: </span><span class="value" id="foxPos">(0, 0)</span></div>
+  <div><span class="label">Target: </span><span class="value" id="targetPos">None</span></div>
+  <div><span class="label">Path Length: </span><span class="value" id="pathLength">0</span></div>
+  <div><span class="label">Animation: </span><span class="value" id="animState">idle</span></div>
+  <div><span class="label">Obstacles: </span><span class="value" id="obstacleCount">0</span></div>
+</div>
+<div id="toast">无法到达！</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// --- Global State ---
+window.__3D_STATE__ = {
+  modelLoaded: false,
+  foxPosition: { col: 0, row: 0 },
+  targetPosition: null,
+  pathLength: 0,
+  animState: 'idle',
+  obstacleCount: 0,
+  isMoving: false,
+  gridSize: 10
+};
+
+const GRID_SIZE = 10;
+const CELL_SIZE = 1;
+const CELL_GAP = 0.05;
+const CELL_STEP = CELL_SIZE + CELL_GAP;
+const MOVE_DURATION = 0.5;
+
+// --- Scene Setup ---
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0xf0f0f0);
+
+const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 100);
+camera.position.set(5, 12, 14);
+camera.lookAt(5, 0, 5);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(CELL_STEP * 4.5, 0, CELL_STEP * 4.5);
+controls.enableDamping = true;
+controls.dampingFactor = 0.1;
+controls.maxPolarAngle = Math.PI / 2.2;
+controls.update();
+
+// --- Lights ---
+const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+scene.add(ambientLight);
+
+const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+dirLight.position.set(10, 15, 10);
+dirLight.castShadow = true;
+dirLight.shadow.mapSize.width = 2048;
+dirLight.shadow.mapSize.height = 2048;
+dirLight.shadow.camera.near = 0.5;
+dirLight.shadow.camera.far = 50;
+dirLight.shadow.camera.left = -15;
+dirLight.shadow.camera.right = 15;
+dirLight.shadow.camera.top = 15;
+dirLight.shadow.camera.bottom = -15;
+scene.add(dirLight);
+
+// --- Grid ---
+const grid = []; // grid[row][col] = { mesh, obstacle, walkable }
+const cellMeshes = [];
+const obstacles = new Set();
+
+function gridToWorld(col, row) {
+  return new THREE.Vector3(col * CELL_STEP, 0.05, row * CELL_STEP);
+}
+
+function createGrid() {
+  const cellGeo = new THREE.BoxGeometry(CELL_SIZE, 0.1, CELL_SIZE);
+  const cellMat = new THREE.MeshStandardMaterial({ color: 0x4CAF50 });
+
+  for (let row = 0; row < GRID_SIZE; row++) {
+    grid[row] = [];
+    for (let col = 0; col < GRID_SIZE; col++) {
+      const mesh = new THREE.Mesh(cellGeo, cellMat.clone());
+      mesh.position.set(col * CELL_STEP, 0, row * CELL_STEP);
+      mesh.receiveShadow = true;
+      mesh.userData = { col, row, type: 'cell' };
+      scene.add(mesh);
+      cellMeshes.push(mesh);
+      grid[row][col] = { mesh, obstacle: null, walkable: true, originalColor: 0x4CAF50 };
+    }
+  }
+}
+
+function placeObstacles() {
+  const obstacleGeo = new THREE.BoxGeometry(0.8, 0.8, 0.8);
+  const obstacleMat = new THREE.MeshStandardMaterial({ color: 0xf44336 });
+
+  const forbidden = new Set();
+  forbidden.add('0,0');
+  forbidden.add('9,9');
+
+  let placed = 0;
+  const maxAttempts = 1000;
+  let attempts = 0;
+
+  while (placed < 15 && attempts < maxAttempts) {
+    attempts++;
+    const col = Math.floor(Math.random() * GRID_SIZE);
+    const row = Math.floor(Math.random() * GRID_SIZE);
+    const key = `${col},${row}`;
+
+    if (forbidden.has(key) || obstacles.has(key)) continue;
+
+    // Temporarily mark as obstacle and check if path still exists from (0,0) to (9,9)
+    obstacles.add(key);
+    grid[row][col].walkable = false;
+
+    // Quick BFS check to ensure connectivity
+    if (!hasPath(0, 0, 9, 9)) {
+      obstacles.delete(key);
+      grid[row][col].walkable = true;
+      continue;
+    }
+
+    const obsMesh = new THREE.Mesh(obstacleGeo, obstacleMat.clone());
+    obsMesh.position.set(col * CELL_STEP, 0.45, row * CELL_STEP);
+    obsMesh.castShadow = true;
+    obsMesh.receiveShadow = true;
+    scene.add(obsMesh);
+    grid[row][col].obstacle = obsMesh;
+
+    placed++;
+  }
+
+  window.__3D_STATE__.obstacleCount = obstacles.size;
+  document.getElementById('obstacleCount').textContent = obstacles.size;
+}
+
+function hasPath(sc, sr, ec, er) {
+  const visited = new Set();
+  const queue = [[sc, sr]];
+  visited.add(`${sc},${sr}`);
+  const dirs = [[0,1],[0,-1],[1,0],[-1,0]];
+
+  while (queue.length > 0) {
+    const [c, r] = queue.shift();
+    if (c === ec && r === er) return true;
+    for (const [dc, dr] of dirs) {
+      const nc = c + dc, nr = r + dr;
+      const key = `${nc},${nr}`;
+      if (nc >= 0 && nc < GRID_SIZE && nr >= 0 && nr < GRID_SIZE && !visited.has(key) && grid[nr][nc].walkable) {
+        visited.add(key);
+        queue.push([nc, nr]);
+      }
+    }
+  }
+  return false;
+}
+
+createGrid();
+placeObstacles();
+
+// --- A* Pathfinding ---
+function aStar(startCol, startRow, endCol, endRow) {
+  if (!grid[endRow][endCol].walkable) return null;
+
+  const openSet = [];
+  const closedSet = new Set();
+  const cameFrom = {};
+  const gScore = {};
+  const fScore = {};
+
+  const startKey = `${startCol},${startRow}`;
+  const endKey = `${endCol},${endRow}`;
+
+  gScore[startKey] = 0;
+  fScore[startKey] = heuristic(startCol, startRow, endCol, endRow);
+  openSet.push({ col: startCol, row: startRow, f: fScore[startKey] });
+
+  const dirs = [[0,1],[0,-1],[1,0],[-1,0]];
+
+  while (openSet.length > 0) {
+    openSet.sort((a, b) => a.f - b.f);
+    const current = openSet.shift();
+    const currentKey = `${current.col},${current.row}`;
+
+    if (currentKey === endKey) {
+      return reconstructPath(cameFrom, currentKey);
+    }
+
+    closedSet.add(currentKey);
+
+    for (const [dc, dr] of dirs) {
+      const nc = current.col + dc;
+      const nr = current.row + dr;
+      const neighborKey = `${nc},${nr}`;
+
+      if (nc < 0 || nc >= GRID_SIZE || nr < 0 || nr >= GRID_SIZE) continue;
+      if (!grid[nr][nc].walkable) continue;
+      if (closedSet.has(neighborKey)) continue;
+
+      const tentativeG = gScore[currentKey] + 1;
+
+      if (gScore[neighborKey] === undefined || tentativeG < gScore[neighborKey]) {
+        cameFrom[neighborKey] = currentKey;
+        gScore[neighborKey] = tentativeG;
+        fScore[neighborKey] = tentativeG + heuristic(nc, nr, endCol, endRow);
+
+        if (!openSet.find(n => `${n.col},${n.row}` === neighborKey)) {
+          openSet.push({ col: nc, row: nr, f: fScore[neighborKey] });
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
+function heuristic(c1, r1, c2, r2) {
+  return Math.abs(c1 - c2) + Math.abs(r1 - r2);
+}
+
+function reconstructPath(cameFrom, currentKey) {
+  const path = [];
+  let key = currentKey;
+  while (key) {
+    const [c, r] = key.split(',').map(Number);
+    path.unshift({ col: c, row: r });
+    key = cameFrom[key];
+  }
+  return path;
+}
+
+// --- Fox Model ---
+let foxModel = null;
+let mixer = null;
+let idleAction = null;
+let walkAction = null;
+let runAction = null;
+let currentAction = null;
+
+const loader = new GLTFLoader();
+loader.load('assets/Fox.glb', (gltf) => {
+  foxModel = gltf.scene;
+  foxModel.scale.set(0.02, 0.02, 0.02);
+
+  const startPos = gridToWorld(0, 0);
+  foxModel.position.set(startPos.x, 0.05, startPos.z);
+
+  foxModel.traverse((child) => {
+    if (child.isMesh) {
+      child.castShadow = true;
+      child.receiveShadow = true;
+    }
+  });
+
+  scene.add(foxModel);
+
+  // Setup animations
+  mixer = new THREE.AnimationMixer(foxModel);
+
+  gltf.animations.forEach((clip) => {
+    const name = clip.name.toLowerCase();
+    if (name.includes('survey') || name.includes('idle')) {
+      idleAction = mixer.clipAction(clip);
+    } else if (name.includes('walk')) {
+      walkAction = mixer.clipAction(clip);
+    } else if (name.includes('run')) {
+      runAction = mixer.clipAction(clip);
+    }
+  });
+
+  // If no idle found, use first animation
+  if (!idleAction && gltf.animations.length > 0) {
+    idleAction = mixer.clipAction(gltf.animations[0]);
+  }
+  if (!walkAction && gltf.animations.length > 1) {
+    walkAction = mixer.clipAction(gltf.animations[1]);
+  }
+
+  playAnimation('idle');
+
+  window.__3D_STATE__.modelLoaded = true;
+}, undefined, (error) => {
+  console.error('Error loading Fox model:', error);
+});
+
+function playAnimation(name) {
+  let targetAction = null;
+  if (name === 'idle') targetAction = idleAction;
+  else if (name === 'walk') targetAction = walkAction;
+  else if (name === 'run') targetAction = runAction;
+
+  if (!targetAction || targetAction === currentAction) return;
+
+  if (currentAction) {
+    currentAction.fadeOut(0.2);
+  }
+
+  targetAction.reset().fadeIn(0.2).play();
+  currentAction = targetAction;
+  window.__3D_STATE__.animState = name;
+  document.getElementById('animState').textContent = name;
+}
+
+// --- Path Visualization ---
+let pathHighlights = [];
+let targetHighlight = null;
+
+function clearPathHighlights() {
+  pathHighlights.forEach(({ col, row }) => {
+    if (grid[row] && grid[row][col]) {
+      grid[row][col].mesh.material.color.setHex(grid[row][col].originalColor);
+    }
+  });
+  pathHighlights = [];
+}
+
+function highlightPath(path) {
+  clearPathHighlights();
+  path.forEach(({ col, row }, index) => {
+    if (index === 0) return; // skip start
+    if (index === path.length - 1) return; // skip end (it's yellow)
+    grid[row][col].mesh.material.color.setHex(0x2196F3);
+    pathHighlights.push({ col, row });
+  });
+}
+
+function setTargetHighlight(col, row) {
+  if (targetHighlight) {
+    const tc = targetHighlight.col, tr = targetHighlight.row;
+    if (grid[tr] && grid[tr][tc]) {
+      grid[tr][tc].mesh.material.color.setHex(grid[tr][tc].originalColor);
+    }
+  }
+  grid[row][col].mesh.material.color.setHex(0xFFEB3B);
+  targetHighlight = { col, row };
+}
+
+function clearTargetHighlight() {
+  if (targetHighlight) {
+    const tc = targetHighlight.col, tr = targetHighlight.row;
+    if (grid[tr] && grid[tr][tc]) {
+      grid[tr][tc].mesh.material.color.setHex(grid[tr][tc].originalColor);
+    }
+    targetHighlight = null;
+  }
+}
+
+// --- Fox Movement ---
+let foxCol = 0, foxRow = 0;
+let currentPath = null;
+let pathIndex = 0;
+let isMoving = false;
+let moveProgress = 0;
+let moveFrom = new THREE.Vector3();
+let moveTo = new THREE.Vector3();
+
+function startPathMovement(path) {
+  if (path.length < 2) {
+    onArrival();
+    return;
+  }
+
+  currentPath = path;
+  pathIndex = 1;
+  isMoving = true;
+  window.__3D_STATE__.isMoving = true;
+  playAnimation('walk');
+  startMoveToNext();
+}
+
+function startMoveToNext() {
+  if (pathIndex >= currentPath.length) {
+    onArrival();
+    return;
+  }
+
+  const from = currentPath[pathIndex - 1];
+  const to = currentPath[pathIndex];
+
+  moveFrom.copy(gridToWorld(from.col, from.row));
+  moveTo.copy(gridToWorld(to.col, to.row));
+  moveProgress = 0;
+
+  // Face direction
+  if (foxModel) {
+    const dir = new THREE.Vector3().subVectors(moveTo, moveFrom).normalize();
+    const angle = Math.atan2(dir.x, dir.z);
+    foxModel.rotation.y = angle;
+  }
+}
+
+function updateMovement(delta) {
+  if (!isMoving || !currentPath || !foxModel) return;
+
+  moveProgress += delta / MOVE_DURATION;
+
+  if (moveProgress >= 1) {
+    moveProgress = 1;
+    const arrived = currentPath[pathIndex];
+    foxCol = arrived.col;
+    foxRow = arrived.row;
+    foxModel.position.set(moveTo.x, 0.05, moveTo.z);
+
+    updateFoxPosHUD();
+
+    pathIndex++;
+    if (pathIndex >= currentPath.length) {
+      onArrival();
+    } else {
+      startMoveToNext();
+    }
+  } else {
+    const pos = new THREE.Vector3().lerpVectors(moveFrom, moveTo, moveProgress);
+    foxModel.position.set(pos.x, 0.05, pos.z);
+  }
+}
+
+function onArrival() {
+  isMoving = false;
+  window.__3D_STATE__.isMoving = false;
+  currentPath = null;
+  playAnimation('idle');
+  clearPathHighlights();
+  clearTargetHighlight();
+  window.__3D_STATE__.pathLength = 0;
+  document.getElementById('pathLength').textContent = '0';
+}
+
+function cancelMovement() {
+  if (isMoving && currentPath && pathIndex > 0) {
+    // Snap to nearest completed cell
+    const lastCompleted = currentPath[pathIndex - 1];
+    foxCol = lastCompleted.col;
+    foxRow = lastCompleted.row;
+    if (foxModel) {
+      const pos = gridToWorld(foxCol, foxRow);
+      foxModel.position.set(pos.x, 0.05, pos.z);
+    }
+  }
+  isMoving = false;
+  window.__3D_STATE__.isMoving = false;
+  currentPath = null;
+  clearPathHighlights();
+  clearTargetHighlight();
+}
+
+function updateFoxPosHUD() {
+  window.__3D_STATE__.foxPosition = { col: foxCol, row: foxRow };
+  document.getElementById('foxPos').textContent = `(${foxCol}, ${foxRow})`;
+}
+
+// --- Raycaster / Click ---
+const raycaster = new THREE.Raycaster();
+const mouse = new THREE.Vector2();
+
+function onMouseClick(event) {
+  if (!foxModel) return;
+
+  mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+  mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+  raycaster.setFromCamera(mouse, camera);
+  const intersects = raycaster.intersectObjects(cellMeshes);
+
+  if (intersects.length > 0) {
+    const hit = intersects[0].object;
+    const { col, row } = hit.userData;
+
+    if (!grid[row][col].walkable) return;
+    if (col === foxCol && row === foxRow) return;
+
+    // Cancel current movement if any
+    if (isMoving) {
+      cancelMovement();
+    }
+
+    // Clear previous highlights
+    clearPathHighlights();
+    clearTargetHighlight();
+
+    // Set target
+    setTargetHighlight(col, row);
+    window.__3D_STATE__.targetPosition = { col, row };
+    document.getElementById('targetPos').textContent = `(${col}, ${row})`;
+
+    // Find path
+    const path = aStar(foxCol, foxRow, col, row);
+
+    if (path) {
+      window.__3D_STATE__.pathLength = path.length - 1;
+      document.getElementById('pathLength').textContent = path.length - 1;
+      highlightPath(path);
+      startPathMovement(path);
+    } else {
+      showToast('无法到达！');
+      window.__3D_STATE__.pathLength = 0;
+      document.getElementById('pathLength').textContent = '0';
+    }
+  }
+}
+
+renderer.domElement.addEventListener('click', onMouseClick);
+
+// --- Toast ---
+function showToast(msg) {
+  const toast = document.getElementById('toast');
+  toast.textContent = msg;
+  toast.style.display = 'block';
+  setTimeout(() => { toast.style.display = 'none'; }, 2000);
+}
+
+// --- Resize ---
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// --- Animation Loop ---
+const clock = new THREE.Clock();
+
+function animate() {
+  requestAnimationFrame(animate);
+  const delta = clock.getDelta();
+
+  if (mixer) mixer.update(delta);
+  updateMovement(delta);
+  controls.update();
+
+  // Update state
+  window.__3D_STATE__.foxPosition = { col: foxCol, row: foxRow };
+  window.__3D_STATE__.gridSize = GRID_SIZE;
+
+  renderer.render(scene, camera);
+}
+
+updateFoxPosHUD();
+animate();
+</script>
+</body>
+</html>

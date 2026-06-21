@@ -1,0 +1,440 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>虚拟显微镜 - 琥珀蚊子标本</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #111;
+            font-family: sans-serif;
+            color: white;
+            user-select: none;
+        }
+        #canvas-container {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100vw;
+            height: 100vh;
+        }
+        #css2d-container {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100vw;
+            height: 100vh;
+            pointer-events: none;
+        }
+        #ui-layer {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+            display: flex;
+            flex-direction: column;
+        }
+        .toolbar {
+            pointer-events: auto;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 10px;
+            display: flex;
+            justify-content: center;
+            gap: 10px;
+            border-bottom: 1px solid #333;
+        }
+        button {
+            background: #333;
+            color: white;
+            border: 1px solid #555;
+            padding: 8px 16px;
+            cursor: pointer;
+            border-radius: 4px;
+            transition: all 0.2s;
+        }
+        button:hover {
+            background: #444;
+        }
+        button.active {
+            background: #007bff;
+            border-color: #0056b3;
+        }
+        button.active-uv {
+            background: #7700ff;
+            border-color: #5500cc;
+        }
+        button.active-measure {
+            background: #dc3545;
+            border-color: #a71d2a;
+        }
+        #hud {
+            position: absolute;
+            top: 60px;
+            left: 10px;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 15px;
+            border-radius: 8px;
+            border: 1px solid #333;
+            pointer-events: auto;
+        }
+        .hud-item {
+            margin-bottom: 8px;
+            font-size: 14px;
+        }
+        .hud-item:last-child {
+            margin-bottom: 0;
+        }
+        .hud-value {
+            font-weight: bold;
+            color: #00ffaa;
+        }
+        .measurement-label {
+            background: rgba(0, 0, 0, 0.8);
+            color: white;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+            border: 1px solid #fff;
+            pointer-events: none;
+        }
+        .loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            font-size: 24px;
+            pointer-events: none;
+            transition: opacity 0.5s;
+        }
+    </style>
+    <script type="importmap">
+    { "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+    } }
+    </script>
+</head>
+<body>
+    <div id="canvas-container"></div>
+    <div id="css2d-container"></div>
+    
+    <div id="ui-layer">
+        <div class="toolbar">
+            <button id="zoom1x" class="active">1x</button>
+            <button id="zoom2x">2x</button>
+            <button id="zoom5x">5x</button>
+            <button id="zoom10x">10x</button>
+            <div style="width: 20px;"></div>
+            <button id="measureBtn">测量工具</button>
+            <div style="width: 20px;"></div>
+            <button id="lightVisible" class="active">可见光</button>
+            <button id="lightUV">UV 光</button>
+        </div>
+        <div id="hud">
+            <div class="hud-item">缩放倍率: <span id="zoomLevel" class="hud-value">1</span>x</div>
+            <div class="hud-item">测量次数: <span id="measureCount" class="hud-value">0</span></div>
+            <div class="hud-item">灯光模式: <span id="lightMode" class="hud-value">visible</span></div>
+        </div>
+    </div>
+    <div id="loading" class="loading">加载模型中...</div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer.js';
+
+        // --- State ---
+        window.__3D_STATE__ = {
+            modelLoaded: false,
+            zoomLevel: 1,
+            measureCount: 0,
+            lightMode: 'visible',
+            cameraDistance: 5.0,
+            measureActive: false
+        };
+
+        // --- Setup ---
+        const container = document.getElementById('canvas-container');
+        const css2dContainer = document.getElementById('css2d-container');
+        
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x222222);
+
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.01, 100);
+        camera.position.set(0, 0, 5);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        container.appendChild(renderer.domElement);
+
+        const labelRenderer = new CSS2DRenderer();
+        labelRenderer.setSize(window.innerWidth, window.innerHeight);
+        css2dContainer.appendChild(labelRenderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enablePan = false;
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.05;
+        controls.minDistance = 0.4;
+        controls.maxDistance = 10;
+
+        // --- Lights ---
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+        dirLight.position.set(5, 5, 5);
+        scene.add(dirLight);
+
+        // --- Model Loading ---
+        let modelGroup = new THREE.Group();
+        scene.add(modelGroup);
+        let loadedMeshes = [];
+
+        const loader = new GLTFLoader();
+        loader.load(
+            'assets/MosquitoInAmber.glb',
+            (gltf) => {
+                const model = gltf.scene;
+                
+                // Center and scale
+                const box = new THREE.Box3().setFromObject(model);
+                const center = box.getCenter(new THREE.Vector3());
+                const size = box.getSize(new THREE.Vector3());
+                const maxDim = Math.max(size.x, size.y, size.z);
+                const scale = 2.0 / maxDim; // Scale to fit within ~2 units
+                
+                model.scale.setScalar(scale);
+                model.position.sub(center.multiplyScalar(scale));
+                
+                // Save original materials
+                model.traverse((child) => {
+                    if (child.isMesh) {
+                        loadedMeshes.push(child);
+                        if (child.material) {
+                            child.userData.origEmissive = child.material.emissive ? child.material.emissive.clone() : new THREE.Color(0x000000);
+                            child.userData.origEmissiveIntensity = child.material.emissiveIntensity !== undefined ? child.material.emissiveIntensity : 1;
+                        }
+                    }
+                });
+
+                modelGroup.add(model);
+                window.__3D_STATE__.modelLoaded = true;
+                document.getElementById('loading').style.opacity = '0';
+            },
+            undefined,
+            (error) => {
+                console.error('Error loading model:', error);
+                document.getElementById('loading').innerText = '模型加载失败 (请确保 assets/MosquitoInAmber.glb 存在)';
+            }
+        );
+
+        // --- Zoom System ---
+        const zoomLevels = {
+            1: { distance: 5.0, btn: 'zoom1x' },
+            2: { distance: 2.5, btn: 'zoom2x' },
+            5: { distance: 1.0, btn: 'zoom5x' },
+            10: { distance: 0.5, btn: 'zoom10x' }
+        };
+
+        let isZooming = false;
+        let zoomStartTime = 0;
+        let zoomStartDistance = 5.0;
+        let zoomTargetDistance = 5.0;
+        const zoomDuration = 800;
+
+        function setZoom(level) {
+            window.__3D_STATE__.zoomLevel = level;
+            document.getElementById('zoomLevel').innerText = level;
+            
+            Object.values(zoomLevels).forEach(z => document.getElementById(z.btn).classList.remove('active'));
+            document.getElementById(zoomLevels[level].btn).classList.add('active');
+
+            zoomStartDistance = camera.position.length();
+            zoomTargetDistance = zoomLevels[level].distance;
+            zoomStartTime = performance.now();
+            isZooming = true;
+        }
+
+        [1, 2, 5, 10].forEach(level => {
+            document.getElementById(`zoom${level}x`).addEventListener('click', () => setZoom(level));
+        });
+
+        // --- Light Modes ---
+        function setLightMode(mode) {
+            window.__3D_STATE__.lightMode = mode;
+            document.getElementById('lightMode').innerText = mode;
+            
+            const btnVis = document.getElementById('lightVisible');
+            const btnUV = document.getElementById('lightUV');
+            
+            if (mode === 'visible') {
+                btnVis.classList.add('active');
+                btnUV.classList.remove('active-uv');
+                
+                scene.background.setHex(0x222222);
+                ambientLight.color.setHex(0xffffff);
+                dirLight.color.setHex(0xffffff);
+                
+                loadedMeshes.forEach(mesh => {
+                    if (mesh.material) {
+                        if (mesh.userData.origEmissive) mesh.material.emissive.copy(mesh.userData.origEmissive);
+                        mesh.material.emissiveIntensity = mesh.userData.origEmissiveIntensity;
+                    }
+                });
+            } else {
+                btnVis.classList.remove('active');
+                btnUV.classList.add('active-uv');
+                
+                scene.background.setHex(0x1a0033);
+                ambientLight.color.setHex(0x7700ff);
+                dirLight.color.setHex(0x7700ff);
+                
+                loadedMeshes.forEach(mesh => {
+                    if (mesh.material) {
+                        mesh.material.emissive.setHex(0x00ffaa);
+                        mesh.material.emissiveIntensity = 0.4;
+                    }
+                });
+            }
+        }
+
+        document.getElementById('lightVisible').addEventListener('click', () => setLightMode('visible'));
+        document.getElementById('lightUV').addEventListener('click', () => setLightMode('uv'));
+
+        // --- Measurement Tool ---
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+        let measurePoints = [];
+        let measureObjects = [];
+
+        const measureBtn = document.getElementById('measureBtn');
+        
+        measureBtn.addEventListener('click', () => {
+            window.__3D_STATE__.measureActive = !window.__3D_STATE__.measureActive;
+            if (window.__3D_STATE__.measureActive) {
+                measureBtn.classList.add('active-measure');
+                container.style.cursor = 'crosshair';
+                clearMeasurement();
+            } else {
+                measureBtn.classList.remove('active-measure');
+                container.style.cursor = 'default';
+                clearMeasurement();
+            }
+        });
+
+        function clearMeasurement() {
+            measureObjects.forEach(obj => scene.remove(obj));
+            measureObjects = [];
+            measurePoints = [];
+        }
+
+        function createMarker(position) {
+            const geo = new THREE.SphereGeometry(0.02, 16, 16);
+            const mat = new THREE.MeshBasicMaterial({ color: 0xff0000, depthTest: false });
+            const sphere = new THREE.Mesh(geo, mat);
+            sphere.position.copy(position);
+            sphere.renderOrder = 999;
+            scene.add(sphere);
+            measureObjects.push(sphere);
+        }
+
+        renderer.domElement.addEventListener('click', (event) => {
+            if (!window.__3D_STATE__.measureActive || !window.__3D_STATE__.modelLoaded) return;
+
+            mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+            raycaster.setFromCamera(mouse, camera);
+            const intersects = raycaster.intersectObjects(loadedMeshes, true);
+
+            if (intersects.length > 0) {
+                const point = intersects[0].point;
+                measurePoints.push(point);
+                createMarker(point);
+
+                if (measurePoints.length === 2) {
+                    // Draw line
+                    const lineGeo = new THREE.BufferGeometry().setFromPoints(measurePoints);
+                    const lineMat = new THREE.LineBasicMaterial({ color: 0xffffff, depthTest: false });
+                    const line = new THREE.Line(lineGeo, lineMat);
+                    line.renderOrder = 998;
+                    scene.add(line);
+                    measureObjects.push(line);
+
+                    // Calculate distance
+                    const distance = measurePoints[0].distanceTo(measurePoints[1]);
+                    
+                    // Add label
+                    const midPoint = new THREE.Vector3().addVectors(measurePoints[0], measurePoints[1]).multiplyScalar(0.5);
+                    const div = document.createElement('div');
+                    div.className = 'measurement-label';
+                    div.textContent = `${distance.toFixed(3)} units`;
+                    const label = new CSS2DObject(div);
+                    label.position.copy(midPoint);
+                    scene.add(label);
+                    measureObjects.push(label);
+
+                    // Update state
+                    window.__3D_STATE__.measureCount++;
+                    document.getElementById('measureCount').innerText = window.__3D_STATE__.measureCount;
+                    
+                    // Auto exit
+                    window.__3D_STATE__.measureActive = false;
+                    measureBtn.classList.remove('active-measure');
+                    container.style.cursor = 'default';
+                }
+            }
+        });
+
+        // --- Resize ---
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            labelRenderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // --- Animation Loop ---
+        function animate(time) {
+            requestAnimationFrame(animate);
+
+            // Handle Zoom Animation
+            if (isZooming) {
+                const elapsed = time - zoomStartTime;
+                let t = elapsed / zoomDuration;
+                if (t >= 1.0) {
+                    t = 1.0;
+                    isZooming = false;
+                }
+                // easeInOutQuad
+                const easeT = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+                
+                const currentDir = camera.position.clone().normalize();
+                const newDist = THREE.MathUtils.lerp(zoomStartDistance, zoomTargetDistance, easeT);
+                camera.position.copy(currentDir.multiplyScalar(newDist));
+            }
+
+            // Dynamic Light Intensity based on distance
+            const dist = camera.position.length();
+            window.__3D_STATE__.cameraDistance = dist;
+            
+            // Base intensity 1.0 at dist 5.0, max intensity 3.0 at dist 0.5
+            const intensityMap = THREE.MathUtils.mapLinear(dist, 5.0, 0.5, 1.0, 3.0);
+            dirLight.intensity = THREE.MathUtils.clamp(intensityMap, 1.0, 3.0);
+
+            controls.update();
+            renderer.render(scene, camera);
+            labelRenderer.render(scene, camera);
+        }
+
+        animate(performance.now());
+    </script>
+</body>
+</html>

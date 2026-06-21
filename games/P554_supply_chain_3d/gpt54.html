@@ -1,0 +1,651 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>3D Supply Chain Flow Visualization</title>
+  <style>
+    html, body {
+      margin: 0;
+      overflow: hidden;
+      background: #1a2030;
+      font-family: Arial, sans-serif;
+      color: #fff;
+    }
+
+    #ui {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      z-index: 20;
+      background: rgba(0,0,0,0.45);
+      padding: 12px 14px;
+      border-radius: 10px;
+      backdrop-filter: blur(6px);
+      min-width: 240px;
+    }
+
+    #ui label, #ui div {
+      font-size: 13px;
+      margin-bottom: 6px;
+      display: block;
+    }
+
+    #slider-flow {
+      width: 220px;
+    }
+
+    #hud {
+      position: absolute;
+      top: 12px;
+      right: 12px;
+      z-index: 20;
+      background: rgba(0,0,0,0.45);
+      padding: 12px 14px;
+      border-radius: 10px;
+      backdrop-filter: blur(6px);
+      min-width: 240px;
+      line-height: 1.5;
+      font-size: 13px;
+    }
+
+    .hint {
+      opacity: 0.8;
+      margin-top: 8px;
+      font-size: 12px;
+    }
+  </style>
+
+  <script type="importmap">
+  { "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+  } }
+  </script>
+</head>
+<body>
+  <div id="ui">
+    <label for="slider-flow">Selected Flow Rate: <span id="slider-value">3.0</span> units/sec</label>
+    <input id="slider-flow" type="range" min="0" max="10" step="0.5" value="3" />
+    <div class="hint">Click a connection to select it</div>
+    <div class="hint">R = randomize flows</div>
+    <div class="hint">Space = pause/play</div>
+    <div class="hint">B = toggle bottlenecks</div>
+  </div>
+
+  <div id="hud">
+    <div>Total throughput: <span id="hud-throughput">0.0</span></div>
+    <div>Bottlenecks: <span id="hud-bottlenecks">0</span></div>
+    <div>Selected connection: <span id="hud-selected">None</span></div>
+    <div>Active particles: <span id="hud-particles">0</span></div>
+    <div>Models loaded: <span id="hud-models">0</span></div>
+    <div>Paused: <span id="hud-paused">Playing</span></div>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+    import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x1a2030);
+
+    const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 200);
+    camera.position.set(0, 20, 30);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    document.body.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.target.set(0, 3, 0);
+
+    const ambient = new THREE.AmbientLight(0x445566, 0.5);
+    scene.add(ambient);
+
+    const dirLight = new THREE.DirectionalLight(0xffffff, 0.6);
+    dirLight.position.set(10, 15, 10);
+    scene.add(dirLight);
+
+    const ground = new THREE.Mesh(
+      new THREE.PlaneGeometry(50, 50),
+      new THREE.MeshPhongMaterial({ color: 0x223344, side: THREE.DoubleSide })
+    );
+    ground.rotation.x = -Math.PI / 2;
+    ground.position.y = 0;
+    scene.add(ground);
+
+    const grid = new THREE.GridHelper(50, 25, 0x4f6b86, 0x34485d);
+    grid.position.y = 0.01;
+    scene.add(grid);
+
+    const loader = new GLTFLoader();
+    let modelsLoaded = 0;
+
+    const clock = new THREE.Clock();
+    const raycaster = new THREE.Raycaster();
+    const mouse = new THREE.Vector2();
+
+    const slider = document.getElementById('slider-flow');
+    const sliderValue = document.getElementById('slider-value');
+
+    const hudThroughput = document.getElementById('hud-throughput');
+    const hudBottlenecks = document.getElementById('hud-bottlenecks');
+    const hudSelected = document.getElementById('hud-selected');
+    const hudParticles = document.getElementById('hud-particles');
+    const hudModels = document.getElementById('hud-models');
+    const hudPaused = document.getElementById('hud-paused');
+
+    const TIER_COLORS = {
+      factory: 0xff5555,
+      warehouse: 0xffcc44,
+      store: 0x44ddaa
+    };
+
+    const factoryPositions = [-12, 0, 12].map(x => new THREE.Vector3(x, 0, -15));
+    const warehousePositions = [-9, -3, 3, 9].map(x => new THREE.Vector3(x, 0, 0));
+    const storePositions = [-12, -6, 0, 6, 12].map(x => new THREE.Vector3(x, 0, 15));
+
+    const factories = [];
+    const warehouses = [];
+    const stores = [];
+    const connections = [];
+    const particles = [];
+
+    let frameCount = 0;
+    let isPaused = false;
+    let bottleneckHighlightEnabled = true;
+    let selectedConnection = null;
+
+    function randomFlow() {
+      return Math.round((1 + Math.random() * 4) * 2) / 2;
+    }
+
+    function getFlowColor(flow) {
+      if (flow < 2) return 0xff4444;
+      if (flow <= 4) return 0xffdd33;
+      return 0x33dd66;
+    }
+
+    function createLabelData(type, index) {
+      if (type === 'factory') return `F${index}`;
+      if (type === 'warehouse') return `W${index}`;
+      return `S${index}`;
+    }
+
+    function safeCloneGLTF(sceneObj) {
+      return sceneObj.clone(true);
+    }
+
+    function createIndicatorSphere(color) {
+      return new THREE.Mesh(
+        new THREE.SphereGeometry(0.35, 16, 16),
+        new THREE.MeshStandardMaterial({
+          color,
+          emissive: color,
+          emissiveIntensity: 0.6
+        })
+      );
+    }
+
+    function createWarehouseBar() {
+      const geom = new THREE.BoxGeometry(0.4, 1, 0.4);
+      const mat = new THREE.MeshStandardMaterial({
+        color: 0x66aaff,
+        emissive: 0x224488,
+        emissiveIntensity: 0.4
+      });
+      const mesh = new THREE.Mesh(geom, mat);
+      mesh.position.y = 4;
+      return mesh;
+    }
+
+    function setWarehouseBarHeight(bar, value) {
+      const h = Math.max(0.1, value);
+      bar.scale.y = h;
+      bar.position.y = 3.2 + h / 2;
+    }
+
+    function createFactoryNode(pos, index, truckTemplate) {
+      const group = new THREE.Group();
+      group.position.copy(pos);
+
+      const base = new THREE.Mesh(
+        new THREE.CylinderGeometry(1.2, 1.2, 0.4, 24),
+        new THREE.MeshStandardMaterial({ color: 0x555b77 })
+      );
+      base.position.y = 0.2;
+      group.add(base);
+
+      if (truckTemplate) {
+        const truck = safeCloneGLTF(truckTemplate);
+        truck.scale.setScalar(1.5);
+        truck.position.y = 0.4;
+        truck.rotation.y = Math.PI;
+        group.add(truck);
+      } else {
+        const fallback = new THREE.Mesh(
+          new THREE.BoxGeometry(2.2, 1, 1.2),
+          new THREE.MeshStandardMaterial({ color: 0x999999 })
+        );
+        fallback.position.y = 1.0;
+        group.add(fallback);
+      }
+
+      const indicator = createIndicatorSphere(0xff4444);
+      indicator.position.y = 3.2;
+      group.add(indicator);
+
+      scene.add(group);
+
+      return {
+        type: 'factory',
+        index,
+        id: createLabelData('factory', index),
+        group,
+        position: group.position,
+        baseScale: 1
+      };
+    }
+
+    function createWarehouseNode(pos, index, bottleTemplate) {
+      const group = new THREE.Group();
+      group.position.copy(pos);
+
+      const building = new THREE.Mesh(
+        new THREE.BoxGeometry(2, 3, 2),
+        new THREE.MeshStandardMaterial({ color: 0x886644 })
+      );
+      building.position.y = 1.5;
+      group.add(building);
+
+      const roof = new THREE.Mesh(
+        new THREE.BoxGeometry(2.2, 0.25, 2.2),
+        new THREE.MeshStandardMaterial({ color: 0x66503a })
+      );
+      roof.position.y = 3.1;
+      group.add(roof);
+
+      if (bottleTemplate) {
+        const bottle = safeCloneGLTF(bottleTemplate);
+        bottle.scale.setScalar(0.4);
+        bottle.position.y = 3.4;
+        group.add(bottle);
+      } else {
+        const fallback = new THREE.Mesh(
+          new THREE.CylinderGeometry(0.18, 0.22, 0.8, 16),
+          new THREE.MeshStandardMaterial({ color: 0x55aaff })
+        );
+        fallback.position.y = 3.6;
+        group.add(fallback);
+      }
+
+      const bar = createWarehouseBar();
+      group.add(bar);
+
+      scene.add(group);
+
+      return {
+        type: 'warehouse',
+        index,
+        id: createLabelData('warehouse', index),
+        group,
+        position: group.position,
+        inventory: 0,
+        inventoryBar: bar,
+        baseScale: 1
+      };
+    }
+
+    function createStoreNode(pos, index) {
+      const group = new THREE.Group();
+      group.position.copy(pos);
+
+      const body = new THREE.Mesh(
+        new THREE.BoxGeometry(1.5, 2, 1.5),
+        new THREE.MeshStandardMaterial({ color: 0x44aa88 })
+      );
+      body.position.y = 1.0;
+      group.add(body);
+
+      const awning = new THREE.Mesh(
+        new THREE.BoxGeometry(1.7, 0.18, 0.6),
+        new THREE.MeshStandardMaterial({ color: 0xeedc82 })
+      );
+      awning.position.set(0, 1.4, 0.75);
+      group.add(awning);
+
+      const door = new THREE.Mesh(
+        new THREE.PlaneGeometry(0.45, 0.8),
+        new THREE.MeshStandardMaterial({ color: 0x224433, side: THREE.DoubleSide })
+      );
+      door.position.set(0, 0.5, 0.76);
+      group.add(door);
+
+      scene.add(group);
+
+      return {
+        type: 'store',
+        index,
+        id: createLabelData('store', index),
+        group,
+        position: group.position,
+        baseScale: 1
+      };
+    }
+
+    function makeArcPoints(a, b) {
+      const mid = a.clone().lerp(b, 0.5);
+      mid.y = 2.5 + Math.abs(a.z - b.z) * 0.08;
+      const curve = new THREE.CatmullRomCurve3([a.clone().setY(1.2), mid, b.clone().setY(1.2)]);
+      return curve;
+    }
+
+    function createConnection(fromNode, toNode, defaultFlow = randomFlow()) {
+      const curve = makeArcPoints(fromNode.position, toNode.position);
+      const geometry = new THREE.TubeGeometry(curve, 40, 0.08, 10, false);
+      const material = new THREE.MeshStandardMaterial({
+        color: getFlowColor(defaultFlow),
+        emissive: getFlowColor(defaultFlow),
+        emissiveIntensity: 0.15
+      });
+      const mesh = new THREE.Mesh(geometry, material);
+      mesh.userData.isConnection = true;
+      scene.add(mesh);
+
+      const conn = {
+        from: fromNode,
+        to: toNode,
+        label: `${fromNode.id}→${toNode.id}`,
+        curve,
+        mesh,
+        flowRate: defaultFlow,
+        spawnAccumulator: 0,
+        originalColor: new THREE.Color(getFlowColor(defaultFlow))
+      };
+      mesh.userData.connectionRef = conn;
+      connections.push(conn);
+      return conn;
+    }
+
+    function updateConnectionVisual(conn) {
+      const color = new THREE.Color(getFlowColor(conn.flowRate));
+      conn.originalColor.copy(color);
+      if (selectedConnection === conn) {
+        conn.mesh.material.color.set(0xffffff);
+        conn.mesh.material.emissive.set(0xffffff);
+        conn.mesh.material.emissiveIntensity = 0.35;
+      } else {
+        conn.mesh.material.color.copy(color);
+        conn.mesh.material.emissive.copy(color);
+        conn.mesh.material.emissiveIntensity = 0.15;
+      }
+    }
+
+    function selectConnection(conn) {
+      selectedConnection = conn;
+      connections.forEach(updateConnectionVisual);
+      if (conn) {
+        slider.value = conn.flowRate.toFixed(1);
+        sliderValue.textContent = Number(conn.flowRate).toFixed(1);
+      }
+    }
+
+    function createParticle(conn) {
+      const color =
+        conn.from.type === 'factory' ? TIER_COLORS.factory :
+        conn.from.type === 'warehouse' ? TIER_COLORS.warehouse :
+        TIER_COLORS.store;
+
+      const mesh = new THREE.Mesh(
+        new THREE.SphereGeometry(0.15, 12, 12),
+        new THREE.MeshStandardMaterial({
+          color,
+          emissive: color,
+          emissiveIntensity: 1.2
+        })
+      );
+      scene.add(mesh);
+
+      const speed = 0.08 + conn.flowRate * 0.05;
+      const particle = {
+        connection: conn,
+        mesh,
+        t: 0,
+        speed
+      };
+      particles.push(particle);
+    }
+
+    function updateParticles(dt) {
+      if (!isPaused) {
+        for (const conn of connections) {
+          conn.spawnAccumulator += conn.flowRate * dt;
+          while (conn.spawnAccumulator >= 1) {
+            createParticle(conn);
+            conn.spawnAccumulator -= 1;
+          }
+        }
+
+        for (let i = particles.length - 1; i >= 0; i--) {
+          const p = particles[i];
+          p.speed = 0.08 + p.connection.flowRate * 0.05;
+          p.t += p.speed * dt * 0.35;
+          if (p.t >= 1) {
+            scene.remove(p.mesh);
+            p.mesh.geometry.dispose();
+            p.mesh.material.dispose();
+            particles.splice(i, 1);
+            continue;
+          }
+          const pos = p.connection.curve.getPointAt(p.t);
+          p.mesh.position.copy(pos);
+        }
+      }
+    }
+
+    function computeNodeFlows() {
+      const inflow = new Map();
+      const outflow = new Map();
+
+      [...factories, ...warehouses, ...stores].forEach(node => {
+        inflow.set(node.id, 0);
+        outflow.set(node.id, 0);
+      });
+
+      for (const conn of connections) {
+        outflow.set(conn.from.id, outflow.get(conn.from.id) + conn.flowRate);
+        inflow.set(conn.to.id, inflow.get(conn.to.id) + conn.flowRate);
+      }
+
+      return { inflow, outflow };
+    }
+
+    function updateBottlenecks(time) {
+      const { inflow, outflow } = computeNodeFlows();
+      let count = 0;
+
+      warehouses.forEach((w, i) => {
+        const incoming = inflow.get(w.id) || 0;
+        const outgoing = outflow.get(w.id) || 0;
+        const inventory = THREE.MathUtils.clamp(5 + (incoming - outgoing) * 1.5, 0, 10);
+        w.inventory = inventory;
+        setWarehouseBarHeight(w.inventoryBar, inventory);
+      });
+
+      const allNodes = [...factories, ...warehouses, ...stores];
+      allNodes.forEach(node => {
+        const incoming = inflow.get(node.id) || 0;
+        const outgoing = outflow.get(node.id) || 0;
+        const mismatch = Math.abs(incoming - outgoing) > 0.01;
+
+        if (mismatch) count++;
+
+        if (bottleneckHighlightEnabled && mismatch) {
+          const pulse = 1 + 0.08 * Math.sin(time * 4 + node.index);
+          node.group.scale.setScalar(pulse);
+        } else {
+          node.group.scale.setScalar(1);
+        }
+      });
+
+      return count;
+    }
+
+    function buildNetwork(truckModel, bottleModel) {
+      for (let i = 0; i < factoryPositions.length; i++) {
+        factories.push(createFactoryNode(factoryPositions[i], i, truckModel));
+      }
+
+      for (let i = 0; i < warehousePositions.length; i++) {
+        warehouses.push(createWarehouseNode(warehousePositions[i], i, bottleModel));
+      }
+
+      for (let i = 0; i < storePositions.length; i++) {
+        stores.push(createStoreNode(storePositions[i], i));
+      }
+
+      createConnection(factories[0], warehouses[0]);
+      createConnection(factories[0], warehouses[1]);
+      createConnection(factories[1], warehouses[1]);
+      createConnection(factories[1], warehouses[2]);
+      createConnection(factories[2], warehouses[2]);
+      createConnection(factories[2], warehouses[3]);
+
+      createConnection(warehouses[0], stores[0]);
+      createConnection(warehouses[0], stores[1]);
+      createConnection(warehouses[1], stores[1]);
+      createConnection(warehouses[1], stores[2]);
+      createConnection(warehouses[2], stores[2]);
+      createConnection(warehouses[2], stores[3]);
+      createConnection(warehouses[3], stores[3]);
+      createConnection(warehouses[3], stores[4]);
+
+      connections.forEach(updateConnectionVisual);
+    }
+
+    function loadModel(url) {
+      return new Promise((resolve) => {
+        loader.load(
+          url,
+          (gltf) => {
+            modelsLoaded++;
+            resolve(gltf.scene);
+          },
+          undefined,
+          () => resolve(null)
+        );
+      });
+    }
+
+    const truckURL = 'https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Models/master/2.0/CesiumMilkTruck/glTF-Binary/CesiumMilkTruck.glb';
+    const bottleURL = 'https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Models/master/2.0/WaterBottle/glTF-Binary/WaterBottle.glb';
+
+    const [truckModel, bottleModel] = await Promise.all([
+      loadModel(truckURL),
+      loadModel(bottleURL)
+    ]);
+
+    buildNetwork(truckModel, bottleModel);
+
+    slider.addEventListener('input', () => {
+      sliderValue.textContent = Number(slider.value).toFixed(1);
+      if (selectedConnection) {
+        selectedConnection.flowRate = Number(slider.value);
+        updateConnectionVisual(selectedConnection);
+      }
+    });
+
+    window.addEventListener('pointerdown', (event) => {
+      mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+      mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+      raycaster.setFromCamera(mouse, camera);
+      const hits = raycaster.intersectObjects(connections.map(c => c.mesh), false);
+      if (hits.length > 0) {
+        const conn = hits[0].object.userData.connectionRef;
+        selectConnection(conn);
+      }
+    });
+
+    window.addEventListener('keydown', (event) => {
+      if (event.code === 'Space') {
+        event.preventDefault();
+        isPaused = !isPaused;
+      } else if (event.key === 'r' || event.key === 'R') {
+        connections.forEach(conn => {
+          conn.flowRate = randomFlow();
+          updateConnectionVisual(conn);
+        });
+        if (selectedConnection) {
+          slider.value = selectedConnection.flowRate.toFixed(1);
+          sliderValue.textContent = Number(selectedConnection.flowRate).toFixed(1);
+        }
+      } else if (event.key === 'b' || event.key === 'B') {
+        bottleneckHighlightEnabled = !bottleneckHighlightEnabled;
+      }
+    });
+
+    function updateHUD(totalThroughput, bottleneckCount) {
+      hudThroughput.textContent = totalThroughput.toFixed(1);
+      hudBottlenecks.textContent = bottleneckCount;
+      hudSelected.textContent = selectedConnection ? selectedConnection.label : 'None';
+      hudParticles.textContent = particles.length;
+      hudModels.textContent = modelsLoaded;
+      hudPaused.textContent = isPaused ? 'Paused' : 'Playing';
+    }
+
+    function updateState(totalThroughput, bottleneckCount) {
+      const allNodes = [...factories, ...warehouses, ...stores];
+      const nodesValid = allNodes.every(n =>
+        Number.isFinite(n.position.x) &&
+        Number.isFinite(n.position.y) &&
+        Number.isFinite(n.position.z)
+      );
+
+      window.__3D_STATE__ = {
+        totalThroughput: Number(totalThroughput.toFixed(1)),
+        bottleneckCount,
+        selectedConnection: selectedConnection ? selectedConnection.label : null,
+        activeParticles: particles.length,
+        modelsLoaded,
+        isPaused,
+        frameCount,
+        flowRates: connections.map(c => c.flowRate),
+        warehouseInventories: warehouses.map(w => Number(w.inventory.toFixed(2))),
+        nodesValid
+      };
+    }
+
+    function animate() {
+      requestAnimationFrame(animate);
+      frameCount++;
+
+      const dt = Math.min(clock.getDelta(), 0.05);
+      const elapsed = clock.elapsedTime;
+
+      controls.update();
+
+      updateParticles(dt);
+
+      const totalThroughput = connections.reduce((sum, c) => sum + c.flowRate, 0);
+      const bottleneckCount = updateBottlenecks(elapsed);
+
+      updateHUD(totalThroughput, bottleneckCount);
+      updateState(totalThroughput, bottleneckCount);
+
+      renderer.render(scene, camera);
+    }
+
+    animate();
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+  </script>
+</body>
+</html>

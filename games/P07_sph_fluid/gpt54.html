@@ -1,0 +1,612 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Three.js 3D SPH 水坝崩塌模拟</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      background: #0b1020;
+      font-family: Arial, Helvetica, sans-serif;
+      color: #fff;
+    }
+
+    #app {
+      width: 100vw;
+      height: 100vh;
+      position: relative;
+    }
+
+    #hud {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      z-index: 10;
+      background: rgba(10, 16, 32, 0.72);
+      border: 1px solid rgba(255,255,255,0.12);
+      border-radius: 10px;
+      padding: 12px 14px;
+      min-width: 220px;
+      backdrop-filter: blur(6px);
+      box-shadow: 0 6px 24px rgba(0,0,0,0.25);
+      line-height: 1.7;
+      font-size: 14px;
+    }
+
+    #hud .title {
+      font-weight: bold;
+      margin-bottom: 6px;
+      color: #90caf9;
+    }
+
+    #resetBtn {
+      margin-top: 10px;
+      width: 100%;
+      padding: 8px 10px;
+      border: none;
+      border-radius: 8px;
+      background: #1e88e5;
+      color: white;
+      cursor: pointer;
+      font-size: 14px;
+    }
+
+    #resetBtn:hover {
+      background: #42a5f5;
+    }
+
+    .label {
+      color: #b0bec5;
+    }
+  </style>
+
+  <script type="importmap">
+  { "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+  } }
+  </script>
+</head>
+<body>
+  <div id="app">
+    <div id="hud">
+      <div class="title">3D SPH 水坝崩塌</div>
+      <div><span class="label">粒子数:</span> <span id="particleCount">0</span></div>
+      <div><span class="label">平均密度:</span> <span id="avgDensity">0</span></div>
+      <div><span class="label">平均速度:</span> <span id="avgSpeed">0</span></div>
+      <div><span class="label">模拟时间:</span> <span id="simTime">0.000</span> s</div>
+      <button id="resetBtn">重置</button>
+    </div>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+    // -----------------------------
+    // 基本参数
+    // -----------------------------
+    const N = 500;
+    const PARTICLE_RADIUS = 0.08;   // 渲染半径
+    const MASS = 0.02;
+    const H = 0.2;
+    const H2 = H * H;
+    const REST_DENSITY = 1000.0;
+    const STIFFNESS = 20.0;
+    const VISCOSITY = 0.1;
+    const DT = 0.001;
+    const SUBSTEPS = 4;
+    const BOUNCE = 0.3;
+
+    const BOUNDS = {
+      minX: 0, maxX: 6,
+      minY: 0, maxY: 4,
+      minZ: 0, maxZ: 2
+    };
+
+    const GRAVITY = new THREE.Vector3(0, -9.81, 0);
+
+    // 核函数常数
+    const POLY6_CONST = 315.0 / (64.0 * Math.PI * Math.pow(H, 9));
+    const SPIKY_GRAD_CONST = -45.0 / (Math.PI * Math.pow(H, 6));
+    const VISC_LAP_CONST = 45.0 / (Math.PI * Math.pow(H, 6));
+
+    // 空间哈希
+    const CELL_SIZE = H;
+    const gridKey = (ix, iy, iz) => `${ix},${iy},${iz}`;
+
+    // -----------------------------
+    // Three.js 场景
+    // -----------------------------
+    const app = document.getElementById('app');
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0b1020);
+
+    const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.01, 100);
+    camera.position.set(7.5, 5.5, 6.5);
+    camera.lookAt(3, 1.5, 1);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    app.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.set(3, 1.5, 1);
+    controls.enableDamping = true;
+
+    const ambient = new THREE.AmbientLight(0xffffff, 0.75);
+    scene.add(ambient);
+
+    const dirLight = new THREE.DirectionalLight(0xffffff, 1.1);
+    dirLight.position.set(5, 8, 4);
+    scene.add(dirLight);
+
+    // 容器线框
+    const boxGeom = new THREE.BoxGeometry(
+      BOUNDS.maxX - BOUNDS.minX,
+      BOUNDS.maxY - BOUNDS.minY,
+      BOUNDS.maxZ - BOUNDS.minZ
+    );
+    const edges = new THREE.EdgesGeometry(boxGeom);
+    const lineMat = new THREE.LineBasicMaterial({ color: 0x90caf9, transparent: true, opacity: 0.8 });
+    const wireBox = new THREE.LineSegments(edges, lineMat);
+    wireBox.position.set(
+      (BOUNDS.minX + BOUNDS.maxX) / 2,
+      (BOUNDS.minY + BOUNDS.maxY) / 2,
+      (BOUNDS.minZ + BOUNDS.maxZ) / 2
+    );
+    scene.add(wireBox);
+
+    // 底面半透明网格
+    const floorGroup = new THREE.Group();
+
+    const floorGeom = new THREE.PlaneGeometry(BOUNDS.maxX - BOUNDS.minX, BOUNDS.maxZ - BOUNDS.minZ);
+    const floorMat = new THREE.MeshBasicMaterial({
+      color: 0x1e3a5f,
+      transparent: true,
+      opacity: 0.28,
+      side: THREE.DoubleSide
+    });
+    const floor = new THREE.Mesh(floorGeom, floorMat);
+    floor.rotation.x = -Math.PI / 2;
+    floor.position.set(3, 0, 1);
+    floorGroup.add(floor);
+
+    const grid = new THREE.GridHelper(BOUNDS.maxX, 12, 0x90caf9, 0x3f6b9f);
+    grid.position.set(3, 0.001, 1);
+    grid.rotation.z = 0;
+    floorGroup.add(grid);
+
+    scene.add(floorGroup);
+
+    // 坐标轴辅助（可注释）
+    // scene.add(new THREE.AxesHelper(1.5));
+
+    // -----------------------------
+    // 粒子渲染
+    // -----------------------------
+    const sphereGeom = new THREE.SphereGeometry(PARTICLE_RADIUS, 16, 16);
+    const sphereMat = new THREE.MeshStandardMaterial({
+      color: 0x42a5f5,
+      roughness: 0.25,
+      metalness: 0.05,
+      vertexColors: true
+    });
+
+    const particlesMesh = new THREE.InstancedMesh(sphereGeom, sphereMat, N);
+    particlesMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    particlesMesh.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(N * 3), 3);
+    scene.add(particlesMesh);
+
+    const tempMatrix = new THREE.Matrix4();
+    const tempColor = new THREE.Color();
+
+    const slowColor = new THREE.Color('#1a237e');
+    const fastColor = new THREE.Color('#42a5f5');
+
+    // -----------------------------
+    // 数据结构
+    // -----------------------------
+    const positions = new Array(N);
+    const velocities = new Array(N);
+    const forces = new Array(N);
+    const densities = new Float32Array(N);
+    const pressures = new Float32Array(N);
+    const initialPositions = new Array(N);
+
+    for (let i = 0; i < N; i++) {
+      positions[i] = new THREE.Vector3();
+      velocities[i] = new THREE.Vector3();
+      forces[i] = new THREE.Vector3();
+      initialPositions[i] = new THREE.Vector3();
+    }
+
+    let simTime = 0;
+
+    // -----------------------------
+    // 初始化粒子：左半部分均匀网格
+    // x ∈ [0,2], y ∈ [0,3], z ∈ [0,2]
+    // -----------------------------
+    function initializeParticles() {
+      const nx = 10;
+      const ny = 10;
+      const nz = 5; // 10*10*5 = 500
+
+      const xMin = 0.18, xMax = 1.98;
+      const yMin = 0.18, yMax = 2.98;
+      const zMin = 0.18, zMax = 1.82;
+
+      const dx = (xMax - xMin) / (nx - 1);
+      const dy = (yMax - yMin) / (ny - 1);
+      const dz = (zMax - zMin) / (nz - 1);
+
+      let idx = 0;
+      for (let iy = 0; iy < ny; iy++) {
+        for (let iz = 0; iz < nz; iz++) {
+          for (let ix = 0; ix < nx; ix++) {
+            const x = xMin + ix * dx;
+            const y = yMin + iy * dy;
+            const z = zMin + iz * dz;
+
+            positions[idx].set(x, y, z);
+            velocities[idx].set(0, 0, 0);
+            forces[idx].set(0, 0, 0);
+            densities[idx] = REST_DENSITY;
+            pressures[idx] = 0;
+
+            initialPositions[idx].set(x, y, z);
+            idx++;
+          }
+        }
+      }
+
+      simTime = 0;
+      updateInstancedMesh();
+      updateHUDAndState();
+    }
+
+    // -----------------------------
+    // 核函数
+    // -----------------------------
+    function poly6Kernel(r2) {
+      if (r2 >= H2) return 0;
+      const diff = H2 - r2;
+      return POLY6_CONST * diff * diff * diff;
+    }
+
+    function spikyGradScalar(r) {
+      if (r <= 0 || r >= H) return 0;
+      const diff = H - r;
+      return SPIKY_GRAD_CONST * diff * diff;
+    }
+
+    function viscosityLaplacian(r) {
+      if (r < 0 || r >= H) return 0;
+      return VISC_LAP_CONST * (H - r);
+    }
+
+    // -----------------------------
+    // 空间哈希构建
+    // -----------------------------
+    function buildSpatialGrid() {
+      const gridMap = new Map();
+      for (let i = 0; i < N; i++) {
+        const p = positions[i];
+        const ix = Math.floor(p.x / CELL_SIZE);
+        const iy = Math.floor(p.y / CELL_SIZE);
+        const iz = Math.floor(p.z / CELL_SIZE);
+        const key = gridKey(ix, iy, iz);
+        if (!gridMap.has(key)) gridMap.set(key, []);
+        gridMap.get(key).push(i);
+      }
+      return gridMap;
+    }
+
+    function getNeighborCandidates(index, gridMap) {
+      const p = positions[index];
+      const ix = Math.floor(p.x / CELL_SIZE);
+      const iy = Math.floor(p.y / CELL_SIZE);
+      const iz = Math.floor(p.z / CELL_SIZE);
+
+      const result = [];
+      for (let dx = -1; dx <= 1; dx++) {
+        for (let dy = -1; dy <= 1; dy++) {
+          for (let dz = -1; dz <= 1; dz++) {
+            const key = gridKey(ix + dx, iy + dy, iz + dz);
+            const cell = gridMap.get(key);
+            if (cell) {
+              for (let k = 0; k < cell.length; k++) result.push(cell[k]);
+            }
+          }
+        }
+      }
+      return result;
+    }
+
+    // -----------------------------
+    // SPH 物理子步
+    // -----------------------------
+    function stepSPH() {
+      const gridMap = buildSpatialGrid();
+
+      // 1. 密度
+      for (let i = 0; i < N; i++) {
+        let rho = 0;
+        const pi = positions[i];
+        const neighbors = getNeighborCandidates(i, gridMap);
+
+        for (let n = 0; n < neighbors.length; n++) {
+          const j = neighbors[n];
+          const pj = positions[j];
+          const dx = pi.x - pj.x;
+          const dy = pi.y - pj.y;
+          const dz = pi.z - pj.z;
+          const r2 = dx * dx + dy * dy + dz * dz;
+          if (r2 < H2) {
+            rho += MASS * poly6Kernel(r2);
+          }
+        }
+
+        // 防止数值过小导致爆炸
+        densities[i] = Math.max(rho, REST_DENSITY * 0.2);
+      }
+
+      // 2. 压力
+      for (let i = 0; i < N; i++) {
+        pressures[i] = STIFFNESS * (Math.pow(densities[i] / REST_DENSITY, 7.0) - 1.0);
+      }
+
+      // 3. 力
+      for (let i = 0; i < N; i++) {
+        const fi = forces[i];
+        fi.set(0, 0, 0);
+
+        const pi = positions[i];
+        const vi = velocities[i];
+        const rhoi = densities[i];
+        const piPressure = pressures[i];
+        const neighbors = getNeighborCandidates(i, gridMap);
+
+        let fx = 0, fy = 0, fz = 0;
+
+        for (let n = 0; n < neighbors.length; n++) {
+          const j = neighbors[n];
+          if (j === i) continue;
+
+          const pj = positions[j];
+          const vj = velocities[j];
+          const rhoj = densities[j];
+          const pjPressure = pressures[j];
+
+          const rx = pi.x - pj.x;
+          const ry = pi.y - pj.y;
+          const rz = pi.z - pj.z;
+          const r2 = rx * rx + ry * ry + rz * rz;
+
+          if (r2 >= H2 || r2 === 0) continue;
+
+          const r = Math.sqrt(r2);
+          const invR = 1.0 / r;
+
+          // 压力梯度力
+          const gradScalar = spikyGradScalar(r);
+          const gradX = gradScalar * rx * invR;
+          const gradY = gradScalar * ry * invR;
+          const gradZ = gradScalar * rz * invR;
+
+          const pressureTerm = -MASS * (piPressure + pjPressure) / (2.0 * rhoj);
+          fx += pressureTerm * gradX;
+          fy += pressureTerm * gradY;
+          fz += pressureTerm * gradZ;
+
+          // 粘性力
+          const lap = viscosityLaplacian(r);
+          const viscTerm = VISCOSITY * MASS * lap / rhoj;
+          fx += viscTerm * (vj.x - vi.x);
+          fy += viscTerm * (vj.y - vi.y);
+          fz += viscTerm * (vj.z - vi.z);
+        }
+
+        // 重力: f = rho * g
+        fx += GRAVITY.x * rhoi;
+        fy += GRAVITY.y * rhoi;
+        fz += GRAVITY.z * rhoi;
+
+        fi.set(fx, fy, fz);
+      }
+
+      // 4. 半隐式欧拉积分
+      for (let i = 0; i < N; i++) {
+        const invRho = 1.0 / densities[i];
+        const v = velocities[i];
+        const p = positions[i];
+        const f = forces[i];
+
+        v.x += DT * f.x * invRho;
+        v.y += DT * f.y * invRho;
+        v.z += DT * f.z * invRho;
+
+        p.x += DT * v.x;
+        p.y += DT * v.y;
+        p.z += DT * v.z;
+
+        handleBoundary(p, v);
+      }
+
+      simTime += DT;
+    }
+
+    // -----------------------------
+    // 边界碰撞
+    // -----------------------------
+    function handleBoundary(p, v) {
+      const r = PARTICLE_RADIUS;
+
+      if (p.x < BOUNDS.minX + r) {
+        p.x = BOUNDS.minX + r;
+        if (v.x < 0) v.x *= -BOUNCE;
+      } else if (p.x > BOUNDS.maxX - r) {
+        p.x = BOUNDS.maxX - r;
+        if (v.x > 0) v.x *= -BOUNCE;
+      }
+
+      if (p.y < BOUNDS.minY + r) {
+        p.y = BOUNDS.minY + r;
+        if (v.y < 0) v.y *= -BOUNCE;
+      } else if (p.y > BOUNDS.maxY - r) {
+        // 顶部开放：不做顶面约束
+      }
+
+      if (p.z < BOUNDS.minZ + r) {
+        p.z = BOUNDS.minZ + r;
+        if (v.z < 0) v.z *= -BOUNCE;
+      } else if (p.z > BOUNDS.maxZ - r) {
+        p.z = BOUNDS.maxZ - r;
+        if (v.z > 0) v.z *= -BOUNCE;
+      }
+    }
+
+    // -----------------------------
+    // 颜色映射与实例更新
+    // -----------------------------
+    function updateInstancedMesh() {
+      for (let i = 0; i < N; i++) {
+        const p = positions[i];
+        tempMatrix.makeTranslation(p.x, p.y, p.z);
+        particlesMesh.setMatrixAt(i, tempMatrix);
+
+        const speed = velocities[i].length();
+        const t = THREE.MathUtils.clamp(speed / 6.0, 0, 1);
+        tempColor.copy(slowColor).lerp(fastColor, t);
+        particlesMesh.setColorAt(i, tempColor);
+      }
+
+      particlesMesh.instanceMatrix.needsUpdate = true;
+      if (particlesMesh.instanceColor) particlesMesh.instanceColor.needsUpdate = true;
+    }
+
+    // -----------------------------
+    // HUD + 状态暴露
+    // -----------------------------
+    const particleCountEl = document.getElementById('particleCount');
+    const avgDensityEl = document.getElementById('avgDensity');
+    const avgSpeedEl = document.getElementById('avgSpeed');
+    const simTimeEl = document.getElementById('simTime');
+    const resetBtn = document.getElementById('resetBtn');
+
+    function updateHUDAndState() {
+      let densitySum = 0;
+      let speedSum = 0;
+      let maxSpeed = 0;
+      let totalKE = 0;
+      let comX = 0, comY = 0, comZ = 0;
+
+      const particleStates = new Array(N);
+
+      for (let i = 0; i < N; i++) {
+        const p = positions[i];
+        const v = velocities[i];
+        const speed = v.length();
+
+        densitySum += densities[i];
+        speedSum += speed;
+        maxSpeed = Math.max(maxSpeed, speed);
+        totalKE += 0.5 * MASS * speed * speed;
+
+        comX += p.x * MASS;
+        comY += p.y * MASS;
+        comZ += p.z * MASS;
+
+        particleStates[i] = {
+          x: p.x,
+          y: p.y,
+          z: p.z,
+          vx: v.x,
+          vy: v.y,
+          vz: v.z,
+          density: densities[i],
+          pressure: pressures[i]
+        };
+      }
+
+      const totalMass = N * MASS;
+      const avgDensity = densitySum / N;
+      const avgSpeed = speedSum / N;
+
+      particleCountEl.textContent = N.toString();
+      avgDensityEl.textContent = avgDensity.toFixed(2);
+      avgSpeedEl.textContent = avgSpeed.toFixed(3);
+      simTimeEl.textContent = simTime.toFixed(3);
+
+      window.__3D_STATE__ = {
+        particleCount: N,
+        particles: particleStates,
+        avgDensity,
+        avgSpeed,
+        maxSpeed,
+        simTime,
+        totalKE,
+        centerOfMass: {
+          x: comX / totalMass,
+          y: comY / totalMass,
+          z: comZ / totalMass
+        }
+      };
+    }
+
+    // -----------------------------
+    // 重置
+    // -----------------------------
+    function resetSimulation() {
+      for (let i = 0; i < N; i++) {
+        positions[i].copy(initialPositions[i]);
+        velocities[i].set(0, 0, 0);
+        forces[i].set(0, 0, 0);
+        densities[i] = REST_DENSITY;
+        pressures[i] = 0;
+      }
+      simTime = 0;
+      updateInstancedMesh();
+      updateHUDAndState();
+    }
+
+    resetBtn.addEventListener('click', resetSimulation);
+
+    // -----------------------------
+    // 动画循环
+    // -----------------------------
+    function animate() {
+      requestAnimationFrame(animate);
+
+      for (let s = 0; s < SUBSTEPS; s++) {
+        stepSPH();
+      }
+
+      updateInstancedMesh();
+      updateHUDAndState();
+
+      controls.update();
+      renderer.render(scene, camera);
+    }
+
+    // -----------------------------
+    // 自适应
+    // -----------------------------
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    // -----------------------------
+    // 启动
+    // -----------------------------
+    initializeParticles();
+    animate();
+  </script>
+</body>
+</html>

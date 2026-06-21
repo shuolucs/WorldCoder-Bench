@@ -1,0 +1,753 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Three.js 3D Histogram with Undo/Redo and Dragon</title>
+  <style>
+    html, body {
+      margin: 0;
+      overflow: hidden;
+      background: #111;
+      font-family: Arial, sans-serif;
+      color: white;
+    }
+
+    #app {
+      position: fixed;
+      inset: 0;
+    }
+
+    #toolbar {
+      position: fixed;
+      top: 12px;
+      left: 12px;
+      right: 12px;
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      align-items: center;
+      z-index: 10;
+      pointer-events: auto;
+    }
+
+    button {
+      padding: 8px 16px;
+      border-radius: 4px;
+      border: none;
+      background: #4A90D9;
+      color: white;
+      cursor: pointer;
+      font-size: 14px;
+    }
+
+    button:disabled {
+      background: #666;
+      cursor: not-allowed;
+      opacity: 0.7;
+    }
+
+    input {
+      padding: 8px 10px;
+      border-radius: 4px;
+      border: 1px solid #777;
+      background: rgba(255,255,255,0.95);
+      color: #111;
+      font-size: 14px;
+      width: 90px;
+    }
+
+    #info-panel {
+      position: fixed;
+      top: 64px;
+      left: 12px;
+      padding: 12px 14px;
+      background: rgba(0, 0, 0, 0.6);
+      border: 1px solid rgba(255,255,255,0.15);
+      border-radius: 8px;
+      z-index: 10;
+      line-height: 1.5;
+      min-width: 240px;
+      white-space: pre-line;
+    }
+
+    #selection-panel {
+      position: fixed;
+      top: 64px;
+      right: 12px;
+      padding: 12px 14px;
+      background: rgba(0, 0, 0, 0.6);
+      border: 1px solid rgba(255,255,255,0.15);
+      border-radius: 8px;
+      z-index: 10;
+      display: none;
+      gap: 8px;
+      align-items: center;
+    }
+
+    #selection-panel.visible {
+      display: flex;
+    }
+  </style>
+</head>
+<body>
+  <div id="app"></div>
+
+  <div id="toolbar">
+    <button id="btn-add">Add Category</button>
+    <button id="btn-remove">Remove Last</button>
+    <button id="btn-undo">Undo</button>
+    <button id="btn-redo">Redo</button>
+    <button id="btn-randomize">Randomize</button>
+    <button id="btn-sort-asc">Sort Asc</button>
+    <button id="btn-sort-desc">Sort Desc</button>
+  </div>
+
+  <div id="info-panel"></div>
+
+  <div id="selection-panel">
+    <input id="value-input" type="number" min="1" max="10" step="1" placeholder="1-10" />
+    <button id="btn-set-value">Set Value</button>
+  </div>
+
+  <script type="module">
+    import * as THREE from "https://unpkg.com/three@0.160.0/build/three.module.js";
+    import { OrbitControls } from "https://unpkg.com/three@0.160.0/examples/jsm/controls/OrbitControls.js";
+    import { GLTFLoader } from "https://unpkg.com/three@0.160.0/examples/jsm/loaders/GLTFLoader.js";
+
+    const app = document.getElementById("app");
+    const btnAdd = document.getElementById("btn-add");
+    const btnRemove = document.getElementById("btn-remove");
+    const btnUndo = document.getElementById("btn-undo");
+    const btnRedo = document.getElementById("btn-redo");
+    const btnRandomize = document.getElementById("btn-randomize");
+    const btnSortAsc = document.getElementById("btn-sort-asc");
+    const btnSortDesc = document.getElementById("btn-sort-desc");
+    const btnSetValue = document.getElementById("btn-set-value");
+    const valueInput = document.getElementById("value-input");
+    const infoPanel = document.getElementById("info-panel");
+    const selectionPanel = document.getElementById("selection-panel");
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x111111);
+
+    const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+    camera.position.set(8, 6, 10);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    app.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.set(0, 1.5, 0);
+    controls.update();
+    controls.enableDamping = true;
+
+    scene.add(new THREE.AmbientLight(0xffffff, 0.5));
+
+    const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+    dirLight.position.set(5, 10, 5);
+    scene.add(dirLight);
+
+    const ground = new THREE.Mesh(
+      new THREE.PlaneGeometry(20, 20),
+      new THREE.MeshStandardMaterial({ color: "#333333" })
+    );
+    ground.rotation.x = -Math.PI / 2;
+    ground.position.y = 0;
+    scene.add(ground);
+
+    const histogramGroup = new THREE.Group();
+    scene.add(histogramGroup);
+
+    const pedestal = new THREE.Mesh(
+      new THREE.CylinderGeometry(1, 1, 0.3, 32),
+      new THREE.MeshStandardMaterial({ color: "#666666" })
+    );
+    pedestal.position.set(6, 0.15, -3);
+    scene.add(pedestal);
+
+    let dragonPivot = new THREE.Group();
+    dragonPivot.position.set(6, 0.3, -3);
+    scene.add(dragonPivot);
+
+    let dragonLoaded = false;
+
+    const loader = new GLTFLoader();
+    loader.load(
+      "https://cdn.jsdelivr.net/gh/KhronosGroup/glTF-Sample-Models/2.0/DragonAttenuation/glTF-Binary/DragonAttenuation.glb",
+      (gltf) => {
+        const dragon = gltf.scene;
+        const box = new THREE.Box3().setFromObject(dragon);
+        const size = new THREE.Vector3();
+        box.getSize(size);
+
+        const currentHeight = size.y || 1;
+        const scale = 2 / currentHeight;
+        dragon.scale.setScalar(scale);
+
+        const scaledBox = new THREE.Box3().setFromObject(dragon);
+        const center = new THREE.Vector3();
+        const scaledSize = new THREE.Vector3();
+        scaledBox.getCenter(center);
+        scaledBox.getSize(scaledSize);
+
+        dragon.position.x -= center.x;
+        dragon.position.z -= center.z;
+        dragon.position.y -= scaledBox.min.y;
+
+        dragonPivot.add(dragon);
+        dragonLoaded = true;
+        updateExposedState();
+      },
+      undefined,
+      (err) => {
+        console.error("Failed to load dragon model:", err);
+      }
+    );
+
+    const BAR_WIDTH = 0.8;
+    const BAR_DEPTH = 0.8;
+    const VALUE_SCALE = 0.5;
+    const BAR_SPACING = 1.5;
+    const BAR_COLORS = ["#FF6B6B", "#4ECDC4", "#45B7D1", "#96CEB4", "#FFEAA7"];
+
+    let categories = ["Alpha", "Beta", "Gamma", "Delta", "Epsilon"];
+    let values = [4, 7, 3, 9, 5];
+    let sortOrder = "none";
+    let lastAction = "init";
+
+    let history = [];
+    let historyIndex = -1;
+
+    let selectedBarIndex = -1;
+    let barObjects = [];
+    let labelSprites = [];
+    let valueSprites = [];
+
+    const raycaster = new THREE.Raycaster();
+    const mouse = new THREE.Vector2();
+
+    function clampValue(v) {
+      return Math.max(1, Math.min(10, Math.round(Number(v) || 1)));
+    }
+
+    function randomInt1to10() {
+      return Math.floor(Math.random() * 10) + 1;
+    }
+
+    function createTextSprite(text, options = {}) {
+      const fontSize = options.fontSize || 48;
+      const padding = options.padding || 16;
+      const textColor = options.textColor || "#ffffff";
+      const bgColor = options.bgColor || "rgba(0,0,0,0)";
+      const borderRadius = options.borderRadius || 0;
+      const scaleX = options.scaleX || 1.4;
+      const scaleY = options.scaleY || 0.5;
+
+      const canvas = document.createElement("canvas");
+      const ctx = canvas.getContext("2d");
+      ctx.font = `bold ${fontSize}px Arial`;
+
+      const metrics = ctx.measureText(text);
+      const textWidth = Math.ceil(metrics.width);
+      const width = textWidth + padding * 2;
+      const height = fontSize + padding * 2;
+
+      canvas.width = width;
+      canvas.height = height;
+
+      const c = canvas.getContext("2d");
+      c.font = `bold ${fontSize}px Arial`;
+
+      if (bgColor !== "rgba(0,0,0,0)") {
+        c.fillStyle = bgColor;
+        if (borderRadius > 0) {
+          roundRect(c, 0, 0, width, height, borderRadius);
+          c.fill();
+        } else {
+          c.fillRect(0, 0, width, height);
+        }
+      }
+
+      c.fillStyle = textColor;
+      c.textAlign = "center";
+      c.textBaseline = "middle";
+      c.fillText(text, width / 2, height / 2);
+
+      const texture = new THREE.CanvasTexture(canvas);
+      texture.needsUpdate = true;
+      texture.minFilter = THREE.LinearFilter;
+
+      const material = new THREE.SpriteMaterial({
+        map: texture,
+        transparent: true,
+        depthTest: false
+      });
+
+      const sprite = new THREE.Sprite(material);
+      sprite.scale.set(scaleX, scaleY, 1);
+      sprite.userData._canvasTexture = texture;
+      return sprite;
+    }
+
+    function roundRect(ctx, x, y, width, height, radius) {
+      ctx.beginPath();
+      ctx.moveTo(x + radius, y);
+      ctx.lineTo(x + width - radius, y);
+      ctx.quadraticCurveTo(x + width, y, x + width, y + radius);
+      ctx.lineTo(x + width, y + height - radius);
+      ctx.quadraticCurveTo(x + width, y + height, x + width - radius, y + height);
+      ctx.lineTo(x + radius, y + height);
+      ctx.quadraticCurveTo(x, y + height, x, y + height - radius);
+      ctx.lineTo(x, y + radius);
+      ctx.quadraticCurveTo(x, y, x + radius, y);
+      ctx.closePath();
+    }
+
+    function disposeObject(obj) {
+      if (!obj) return;
+      obj.traverse?.((child) => {
+        if (child.geometry) child.geometry.dispose?.();
+        if (child.material) {
+          if (Array.isArray(child.material)) {
+            child.material.forEach(m => {
+              if (m.map) m.map.dispose?.();
+              m.dispose?.();
+            });
+          } else {
+            if (child.material.map) child.material.map.dispose?.();
+            child.material.dispose?.();
+          }
+        }
+      });
+      if (obj.material?.map) obj.material.map.dispose?.();
+      obj.material?.dispose?.();
+    }
+
+    function clearHistogram() {
+      [...barObjects, ...labelSprites, ...valueSprites].forEach(obj => {
+        histogramGroup.remove(obj);
+        disposeObject(obj);
+      });
+      barObjects = [];
+      labelSprites = [];
+      valueSprites = [];
+    }
+
+    function createHistogram() {
+      clearHistogram();
+
+      const totalWidth = (categories.length - 1) * BAR_SPACING;
+      const startX = -totalWidth / 2;
+
+      for (let i = 0; i < categories.length; i++) {
+        const value = values[i];
+        const height = value * VALUE_SCALE;
+        const x = startX + i * BAR_SPACING;
+        const color = BAR_COLORS[i % BAR_COLORS.length];
+
+        const geom = new THREE.BoxGeometry(BAR_WIDTH, 1, BAR_DEPTH);
+        const mat = new THREE.MeshStandardMaterial({
+          color,
+          emissive: 0x000000,
+          emissiveIntensity: 0.6
+        });
+
+        const bar = new THREE.Mesh(geom, mat);
+        bar.position.set(x, height / 2, 0);
+        bar.scale.y = height;
+        bar.userData = {
+          index: i,
+          targetHeight: height,
+          currentHeight: height,
+          baseColor: new THREE.Color(color)
+        };
+        histogramGroup.add(bar);
+        barObjects.push(bar);
+
+        const label = createTextSprite(categories[i], {
+          fontSize: 44,
+          textColor: "#ffffff",
+          bgColor: "rgba(0,0,0,0.35)",
+          borderRadius: 12,
+          scaleX: 1.6,
+          scaleY: 0.5
+        });
+        label.position.set(x, 0.18, -0.8);
+        histogramGroup.add(label);
+        labelSprites.push(label);
+
+        const valueLabel = createTextSprite(String(value), {
+          fontSize: 44,
+          textColor: "#ffffaa",
+          bgColor: "rgba(0,0,0,0.35)",
+          borderRadius: 12,
+          scaleX: 0.9,
+          scaleY: 0.45
+        });
+        valueLabel.position.set(x, height + 0.35, 0);
+        histogramGroup.add(valueLabel);
+        valueSprites.push(valueLabel);
+      }
+
+      applySelectionHighlight();
+    }
+
+    function updateHistogramTargets() {
+      const totalWidth = (categories.length - 1) * BAR_SPACING;
+      const startX = -totalWidth / 2;
+
+      for (let i = 0; i < categories.length; i++) {
+        const bar = barObjects[i];
+        const label = labelSprites[i];
+        const valueLabel = valueSprites[i];
+        const x = startX + i * BAR_SPACING;
+        const targetHeight = values[i] * VALUE_SCALE;
+
+        bar.userData.index = i;
+        bar.userData.targetHeight = targetHeight;
+
+        label.position.x = x;
+        label.position.z = -0.8;
+        replaceSpriteText(label, categories[i], {
+          fontSize: 44,
+          textColor: "#ffffff",
+          bgColor: "rgba(0,0,0,0.35)",
+          borderRadius: 12,
+          scaleX: 1.6,
+          scaleY: 0.5
+        });
+
+        replaceSpriteText(valueLabel, String(values[i]), {
+          fontSize: 44,
+          textColor: "#ffffaa",
+          bgColor: "rgba(0,0,0,0.35)",
+          borderRadius: 12,
+          scaleX: 0.9,
+          scaleY: 0.45
+        });
+      }
+
+      applySelectionHighlight();
+    }
+
+    function replaceSpriteText(oldSprite, text, opts) {
+      const parent = oldSprite.parent;
+      const pos = oldSprite.position.clone();
+      const newSprite = createTextSprite(text, opts);
+      newSprite.position.copy(pos);
+
+      parent.add(newSprite);
+      parent.remove(oldSprite);
+      disposeObject(oldSprite);
+
+      const barLabelIndex = labelSprites.indexOf(oldSprite);
+      if (barLabelIndex !== -1) {
+        labelSprites[barLabelIndex] = newSprite;
+        return;
+      }
+
+      const valLabelIndex = valueSprites.indexOf(oldSprite);
+      if (valLabelIndex !== -1) {
+        valueSprites[valLabelIndex] = newSprite;
+      }
+    }
+
+    function syncHistogramToState(rebuildIfNeeded = true) {
+      if (barObjects.length !== categories.length) {
+        if (rebuildIfNeeded) createHistogram();
+      } else {
+        updateHistogramTargets();
+      }
+      updateSelectionPanel();
+      updateInfoPanel();
+      updateExposedState();
+    }
+
+    function pushHistorySnapshot(actionName) {
+      const snapshot = {
+        categories: [...categories],
+        values: [...values],
+        sortOrder
+      };
+
+      if (historyIndex < history.length - 1) {
+        history = history.slice(0, historyIndex + 1);
+      }
+
+      history.push(snapshot);
+
+      if (history.length > 20) {
+        history.shift();
+      }
+
+      historyIndex = history.length - 1;
+      lastAction = actionName;
+      updateInfoPanel();
+      updateExposedState();
+    }
+
+    function restoreFromHistory(index, actionName) {
+      if (index < 0 || index >= history.length) return;
+      historyIndex = index;
+      const snapshot = history[historyIndex];
+      categories = [...snapshot.categories];
+      values = [...snapshot.values];
+      sortOrder = snapshot.sortOrder || "none";
+
+      if (selectedBarIndex >= categories.length) selectedBarIndex = -1;
+
+      lastAction = actionName;
+      syncHistogramToState(true);
+    }
+
+    function updateInfoPanel() {
+      const sum = values.reduce((a, b) => a + b, 0);
+      const avg = values.length ? (sum / values.length) : 0;
+      infoPanel.textContent =
+        `Categories: ${categories.length}\n` +
+        `Sum: ${sum}\n` +
+        `Average: ${avg.toFixed(2)}\n` +
+        `History Size: ${history.length}\n` +
+        `History Index: ${historyIndex}\n` +
+        `Last Action: ${lastAction}`;
+
+      btnUndo.disabled = historyIndex <= 0;
+      btnRedo.disabled = historyIndex >= history.length - 1;
+      btnRemove.disabled = categories.length === 0;
+      btnSetValue.disabled = selectedBarIndex === -1;
+    }
+
+    function updateSelectionPanel() {
+      if (selectedBarIndex >= 0 && selectedBarIndex < categories.length) {
+        selectionPanel.classList.add("visible");
+        valueInput.value = values[selectedBarIndex];
+      } else {
+        selectionPanel.classList.remove("visible");
+        valueInput.value = "";
+      }
+    }
+
+    function applySelectionHighlight() {
+      barObjects.forEach((bar, i) => {
+        if (i === selectedBarIndex) {
+          bar.material.emissive.set("#FFFF00");
+        } else {
+          bar.material.emissive.set(0x000000);
+        }
+      });
+    }
+
+    function setSelectedBar(index) {
+      selectedBarIndex = index;
+      applySelectionHighlight();
+      updateSelectionPanel();
+      updateExposedState();
+    }
+
+    function addCategory() {
+      const existingNums = categories
+        .map(name => {
+          const m = /^Cat_(\d+)$/.exec(name);
+          return m ? Number(m[1]) : 0;
+        });
+      const nextNum = Math.max(0, ...existingNums, categories.length) + 1;
+      categories.push(`Cat_${nextNum}`);
+      values.push(randomInt1to10());
+      sortOrder = "none";
+      selectedBarIndex = -1;
+      createHistogram();
+      pushHistorySnapshot("add");
+      updateSelectionPanel();
+      updateInfoPanel();
+      updateExposedState();
+    }
+
+    function removeLastCategory() {
+      if (!categories.length) return;
+      categories.pop();
+      values.pop();
+      if (selectedBarIndex >= categories.length) selectedBarIndex = -1;
+      sortOrder = "none";
+      createHistogram();
+      pushHistorySnapshot("remove");
+      updateSelectionPanel();
+      updateInfoPanel();
+      updateExposedState();
+    }
+
+    function deleteSelectedCategory() {
+      if (selectedBarIndex < 0 || selectedBarIndex >= categories.length) return;
+      categories.splice(selectedBarIndex, 1);
+      values.splice(selectedBarIndex, 1);
+      selectedBarIndex = -1;
+      sortOrder = "none";
+      createHistogram();
+      pushHistorySnapshot("delete");
+      updateSelectionPanel();
+      updateInfoPanel();
+      updateExposedState();
+    }
+
+    function randomizeValues() {
+      values = values.map(() => randomInt1to10());
+      syncHistogramToState(false);
+      pushHistorySnapshot("randomize");
+    }
+
+    function sortBars(order) {
+      const zipped = categories.map((c, i) => ({ category: c, value: values[i] }));
+      zipped.sort((a, b) => order === "asc" ? a.value - b.value : b.value - a.value);
+      categories = zipped.map(z => z.category);
+      values = zipped.map(z => z.value);
+      selectedBarIndex = -1;
+      sortOrder = order;
+      syncHistogramToState(false);
+      pushHistorySnapshot(order === "asc" ? "sort_asc" : "sort_desc");
+    }
+
+    function setSelectedValue() {
+      if (selectedBarIndex < 0 || selectedBarIndex >= values.length) return;
+      values[selectedBarIndex] = clampValue(valueInput.value);
+      syncHistogramToState(false);
+      pushHistorySnapshot("set_value");
+      valueInput.value = values[selectedBarIndex];
+    }
+
+    function undo() {
+      if (historyIndex <= 0) return;
+      restoreFromHistory(historyIndex - 1, "undo");
+    }
+
+    function redo() {
+      if (historyIndex >= history.length - 1) return;
+      restoreFromHistory(historyIndex + 1, "redo");
+    }
+
+    function updateExposedState() {
+      const sum = values.reduce((a, b) => a + b, 0);
+      const avg = values.length ? Number((sum / values.length).toFixed(2)) : 0;
+
+      window.__3D_STATE__ = {
+        categories: [...categories],
+        values: [...values],
+        barCount: barObjects.length,
+        selectedBarIndex,
+        historyIndex,
+        historyLength: history.length,
+        canUndo: historyIndex > 0,
+        canRedo: historyIndex < history.length - 1,
+        sumValues: sum,
+        avgValue: avg,
+        dragonLoaded,
+        sortOrder,
+        lastAction
+      };
+    }
+
+    btnAdd.addEventListener("click", addCategory);
+    btnRemove.addEventListener("click", removeLastCategory);
+    btnUndo.addEventListener("click", undo);
+    btnRedo.addEventListener("click", redo);
+    btnRandomize.addEventListener("click", randomizeValues);
+    btnSortAsc.addEventListener("click", () => sortBars("asc"));
+    btnSortDesc.addEventListener("click", () => sortBars("desc"));
+    btnSetValue.addEventListener("click", setSelectedValue);
+
+    valueInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") setSelectedValue();
+    });
+
+    renderer.domElement.addEventListener("pointerdown", (event) => {
+      const rect = renderer.domElement.getBoundingClientRect();
+      mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+      mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+
+      raycaster.setFromCamera(mouse, camera);
+      const intersects = raycaster.intersectObjects(barObjects, false);
+
+      if (intersects.length > 0) {
+        const bar = intersects[0].object;
+        setSelectedBar(bar.userData.index);
+      } else {
+        setSelectedBar(-1);
+      }
+    });
+
+    window.addEventListener("keydown", (e) => {
+      if (e.ctrlKey && (e.key === "z" || e.key === "Z")) {
+        e.preventDefault();
+        undo();
+        return;
+      }
+      if (e.ctrlKey && (e.key === "y" || e.key === "Y")) {
+        e.preventDefault();
+        redo();
+        return;
+      }
+      if (e.key === "Delete") {
+        e.preventDefault();
+        deleteSelectedCategory();
+      }
+    });
+
+    window.addEventListener("resize", () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      updateExposedState();
+    });
+
+    createHistogram();
+    pushHistorySnapshot("init");
+    updateSelectionPanel();
+    updateInfoPanel();
+    updateExposedState();
+
+    const clock = new THREE.Clock();
+
+    function animate() {
+      requestAnimationFrame(animate);
+      const dt = clock.getDelta();
+
+      controls.update();
+
+      for (let i = 0; i < barObjects.length; i++) {
+        const bar = barObjects[i];
+        const target = bar.userData.targetHeight ?? 0;
+        let current = bar.userData.currentHeight ?? target;
+
+        const alpha = Math.min(1, dt / 0.5 * 3.5);
+        current = THREE.MathUtils.lerp(current, target, alpha);
+
+        if (Math.abs(current - target) < 0.001) current = target;
+
+        bar.userData.currentHeight = current;
+        bar.scale.y = current;
+        bar.position.y = current / 2;
+
+        if (valueSprites[i]) {
+          valueSprites[i].position.x = bar.position.x;
+          valueSprites[i].position.y = current + 0.35;
+          valueSprites[i].position.z = 0;
+        }
+        if (labelSprites[i]) {
+          labelSprites[i].position.x = bar.position.x;
+          labelSprites[i].position.y = 0.18;
+        }
+      }
+
+      if (dragonPivot) {
+        dragonPivot.rotation.y += 0.5 * dt;
+      }
+
+      renderer.render(scene, camera);
+    }
+
+    animate();
+  </script>
+</body>
+</html>

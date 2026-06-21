@@ -1,0 +1,422 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Rotational Inertia Demo</title>
+  <style>
+    html, body {
+      margin: 0;
+      overflow: hidden;
+      background: #101418;
+      font-family: Arial, sans-serif;
+      color: white;
+    }
+
+    #hud {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      padding: 12px 14px;
+      background: rgba(0, 0, 0, 0.6);
+      border: 1px solid rgba(255,255,255,0.15);
+      border-radius: 8px;
+      line-height: 1.5;
+      z-index: 10;
+      min-width: 220px;
+    }
+
+    #applyTorqueBtn {
+      margin-top: 10px;
+      padding: 8px 12px;
+      border: none;
+      border-radius: 6px;
+      background: #2f7df6;
+      color: white;
+      cursor: pointer;
+      font-size: 14px;
+    }
+
+    #applyTorqueBtn:hover {
+      background: #2267d1;
+    }
+
+    #info {
+      margin-top: 8px;
+      font-size: 12px;
+      color: #cdd6e0;
+    }
+
+    canvas {
+      display: block;
+    }
+  </style>
+
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+      }
+    }
+  </script>
+</head>
+<body>
+  <div id="hud">
+    <div id="hudText">Loading...</div>
+    <button id="applyTorqueBtn">Apply Torque</button>
+    <div id="info">
+      Keys: I = inward, O = outward, B = brake, R = reset, Space = pause
+    </div>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x182028);
+
+    const camera = new THREE.PerspectiveCamera(
+      60,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      100
+    );
+    camera.position.set(0, 5, 12);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    document.body.appendChild(renderer.domElement);
+
+    // Lights
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+    scene.add(ambientLight);
+
+    const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+    dirLight.position.set(5, 10, 5);
+    scene.add(dirLight);
+
+    // Ground
+    const ground = new THREE.Mesh(
+      new THREE.PlaneGeometry(30, 30),
+      new THREE.MeshStandardMaterial({ color: 0x777777, roughness: 0.9, metalness: 0.05 })
+    );
+    ground.rotation.x = -Math.PI / 2;
+    ground.position.y = 0;
+    scene.add(ground);
+
+    // Turntable
+    const turntable = new THREE.Group();
+    scene.add(turntable);
+
+    const turntableMesh = new THREE.Mesh(
+      new THREE.CylinderGeometry(4, 4, 0.2, 64),
+      new THREE.MeshStandardMaterial({
+        color: 0x3b6ea8,
+        roughness: 0.5,
+        metalness: 0.25
+      })
+    );
+    turntableMesh.position.y = 0.1;
+    turntable.add(turntableMesh);
+
+    // Axis marker ring / center marker
+    const centerMarker = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.15, 0.15, 0.4, 24),
+      new THREE.MeshStandardMaterial({ color: 0xffff66 })
+    );
+    centerMarker.position.y = 0.3;
+    turntable.add(centerMarker);
+
+    // Robot holder
+    const robotAnchor = new THREE.Group();
+    robotAnchor.position.set(0, 0.2, 0);
+    turntable.add(robotAnchor);
+
+    // Procedural masses
+    const massMaterial = new THREE.MeshStandardMaterial({
+      color: 0xcc3333,
+      roughness: 0.45,
+      metalness: 0.15
+    });
+
+    const massGeometry = new THREE.SphereGeometry(0.4, 32, 32);
+    const mass1 = new THREE.Mesh(massGeometry, massMaterial);
+    const mass2 = new THREE.Mesh(massGeometry, massMaterial);
+    mass1.position.y = 0.6;
+    mass2.position.y = 0.6;
+    turntable.add(mass1, mass2);
+
+    // Optional radial guide lines
+    const guideMat = new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.35 });
+    const guideGeom1 = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3()]);
+    const guideGeom2 = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3()]);
+    const guide1 = new THREE.Line(guideGeom1, guideMat);
+    const guide2 = new THREE.Line(guideGeom2, guideMat);
+    guide1.position.y = 0.21;
+    guide2.position.y = 0.21;
+    turntable.add(guide1, guide2);
+
+    // Physics constants
+    const I_BASE = 2.0;
+    const MASS = 1.0;
+    const INITIAL_RADIUS = 1.0;
+    const INITIAL_OMEGA = 2.0;
+    const MIN_RADIUS = 0.5;
+    const MAX_RADIUS = 3.5;
+    const RADIUS_STEP = 0.5;
+
+    // Simulation state
+    let massRadius = INITIAL_RADIUS;
+    let omega = INITIAL_OMEGA;
+    let paused = false;
+    let angularMomentum = 0;
+    let robotLoaded = false;
+    let brakeCount = 0;
+    let torqueCount = 0;
+
+    function safeNumber(v, fallback = 0) {
+      return Number.isFinite(v) ? v : fallback;
+    }
+
+    function computeMomentOfInertia(r) {
+      const rr = safeNumber(r, INITIAL_RADIUS);
+      return safeNumber(I_BASE + 2 * MASS * rr * rr, I_BASE);
+    }
+
+    function recalcOmegaFromL() {
+      const I = computeMomentOfInertia(massRadius);
+      omega = safeNumber(angularMomentum / I, 0);
+    }
+
+    function resetSimulation() {
+      massRadius = INITIAL_RADIUS;
+      omega = INITIAL_OMEGA;
+      const I = computeMomentOfInertia(massRadius);
+      angularMomentum = safeNumber(I * omega, 0);
+      paused = false;
+      turntable.rotation.y = 0;
+      updateMassPositions();
+      updateState();
+      updateHUD();
+    }
+
+    function updateMassPositions() {
+      mass1.position.x = massRadius;
+      mass1.position.z = 0;
+
+      mass2.position.x = -massRadius;
+      mass2.position.z = 0;
+
+      const p1 = guide1.geometry.attributes.position.array;
+      p1[0] = 0; p1[1] = 0; p1[2] = 0;
+      p1[3] = massRadius; p1[4] = 0; p1[5] = 0;
+      guide1.geometry.attributes.position.needsUpdate = true;
+
+      const p2 = guide2.geometry.attributes.position.array;
+      p2[0] = 0; p2[1] = 0; p2[2] = 0;
+      p2[3] = -massRadius; p2[4] = 0; p2[5] = 0;
+      guide2.geometry.attributes.position.needsUpdate = true;
+    }
+
+    const hudText = document.getElementById('hudText');
+    const applyTorqueBtn = document.getElementById('applyTorqueBtn');
+
+    function formatNum(n, digits) {
+      const v = safeNumber(n, 0);
+      return v.toFixed(digits);
+    }
+
+    function updateHUD() {
+      const I = computeMomentOfInertia(massRadius);
+      hudText.innerHTML = `
+        <strong>Rotational Inertia Demo</strong><br>
+        Angular Velocity (ω): ${formatNum(omega, 3)} rad/s<br>
+        Moment of Inertia (I): ${formatNum(I, 3)}<br>
+        Angular Momentum (L): ${formatNum(angularMomentum, 3)}<br>
+        Mass Radius (r): ${formatNum(massRadius, 1)}<br>
+        Paused: ${paused}
+      `;
+    }
+
+    // Exposed state
+    window.__3D_STATE__ = {
+      omega: 0,
+      momentOfInertia: 0,
+      angularMomentum: 0,
+      massRadius: 0,
+      paused: false,
+      turntableAngle: 0,
+      robotLoaded: false,
+      massCount: 2,
+      brakeCount: 0,
+      torqueCount: 0
+    };
+
+    function updateState() {
+      const I = computeMomentOfInertia(massRadius);
+      window.__3D_STATE__.omega = safeNumber(omega, 0);
+      window.__3D_STATE__.momentOfInertia = safeNumber(I, I_BASE);
+      window.__3D_STATE__.angularMomentum = safeNumber(angularMomentum, 0);
+      window.__3D_STATE__.massRadius = safeNumber(massRadius, INITIAL_RADIUS);
+      window.__3D_STATE__.paused = !!paused;
+      window.__3D_STATE__.turntableAngle = safeNumber(turntable.rotation.y, 0);
+      window.__3D_STATE__.robotLoaded = !!robotLoaded;
+      window.__3D_STATE__.massCount = 2;
+      window.__3D_STATE__.brakeCount = safeNumber(brakeCount, 0);
+      window.__3D_STATE__.torqueCount = safeNumber(torqueCount, 0);
+    }
+
+    function changeRadius(delta) {
+      const newRadius = THREE.MathUtils.clamp(massRadius + delta, MIN_RADIUS, MAX_RADIUS);
+      massRadius = safeNumber(newRadius, massRadius);
+      updateMassPositions();
+      recalcOmegaFromL();
+      updateState();
+      updateHUD();
+    }
+
+    function applyBrake() {
+      angularMomentum = safeNumber(angularMomentum * 0.7, 0);
+      brakeCount++;
+      recalcOmegaFromL();
+      updateState();
+      updateHUD();
+    }
+
+    function applyTorque() {
+      angularMomentum = safeNumber(angularMomentum * 1.2, 0);
+      torqueCount++;
+      recalcOmegaFromL();
+      updateState();
+      updateHUD();
+    }
+
+    applyTorqueBtn.addEventListener('click', applyTorque);
+
+    window.addEventListener('keydown', (event) => {
+      const key = event.key;
+
+      if (key === 'o' || key === 'O') {
+        changeRadius(RADIUS_STEP);
+      } else if (key === 'i' || key === 'I') {
+        changeRadius(-RADIUS_STEP);
+      } else if (key === 'b' || key === 'B') {
+        applyBrake();
+      } else if (key === 'r' || key === 'R') {
+        resetSimulation();
+      } else if (key === ' ') {
+        event.preventDefault();
+        paused = !paused;
+        updateState();
+        updateHUD();
+      }
+    });
+
+    // Load robot.glb
+    const loader = new GLTFLoader();
+    loader.load(
+      'robot.glb',
+      (gltf) => {
+        const robot = gltf.scene;
+
+        const box = new THREE.Box3().setFromObject(robot);
+        const size = new THREE.Vector3();
+        box.getSize(size);
+
+        const height = Math.max(size.y, 0.001);
+        const scale = 2.0 / height;
+        robot.scale.setScalar(scale);
+
+        // Recompute after scale, then center and place on turntable
+        const scaledBox = new THREE.Box3().setFromObject(robot);
+        const center = new THREE.Vector3();
+        const scaledSize = new THREE.Vector3();
+        scaledBox.getCenter(center);
+        scaledBox.getSize(scaledSize);
+
+        robot.position.x -= center.x;
+        robot.position.z -= center.z;
+        robot.position.y -= scaledBox.min.y;
+
+        robotAnchor.add(robot);
+        robotLoaded = true;
+        updateState();
+      },
+      undefined,
+      (error) => {
+        console.warn('Failed to load robot.glb:', error);
+        robotLoaded = false;
+
+        // Fallback procedural robot-like marker
+        const fallback = new THREE.Group();
+
+        const body = new THREE.Mesh(
+          new THREE.BoxGeometry(0.8, 1.1, 0.5),
+          new THREE.MeshStandardMaterial({ color: 0x88ccff })
+        );
+        body.position.y = 1.05;
+        fallback.add(body);
+
+        const head = new THREE.Mesh(
+          new THREE.SphereGeometry(0.28, 24, 24),
+          new THREE.MeshStandardMaterial({ color: 0xffddaa })
+        );
+        head.position.y = 1.85;
+        fallback.add(head);
+
+        const leg1 = new THREE.Mesh(
+          new THREE.BoxGeometry(0.18, 0.8, 0.18),
+          new THREE.MeshStandardMaterial({ color: 0xcccccc })
+        );
+        leg1.position.set(-0.18, 0.4, 0);
+        fallback.add(leg1);
+
+        const leg2 = leg1.clone();
+        leg2.position.x = 0.18;
+        fallback.add(leg2);
+
+        robotAnchor.add(fallback);
+        updateState();
+      }
+    );
+
+    // Initial setup
+    updateMassPositions();
+    resetSimulation();
+
+    const clock = new THREE.Clock();
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      let dt = clock.getDelta();
+      dt = Math.min(dt, 1 / 30);
+
+      omega = safeNumber(omega, 0);
+      angularMomentum = safeNumber(angularMomentum, 0);
+      massRadius = safeNumber(massRadius, INITIAL_RADIUS);
+
+      if (!paused) {
+        turntable.rotation.y += omega * dt;
+        turntable.rotation.y = safeNumber(turntable.rotation.y, 0);
+      }
+
+      updateState();
+      updateHUD();
+      renderer.render(scene, camera);
+    }
+
+    animate();
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+  </script>
+</body>
+</html>

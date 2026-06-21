@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Sound-Reactive Sculpture</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #0a0a1a;
+            font-family: 'Courier New', Courier, monospace;
+            user-select: none;
+        }
+        canvas {
+            display: block;
+        }
+        .hud {
+            position: absolute;
+            color: #ffffff;
+            background-color: rgba(10, 10, 26, 0.7);
+            padding: 10px 15px;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            border-radius: 4px;
+            pointer-events: none;
+            z-index: 10;
+            text-transform: uppercase;
+            font-size: 14px;
+            letter-spacing: 1px;
+        }
+        #hud-status {
+            top: 20px;
+            left: 20px;
+        }
+        #color-mode-display {
+            top: 20px;
+            right: 20px;
+        }
+        #beat-counter {
+            bottom: 20px;
+            left: 20px;
+        }
+        #intensity-display {
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+        }
+        #controls-help {
+            position: absolute;
+            bottom: 20px;
+            right: 20px;
+            color: rgba(255, 255, 255, 0.5);
+            font-size: 10px;
+            text-align: right;
+            pointer-events: none;
+        }
+    </style>
+    <!-- Import maps polyfill -->
+    <script async src="https://unpkg.com/es-module-shims@1.8.0/dist/es-module-shims.js"></script>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="hud-status" class="hud">PLAYING</div>
+    <div id="color-mode-display" class="hud">SPECTRUM</div>
+    <div id="beat-counter" class="hud">BEATS: 0</div>
+    <div id="intensity-display" class="hud">INTENSITY: 1.0</div>
+    <div id="controls-help">
+        SPACE: Play/Pause<br>
+        C: Color Mode<br>
+        R: Reset<br>
+        B: Burst<br>
+        UP/DOWN: Intensity
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+        // Initialize Global State
+        window.__3D_STATE__ = {
+            isPlaying: true,
+            colorMode: 'spectrum', // 'spectrum', 'monochrome', 'neon'
+            beatCount: 0,
+            intensity: 1.0,
+            burstActive: false,
+            particleCount: 2000,
+            avgParticleDistance: 0.0,
+            modelRotationY: 0.0,
+            modelScaleY: 1.0,
+            frequencies: new Array(8).fill(0),
+            modelLoaded: false,
+            frameCount: 0
+        };
+
+        // Internal variables
+        let burstFramesRemaining = 0;
+        let previousAvgFreq = 0;
+        let time = 0;
+        let modelGroup = new THREE.Group();
+        const colorModes = ['spectrum', 'monochrome', 'neon'];
+
+        // Scene Setup
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x0a0a1a);
+
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+        camera.position.set(0, 2, 6);
+        camera.lookAt(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        document.body.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.05;
+        controls.target.set(0, 1.5, 0);
+
+        // Lighting
+        const ambientLight = new THREE.AmbientLight(0x4444ff, 0.3);
+        scene.add(ambientLight);
+
+        const pointLight = new THREE.PointLight(0xff44ff, 1.5, 20);
+        pointLight.position.set(3, 5, 3);
+        scene.add(pointLight);
+
+        scene.add(modelGroup);
+
+        // Load Model
+        const loader = new GLTFLoader();
+        const material = new THREE.MeshStandardMaterial({
+            color: 0x8844ff,
+            metalness: 0.9,
+            roughness: 0.1
+        });
+
+        loader.load('https://raw.githubusercontent.com/mrdoob/three.js/master/examples/models/gltf/Xbot.glb', (gltf) => {
+            const model = gltf.scene;
+            
+            // Apply material
+            model.traverse((child) => {
+                if (child.isMesh) {
+                    child.material = material;
+                }
+            });
+
+            // Center and scale
+            const box = new THREE.Box3().setFromObject(model);
+            const center = box.getCenter(new THREE.Vector3());
+            const size = box.getSize(new THREE.Vector3());
+            
+            const maxDim = Math.max(size.x, size.y, size.z);
+            const scale = 3.0 / maxDim;
+            
+            model.position.sub(center); // Center to local origin
+            modelGroup.add(model);
+            modelGroup.scale.set(scale, scale, scale);
+            modelGroup.position.y = 1.5; // Move up so feet are near 0
+
+            window.__3D_STATE__.modelLoaded = true;
+        });
+
+        // Particle System Setup
+        const particleCount = window.__3D_STATE__.particleCount;
+        const geometry = new THREE.BufferGeometry();
+        const positions = new Float32Array(particleCount * 3);
+        const colors = new Float32Array(particleCount * 3);
+        
+        // Store base parameters for animation
+        const particleData = [];
+
+        for (let i = 0; i < particleCount; i++) {
+            // Toroidal/Cylindrical distribution around model
+            const theta = Math.random() * Math.PI * 2; // Angle around Y
+            const yOffset = (Math.random() - 0.5) * 4.0; // Height spread
+            const bandIndex = i % 8;
+
+            particleData.push({
+                theta: theta,
+                yOffset: yOffset,
+                bandIndex: bandIndex,
+                speed: (Math.random() * 0.02) + 0.01
+            });
+
+            // Initial positions (will be overwritten in loop)
+            positions[i * 3] = 0;
+            positions[i * 3 + 1] = 0;
+            positions[i * 3 + 2] = 0;
+
+            colors[i * 3] = 1;
+            colors[i * 3 + 1] = 1;
+            colors[i * 3 + 2] = 1;
+        }
+
+        geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+        geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+        const particleMaterial = new THREE.PointsMaterial({
+            size: 0.06,
+            vertexColors: true,
+            transparent: true,
+            opacity: 0.8,
+            blending: THREE.AdditiveBlending,
+            depthWrite: false
+        });
+
+        const particleSystem = new THREE.Points(geometry, particleMaterial);
+        scene.add(particleSystem);
+
+        // Interaction Controls
+        window.addEventListener('keydown', (e) => {
+            const state = window.__3D_STATE__;
+            switch(e.code) {
+                case 'Space':
+                    state.isPlaying = !state.isPlaying;
+                    break;
+                case 'KeyC':
+                    const currentIndex = colorModes.indexOf(state.colorMode);
+                    state.colorMode = colorModes[(currentIndex + 1) % colorModes.length];
+                    break;
+                case 'KeyR':
+                    state.modelRotationY = 0;
+                    modelGroup.rotation.y = 0;
+                    state.beatCount = 0;
+                    state.colorMode = 'spectrum';
+                    state.isPlaying = true;
+                    state.intensity = 1.0;
+                    break;
+                case 'KeyB':
+                    state.burstActive = true;
+                    burstFramesRemaining = 30;
+                    break;
+                case 'ArrowUp':
+                    state.intensity = Math.min(2.0, state.intensity + 0.1);
+                    break;
+                case 'ArrowDown':
+                    state.intensity = Math.max(0.1, state.intensity - 0.1);
+                    break;
+            }
+        });
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // DOM Elements
+        const elStatus = document.getElementById('hud-status');
+        const elColorMode = document.getElementById('color-mode-display');
+        const elBeatCounter = document.getElementById('beat-counter');
+        const elIntensity = document.getElementById('intensity-display');
+
+        const tempColor = new THREE.Color();
+
+        // Animation Loop
+        function animate() {
+            requestAnimationFrame(animate);
+            
+            const state = window.__3D_STATE__;
+            state.frameCount++;
+
+            if (state.isPlaying) {
+                time += 0.016; // Approx 60fps step
+            }
+
+            // 1. Audio Simulation
+            let currentAvgFreq = 0;
+            for (let i = 0; i < 8; i++) {
+                if (state.isPlaying) {
+                    let freq = 0.5 + 0.5 * Math.sin(time * (1.0 + i * 0.3));
+                    
+                    if (state.burstActive) {
+                        freq *= 2.0;
+                    }
+                    
+                    state.frequencies[i] = Math.min(1.0, Math.max(0.0, freq));
+                }
+                currentAvgFreq += state.frequencies[i];
+            }
+            currentAvgFreq /= 8;
+
+            // Burst logic
+            if (burstFramesRemaining > 0) {
+                burstFramesRemaining--;
+                if (burstFramesRemaining === 0) {
+                    state.burstActive = false;
+                }
+            }
+
+            // Beat detection
+            if (currentAvgFreq > 0.75 && previousAvgFreq <= 0.75 && state.isPlaying) {
+                state.beatCount++;
+            }
+            previousAvgFreq = currentAvgFreq;
+
+            // 2. Particle System Update
+            const posAttr = geometry.attributes.position;
+            const colAttr = geometry.attributes.color;
+            let totalDistance = 0;
+
+            for (let i = 0; i < particleCount; i++) {
+                const data = particleData[i];
+                const freq = state.frequencies[data.bandIndex];
+                
+                // Animate rotation if playing
+                if (state.isPlaying) {
+                    data.theta += data.speed * (freq * 0.5 + 0.5);
+                }
+
+                // Calculate position
+                const baseRadius = 2.5;
+                const radius = baseRadius + (freq * 1.5 * state.intensity);
+                
+                const x = Math.cos(data.theta) * radius;
+                const y = data.yOffset + Math.sin(time * 2 + i) * 0.2; // Slight vertical bob
+                const z = Math.sin(data.theta) * radius;
+
+                posAttr.setXYZ(i, x, y, z);
+                
+                // Calculate distance from center (0, y, 0)
+                totalDistance += Math.sqrt(x*x + z*z);
+
+                // Colors
+                if (state.colorMode === 'spectrum') {
+                    // Blue (0.6) to Red (0.0)
+                    const hue = 0.6 - (data.bandIndex / 7) * 0.6;
+                    tempColor.setHSL(hue, 1.0, 0.5);
+                } else if (state.colorMode === 'monochrome') {
+                    tempColor.setHex(0xffffff);
+                } else if (state.colorMode === 'neon') {
+                    const hue = (time * 0.2 + i / particleCount) % 1.0;
+                    tempColor.setHSL(hue, 1.0, 0.6);
+                }
+
+                colAttr.setXYZ(i, tempColor.r, tempColor.g, tempColor.b);
+            }
+
+            posAttr.needsUpdate = true;
+            colAttr.needsUpdate = true;
+            state.avgParticleDistance = totalDistance / particleCount;
+
+            // 3. Sculpture Deformation
+            if (state.modelLoaded) {
+                const bassAvg = (state.frequencies[0] + state.frequencies[1]) / 2.0;
+                state.modelScaleY = 1.0 + (bassAvg * 0.3 * state.intensity);
+                
+                // Apply scale (keeping base scale from load)
+                const baseScale = modelGroup.scale.x; // x and z are base scale
+                modelGroup.scale.set(baseScale, baseScale * state.modelScaleY, baseScale);
+
+                if (state.isPlaying) {
+                    state.modelRotationY += 0.005;
+                    modelGroup.rotation.y = state.modelRotationY;
+                }
+            }
+
+            // 4. Update HUD
+            elStatus.innerText = state.isPlaying ? 'PLAYING' : 'PAUSED';
+            elStatus.style.color = state.isPlaying ? '#00ff00' : '#ff0000';
+            elColorMode.innerText = state.colorMode;
+            elBeatCounter.innerText = `BEATS: ${state.beatCount}`;
+            elIntensity.innerText = `INTENSITY: ${state.intensity.toFixed(1)}`;
+
+            controls.update();
+            renderer.render(scene, camera);
+        }
+
+        animate();
+    </script>
+</body>
+</html>

@@ -1,0 +1,645 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Three.js 3D 滑块拼图 - Duck Puzzle</title>
+  <style>
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #0f172a;
+      font-family: Arial, Helvetica, sans-serif;
+      color: #fff;
+    }
+
+    #app {
+      width: 100%;
+      height: 100%;
+      position: relative;
+    }
+
+    #hud {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      z-index: 10;
+      background: rgba(0, 0, 0, 0.45);
+      padding: 12px 14px;
+      border-radius: 10px;
+      line-height: 1.8;
+      font-size: 14px;
+      min-width: 180px;
+      backdrop-filter: blur(4px);
+    }
+
+    #hud b {
+      color: #93c5fd;
+    }
+
+    #shuffleBtn {
+      position: absolute;
+      top: 12px;
+      right: 12px;
+      z-index: 10;
+      border: none;
+      background: #2563eb;
+      color: white;
+      padding: 10px 14px;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 14px;
+    }
+
+    #shuffleBtn:hover {
+      background: #1d4ed8;
+    }
+
+    #tip {
+      position: absolute;
+      bottom: 12px;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 10;
+      background: rgba(0, 0, 0, 0.4);
+      padding: 8px 12px;
+      border-radius: 8px;
+      font-size: 13px;
+      color: #e5e7eb;
+    }
+
+    canvas {
+      display: block;
+    }
+  </style>
+
+  <script type="importmap">
+  { "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+  } }
+  </script>
+</head>
+<body>
+  <div id="app">
+    <div id="hud">
+      <div>移动次数: <b id="moves">0</b></div>
+      <div>是否已解决: <b id="solved">false</b></div>
+      <div>鸭子是否揭示: <b id="duckRevealed">false</b></div>
+      <div>已用时间: <b id="elapsed">0.0</b>s</div>
+    </div>
+    <button id="shuffleBtn">重新打乱</button>
+    <div id="tip">点击与空位相邻的方块进行滑动</div>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+    const app = document.getElementById('app');
+    const movesEl = document.getElementById('moves');
+    const solvedEl = document.getElementById('solved');
+    const duckRevealedEl = document.getElementById('duckRevealed');
+    const elapsedEl = document.getElementById('elapsed');
+    const shuffleBtn = document.getElementById('shuffleBtn');
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0f172a);
+    scene.fog = new THREE.Fog(0x0f172a, 10, 24);
+
+    const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 100);
+    camera.position.set(0, 5.6, 8.4);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    renderer.shadowMap.enabled = true;
+    app.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enablePan = false;
+    controls.enableDamping = true;
+    controls.target.set(0, 0.9, 0);
+
+    const hemi = new THREE.HemisphereLight(0xffffff, 0x334155, 1.2);
+    scene.add(hemi);
+
+    const dir = new THREE.DirectionalLight(0xffffff, 1.6);
+    dir.position.set(6, 10, 7);
+    dir.castShadow = true;
+    dir.shadow.mapSize.set(2048, 2048);
+    scene.add(dir);
+
+    const floor = new THREE.Mesh(
+      new THREE.BoxGeometry(10, 0.4, 10),
+      new THREE.MeshStandardMaterial({ color: 0x1e293b, roughness: 0.85, metalness: 0.05 })
+    );
+    floor.position.y = -0.7;
+    floor.receiveShadow = true;
+    scene.add(floor);
+
+    const board = new THREE.Mesh(
+      new THREE.BoxGeometry(5.1, 0.25, 5.1),
+      new THREE.MeshStandardMaterial({ color: 0x334155, roughness: 0.7, metalness: 0.08 })
+    );
+    board.position.y = -0.36;
+    board.receiveShadow = true;
+    scene.add(board);
+
+    const gridHelper = new THREE.GridHelper(5.2, 3, 0x64748b, 0x475569);
+    gridHelper.position.y = -0.235;
+    scene.add(gridHelper);
+
+    const raycaster = new THREE.Raycaster();
+    const pointer = new THREE.Vector2();
+    const clock = new THREE.Clock();
+
+    const loader = new GLTFLoader();
+
+    const BOARD_SIZE = 3;
+    const TILE_SPACING = 1.65;
+    const TILE_Y = 0;
+    const MOVE_DURATION = 0.3;
+    const REVEAL_RISE = 1.3;
+
+    let modelLoaded = false;
+    let moveCount = 0;
+    let solved = false;
+    let duckRevealed = false;
+    let gameStartedAt = performance.now();
+    let pausedElapsed = 0;
+    let isBusy = false;
+    let isShuffling = false;
+
+    let boxTemplate = null;
+    let duckTemplate = null;
+    let boxAnimationClip = null;
+
+    const mixerEntries = [];
+    const tiles = [];
+    const tileByNumber = new Map();
+    const clickableRoots = [];
+
+    let emptySlot = { row: 2, col: 2 };
+
+    const revealState = {
+      active: false,
+      phase: 'idle',
+      start: 0,
+      duck: null,
+      baseY: 0,
+      durationRise: 1.2,
+      durationSpin: 2.2
+    };
+
+    function initGlobalState() {
+      window.__3D_STATE__ = {
+        modelLoaded: false,
+        moveCount: 0,
+        solved: false,
+        duckRevealed: false,
+        elapsed: 0,
+        emptySlot: { row: emptySlot.row, col: emptySlot.col }
+      };
+    }
+    initGlobalState();
+
+    function updateGlobalState(elapsedSec = 0) {
+      window.__3D_STATE__ = {
+        modelLoaded,
+        moveCount,
+        solved,
+        duckRevealed,
+        elapsed: elapsedSec,
+        emptySlot: { row: emptySlot.row, col: emptySlot.col }
+      };
+    }
+
+    function gridToPosition(row, col) {
+      const x = (col - 1) * TILE_SPACING;
+      const z = (row - 1) * TILE_SPACING;
+      return new THREE.Vector3(x, TILE_Y, z);
+    }
+
+    function isAdjacentToEmpty(row, col) {
+      const dr = Math.abs(row - emptySlot.row);
+      const dc = Math.abs(col - emptySlot.col);
+      return dr + dc === 1;
+    }
+
+    function tileWorldPosition(tile) {
+      return gridToPosition(tile.row, tile.col);
+    }
+
+    function setHUD(elapsedSec) {
+      movesEl.textContent = String(moveCount);
+      solvedEl.textContent = String(solved);
+      duckRevealedEl.textContent = String(duckRevealed);
+      elapsedEl.textContent = elapsedSec.toFixed(1);
+    }
+
+    function findRootObject(sceneOrObj) {
+      let found = null;
+      sceneOrObj.traverse((obj) => {
+        if (!found && obj.isMesh) found = sceneOrObj;
+      });
+      return found || sceneOrObj;
+    }
+
+    function cloneGltfScene(src) {
+      return src.clone(true);
+    }
+
+    function prepareShadows(root) {
+      root.traverse((obj) => {
+        if (obj.isMesh) {
+          obj.castShadow = true;
+          obj.receiveShadow = true;
+          if (obj.material) {
+            if (Array.isArray(obj.material)) {
+              obj.material = obj.material.map(m => m.clone());
+            } else {
+              obj.material = obj.material.clone();
+            }
+          }
+        }
+      });
+    }
+
+    function createAnimationMixerForTile(root) {
+      const mixer = new THREE.AnimationMixer(root);
+      mixerEntries.push({ mixer });
+      return mixer;
+    }
+
+    function createTile(number) {
+      const group = new THREE.Group();
+      group.userData.tileNumber = number;
+
+      const modelRoot = cloneGltfScene(boxTemplate);
+      prepareShadows(modelRoot);
+      modelRoot.scale.setScalar(0.9);
+      modelRoot.position.set(0, 0, 0);
+      group.add(modelRoot);
+
+      const mixer = createAnimationMixerForTile(modelRoot);
+
+      let action = null;
+      if (boxAnimationClip) {
+        action = mixer.clipAction(boxAnimationClip);
+        action.clampWhenFinished = true;
+        action.loop = THREE.LoopOnce;
+        action.enabled = true;
+      }
+
+      const labelCanvas = document.createElement('canvas');
+      labelCanvas.width = 256;
+      labelCanvas.height = 256;
+      const ctx = labelCanvas.getContext('2d');
+      ctx.clearRect(0, 0, 256, 256);
+      ctx.fillStyle = '#ffffff';
+      ctx.beginPath();
+      ctx.arc(128, 128, 88, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#0f172a';
+      ctx.font = 'bold 128px Arial';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(String(number), 128, 138);
+
+      const labelTex = new THREE.CanvasTexture(labelCanvas);
+      labelTex.colorSpace = THREE.SRGBColorSpace;
+      const label = new THREE.Mesh(
+        new THREE.PlaneGeometry(0.7, 0.7),
+        new THREE.MeshBasicMaterial({
+          map: labelTex,
+          transparent: true,
+          depthTest: true
+        })
+      );
+      label.rotation.x = -Math.PI / 2;
+      label.position.set(0, 0.75, 0);
+      group.add(label);
+
+      let duck = null;
+      if (number === 5) {
+        duck = cloneGltfScene(duckTemplate);
+        prepareShadows(duck);
+        duck.scale.setScalar(0.012);
+        duck.position.set(0, -0.1, 0);
+        duck.visible = false;
+        group.add(duck);
+      }
+
+      group.userData.isTile = true;
+      group.userData.tileNumber = number;
+      group.userData.tile = {
+        number,
+        row: 0,
+        col: 0,
+        group,
+        modelRoot,
+        mixer,
+        action,
+        duck,
+        moving: false
+      };
+
+      return group.userData.tile;
+    }
+
+    function stopAllBoxActions() {
+      for (const tile of tiles) {
+        if (tile.action) {
+          tile.action.stop();
+        }
+      }
+    }
+
+    function playBoxOpenAnimation(tile) {
+      if (!tile.action) return;
+      tile.action.reset();
+      tile.action.paused = false;
+      tile.action.timeScale = 1;
+      tile.action.play();
+    }
+
+    async function moveTile(tile, countMove = true) {
+      if (isBusy || tile.moving || !isAdjacentToEmpty(tile.row, tile.col)) return false;
+
+      isBusy = true;
+      tile.moving = true;
+
+      const from = tileWorldPosition(tile).clone();
+      const targetRow = emptySlot.row;
+      const targetCol = emptySlot.col;
+      const to = gridToPosition(targetRow, targetCol);
+
+      const prevRow = tile.row;
+      const prevCol = tile.col;
+
+      playBoxOpenAnimation(tile);
+
+      await animate(0.3, (t) => {
+        const e = easeInOutCubic(t);
+        tile.group.position.lerpVectors(from, to, e);
+      });
+
+      tile.row = targetRow;
+      tile.col = targetCol;
+      emptySlot = { row: prevRow, col: prevCol };
+
+      tile.group.position.copy(to);
+
+      tile.moving = false;
+      isBusy = false;
+
+      if (countMove) {
+        moveCount++;
+        checkSolved();
+      }
+
+      return true;
+    }
+
+    function easeInOutCubic(t) {
+      return t < 0.5
+        ? 4 * t * t * t
+        : 1 - Math.pow(-2 * t + 2, 3) / 2;
+    }
+
+    function animate(duration, onUpdate) {
+      return new Promise((resolve) => {
+        const start = performance.now();
+        function tick() {
+          const now = performance.now();
+          const t = Math.min((now - start) / (duration * 1000), 1);
+          onUpdate(t);
+          if (t < 1) {
+            requestAnimationFrame(tick);
+          } else {
+            resolve();
+          }
+        }
+        tick();
+      });
+    }
+
+    function currentSolved() {
+      for (const tile of tiles) {
+        const index = tile.number - 1;
+        const expectedRow = Math.floor(index / 3);
+        const expectedCol = index % 3;
+        if (tile.row !== expectedRow || tile.col !== expectedCol) return false;
+      }
+      return emptySlot.row === 2 && emptySlot.col === 2;
+    }
+
+    function checkSolved() {
+      if (duckRevealed) return;
+      solved = currentSolved();
+      if (solved) {
+        triggerDuckReveal();
+      }
+    }
+
+    async function triggerDuckReveal() {
+      const tile5 = tileByNumber.get(5);
+      if (!tile5 || !tile5.duck || duckRevealed) return;
+
+      duckRevealed = true;
+      playBoxOpenAnimation(tile5);
+
+      tile5.duck.visible = true;
+      revealState.active = true;
+      revealState.phase = 'rise';
+      revealState.start = performance.now();
+      revealState.duck = tile5.duck;
+      revealState.baseY = tile5.duck.position.y;
+    }
+
+    function updateDuckReveal(now) {
+      if (!revealState.active || !revealState.duck) return;
+
+      const duck = revealState.duck;
+      const elapsed = (now - revealState.start) / 1000;
+
+      if (revealState.phase === 'rise') {
+        const t = Math.min(elapsed / revealState.durationRise, 1);
+        const e = easeInOutCubic(t);
+        duck.position.y = revealState.baseY + REVEAL_RISE * e;
+        duck.rotation.y += 0.03;
+        if (t >= 1) {
+          revealState.phase = 'spin';
+          revealState.start = now;
+        }
+      } else if (revealState.phase === 'spin') {
+        const t = Math.min(elapsed / revealState.durationSpin, 1);
+        duck.rotation.y += 0.06;
+        duck.position.y = revealState.baseY + REVEAL_RISE + Math.sin(now * 0.005) * 0.05;
+        if (t >= 1) {
+          revealState.phase = 'done';
+        }
+      } else if (revealState.phase === 'done') {
+        duck.rotation.y += 0.02;
+        duck.position.y = revealState.baseY + REVEAL_RISE + Math.sin(now * 0.004) * 0.05;
+      }
+    }
+
+    function layoutSolvedState() {
+      for (const tile of tiles) {
+        const index = tile.number - 1;
+        tile.row = Math.floor(index / 3);
+        tile.col = index % 3;
+        tile.group.position.copy(gridToPosition(tile.row, tile.col));
+      }
+      emptySlot = { row: 2, col: 2 };
+    }
+
+    function resetDuckAndState() {
+      solved = false;
+      duckRevealed = false;
+      revealState.active = false;
+      revealState.phase = 'idle';
+      revealState.duck = null;
+
+      const tile5 = tileByNumber.get(5);
+      if (tile5 && tile5.duck) {
+        tile5.duck.visible = false;
+        tile5.duck.position.set(0, -0.1, 0);
+        tile5.duck.rotation.set(0, 0, 0);
+      }
+    }
+
+    async function shufflePuzzle() {
+      if (!modelLoaded || isBusy || isShuffling) return;
+
+      isShuffling = true;
+      resetDuckAndState();
+      stopAllBoxActions();
+
+      moveCount = 0;
+      gameStartedAt = performance.now();
+      pausedElapsed = 0;
+
+      layoutSolvedState();
+
+      let lastMovedNumber = null;
+      const steps = 30 + Math.floor(Math.random() * 21);
+
+      for (let i = 0; i < steps; i++) {
+        const candidates = tiles.filter(tile => {
+          if (!isAdjacentToEmpty(tile.row, tile.col)) return false;
+          if (tiles.length > 1 && tile.number === lastMovedNumber) return false;
+          return true;
+        });
+
+        const pick = candidates[Math.floor(Math.random() * candidates.length)];
+        if (!pick) continue;
+
+        await moveTile(pick, false);
+        lastMovedNumber = pick.number;
+      }
+
+      if (currentSolved()) {
+        const candidates = tiles.filter(tile => isAdjacentToEmpty(tile.row, tile.col));
+        if (candidates[0]) {
+          await moveTile(candidates[0], false);
+        }
+      }
+
+      isShuffling = false;
+    }
+
+    function onPointerDown(event) {
+      if (!modelLoaded || isBusy || isShuffling || duckRevealed) return;
+
+      const rect = renderer.domElement.getBoundingClientRect();
+      pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+      pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+
+      raycaster.setFromCamera(pointer, camera);
+      const intersects = raycaster.intersectObjects(clickableRoots, true);
+
+      if (!intersects.length) return;
+
+      let obj = intersects[0].object;
+      while (obj && !obj.userData.isTile && obj.parent) {
+        obj = obj.parent;
+      }
+      if (!obj || !obj.userData.tile) return;
+
+      const tile = obj.userData.tile;
+      if (isAdjacentToEmpty(tile.row, tile.col)) {
+        moveTile(tile, true);
+      }
+    }
+
+    async function loadModels() {
+      const [boxGltf, duckGltf] = await Promise.all([
+        loader.loadAsync('assets/BoxAnimated.glb'),
+        loader.loadAsync('assets/Duck.glb')
+      ]);
+
+      boxTemplate = findRootObject(boxGltf.scene);
+      duckTemplate = findRootObject(duckGltf.scene);
+
+      boxAnimationClip = (boxGltf.animations && boxGltf.animations[0]) ? boxGltf.animations[0] : null;
+
+      for (let n = 1; n <= 8; n++) {
+        const tile = createTile(n);
+        tiles.push(tile);
+        tileByNumber.set(n, tile);
+        clickableRoots.push(tile.group);
+        scene.add(tile.group);
+      }
+
+      layoutSolvedState();
+      modelLoaded = true;
+      await shufflePuzzle();
+    }
+
+    shuffleBtn.addEventListener('click', async () => {
+      await shufflePuzzle();
+    });
+
+    renderer.domElement.addEventListener('pointerdown', onPointerDown);
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    function renderLoop() {
+      requestAnimationFrame(renderLoop);
+
+      const dt = clock.getDelta();
+      const now = performance.now();
+
+      for (const entry of mixerEntries) {
+        entry.mixer.update(dt);
+      }
+
+      updateDuckReveal(now);
+      controls.update();
+
+      const elapsedSec = modelLoaded ? (now - gameStartedAt) / 1000 + pausedElapsed : 0;
+      setHUD(elapsedSec);
+      updateGlobalState(elapsedSec);
+
+      renderer.render(scene, camera);
+    }
+
+    loadModels().catch((err) => {
+      console.error('模型加载失败:', err);
+    });
+
+    renderLoop();
+  </script>
+</body>
+</html>

@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3D Audio Spectrum Visualizer</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { overflow: hidden; background: #000; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+  canvas { display: block; }
+
+  #hud-panel {
+    position: absolute;
+    top: 15px;
+    left: 15px;
+    background: rgba(0, 0, 0, 0.75);
+    color: #e0e0e0;
+    padding: 15px 20px;
+    border-radius: 10px;
+    font-size: 14px;
+    line-height: 1.8;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    backdrop-filter: blur(10px);
+    min-width: 200px;
+    z-index: 10;
+  }
+
+  #hud-panel div {
+    font-family: 'Courier New', monospace;
+  }
+
+  #slider-container {
+    position: absolute;
+    top: 200px;
+    left: 15px;
+    z-index: 10;
+    width: 220px;
+  }
+
+  #slider-time {
+    width: 100%;
+    cursor: pointer;
+    accent-color: #00aaff;
+  }
+
+  #slider-label {
+    color: #aaa;
+    font-size: 12px;
+    font-family: 'Courier New', monospace;
+    margin-bottom: 4px;
+    display: block;
+  }
+
+  #button-row {
+    position: absolute;
+    bottom: 25px;
+    left: 50%;
+    transform: translateX(-50%);
+    display: flex;
+    gap: 10px;
+    z-index: 10;
+  }
+
+  #button-row button {
+    background: rgba(30, 30, 30, 0.85);
+    color: #e0e0e0;
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    padding: 10px 20px;
+    border-radius: 8px;
+    cursor: pointer;
+    font-size: 14px;
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    transition: all 0.2s ease;
+    backdrop-filter: blur(10px);
+    min-width: 90px;
+  }
+
+  #button-row button:hover {
+    background: rgba(60, 60, 60, 0.9);
+    border-color: rgba(255, 255, 255, 0.4);
+  }
+
+  #button-row button:active {
+    background: rgba(80, 80, 80, 0.9);
+    transform: scale(0.97);
+  }
+
+  #keyboard-hints {
+    position: absolute;
+    bottom: 70px;
+    left: 50%;
+    transform: translateX(-50%);
+    color: rgba(255, 255, 255, 0.3);
+    font-size: 11px;
+    font-family: 'Courier New', monospace;
+    z-index: 10;
+    white-space: nowrap;
+  }
+</style>
+</head>
+<body>
+
+<div id="hud-panel">
+  <div id="hud-time">Time: 0.0</div>
+  <div id="hud-rate">Rate: 1.00x</div>
+  <div id="hud-state">PLAYING</div>
+  <div id="hud-orbit">Orbit: OFF</div>
+</div>
+
+<div id="slider-container">
+  <label id="slider-label">Time Scrub</label>
+  <input type="range" id="slider-time" min="0" max="100" step="0.1" value="0">
+</div>
+
+<div id="keyboard-hints">SPACE: Play/Pause &nbsp;|&nbsp; O: Toggle Orbit</div>
+
+<div id="button-row">
+  <button id="btn-slower">⏪ Slower</button>
+  <button id="btn-playpause">⏸ Pause</button>
+  <button id="btn-faster">⏩ Faster</button>
+  <button id="btn-reset">↺ Reset</button>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+(function() {
+  // --- State ---
+  let isPlaying = true;
+  let playbackRate = 1.0;
+  let simTime = 0;
+  let orbitEnabled = false;
+  let frameCount = 0;
+  let orbitAngle = 0;
+  const gridRows = 8;
+  const gridCols = 8;
+  const maxHeight = 15;
+  const barSpacing = 2.5;
+  const orbitRadius = 50;
+  const orbitHeight = 30;
+  const orbitSpeed = 0.3;
+  let sliderDragging = false;
+
+  // --- Expose state ---
+  window.__3D_STATE__ = {
+    isPlaying: isPlaying,
+    playbackRate: playbackRate,
+    simTime: simTime,
+    orbitEnabled: orbitEnabled,
+    barCount: 64,
+    maxBarHeight: 0,
+    avgBarHeight: 0,
+    gridRows: gridRows,
+    gridCols: gridCols,
+    cameraDistance: 0,
+    frameCount: 0
+  };
+
+  // --- Three.js Setup ---
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x0a0a0f);
+  scene.fog = new THREE.FogExp2(0x0a0a0f, 0.008);
+
+  const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 200);
+  camera.position.set(0, 30, 50);
+  camera.lookAt(0, 0, 0);
+
+  const renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.shadowMap.enabled = true;
+  document.body.appendChild(renderer.domElement);
+
+  // --- Lights ---
+  const ambientLight = new THREE.AmbientLight(0x404040);
+  scene.add(ambientLight);
+
+  const directionalLight = new THREE.DirectionalLight(0xffffff, 1.0);
+  directionalLight.position.set(10, 20, 10);
+  directionalLight.castShadow = true;
+  scene.add(directionalLight);
+
+  // Add a subtle point light for extra glow
+  const pointLight = new THREE.PointLight(0x0066ff, 0.5, 80);
+  pointLight.position.set(0, 20, 0);
+  scene.add(pointLight);
+
+  // --- Grid Helper ---
+  const gridHelper = new THREE.GridHelper(80, 20, 0x222233, 0x111122);
+  scene.add(gridHelper);
+
+  // --- Spectrum Bars ---
+  const bars = [];
+  const barMaterials = [];
+  const barGeometry = new THREE.BoxGeometry(1, 1, 1);
+
+  const offsetX = -(gridCols - 1) * barSpacing / 2;
+  const offsetZ = -(gridRows - 1) * barSpacing / 2;
+
+  for (let row = 0; row < gridRows; row++) {
+    bars[row] = [];
+    barMaterials[row] = [];
+    for (let col = 0; col < gridCols; col++) {
+      const material = new THREE.MeshStandardMaterial({
+        color: 0x0044ff,
+        metalness: 0.3,
+        roughness: 0.4,
+        emissive: 0x000000,
+        emissiveIntensity: 0.3
+      });
+      const mesh = new THREE.Mesh(barGeometry, material);
+      mesh.position.x = offsetX + col * barSpacing;
+      mesh.position.z = offsetZ + row * barSpacing;
+      mesh.position.y = 0.5;
+      mesh.castShadow = true;
+      mesh.receiveShadow = true;
+      scene.add(mesh);
+      bars[row][col] = mesh;
+      barMaterials[row][col] = material;
+    }
+  }
+
+  // --- Color interpolation ---
+  const colorLow = new THREE.Color(0x0044ff);
+  const colorMid = new THREE.Color(0x00ff44);
+  const colorHigh = new THREE.Color(0xff4400);
+  const tempColor = new THREE.Color();
+
+  function getAmplitudeColor(t) {
+    // t is 0..1 (amplitude / maxHeight)
+    t = Math.max(0, Math.min(1, t));
+    if (t < 0.5) {
+      const f = t * 2;
+      tempColor.copy(colorLow).lerp(colorMid, f);
+    } else {
+      const f = (t - 0.5) * 2;
+      tempColor.copy(colorMid).lerp(colorHigh, f);
+    }
+    return tempColor;
+  }
+
+  // --- Procedural Audio Data ---
+  function getAmplitude(row, col, time, speed) {
+    return Math.abs(
+      Math.sin(time * speed + col * 0.5) *
+      Math.cos(time * speed * 0.7 + row * 0.3)
+    ) * maxHeight;
+  }
+
+  // --- UI References ---
+  const hudTime = document.getElementById('hud-time');
+  const hudRate = document.getElementById('hud-rate');
+  const hudState = document.getElementById('hud-state');
+  const hudOrbit = document.getElementById('hud-orbit');
+  const btnPlayPause = document.getElementById('btn-playpause');
+  const btnSlower = document.getElementById('btn-slower');
+  const btnFaster = document.getElementById('btn-faster');
+  const btnReset = document.getElementById('btn-reset');
+  const sliderTime = document.getElementById('slider-time');
+
+  // --- UI Functions ---
+  function updateHUD() {
+    hudTime.textContent = 'Time: ' + simTime.toFixed(1);
+    hudRate.textContent = 'Rate: ' + playbackRate.toFixed(2) + 'x';
+    hudState.textContent = isPlaying ? 'PLAYING' : 'PAUSED';
+    hudOrbit.textContent = 'Orbit: ' + (orbitEnabled ? 'ON' : 'OFF');
+    btnPlayPause.textContent = isPlaying ? '⏸ Pause' : '▶ Play';
+  }
+
+  function togglePlayPause() {
+    isPlaying = !isPlaying;
+    updateHUD();
+  }
+
+  function slower() {
+    playbackRate = Math.max(0.25, playbackRate - 0.25);
+    updateHUD();
+  }
+
+  function faster() {
+    playbackRate = Math.min(3.0, playbackRate + 0.25);
+    updateHUD();
+  }
+
+  function resetSim() {
+    simTime = 0;
+    playbackRate = 1.0;
+    isPlaying = true;
+    sliderTime.value = 0;
+    updateHUD();
+  }
+
+  function toggleOrbit() {
+    orbitEnabled = !orbitEnabled;
+    if (orbitEnabled) {
+      // Calculate current angle from camera position
+      orbitAngle = Math.atan2(camera.position.x, camera.position.z);
+    }
+    updateHUD();
+  }
+
+  // --- Event Listeners ---
+  btnPlayPause.addEventListener('click', togglePlayPause);
+  btnSlower.addEventListener('click', slower);
+  btnFaster.addEventListener('click', faster);
+  btnReset.addEventListener('click', resetSim);
+
+  sliderTime.addEventListener('input', function() {
+    sliderDragging = true;
+    isPlaying = false;
+    simTime = parseFloat(sliderTime.value);
+    updateHUD();
+  });
+
+  sliderTime.addEventListener('change', function() {
+    sliderDragging = false;
+  });
+
+  document.addEventListener('keydown', function(e) {
+    if (e.code === 'Space') {
+      e.preventDefault();
+      togglePlayPause();
+    } else if (e.code === 'KeyO') {
+      toggleOrbit();
+    }
+  });
+
+  window.addEventListener('resize', function() {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  });
+
+  // --- Animation Loop ---
+  const clock = new THREE.Clock();
+  let maxBarHeight = 0;
+  let avgBarHeight = 0;
+
+  function animate() {
+    requestAnimationFrame(animate);
+
+    const deltaTime = clock.getDelta();
+    frameCount++;
+
+    // Update simTime
+    if (isPlaying) {
+      simTime += deltaTime * playbackRate;
+      // Wrap at 100
+      if (simTime >= 100) {
+        simTime -= 100;
+      }
+    }
+
+    // Update slider
+    if (!sliderDragging) {
+      sliderTime.value = simTime;
+    }
+
+    // Update bars
+    let totalHeight = 0;
+    let currentMax = 0;
+
+    for (let row = 0; row < gridRows; row++) {
+      for (let col = 0; col < gridCols; col++) {
+        const amplitude = getAmplitude(row, col, simTime, playbackRate > 0 ? 1.0 : 1.0);
+        const bar = bars[row][col];
+        const mat = barMaterials[row][col];
+
+        // Scale bar height (minimum height of 0.1 to keep it visible)
+        const h = Math.max(0.1, amplitude);
+        bar.scale.y = h;
+        bar.position.y = h / 2;
+
+        // Color based on amplitude
+        const t = amplitude / maxHeight;
+        const c = getAmplitudeColor(t);
+        mat.color.copy(c);
+        mat.emissive.copy(c).multiplyScalar(0.2);
+
+        totalHeight += amplitude;
+        if (amplitude > currentMax) currentMax = amplitude;
+      }
+    }
+
+    maxBarHeight = currentMax;
+    avgBarHeight = totalHeight / 64;
+
+    // Update point light color based on average
+    const avgT = avgBarHeight / maxHeight;
+    const lightColor = getAmplitudeColor(avgT);
+    pointLight.color.copy(lightColor);
+    pointLight.intensity = 0.3 + avgT * 0.7;
+
+    // Camera orbit
+    if (orbitEnabled) {
+      orbitAngle += orbitSpeed * deltaTime;
+      camera.position.x = Math.sin(orbitAngle) * orbitRadius;
+      camera.position.z = Math.cos(orbitAngle) * orbitRadius;
+      camera.position.y = orbitHeight;
+      camera.lookAt(0, 0, 0);
+    }
+
+    // Camera distance
+    const camDist = camera.position.length();
+
+    // Update HUD
+    updateHUD();
+
+    // Update global state
+    window.__3D_STATE__.isPlaying = isPlaying;
+    window.__3D_STATE__.playbackRate = playbackRate;
+    window.__3D_STATE__.simTime = simTime;
+    window.__3D_STATE__.orbitEnabled = orbitEnabled;
+    window.__3D_STATE__.barCount = 64;
+    window.__3D_STATE__.maxBarHeight = maxBarHeight;
+    window.__3D_STATE__.avgBarHeight = avgBarHeight;
+    window.__3D_STATE__.gridRows = gridRows;
+    window.__3D_STATE__.gridCols = gridCols;
+    window.__3D_STATE__.cameraDistance = camDist;
+    window.__3D_STATE__.frameCount = frameCount;
+
+    renderer.render(scene, camera);
+  }
+
+  updateHUD();
+  animate();
+})();
+</script>
+</body>
+</html>

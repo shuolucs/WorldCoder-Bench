@@ -1,0 +1,649 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pressure Simulation</title>
+<style>
+body {
+    margin: 0;
+    overflow: hidden;
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+}
+canvas {
+    display: block;
+}
+#hud {
+    position: absolute;
+    top: 10px;
+    left: 10px;
+    background: rgba(0, 0, 0, 0.7);
+    color: white;
+    padding: 15px 20px;
+    border-radius: 8px;
+    font-size: 14px;
+    line-height: 1.8;
+    min-width: 250px;
+    pointer-events: none;
+}
+#hud h3 {
+    margin: 0 0 8px 0;
+    font-size: 16px;
+    border-bottom: 1px solid rgba(255,255,255,0.3);
+    padding-bottom: 5px;
+}
+#addParticlesBtn {
+    position: absolute;
+    top: 320px;
+    left: 10px;
+    padding: 10px 20px;
+    font-size: 14px;
+    background: #4CAF50;
+    color: white;
+    border: none;
+    border-radius: 5px;
+    cursor: pointer;
+    font-weight: bold;
+}
+#addParticlesBtn:hover {
+    background: #45a049;
+}
+#controls-info {
+    position: absolute;
+    bottom: 10px;
+    left: 10px;
+    background: rgba(0, 0, 0, 0.7);
+    color: #ccc;
+    padding: 10px 15px;
+    border-radius: 8px;
+    font-size: 12px;
+    line-height: 1.6;
+    pointer-events: none;
+}
+</style>
+</head>
+<body>
+
+<div id="hud">
+    <h3>⚗️ Gas Pressure Simulation</h3>
+    <div id="hudContent"></div>
+</div>
+<button id="addParticlesBtn">Add Particles (+5)</button>
+<div id="controls-info">
+    <strong>Controls:</strong><br>
+    ↑ Arrow: Compress (piston down) | ↓ Arrow: Expand (piston up)<br>
+    H: Heat | C: Cool | D: Increase Difficulty | R: Reset<br>
+    Mouse: Orbit/Zoom
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r152/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.152.0/examples/js/controls/OrbitControls.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.152.0/examples/js/loaders/GLTFLoader.js"></script>
+
+<script>
+// --- State ---
+window.__3D_STATE__ = {
+    particleCount: 20,
+    pistonY: 7,
+    pressure: 0,
+    temperature: 0,
+    volume: 0,
+    difficulty: 1,
+    heated: false,
+    cooled: false,
+    totalKE: 0,
+    avgKE: 0,
+    soldierLoaded: false,
+    paused: false,
+    particlesAdded: 0,
+    allParticlesInBounds: true,
+    nanFree: true
+};
+
+// --- Scene Setup ---
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x1a1a2e);
+scene.fog = new THREE.Fog(0x1a1a2e, 20, 50);
+
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+camera.position.set(0, 5, 15);
+camera.lookAt(0, 0, 0);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+
+const controls = new THREE.OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.05;
+controls.target.set(0, 3, 0);
+
+// --- Lights ---
+const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
+scene.add(ambientLight);
+
+const directionalLight = new THREE.DirectionalLight(0xffffff, 1.0);
+directionalLight.position.set(5, 10, 5);
+directionalLight.castShadow = true;
+directionalLight.shadow.mapSize.width = 2048;
+directionalLight.shadow.mapSize.height = 2048;
+scene.add(directionalLight);
+
+// --- Ground Plane ---
+const groundGeometry = new THREE.PlaneGeometry(40, 40);
+const groundMaterial = new THREE.MeshStandardMaterial({ color: 0x333333, roughness: 0.8 });
+const ground = new THREE.Mesh(groundGeometry, groundMaterial);
+ground.rotation.x = -Math.PI / 2;
+ground.position.y = 0;
+ground.receiveShadow = true;
+scene.add(ground);
+
+// --- Container ---
+const containerGroup = new THREE.Group();
+containerGroup.position.set(0, 4, 0);
+scene.add(containerGroup);
+
+// Container wireframe edges
+const containerBoxGeo = new THREE.BoxGeometry(6, 6, 6);
+const containerEdges = new THREE.EdgesGeometry(containerBoxGeo);
+const containerLineMat = new THREE.LineBasicMaterial({ color: 0x00ffff, transparent: true, opacity: 0.6 });
+const containerWireframe = new THREE.LineSegments(containerEdges, containerLineMat);
+scene.add(containerWireframe);
+containerWireframe.position.set(0, 4, 0);
+
+// Semi-transparent container faces
+const containerFaceMat = new THREE.MeshStandardMaterial({
+    color: 0x00aaff,
+    transparent: true,
+    opacity: 0.08,
+    side: THREE.DoubleSide,
+    depthWrite: false
+});
+const containerFaceMesh = new THREE.Mesh(containerBoxGeo, containerFaceMat);
+containerFaceMesh.position.set(0, 4, 0);
+scene.add(containerFaceMesh);
+
+// --- Piston ---
+let pistonY = 7;
+const pistonGeo = new THREE.BoxGeometry(6, 0.3, 6);
+const pistonMat = new THREE.MeshStandardMaterial({
+    color: 0xff6600,
+    transparent: true,
+    opacity: 0.7,
+    metalness: 0.5,
+    roughness: 0.3
+});
+const piston = new THREE.Mesh(pistonGeo, pistonMat);
+piston.position.set(0, pistonY, 0);
+piston.castShadow = true;
+scene.add(piston);
+
+// Container floor visual
+const floorGeo = new THREE.BoxGeometry(6, 0.1, 6);
+const floorMat = new THREE.MeshStandardMaterial({
+    color: 0x00aaff,
+    transparent: true,
+    opacity: 0.3
+});
+const containerFloor = new THREE.Mesh(floorGeo, floorMat);
+containerFloor.position.set(0, 1, 0);
+scene.add(containerFloor);
+
+// Container side pillars for visual clarity
+const pillarGeo = new THREE.CylinderGeometry(0.05, 0.05, 6, 8);
+const pillarMat = new THREE.MeshStandardMaterial({ color: 0x00ffff, emissive: 0x004444 });
+const pillarPositions = [
+    [-3, 4, -3], [-3, 4, 3], [3, 4, -3], [3, 4, 3]
+];
+pillarPositions.forEach(pos => {
+    const pillar = new THREE.Mesh(pillarGeo, pillarMat);
+    pillar.position.set(pos[0], pos[1], pos[2]);
+    scene.add(pillar);
+});
+
+// --- Particles ---
+const particles = [];
+const particleMeshes = [];
+const particleGeometry = new THREE.SphereGeometry(0.15, 12, 12);
+
+function randomColor() {
+    const colors = [0xff4444, 0x44ff44, 0x4444ff, 0xffff44, 0xff44ff, 0x44ffff, 0xff8800, 0x88ff00, 0x0088ff, 0xff0088];
+    return colors[Math.floor(Math.random() * colors.length)];
+}
+
+function createParticle() {
+    const color = randomColor();
+    const material = new THREE.MeshStandardMaterial({
+        color: color,
+        emissive: color,
+        emissiveIntensity: 0.3,
+        roughness: 0.2,
+        metalness: 0.5
+    });
+    const mesh = new THREE.Mesh(particleGeometry, material);
+
+    const x = (Math.random() - 0.5) * 5;
+    const y = 1.5 + Math.random() * (pistonY - 1.5 - 0.5);
+    const z = (Math.random() - 0.5) * 5;
+    mesh.position.set(x, y, z);
+    mesh.castShadow = true;
+
+    scene.add(mesh);
+    particleMeshes.push(mesh);
+
+    const vx = (Math.random() - 0.5) * 4;
+    const vy = (Math.random() - 0.5) * 4;
+    const vz = (Math.random() - 0.5) * 4;
+
+    particles.push({ mesh, vx, vy, vz });
+}
+
+function initParticles(count) {
+    for (let i = 0; i < count; i++) {
+        createParticle();
+    }
+}
+
+function clearAllParticles() {
+    for (let i = particles.length - 1; i >= 0; i--) {
+        scene.remove(particles[i].mesh);
+        particles[i].mesh.geometry.dispose && particles[i].mesh.geometry.dispose();
+        particles[i].mesh.material.dispose && particles[i].mesh.material.dispose();
+    }
+    particles.length = 0;
+    particleMeshes.length = 0;
+}
+
+initParticles(20);
+
+// --- Soldier ---
+let soldierMixer = null;
+const loader = new THREE.GLTFLoader();
+loader.load(
+    'soldier.glb',
+    function(gltf) {
+        const soldier = gltf.scene;
+        soldier.position.set(-6, 0, 0);
+        soldier.scale.set(1.5, 1.5, 1.5);
+        soldier.rotation.y = Math.PI / 2;
+        soldier.traverse(child => {
+            if (child.isMesh) {
+                child.castShadow = true;
+                child.receiveShadow = true;
+            }
+        });
+        scene.add(soldier);
+        window.__3D_STATE__.soldierLoaded = true;
+
+        if (gltf.animations && gltf.animations.length > 0) {
+            soldierMixer = new THREE.AnimationMixer(soldier);
+            const idleAction = soldierMixer.clipAction(gltf.animations[0]);
+            idleAction.play();
+        }
+    },
+    undefined,
+    function(error) {
+        console.warn('Could not load soldier.glb:', error);
+        // Create a placeholder soldier
+        const soldierGroup = new THREE.Group();
+        
+        // Body
+        const bodyGeo = new THREE.CylinderGeometry(0.3, 0.3, 1.2, 8);
+        const bodyMat = new THREE.MeshStandardMaterial({ color: 0x556b2f });
+        const body = new THREE.Mesh(bodyGeo, bodyMat);
+        body.position.y = 1.5;
+        soldierGroup.add(body);
+        
+        // Head
+        const headGeo = new THREE.SphereGeometry(0.25, 8, 8);
+        const headMat = new THREE.MeshStandardMaterial({ color: 0xdeb887 });
+        const head = new THREE.Mesh(headGeo, headMat);
+        head.position.y = 2.35;
+        soldierGroup.add(head);
+        
+        // Helmet
+        const helmetGeo = new THREE.SphereGeometry(0.28, 8, 8, 0, Math.PI * 2, 0, Math.PI / 2);
+        const helmetMat = new THREE.MeshStandardMaterial({ color: 0x2f4f2f });
+        const helmet = new THREE.Mesh(helmetGeo, helmetMat);
+        helmet.position.y = 2.4;
+        soldierGroup.add(helmet);
+        
+        // Legs
+        const legGeo = new THREE.CylinderGeometry(0.12, 0.12, 0.9, 6);
+        const legMat = new THREE.MeshStandardMaterial({ color: 0x556b2f });
+        const leftLeg = new THREE.Mesh(legGeo, legMat);
+        leftLeg.position.set(-0.15, 0.45, 0);
+        soldierGroup.add(leftLeg);
+        const rightLeg = new THREE.Mesh(legGeo, legMat);
+        rightLeg.position.set(0.15, 0.45, 0);
+        soldierGroup.add(rightLeg);
+
+        soldierGroup.position.set(-6, 0, 0);
+        soldierGroup.scale.set(1.5, 1.5, 1.5);
+        soldierGroup.rotation.y = Math.PI / 2;
+        scene.add(soldierGroup);
+        window.__3D_STATE__.soldierLoaded = true;
+    }
+);
+
+// --- Trail effect for particles ---
+const trailGeometry = new THREE.SphereGeometry(0.05, 4, 4);
+
+// --- Difficulty & State ---
+let difficulty = 1;
+let heated = false;
+let cooled = false;
+let particlesAddedCount = 0;
+
+// --- Physics Update ---
+const RESTITUTION = 0.98;
+const BOUNDS = { xMin: -3, xMax: 3, zMin: -3, zMax: 3, yMin: 1 };
+const PARTICLE_RADIUS = 0.15;
+
+function updatePhysics(dt) {
+    const currentPistonY = pistonY;
+
+    for (let i = 0; i < particles.length; i++) {
+        const p = particles[i];
+        
+        // Update position
+        p.mesh.position.x += p.vx * dt;
+        p.mesh.position.y += p.vy * dt;
+        p.mesh.position.z += p.vz * dt;
+
+        // Bounce off walls
+        if (p.mesh.position.x - PARTICLE_RADIUS < BOUNDS.xMin) {
+            p.mesh.position.x = BOUNDS.xMin + PARTICLE_RADIUS;
+            p.vx = Math.abs(p.vx) * RESTITUTION;
+        }
+        if (p.mesh.position.x + PARTICLE_RADIUS > BOUNDS.xMax) {
+            p.mesh.position.x = BOUNDS.xMax - PARTICLE_RADIUS;
+            p.vx = -Math.abs(p.vx) * RESTITUTION;
+        }
+        if (p.mesh.position.z - PARTICLE_RADIUS < BOUNDS.zMin) {
+            p.mesh.position.z = BOUNDS.zMin + PARTICLE_RADIUS;
+            p.vz = Math.abs(p.vz) * RESTITUTION;
+        }
+        if (p.mesh.position.z + PARTICLE_RADIUS > BOUNDS.zMax) {
+            p.mesh.position.z = BOUNDS.zMax - PARTICLE_RADIUS;
+            p.vz = -Math.abs(p.vz) * RESTITUTION;
+        }
+        // Floor
+        if (p.mesh.position.y - PARTICLE_RADIUS < BOUNDS.yMin) {
+            p.mesh.position.y = BOUNDS.yMin + PARTICLE_RADIUS;
+            p.vy = Math.abs(p.vy) * RESTITUTION;
+        }
+        // Piston (top)
+        if (p.mesh.position.y + PARTICLE_RADIUS > currentPistonY) {
+            p.mesh.position.y = currentPistonY - PARTICLE_RADIUS;
+            p.vy = -Math.abs(p.vy) * RESTITUTION;
+        }
+    }
+
+    // Particle-particle collisions (simplified)
+    for (let i = 0; i < particles.length; i++) {
+        for (let j = i + 1; j < particles.length; j++) {
+            const a = particles[i];
+            const b = particles[j];
+            const dx = b.mesh.position.x - a.mesh.position.x;
+            const dy = b.mesh.position.y - a.mesh.position.y;
+            const dz = b.mesh.position.z - a.mesh.position.z;
+            const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+            
+            if (dist < PARTICLE_RADIUS * 2) {
+                // Swap velocities (simplified elastic collision)
+                let tmpVx = a.vx; let tmpVy = a.vy; let tmpVz = a.vz;
+                a.vx = b.vx; a.vy = b.vy; a.vz = b.vz;
+                b.vx = tmpVx; b.vy = tmpVy; b.vz = tmpVz;
+
+                // Separate particles
+                if (dist > 0) {
+                    const overlap = (PARTICLE_RADIUS * 2 - dist) / 2;
+                    const nx = dx / dist;
+                    const ny = dy / dist;
+                    const nz = dz / dist;
+                    a.mesh.position.x -= nx * overlap;
+                    a.mesh.position.y -= ny * overlap;
+                    a.mesh.position.z -= nz * overlap;
+                    b.mesh.position.x += nx * overlap;
+                    b.mesh.position.y += ny * overlap;
+                    b.mesh.position.z += nz * overlap;
+                }
+            }
+        }
+    }
+}
+
+function calculateStats() {
+    let totalKE = 0;
+    let allInBounds = true;
+    let nanFree = true;
+
+    for (let i = 0; i < particles.length; i++) {
+        const p = particles[i];
+        const speed2 = p.vx * p.vx + p.vy * p.vy + p.vz * p.vz;
+        totalKE += 0.5 * speed2; // mass = 1
+
+        if (isNaN(p.mesh.position.x) || isNaN(p.mesh.position.y) || isNaN(p.mesh.position.z) ||
+            isNaN(p.vx) || isNaN(p.vy) || isNaN(p.vz)) {
+            nanFree = false;
+        }
+
+        if (p.mesh.position.x < BOUNDS.xMin - 0.5 || p.mesh.position.x > BOUNDS.xMax + 0.5 ||
+            p.mesh.position.y < BOUNDS.yMin - 0.5 || p.mesh.position.y > pistonY + 0.5 ||
+            p.mesh.position.z < BOUNDS.zMin - 0.5 || p.mesh.position.z > BOUNDS.zMax + 0.5) {
+            allInBounds = false;
+        }
+    }
+
+    const N = particles.length;
+    const avgKE = N > 0 ? totalKE / N : 0;
+    const volume = 6 * 6 * (pistonY - 1);
+    const pressure = volume > 0 ? (N * avgKE) / volume : 0;
+    const temperature = avgKE * 500;
+
+    return { totalKE, avgKE, volume, pressure, temperature, allInBounds, nanFree };
+}
+
+// --- Update container visuals based on piston ---
+function updateContainerVisuals() {
+    const height = pistonY - 1;
+    const centerY = 1 + height / 2;
+
+    containerWireframe.geometry.dispose();
+    const newBoxGeo = new THREE.BoxGeometry(6, height, 6);
+    containerWireframe.geometry = new THREE.EdgesGeometry(newBoxGeo);
+    containerWireframe.position.set(0, centerY, 0);
+
+    containerFaceMesh.geometry.dispose();
+    containerFaceMesh.geometry = newBoxGeo.clone();
+    containerFaceMesh.position.set(0, centerY, 0);
+
+    piston.position.y = pistonY;
+}
+
+// --- HUD Update ---
+const hudContent = document.getElementById('hudContent');
+function updateHUD(stats) {
+    hudContent.innerHTML = `
+        <div>🔵 <strong>Particles:</strong> ${particles.length}</div>
+        <div>📊 <strong>Pressure:</strong> ${stats.pressure.toFixed(2)} units</div>
+        <div>🌡️ <strong>Temperature:</strong> ${stats.temperature.toFixed(2)} K</div>
+        <div>📦 <strong>Volume:</strong> ${stats.volume.toFixed(2)} units³</div>
+        <div>⚡ <strong>Difficulty:</strong> ${difficulty} / 5</div>
+        <div>🔽 <strong>Piston Y:</strong> ${pistonY.toFixed(1)}</div>
+        <div>🔥 <strong>Heated:</strong> ${heated ? '✅' : '❌'} | ❄️ <strong>Cooled:</strong> ${cooled ? '✅' : '❌'}</div>
+        <div>⚡ <strong>Total KE:</strong> ${stats.totalKE.toFixed(2)}</div>
+    `;
+}
+
+// --- Update global state ---
+function updateGlobalState(stats) {
+    window.__3D_STATE__.particleCount = particles.length;
+    window.__3D_STATE__.pistonY = pistonY;
+    window.__3D_STATE__.pressure = stats.pressure;
+    window.__3D_STATE__.temperature = stats.temperature;
+    window.__3D_STATE__.volume = stats.volume;
+    window.__3D_STATE__.difficulty = difficulty;
+    window.__3D_STATE__.heated = heated;
+    window.__3D_STATE__.cooled = cooled;
+    window.__3D_STATE__.totalKE = stats.totalKE;
+    window.__3D_STATE__.avgKE = stats.avgKE;
+    window.__3D_STATE__.paused = false;
+    window.__3D_STATE__.particlesAdded = particlesAddedCount;
+    window.__3D_STATE__.allParticlesInBounds = stats.allInBounds;
+    window.__3D_STATE__.nanFree = stats.nanFree;
+}
+
+// --- Key Handling ---
+document.addEventListener('keydown', (e) => {
+    switch (e.key) {
+        case 'ArrowUp':
+            e.preventDefault();
+            if (pistonY > 3) {
+                pistonY -= 0.5;
+                updateContainerVisuals();
+                // Push particles below piston if needed
+                for (const p of particles) {
+                    if (p.mesh.position.y + PARTICLE_RADIUS > pistonY) {
+                        p.mesh.position.y = pistonY - PARTICLE_RADIUS;
+                        p.vy = -Math.abs(p.vy);
+                    }
+                }
+            }
+            break;
+        case 'ArrowDown':
+            e.preventDefault();
+            if (pistonY < 7) {
+                pistonY += 0.5;
+                updateContainerVisuals();
+            }
+            break;
+        case 'h':
+        case 'H':
+            heated = true;
+            cooled = false;
+            for (const p of particles) {
+                p.vx *= 1.5;
+                p.vy *= 1.5;
+                p.vz *= 1.5;
+            }
+            break;
+        case 'c':
+        case 'C':
+            cooled = true;
+            heated = false;
+            for (const p of particles) {
+                p.vx *= 0.5;
+                p.vy *= 0.5;
+                p.vz *= 0.5;
+            }
+            break;
+        case 'd':
+        case 'D':
+            if (difficulty < 5) {
+                difficulty++;
+                // Speed up existing particles
+                for (const p of particles) {
+                    p.vx *= 1.2;
+                    p.vy *= 1.2;
+                    p.vz *= 1.2;
+                }
+                // Add 10 more particles
+                for (let i = 0; i < 10; i++) {
+                    createParticle();
+                }
+            }
+            break;
+        case 'r':
+        case 'R':
+            // Reset
+            clearAllParticles();
+            pistonY = 7;
+            difficulty = 1;
+            heated = false;
+            cooled = false;
+            particlesAddedCount = 0;
+            initParticles(20);
+            updateContainerVisuals();
+            break;
+    }
+});
+
+// --- Add Particles Button ---
+document.getElementById('addParticlesBtn').addEventListener('click', () => {
+    for (let i = 0; i < 5; i++) {
+        createParticle();
+    }
+    particlesAddedCount += 5;
+});
+
+// --- Particle glow effect ---
+function updateParticleVisuals(time) {
+    for (let i = 0; i < particles.length; i++) {
+        const p = particles[i];
+        const speed = Math.sqrt(p.vx * p.vx + p.vy * p.vy + p.vz * p.vz);
+        const scale = 0.8 + speed * 0.1;
+        p.mesh.scale.set(scale, scale, scale);
+        if (p.mesh.material.emissiveIntensity !== undefined) {
+            p.mesh.material.emissiveIntensity = 0.2 + speed * 0.1;
+        }
+    }
+}
+
+// --- Animation Loop ---
+const clock = new THREE.Clock();
+let lastTime = 0;
+
+function animate() {
+    requestAnimationFrame(animate);
+
+    const dt = Math.min(clock.getDelta(), 0.05); // Cap delta time
+    const time = clock.getElapsedTime();
+
+    // Update soldier animation
+    if (soldierMixer) {
+        soldierMixer.update(dt);
+    }
+
+    // Update physics
+    updatePhysics(dt);
+
+    // Update particle visuals
+    updateParticleVisuals(time);
+
+    // Piston visual pulse
+    piston.material.emissive = new THREE.Color(0xff3300);
+    piston.material.emissiveIntensity = 0.1 + Math.sin(time * 2) * 0.05;
+
+    // Calculate stats
+    const stats = calculateStats();
+
+    // Update HUD
+    updateHUD(stats);
+
+    // Update global state
+    updateGlobalState(stats);
+
+    // Update controls
+    controls.update();
+
+    // Render
+    renderer.render(scene, camera);
+}
+
+// --- Handle Resize ---
+window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// Start
+animate();
+</script>
+</body>
+</html>

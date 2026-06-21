@@ -1,0 +1,595 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Rigid Body Chain & Ragdoll Simulation</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #111; color: #fff; font-family: monospace; }
+        #canvas-container { width: 100vw; height: 100vh; display: block; }
+        #hud {
+            position: absolute; top: 10px; left: 10px; background: rgba(0, 0, 0, 0.7);
+            padding: 15px; border-radius: 8px; pointer-events: none; border: 1px solid #444;
+        }
+        #controls {
+            position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%);
+            display: flex; gap: 10px; background: rgba(0, 0, 0, 0.7); padding: 10px; border-radius: 8px;
+        }
+        button {
+            background: #333; color: #fff; border: 1px solid #666; padding: 8px 16px;
+            cursor: pointer; border-radius: 4px; font-family: monospace; transition: background 0.2s;
+        }
+        button:hover { background: #555; }
+        .hud-line { margin: 5px 0; }
+        .val { color: #00ffcc; }
+    </style>
+    <script type="importmap">
+    { "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+    } }
+    </script>
+</head>
+<body>
+    <div id="canvas-container"></div>
+    <div id="hud">
+        <div class="hud-line">Sim Time: <span id="simTime" class="val">0.00</span> s</div>
+        <div class="hud-line">Chain Tip Y: <span id="chainTipY" class="val">0.00</span> m</div>
+        <div class="hud-line">Torso Y: <span id="torsoY" class="val">0.00</span> m</div>
+        <div class="hud-line">Max Violation: <span id="maxViolation" class="val">0.0000</span> m</div>
+    </div>
+    <div id="controls">
+        <button id="resetBtn">Reset Scene</button>
+        <button id="kickChainBtn">Kick Chain</button>
+        <button id="kickRagdollBtn">Kick Ragdoll</button>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        // --- Physics Engine (PBD Rigid Body) ---
+        class RigidBody {
+            constructor(mass, type, size) {
+                this.mass = mass;
+                this.invMass = mass > 0 ? 1 / mass : 0;
+                this.x = new THREE.Vector3();
+                this.q = new THREE.Quaternion();
+                this.v = new THREE.Vector3();
+                this.w = new THREE.Vector3();
+                this.x_prev = new THREE.Vector3();
+                this.q_prev = new THREE.Quaternion();
+                
+                this.I_local = new THREE.Matrix3();
+                this.invI_local = new THREE.Matrix3();
+                this.invI_world = new THREE.Matrix3();
+                
+                this.type = type;
+                this.size = size;
+                this.colPoints = [];
+                this.mesh = null;
+
+                this.calculateInertia();
+                this.generateCollisionPoints();
+            }
+
+            calculateInertia() {
+                if (this.invMass === 0) {
+                    this.I_local.set(0,0,0,0,0,0,0,0,0);
+                    this.invI_local.set(0,0,0,0,0,0,0,0,0);
+                    return;
+                }
+                let m = this.mass;
+                let I = new THREE.Matrix3();
+                if (this.type === 'box') {
+                    let [w, h, d] = this.size;
+                    I.set(m*(h*h+d*d)/12, 0, 0,  0, m*(w*w+d*d)/12, 0,  0, 0, m*(w*w+h*h)/12);
+                } else if (this.type === 'sphere') {
+                    let r = this.size[0];
+                    let val = 2*m*r*r/5;
+                    I.set(val, 0, 0,  0, val, 0,  0, 0, val);
+                } else if (this.type === 'cylinder') {
+                    let [r, h] = this.size;
+                    let ixz = m*(3*r*r+h*h)/12;
+                    let iy = m*r*r/2;
+                    I.set(ixz, 0, 0,  0, iy, 0,  0, 0, ixz);
+                }
+                this.I_local.copy(I);
+                this.invI_local.copy(I).invert();
+            }
+
+            generateCollisionPoints() {
+                if (this.type === 'box') {
+                    let [w, h, d] = this.size;
+                    for(let x of [-w/2, w/2]) for(let y of [-h/2, h/2]) for(let z of [-d/2, d/2])
+                        this.colPoints.push(new THREE.Vector3(x, y, z));
+                } else if (this.type === 'cylinder') {
+                    let [r, h] = this.size;
+                    for(let y of [-h/2, h/2]) {
+                        this.colPoints.push(new THREE.Vector3(r, y, 0), new THREE.Vector3(-r, y, 0),
+                                            new THREE.Vector3(0, y, r), new THREE.Vector3(0, y, -r));
+                    }
+                } else if (this.type === 'sphere') {
+                    this.colPoints.push(new THREE.Vector3(0, -this.size[0], 0));
+                }
+            }
+
+            updateInvIWorld() {
+                if (this.invMass === 0) return;
+                let R = new THREE.Matrix4().makeRotationFromQuaternion(this.q);
+                let R3 = new THREE.Matrix3().setFromMatrix4(R);
+                let R3T = R3.clone().transpose();
+                this.invI_world.copy(R3).multiply(this.invI_local).multiply(R3T);
+            }
+
+            applyImpulse(impulse, point_local = new THREE.Vector3()) {
+                if (this.invMass === 0) return;
+                this.v.add(impulse.clone().multiplyScalar(this.invMass));
+                let r = point_local.clone().applyQuaternion(this.q);
+                let torqueImpulse = r.cross(impulse);
+                this.w.add(torqueImpulse.applyMatrix3(this.invI_world));
+            }
+        }
+
+        class BallJoint {
+            constructor(b1, b2, r1_local, r2_local) {
+                this.b1 = b1; this.b2 = b2;
+                this.r1_local = r1_local; this.r2_local = r2_local;
+                this.violation = 0;
+            }
+
+            solve() {
+                let r1 = this.r1_local.clone().applyQuaternion(this.b1.q);
+                let r2 = this.r2_local.clone().applyQuaternion(this.b2.q);
+                let p1 = this.b1.x.clone().add(r1);
+                let p2 = this.b2.x.clone().add(r2);
+                let err = p2.clone().sub(p1);
+                this.violation = err.length();
+                if (this.violation < 1e-6) return this.violation;
+
+                let K = new THREE.Matrix3();
+                let vs = [new THREE.Vector3(1,0,0), new THREE.Vector3(0,1,0), new THREE.Vector3(0,0,1)];
+                for(let i=0; i<3; i++) {
+                    let v = vs[i];
+                    let term = v.clone().multiplyScalar(this.b1.invMass + this.b2.invMass);
+                    if(this.b1.invMass > 0) {
+                        let rxv = r1.clone().cross(v).applyMatrix3(this.b1.invI_world);
+                        term.sub(r1.clone().cross(rxv));
+                    }
+                    if(this.b2.invMass > 0) {
+                        let rxv = r2.clone().cross(v).applyMatrix3(this.b2.invI_world);
+                        term.sub(r2.clone().cross(rxv));
+                    }
+                    K.elements[i*3+0] = term.x; K.elements[i*3+1] = term.y; K.elements[i*3+2] = term.z;
+                }
+                K.elements[0]+=1e-6; K.elements[4]+=1e-6; K.elements[8]+=1e-6; // Regularization
+                
+                let K_inv = K.clone().invert();
+                let lambda = err.clone().applyMatrix3(K_inv);
+
+                if (this.b1.invMass > 0) {
+                    this.b1.x.add(lambda.clone().multiplyScalar(this.b1.invMass));
+                    let dw1 = r1.clone().cross(lambda).applyMatrix3(this.b1.invI_world);
+                    let dq1 = new THREE.Quaternion(dw1.x, dw1.y, dw1.z, 0).multiply(this.b1.q);
+                    this.b1.q.set(this.b1.q.x + 0.5*dq1.x, this.b1.q.y + 0.5*dq1.y, this.b1.q.z + 0.5*dq1.z, this.b1.q.w + 0.5*dq1.w).normalize();
+                    this.b1.updateInvIWorld();
+                }
+                if (this.b2.invMass > 0) {
+                    this.b2.x.add(lambda.clone().multiplyScalar(-this.b2.invMass));
+                    let dw2 = r2.clone().cross(lambda).applyMatrix3(this.b2.invI_world).negate();
+                    let dq2 = new THREE.Quaternion(dw2.x, dw2.y, dw2.z, 0).multiply(this.b2.q);
+                    this.b2.q.set(this.b2.q.x + 0.5*dq2.x, this.b2.q.y + 0.5*dq2.y, this.b2.q.z + 0.5*dq2.z, this.b2.q.w + 0.5*dq2.w).normalize();
+                    this.b2.updateInvIWorld();
+                }
+                return this.violation;
+            }
+        }
+
+        class DistanceConstraint {
+            constructor(b1, b2, p1_local, p2_local, min_dist, max_dist) {
+                this.b1 = b1; this.b2 = b2;
+                this.p1_local = p1_local; this.p2_local = p2_local;
+                this.min_dist = min_dist; this.max_dist = max_dist;
+                this.violation = 0;
+            }
+
+            solve() {
+                let r1 = this.p1_local.clone().applyQuaternion(this.b1.q);
+                let r2 = this.p2_local.clone().applyQuaternion(this.b2.q);
+                let p1 = this.b1.x.clone().add(r1);
+                let p2 = this.b2.x.clone().add(r2);
+                let dir = p2.clone().sub(p1);
+                let dist = dir.length();
+                if (dist < 1e-6) return 0;
+                dir.normalize();
+                
+                let C = 0;
+                if (dist < this.min_dist) C = dist - this.min_dist;
+                else if (dist > this.max_dist) C = dist - this.max_dist;
+                else return 0;
+
+                this.violation = Math.abs(C);
+
+                let w1 = this.b1.invMass + r1.clone().cross(dir).applyMatrix3(this.b1.invI_world).dot(r1.clone().cross(dir));
+                let w2 = this.b2.invMass + r2.clone().cross(dir).applyMatrix3(this.b2.invI_world).dot(r2.clone().cross(dir));
+                let w = w1 + w2;
+                if (w < 1e-6) return 0;
+                let lambda = -C / w;
+                let p_impulse = dir.clone().multiplyScalar(lambda);
+
+                if (this.b1.invMass > 0) {
+                    this.b1.x.add(p_impulse.clone().multiplyScalar(this.b1.invMass));
+                    let dw1 = r1.clone().cross(p_impulse).applyMatrix3(this.b1.invI_world);
+                    let dq1 = new THREE.Quaternion(dw1.x, dw1.y, dw1.z, 0).multiply(this.b1.q);
+                    this.b1.q.set(this.b1.q.x + 0.5*dq1.x, this.b1.q.y + 0.5*dq1.y, this.b1.q.z + 0.5*dq1.z, this.b1.q.w + 0.5*dq1.w).normalize();
+                    this.b1.updateInvIWorld();
+                }
+                if (this.b2.invMass > 0) {
+                    this.b2.x.add(p_impulse.clone().multiplyScalar(-this.b2.invMass));
+                    let dw2 = r2.clone().cross(p_impulse.clone().negate()).applyMatrix3(this.b2.invI_world);
+                    let dq2 = new THREE.Quaternion(dw2.x, dw2.y, dw2.z, 0).multiply(this.b2.q);
+                    this.b2.q.set(this.b2.q.x + 0.5*dq2.x, this.b2.q.y + 0.5*dq2.y, this.b2.q.z + 0.5*dq2.z, this.b2.q.w + 0.5*dq2.w).normalize();
+                    this.b2.updateInvIWorld();
+                }
+                return this.violation;
+            }
+        }
+
+        // --- Global State ---
+        let scene, camera, renderer, controls;
+        let bodies = [], joints = [], limits = [];
+        let chainBodies = [], ragdollBodies = {};
+        let jointMeshes = [];
+        let simTime = 0;
+        const dt = 1/60;
+        const gravity = new THREE.Vector3(0, -9.8, 0);
+        let maxConstraintViolation = 0;
+        let avgConstraintViolation = 0;
+
+        // --- Initialization ---
+        function init() {
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x222222);
+            scene.fog = new THREE.Fog(0x222222, 10, 50);
+
+            camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+            camera.position.set(0, 5, 15);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.shadowMap.enabled = true;
+            document.getElementById('canvas-container').appendChild(renderer.domElement);
+
+            controls = new OrbitControls(camera, renderer.domElement);
+            controls.target.set(0, 4, 0);
+            controls.update();
+
+            const ambientLight = new THREE.AmbientLight(0x404040, 2);
+            scene.add(ambientLight);
+            const dirLight = new THREE.DirectionalLight(0xffffff, 2);
+            dirLight.position.set(5, 10, 5);
+            dirLight.castShadow = true;
+            dirLight.shadow.camera.top = 10; dirLight.shadow.camera.bottom = -10;
+            dirLight.shadow.camera.left = -10; dirLight.shadow.camera.right = 10;
+            scene.add(dirLight);
+
+            const grid = new THREE.GridHelper(20, 20, 0x555555, 0x333333);
+            scene.add(grid);
+
+            window.addEventListener('resize', onWindowResize);
+            
+            setupInteraction();
+            resetScene();
+            animate();
+        }
+
+        function createVisualMesh(body, color) {
+            let geometry;
+            if (body.type === 'box') geometry = new THREE.BoxGeometry(...body.size);
+            else if (body.type === 'sphere') geometry = new THREE.SphereGeometry(body.size[0], 16, 16);
+            else if (body.type === 'cylinder') geometry = new THREE.CylinderGeometry(body.size[0], body.size[0], body.size[1], 16);
+            
+            const material = new THREE.MeshStandardMaterial({ color: color, roughness: 0.4, metalness: 0.1 });
+            const mesh = new THREE.Mesh(geometry, material);
+            mesh.castShadow = true; mesh.receiveShadow = true;
+            scene.add(mesh);
+            body.mesh = mesh;
+            return mesh;
+        }
+
+        function addJointVisual(pos) {
+            const mesh = new THREE.Mesh(new THREE.SphereGeometry(0.04, 8, 8), new THREE.MeshBasicMaterial({color: 0xff0000}));
+            mesh.position.copy(pos);
+            scene.add(mesh);
+            jointMeshes.push(mesh);
+            return mesh;
+        }
+
+        function resetScene() {
+            bodies.forEach(b => scene.remove(b.mesh));
+            jointMeshes.forEach(m => scene.remove(m));
+            bodies = []; joints = []; limits = []; chainBodies = []; ragdollBodies = {}; jointMeshes = [];
+            simTime = 0;
+
+            // --- Scene 1: Chain ---
+            const chainStart = new THREE.Vector3(-3, 8, 0);
+            const linkH = 0.5, linkR = 0.1, linkMass = 0.5;
+            let prevBody = null;
+            for (let i = 0; i < 20; i++) {
+                let isFixed = (i === 0);
+                let b = new RigidBody(isFixed ? 0 : linkMass, 'cylinder', [linkR, linkH]);
+                b.x.set(chainStart.x, chainStart.y - i * linkH, chainStart.z);
+                b.updateInvIWorld();
+                bodies.push(b);
+                chainBodies.push(b);
+                createVisualMesh(b, i % 2 === 0 ? 0xffd700 : 0xc0c0c0);
+
+                if (prevBody) {
+                    let r1 = new THREE.Vector3(0, -linkH/2, 0);
+                    let r2 = new THREE.Vector3(0, linkH/2, 0);
+                    joints.push(new BallJoint(prevBody, b, r1, r2));
+                    addJointVisual(b.x.clone().add(r2));
+                } else {
+                    addJointVisual(b.x.clone().add(new THREE.Vector3(0, linkH/2, 0)));
+                }
+                prevBody = b;
+            }
+
+            // --- Scene 2: Ragdoll ---
+            const rX = 3, rY = 6, rZ = 0;
+            const createPart = (name, m, type, size, pos, color) => {
+                let b = new RigidBody(m, type, size);
+                b.x.copy(pos); b.updateInvIWorld();
+                bodies.push(b); ragdollBodies[name] = b;
+                createVisualMesh(b, color);
+                return b;
+            };
+
+            const cSkin = 0xffccaa, cBlue = 0x3366ff, cGrey = 0x888888;
+            
+            let torso = createPart('torso', 10, 'box', [0.3, 0.5, 0.2], new THREE.Vector3(rX, rY, rZ), cBlue);
+            let head = createPart('head', 3, 'sphere', [0.15], new THREE.Vector3(rX, rY + 0.4, rZ), cSkin);
+            
+            let uArmL = createPart('uArmL', 2, 'cylinder', [0.06, 0.3], new THREE.Vector3(rX - 0.21, rY + 0.1, rZ), cGrey);
+            let lArmL = createPart('lArmL', 1.5, 'cylinder', [0.05, 0.3], new THREE.Vector3(rX - 0.21, rY - 0.2, rZ), cGrey);
+            let uArmR = createPart('uArmR', 2, 'cylinder', [0.06, 0.3], new THREE.Vector3(rX + 0.21, rY + 0.1, rZ), cGrey);
+            let lArmR = createPart('lArmR', 1.5, 'cylinder', [0.05, 0.3], new THREE.Vector3(rX + 0.21, rY - 0.2, rZ), cGrey);
+            
+            let uLegL = createPart('uLegL', 3, 'cylinder', [0.08, 0.4], new THREE.Vector3(rX - 0.1, rY - 0.45, rZ), cGrey);
+            let lLegL = createPart('lLegL', 2, 'cylinder', [0.06, 0.4], new THREE.Vector3(rX - 0.1, rY - 0.85, rZ), cGrey);
+            let uLegR = createPart('uLegR', 3, 'cylinder', [0.08, 0.4], new THREE.Vector3(rX + 0.1, rY - 0.45, rZ), cGrey);
+            let lLegR = createPart('lLegR', 2, 'cylinder', [0.06, 0.4], new THREE.Vector3(rX + 0.1, rY - 0.85, rZ), cGrey);
+
+            const addRagdollJoint = (b1, b2, p1, p2) => {
+                joints.push(new BallJoint(b1, b2, p1, p2));
+                addJointVisual(b1.x.clone().add(p1));
+            };
+
+            // Joints
+            addRagdollJoint(torso, head, new THREE.Vector3(0, 0.25, 0), new THREE.Vector3(0, -0.15, 0));
+            addRagdollJoint(torso, uArmL, new THREE.Vector3(-0.15, 0.25, 0), new THREE.Vector3(0, 0.15, 0));
+            addRagdollJoint(uArmL, lArmL, new THREE.Vector3(0, -0.15, 0), new THREE.Vector3(0, 0.15, 0));
+            addRagdollJoint(torso, uArmR, new THREE.Vector3(0.15, 0.25, 0), new THREE.Vector3(0, 0.15, 0));
+            addRagdollJoint(uArmR, lArmR, new THREE.Vector3(0, -0.15, 0), new THREE.Vector3(0, 0.15, 0));
+            addRagdollJoint(torso, uLegL, new THREE.Vector3(-0.1, -0.25, 0), new THREE.Vector3(0, 0.2, 0));
+            addRagdollJoint(uLegL, lLegL, new THREE.Vector3(0, -0.2, 0), new THREE.Vector3(0, 0.2, 0));
+            addRagdollJoint(torso, uLegR, new THREE.Vector3(0.1, -0.25, 0), new THREE.Vector3(0, 0.2, 0));
+            addRagdollJoint(uLegR, lLegR, new THREE.Vector3(0, -0.2, 0), new THREE.Vector3(0, 0.2, 0));
+
+            // Limits (Distance Constraints on auxiliary points)
+            const addLimit = (b1, b2, axis1, axis2, maxAngleDeg) => {
+                let maxD = 2 * Math.sin((maxAngleDeg / 2) * Math.PI / 180);
+                limits.push(new DistanceConstraint(b1, b2, axis1, axis2, 0, maxD));
+            };
+            const addHinge = (b1, b2, axisLock, axisLimit, maxAngleDeg) => {
+                limits.push(new DistanceConstraint(b1, b2, axisLock, axisLock, 0, 0)); // Lock twist
+                let maxD = Math.sqrt(2 - 2 * Math.cos(maxAngleDeg * Math.PI / 180));
+                limits.push(new DistanceConstraint(b1, b2, axisLimit, axisLimit, 0, maxD)); // Limit swing
+            };
+
+            addLimit(head, torso, new THREE.Vector3(0,1,0), new THREE.Vector3(0,1,0), 60); // ±30
+            addLimit(uArmL, torso, new THREE.Vector3(0,-1,0), new THREE.Vector3(0,-1,0), 180); // ±90
+            addLimit(uArmR, torso, new THREE.Vector3(0,-1,0), new THREE.Vector3(0,-1,0), 180);
+            addHinge(uArmL, lArmL, new THREE.Vector3(1,0,0), new THREE.Vector3(0,1,0), 150);
+            addHinge(uArmR, lArmR, new THREE.Vector3(1,0,0), new THREE.Vector3(0,1,0), 150);
+            addLimit(uLegL, torso, new THREE.Vector3(0,-1,0), new THREE.Vector3(0,-1,0), 120); // ±60
+            addLimit(uLegR, torso, new THREE.Vector3(0,-1,0), new THREE.Vector3(0,-1,0), 120);
+            addHinge(uLegL, lLegL, new THREE.Vector3(1,0,0), new THREE.Vector3(0,1,0), 150);
+            addHinge(uLegR, lLegR, new THREE.Vector3(1,0,0), new THREE.Vector3(0,1,0), 150);
+        }
+
+        function physicsStep() {
+            // 1. Predict
+            for (let b of bodies) {
+                if (b.invMass === 0) continue;
+                b.v.addScaledVector(gravity, dt);
+                b.x_prev.copy(b.x);
+                b.q_prev.copy(b.q);
+                b.x.addScaledVector(b.v, dt);
+                
+                let w_q = new THREE.Quaternion(b.w.x * dt * 0.5, b.w.y * dt * 0.5, b.w.z * dt * 0.5, 0);
+                w_q.multiply(b.q);
+                b.q.set(b.q.x + w_q.x, b.q.y + w_q.y, b.q.z + w_q.z, b.q.w + w_q.w).normalize();
+                b.updateInvIWorld();
+            }
+
+            // 2. Solve Constraints
+            maxConstraintViolation = 0;
+            let totalViolation = 0;
+            let constraintCount = joints.length + limits.length;
+
+            for (let iter = 0; iter < 20; iter++) {
+                let currentMaxV = 0;
+                let currentTotalV = 0;
+                
+                for (let j of joints) {
+                    let v = j.solve();
+                    if (iter === 19) { currentMaxV = Math.max(currentMaxV, v); currentTotalV += v; }
+                }
+                for (let l of limits) {
+                    let v = l.solve();
+                    if (iter === 19) { currentMaxV = Math.max(currentMaxV, v); currentTotalV += v; }
+                }
+
+                // Ground Collision (y >= 0)
+                let n = new THREE.Vector3(0, 1, 0);
+                for (let b of bodies) {
+                    if (b.invMass === 0) continue;
+                    for (let p_local of b.colPoints) {
+                        let r = p_local.clone().applyQuaternion(b.q);
+                        let p_world = b.x.clone().add(r);
+                        if (p_world.y < 0) {
+                            let C = p_world.y;
+                            let rxn = r.clone().cross(n);
+                            let w_rot = rxn.dot(rxn.clone().applyMatrix3(b.invI_world));
+                            let w = b.invMass + w_rot;
+                            if (w > 0) {
+                                let lambda = -C / w;
+                                b.x.add(n.clone().multiplyScalar(lambda * b.invMass));
+                                let dw = r.clone().cross(n.clone().multiplyScalar(lambda)).applyMatrix3(b.invI_world);
+                                let dq = new THREE.Quaternion(dw.x, dw.y, dw.z, 0).multiply(b.q);
+                                b.q.set(b.q.x + 0.5*dq.x, b.q.y + 0.5*dq.y, b.q.z + 0.5*dq.z, b.q.w + 0.5*dq.w).normalize();
+                                b.updateInvIWorld();
+                            }
+                        }
+                    }
+                }
+                if (iter === 19) {
+                    maxConstraintViolation = currentMaxV;
+                    avgConstraintViolation = constraintCount > 0 ? currentTotalV / constraintCount : 0;
+                }
+            }
+
+            // 3. Update Velocities & Restitution
+            for (let b of bodies) {
+                if (b.invMass === 0) continue;
+                b.v.subVectors(b.x, b.x_prev).divideScalar(dt);
+                let dq = b.q.clone().multiply(b.q_prev.clone().invert());
+                b.w.set(dq.x, dq.y, dq.z).multiplyScalar(2 / dt);
+                if (dq.w < 0) b.w.negate();
+
+                // Simple ground friction/restitution
+                let hitGround = false;
+                for (let p_local of b.colPoints) {
+                    let r = p_local.clone().applyQuaternion(b.q);
+                    if (b.x.y + r.y < 0.02) hitGround = true;
+                }
+                if (hitGround) {
+                    if (b.v.y < 0) b.v.y *= -0.2; // Restitution
+                    b.v.x *= 0.9; b.v.z *= 0.9; // Friction
+                    b.w.multiplyScalar(0.9);
+                }
+            }
+            simTime += dt;
+        }
+
+        function updateVisuals() {
+            for (let b of bodies) {
+                if (b.mesh) {
+                    b.mesh.position.copy(b.x);
+                    b.mesh.quaternion.copy(b.q);
+                }
+            }
+            for (let i = 0; i < joints.length; i++) {
+                let j = joints[i];
+                jointMeshes[i].position.copy(j.b1.x.clone().add(j.r1_local.clone().applyQuaternion(j.b1.q)));
+            }
+        }
+
+        function updateHUD() {
+            document.getElementById('simTime').innerText = simTime.toFixed(2);
+            document.getElementById('chainTipY').innerText = chainBodies[19].x.y.toFixed(2);
+            document.getElementById('torsoY').innerText = ragdollBodies.torso.x.y.toFixed(2);
+            document.getElementById('maxViolation').innerText = maxConstraintViolation.toFixed(4);
+        }
+
+        function updateStateExposure() {
+            let totalEnergy = 0;
+            let chainState = [];
+            for (let b of bodies) {
+                if (b.invMass > 0) {
+                    let v2 = b.v.lengthSq();
+                    let I_world = b.invI_world.clone().invert();
+                    let Iw = b.w.clone().applyMatrix3(I_world);
+                    totalEnergy += 0.5 * b.mass * v2 + 0.5 * b.w.dot(Iw) + b.mass * 9.8 * b.x.y;
+                }
+            }
+            for (let b of chainBodies) {
+                chainState.push({x: b.x.x, y: b.x.y, z: b.x.z, vx: b.v.x, vy: b.v.y, vz: b.v.z});
+            }
+            let limbs = [];
+            ['uArmL','lArmL','uArmR','lArmR','uLegL','lLegL','uLegR','lLegR'].forEach(k => limbs.push({...ragdollBodies[k].x}));
+
+            window.__3D_STATE__ = {
+                simTime: simTime,
+                chain: chainState,
+                chainTipY: chainBodies[19].x.y,
+                ragdoll: {
+                    head: {...ragdollBodies.head.x},
+                    torso: {...ragdollBodies.torso.x},
+                    limbs: limbs
+                },
+                torsoY: ragdollBodies.torso.x.y,
+                maxConstraintViolation: maxConstraintViolation,
+                avgConstraintViolation: avgConstraintViolation,
+                totalEnergy: totalEnergy
+            };
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            physicsStep();
+            updateVisuals();
+            updateHUD();
+            updateStateExposure();
+            renderer.render(scene, camera);
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        function setupInteraction() {
+            const raycaster = new THREE.Raycaster();
+            const mouse = new THREE.Vector2();
+
+            window.addEventListener('pointerdown', (e) => {
+                if(e.target.tagName === 'BUTTON') return;
+                mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
+                mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+                raycaster.setFromCamera(mouse, camera);
+                
+                let intersects = raycaster.intersectObjects(bodies.map(b => b.mesh));
+                if (intersects.length > 0) {
+                    let mesh = intersects[0].object;
+                    let body = bodies.find(b => b.mesh === mesh);
+                    if (body) {
+                        if (chainBodies.includes(body)) kickChain();
+                        else kickRagdoll();
+                    }
+                }
+            });
+
+            document.getElementById('resetBtn').addEventListener('click', resetScene);
+            document.getElementById('kickChainBtn').addEventListener('click', kickChain);
+            document.getElementById('kickRagdollBtn').addEventListener('click', kickRagdoll);
+        }
+
+        function kickChain() {
+            let tip = chainBodies[19];
+            tip.applyImpulse(new THREE.Vector3(50, 0, 0));
+        }
+
+        function kickRagdoll() {
+            let parts = Object.values(ragdollBodies);
+            let target = parts[Math.floor(Math.random() * parts.length)];
+            let dir = new THREE.Vector3(Math.random()-0.5, Math.random()*0.5, Math.random()-0.5).normalize();
+            target.applyImpulse(dir.multiplyScalar(100));
+        }
+
+        init();
+    </script>
+</body>
+</html>

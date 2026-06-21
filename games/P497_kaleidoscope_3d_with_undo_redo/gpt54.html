@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>3D Kaleidoscope with Undo/Redo</title>
+  <style>
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #000;
+      font-family: Arial, Helvetica, sans-serif;
+    }
+
+    canvas {
+      display: block;
+    }
+
+    #hud {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      z-index: 10;
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      padding: 12px;
+      background: rgba(20, 20, 20, 0.72);
+      border: 1px solid rgba(255,255,255,0.12);
+      border-radius: 12px;
+      backdrop-filter: blur(4px);
+    }
+
+    #hud button {
+      border: none;
+      border-radius: 8px;
+      padding: 10px 14px;
+      color: #fff;
+      font-size: 14px;
+      cursor: pointer;
+      transition: transform 0.08s ease, opacity 0.2s ease, filter 0.2s ease;
+    }
+
+    #hud button:hover:not(:disabled) {
+      filter: brightness(1.08);
+    }
+
+    #hud button:active:not(:disabled) {
+      transform: scale(0.97);
+    }
+
+    #hud button:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
+
+    #addShapeBtn { background: #1e88e5; }
+    #undoBtn     { background: #8e24aa; }
+    #redoBtn     { background: #43a047; }
+    #clearBtn    { background: #e53935; }
+  </style>
+</head>
+<body>
+  <div id="hud">
+    <button id="addShapeBtn">Add Shape</button>
+    <button id="undoBtn" disabled>Undo</button>
+    <button id="redoBtn" disabled>Redo</button>
+    <button id="clearBtn">Clear All</button>
+  </div>
+
+  <script type="module">
+    import * as THREE from "https://unpkg.com/three@0.160.0/build/three.module.js";
+
+    // Renderer
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setClearColor(0x000000);
+    document.body.appendChild(renderer.domElement);
+
+    // Scene
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x000000);
+
+    // Camera
+    const camera = new THREE.PerspectiveCamera(
+      60,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      100
+    );
+    camera.position.set(0, 0, 8);
+    camera.lookAt(0, 0, 0);
+
+    // Lights
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+    scene.add(ambientLight);
+
+    const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
+    directionalLight.position.set(5, 5, 5);
+    scene.add(directionalLight);
+
+    // Main kaleidoscope group
+    const kaleidoscopeGroup = new THREE.Group();
+    scene.add(kaleidoscopeGroup);
+
+    // UI
+    const addShapeBtn = document.getElementById("addShapeBtn");
+    const undoBtn = document.getElementById("undoBtn");
+    const redoBtn = document.getElementById("redoBtn");
+    const clearBtn = document.getElementById("clearBtn");
+
+    // Bright palette
+    const palette = [
+      0xff1744, // pink-red
+      0xff9100, // orange
+      0xffea00, // yellow
+      0x00e676, // green
+      0x00e5ff, // cyan
+      0x2979ff, // blue
+      0xd500f9, // magenta
+      0xffffff  // white
+    ];
+
+    // Base geometries reused
+    const geometryFactories = [
+      (s) => new THREE.BoxGeometry(s, s, s),
+      (s) => new THREE.SphereGeometry(s * 0.55, 20, 16),
+      (s) => new THREE.ConeGeometry(s * 0.55, s * 1.2, 20)
+    ];
+
+    // State
+    const seedShapes = [];
+    const historyStack = [];
+    const redoStack = [];
+    let animationRunning = true;
+
+    // Exposed state
+    window.__3D_STATE__ = {
+      seedCount: 0,
+      totalMeshCount: 0,
+      historyLength: 0,
+      redoLength: 0,
+      undoBtnDisabled: true,
+      redoBtnDisabled: true,
+      rotationAngle: 0,
+      isAnimating: true
+    };
+
+    function randomFrom(arr) {
+      return arr[Math.floor(Math.random() * arr.length)];
+    }
+
+    function randomSeedData() {
+      const size = THREE.MathUtils.randFloat(0.3, 0.5);
+      const geometryIndex = Math.floor(Math.random() * geometryFactories.length);
+      const color = randomFrom(palette);
+
+      const angle = Math.random() * Math.PI * 2;
+      const radius = Math.random() * 2.0;
+      const x = Math.cos(angle) * radius;
+      const y = Math.sin(angle) * radius;
+      const z = 0;
+
+      const rotX = Math.random() * Math.PI * 2;
+      const rotY = Math.random() * Math.PI * 2;
+      const rotZ = Math.random() * Math.PI * 2;
+
+      return {
+        size,
+        geometryIndex,
+        color,
+        position: { x, y, z },
+        rotation: { x: rotX, y: rotY, z: rotZ }
+      };
+    }
+
+    function buildSeedGroupFromData(data) {
+      const group = new THREE.Group();
+
+      const geometry = geometryFactories[data.geometryIndex](data.size);
+      const material = new THREE.MeshStandardMaterial({
+        color: data.color,
+        roughness: 0.35,
+        metalness: 0.15
+      });
+
+      for (let i = 0; i < 6; i++) {
+        const mesh = new THREE.Mesh(geometry, material);
+        const segmentAngle = i * (Math.PI / 3);
+
+        const px = data.position.x;
+        const py = data.position.y;
+
+        const rx = px * Math.cos(segmentAngle) - py * Math.sin(segmentAngle);
+        const ry = px * Math.sin(segmentAngle) + py * Math.cos(segmentAngle);
+
+        mesh.position.set(rx, ry, data.position.z);
+
+        mesh.rotation.set(
+          data.rotation.x,
+          data.rotation.y,
+          data.rotation.z + segmentAngle
+        );
+
+        if (i % 2 === 1) {
+          mesh.scale.x *= -1; // mirrored clone effect
+        }
+
+        group.add(mesh);
+      }
+
+      group.userData.seedData = data;
+      return group;
+    }
+
+    function addSeedShape(data = randomSeedData(), recordHistory = true) {
+      const group = buildSeedGroupFromData(data);
+      kaleidoscopeGroup.add(group);
+      seedShapes.push(group);
+
+      if (recordHistory) {
+        historyStack.push(data);
+        redoStack.length = 0;
+      }
+
+      updateButtons();
+      updateState();
+    }
+
+    function removeLastSeedShape(pushToRedo = true) {
+      if (seedShapes.length === 0) return;
+
+      const group = seedShapes.pop();
+      kaleidoscopeGroup.remove(group);
+
+      disposeGroup(group);
+
+      if (historyStack.length > 0) {
+        const data = historyStack.pop();
+        if (pushToRedo) {
+          redoStack.push(data);
+        }
+      }
+
+      updateButtons();
+      updateState();
+    }
+
+    function redoLastShape() {
+      if (redoStack.length === 0) return;
+      const data = redoStack.pop();
+      const group = buildSeedGroupFromData(data);
+      kaleidoscopeGroup.add(group);
+      seedShapes.push(group);
+      historyStack.push(data);
+
+      updateButtons();
+      updateState();
+    }
+
+    function clearAll() {
+      while (seedShapes.length > 0) {
+        const group = seedShapes.pop();
+        kaleidoscopeGroup.remove(group);
+        disposeGroup(group);
+      }
+
+      historyStack.length = 0;
+      redoStack.length = 0;
+
+      updateButtons();
+      updateState();
+    }
+
+    function disposeGroup(group) {
+      group.traverse((obj) => {
+        if (obj.isMesh) {
+          if (obj.geometry) obj.geometry.dispose();
+          if (obj.material) {
+            if (Array.isArray(obj.material)) {
+              obj.material.forEach((m) => m.dispose());
+            } else {
+              obj.material.dispose();
+            }
+          }
+        }
+      });
+    }
+
+    function updateButtons() {
+      undoBtn.disabled = historyStack.length === 0;
+      redoBtn.disabled = redoStack.length === 0;
+    }
+
+    function updateState() {
+      window.__3D_STATE__.seedCount = seedShapes.length;
+      window.__3D_STATE__.totalMeshCount = seedShapes.length * 6;
+      window.__3D_STATE__.historyLength = historyStack.length;
+      window.__3D_STATE__.redoLength = redoStack.length;
+      window.__3D_STATE__.undoBtnDisabled = undoBtn.disabled;
+      window.__3D_STATE__.redoBtnDisabled = redoBtn.disabled;
+      window.__3D_STATE__.rotationAngle = kaleidoscopeGroup.rotation.z;
+      window.__3D_STATE__.isAnimating = animationRunning;
+    }
+
+    // Button events
+    addShapeBtn.addEventListener("click", () => {
+      addSeedShape();
+    });
+
+    undoBtn.addEventListener("click", () => {
+      removeLastSeedShape(true);
+    });
+
+    redoBtn.addEventListener("click", () => {
+      redoLastShape();
+    });
+
+    clearBtn.addEventListener("click", () => {
+      clearAll();
+    });
+
+    // Resize
+    window.addEventListener("resize", () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    // Animation
+    const clock = new THREE.Clock();
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      const delta = clock.getDelta();
+      kaleidoscopeGroup.rotation.z += 0.3 * delta;
+
+      renderer.render(scene, camera);
+      updateState();
+    }
+
+    updateButtons();
+    updateState();
+    animate();
+  </script>
+</body>
+</html>

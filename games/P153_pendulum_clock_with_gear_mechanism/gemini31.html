@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Pendulum Clock Simulation</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #1a1a2e;
+            font-family: monospace;
+            color: white;
+            user-select: none;
+        }
+        #container {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+        }
+        #ui-container {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(0, 0, 0, 0.6);
+            padding: 15px;
+            border-radius: 8px;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            z-index: 10;
+        }
+        #hud {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            background: rgba(0, 0, 0, 0.6);
+            padding: 15px;
+            border-radius: 8px;
+            z-index: 10;
+            min-width: 200px;
+            line-height: 1.5;
+        }
+        button {
+            background: #333;
+            color: white;
+            border: 1px solid #555;
+            padding: 8px 12px;
+            cursor: pointer;
+            border-radius: 4px;
+            font-family: inherit;
+        }
+        button:hover {
+            background: #444;
+        }
+        .slider-container {
+            display: flex;
+            flex-direction: column;
+            gap: 5px;
+        }
+        input[type=range] {
+            width: 100%;
+        }
+    </style>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="ui-container">
+        <button id="toggleBtn">Start</button>
+        <button id="dampingBtn">Damping: OFF</button>
+        <button id="resetBtn">Reset</button>
+        <div class="slider-container">
+            <label for="speedSlider">Speed: <span id="speedVal">6</span>x</label>
+            <input type="range" id="speedSlider" min="1" max="20" value="6">
+        </div>
+        <div style="font-size: 12px; color: #aaa; margin-top: 5px;">
+            Press 'g' to toggle gears<br>
+            Click bob to push
+        </div>
+    </div>
+    <div id="hud"></div>
+    <div id="container"></div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+        // State Management
+        window.__3D_STATE__ = {
+            running: false,
+            dampingEnabled: false,
+            pendulumAngle: 0,
+            pendulumAmplitude: 0.4,
+            pendulumOmega: Math.sqrt(9.81 / 1.5),
+            swingCount: 0,
+            gear1Rotation: 0,
+            gear2Rotation: 0,
+            gear3Rotation: 0,
+            minuteHandAngle: 0,
+            hourHandAngle: 0,
+            simulationSpeed: 6,
+            gearsVisible: true,
+            assetLoaded: false,
+            elapsedTime: 0,
+            pendulumEnergy: 0
+        };
+        const state = window.__3D_STATE__;
+
+        let simTime = 0;
+        let phase = 0;
+
+        // Scene Setup
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x1a1a2e);
+
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+        camera.position.set(0, 3, 8);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        document.getElementById('container').appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.target.set(0, 2, 0);
+        controls.update();
+
+        // Lights
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+        dirLight.position.set(5, 10, 5);
+        dirLight.castShadow = true;
+        dirLight.shadow.camera.top = 5;
+        dirLight.shadow.camera.bottom = -5;
+        dirLight.shadow.camera.left = -5;
+        dirLight.shadow.camera.right = 5;
+        scene.add(dirLight);
+
+        // Ground
+        const canvas = document.createElement('canvas');
+        canvas.width = 512; canvas.height = 512;
+        const ctx = canvas.getContext('2d');
+        ctx.fillStyle = '#4a3018';
+        ctx.fillRect(0, 0, 512, 512);
+        for (let i = 0; i < 200; i++) {
+            ctx.fillStyle = `rgba(0,0,0,${Math.random() * 0.15})`;
+            ctx.fillRect(0, Math.random() * 512, 512, Math.random() * 10);
+        }
+        const woodTex = new THREE.CanvasTexture(canvas);
+        woodTex.wrapS = THREE.RepeatWrapping;
+        woodTex.wrapT = THREE.RepeatWrapping;
+        woodTex.repeat.set(4, 4);
+
+        const groundGeo = new THREE.PlaneGeometry(20, 20);
+        const groundMat = new THREE.MeshStandardMaterial({ map: woodTex, roughness: 0.8 });
+        const ground = new THREE.Mesh(groundGeo, groundMat);
+        ground.rotation.x = -Math.PI / 2;
+        ground.receiveShadow = true;
+        scene.add(ground);
+
+        // Clock Structure
+        const clockGroup = new THREE.Group();
+        scene.add(clockGroup);
+
+        const bodyMat = new THREE.MeshStandardMaterial({ color: 0x3e2723, roughness: 0.7 });
+        const bodyGeo = new THREE.BoxGeometry(1.2, 4, 0.4);
+        const body = new THREE.Mesh(bodyGeo, bodyMat);
+        body.position.set(0, 2, -0.1);
+        body.castShadow = true;
+        body.receiveShadow = true;
+        clockGroup.add(body);
+
+        const glassGeo = new THREE.BoxGeometry(1.2, 4, 0.2);
+        const glassMat = new THREE.MeshStandardMaterial({ color: 0xffffff, transparent: true, opacity: 0.1, roughness: 0.1, metalness: 0.9 });
+        const glass = new THREE.Mesh(glassGeo, glassMat);
+        glass.position.set(0, 2, 0.2);
+        clockGroup.add(glass);
+
+        // Clock Face
+        const faceGeo = new THREE.CircleGeometry(0.45, 32);
+        const faceMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.5 });
+        const face = new THREE.Mesh(faceGeo, faceMat);
+        face.position.set(0, 3.2, 0.31);
+        clockGroup.add(face);
+
+        const markerGeo = new THREE.CylinderGeometry(0.01, 0.01, 0.05);
+        const markerMat = new THREE.MeshStandardMaterial({ color: 0x000000 });
+        for (let i = 0; i < 12; i++) {
+            const marker = new THREE.Mesh(markerGeo, markerMat);
+            const angle = (i / 12) * Math.PI * 2;
+            marker.position.set(Math.sin(angle) * 0.38, 3.2 + Math.cos(angle) * 0.38, 0.32);
+            marker.rotation.x = Math.PI / 2;
+            marker.rotation.z = -angle;
+            clockGroup.add(marker);
+        }
+
+        // Hands
+        const minuteHandPivot = new THREE.Group();
+        minuteHandPivot.position.set(0, 3.2, 0.33);
+        const minuteHandGeo = new THREE.BoxGeometry(0.02, 0.35, 0.01);
+        const minuteHand = new THREE.Mesh(minuteHandGeo, markerMat);
+        minuteHand.position.y = 0.175;
+        minuteHandPivot.add(minuteHand);
+        clockGroup.add(minuteHandPivot);
+
+        const hourHandPivot = new THREE.Group();
+        hourHandPivot.position.set(0, 3.2, 0.34);
+        const hourHandGeo = new THREE.BoxGeometry(0.03, 0.25, 0.01);
+        const hourHand = new THREE.Mesh(hourHandGeo, markerMat);
+        hourHand.position.y = 0.125;
+        hourHandPivot.add(hourHand);
+        clockGroup.add(hourHandPivot);
+
+        // Pendulum
+        const pendulumPivot = new THREE.Group();
+        pendulumPivot.position.set(0, 1.8, 0.15);
+        clockGroup.add(pendulumPivot);
+
+        const rodGeo = new THREE.CylinderGeometry(0.01, 0.01, 1.5);
+        const rodMat = new THREE.MeshStandardMaterial({ color: 0xaaaaaa, metalness: 0.8 });
+        const rod = new THREE.Mesh(rodGeo, rodMat);
+        rod.position.y = -0.75;
+        rod.castShadow = true;
+        pendulumPivot.add(rod);
+
+        const bobGeo = new THREE.SphereGeometry(0.12, 32, 32);
+        const bobMat = new THREE.MeshStandardMaterial({ color: 0xffd700, metalness: 0.6, roughness: 0.2 });
+        const bob = new THREE.Mesh(bobGeo, bobMat);
+        bob.position.y = -1.5;
+        bob.castShadow = true;
+        pendulumPivot.add(bob);
+
+        // Gears
+        const gearsGroup = new THREE.Group();
+        clockGroup.add(gearsGroup);
+
+        function createGear(teeth, radius) {
+            const group = new THREE.Group();
+            const mat = new THREE.MeshStandardMaterial({ color: 0x888888, metalness: 0.7, roughness: 0.3 });
+            
+            const bodyGeo = new THREE.CylinderGeometry(radius - 0.04, radius - 0.04, 0.04, 32);
+            const body = new THREE.Mesh(bodyGeo, mat);
+            body.rotation.x = Math.PI / 2;
+            group.add(body);
+
+            const toothGeo = new THREE.BoxGeometry(0.03, 0.08, 0.04);
+            for (let i = 0; i < teeth; i++) {
+                const angle = (i / teeth) * Math.PI * 2;
+                const tooth = new THREE.Mesh(toothGeo, mat);
+                tooth.position.set(Math.cos(angle) * radius, Math.sin(angle) * radius, 0);
+                tooth.rotation.z = angle;
+                group.add(tooth);
+            }
+            return group;
+        }
+
+        const gear1 = createGear(20, 0.3);
+        gear1.position.set(0, 2.5, 0.15);
+        gearsGroup.add(gear1);
+
+        const gear2 = createGear(12, 0.18);
+        gear2.position.set(0.42, 2.731, 0.15);
+        gearsGroup.add(gear2);
+
+        const gear3 = createGear(30, 0.45);
+        gear3.position.set(0, 3.2, 0.15);
+        gearsGroup.add(gear3);
+
+        // Shelf & Asset
+        const shelfGeo = new THREE.BoxGeometry(1, 0.05, 0.5);
+        const shelf = new THREE.Mesh(shelfGeo, bodyMat);
+        shelf.position.set(2.5, 0.95, 0);
+        shelf.castShadow = true;
+        shelf.receiveShadow = true;
+        scene.add(shelf);
+
+        const loader = new GLTFLoader();
+        loader.load('coffeemat.glb', (gltf) => {
+            const model = gltf.scene;
+            model.position.set(2.5, 1.0, 0);
+            model.scale.set(0.5, 0.5, 0.5);
+            model.traverse((child) => {
+                if (child.isMesh) {
+                    child.castShadow = true;
+                    child.receiveShadow = true;
+                }
+            });
+            scene.add(model);
+            state.assetLoaded = true;
+        }, undefined, (error) => {
+            console.warn('Could not load coffeemat.glb. Continuing without it.', error);
+        });
+
+        // UI Interactions
+        const toggleBtn = document.getElementById('toggleBtn');
+        toggleBtn.addEventListener('click', () => {
+            state.running = !state.running;
+            toggleBtn.textContent = state.running ? 'Stop' : 'Start';
+        });
+
+        const dampingBtn = document.getElementById('dampingBtn');
+        dampingBtn.addEventListener('click', () => {
+            state.dampingEnabled = !state.dampingEnabled;
+            dampingBtn.textContent = `Damping: ${state.dampingEnabled ? 'ON' : 'OFF'}`;
+        });
+
+        const speedSlider = document.getElementById('speedSlider');
+        const speedVal = document.getElementById('speedVal');
+        speedSlider.addEventListener('input', (e) => {
+            state.simulationSpeed = parseFloat(e.target.value);
+            speedVal.textContent = state.simulationSpeed;
+        });
+
+        document.getElementById('resetBtn').addEventListener('click', () => {
+            state.pendulumAmplitude = 0.4;
+            phase = 0;
+            simTime = 0;
+            state.swingCount = 0;
+            state.gear1Rotation = 0;
+            state.gear2Rotation = 0;
+            state.gear3Rotation = 0;
+            state.minuteHandAngle = 0;
+            state.hourHandAngle = 0;
+            state.elapsedTime = 0;
+            pendulumPivot.rotation.z = state.pendulumAmplitude;
+            gear1.rotation.z = 0;
+            gear2.rotation.z = 0;
+            gear3.rotation.z = 0;
+            minuteHandPivot.rotation.z = 0;
+            hourHandPivot.rotation.z = 0;
+        });
+
+        window.addEventListener('keydown', (e) => {
+            if (e.key === 'g' || e.key === 'G') {
+                state.gearsVisible = !state.gearsVisible;
+                gearsGroup.visible = state.gearsVisible;
+            }
+        });
+
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+        window.addEventListener('pointerdown', (e) => {
+            if (e.target.tagName === 'BUTTON' || e.target.tagName === 'INPUT') return;
+            mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+            raycaster.setFromCamera(mouse, camera);
+            const intersects = raycaster.intersectObject(bob);
+            if (intersects.length > 0) {
+                state.pendulumAmplitude = Math.min(0.8, state.pendulumAmplitude + 0.1);
+            }
+        });
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // Animation Loop
+        const clock = new THREE.Clock();
+        const hud = document.getElementById('hud');
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const dt = clock.getDelta();
+            
+            if (state.running) {
+                const simDt = dt * state.simulationSpeed;
+                state.elapsedTime += simDt;
+                simTime += simDt;
+
+                if (state.dampingEnabled) {
+                    state.pendulumAmplitude *= (1 - 0.005 * simDt);
+                    if (state.pendulumAmplitude < 0.0001) state.pendulumAmplitude = 0;
+                }
+
+                phase += state.pendulumOmega * simDt;
+                state.pendulumAngle = state.pendulumAmplitude * Math.cos(phase);
+                pendulumPivot.rotation.z = state.pendulumAngle;
+
+                state.swingCount = Math.floor(phase / Math.PI);
+
+                state.gear1Rotation = (phase / Math.PI) * (Math.PI / 10);
+                state.gear2Rotation = -state.gear1Rotation * (20 / 12);
+                state.gear3Rotation = -state.gear2Rotation * (12 / 30);
+
+                gear1.rotation.z = state.gear1Rotation;
+                gear2.rotation.z = state.gear2Rotation;
+                gear3.rotation.z = state.gear3Rotation;
+
+                state.minuteHandAngle = -simTime * (2 * Math.PI / 60);
+                state.hourHandAngle = state.minuteHandAngle / 12;
+
+                minuteHandPivot.rotation.z = state.minuteHandAngle;
+                hourHandPivot.rotation.z = state.hourHandAngle;
+            }
+
+            state.pendulumEnergy = 0.5 * 1.5 * 9.81 * state.pendulumAmplitude * state.pendulumAmplitude;
+
+            hud.innerHTML = `
+                Pendulum Angle: ${(state.pendulumAngle * 180 / Math.PI).toFixed(2)}&deg;<br>
+                Amplitude: ${state.pendulumAmplitude.toFixed(3)} rad<br>
+                Swing Count: ${state.swingCount}<br>
+                Gear 1 Rotation: ${(state.gear1Rotation * 180 / Math.PI).toFixed(2)}&deg;<br>
+                Sim Speed: ${state.simulationSpeed}x
+            `;
+
+            controls.update();
+            renderer.render(scene, camera);
+        }
+
+        // Initial setup
+        pendulumPivot.rotation.z = state.pendulumAmplitude;
+        animate();
+    </script>
+</body>
+</html>

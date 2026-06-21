@@ -1,0 +1,649 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3D Whack-a-Mole</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { overflow: hidden; font-family: Arial, sans-serif; }
+canvas { display: block; }
+#hud {
+    position: absolute;
+    top: 10px;
+    left: 10px;
+    color: white;
+    font-size: 20px;
+    font-weight: bold;
+    text-shadow: 2px 2px 4px rgba(0,0,0,0.7);
+    z-index: 10;
+    pointer-events: none;
+}
+#startButton {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    padding: 20px 40px;
+    font-size: 24px;
+    font-weight: bold;
+    background: #ff6600;
+    color: white;
+    border: none;
+    border-radius: 10px;
+    cursor: pointer;
+    z-index: 20;
+    box-shadow: 0 4px 8px rgba(0,0,0,0.3);
+}
+#startButton:hover {
+    background: #ff8833;
+}
+#gameOverOverlay {
+    display: none;
+    position: absolute;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background: rgba(0,0,0,0.7);
+    z-index: 30;
+    justify-content: center;
+    align-items: center;
+    flex-direction: column;
+}
+#gameOverOverlay.show {
+    display: flex;
+}
+#gameOverOverlay h1 {
+    color: white;
+    font-size: 48px;
+    margin-bottom: 20px;
+}
+#gameOverOverlay p {
+    color: white;
+    font-size: 24px;
+    margin-bottom: 10px;
+}
+#gameOverOverlay button {
+    padding: 15px 30px;
+    font-size: 20px;
+    font-weight: bold;
+    background: #ff6600;
+    color: white;
+    border: none;
+    border-radius: 10px;
+    cursor: pointer;
+    margin-top: 20px;
+}
+</style>
+</head>
+<body>
+<div id="hud">Score: 0 | Time: 30s | Combo: x0</div>
+<button id="startButton">Start Game</button>
+<div id="gameOverOverlay">
+    <h1>Game Over!</h1>
+    <p id="finalScore">Score: 0</p>
+    <p id="finalStats"></p>
+    <button id="restartButton">Play Again</button>
+</div>
+
+<script type="importmap">
+{
+    "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+    }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+// --- State ---
+const state = {
+    phase: 'waiting',
+    score: 0,
+    timeLeft: 30,
+    molesWhacked: 0,
+    misses: 0,
+    currentCombo: 0,
+    maxCombo: 0,
+    activeMoles: 0,
+    totalPops: 0,
+    molePositions: Array.from({length: 9}, () => ({x: 0, y: -1.5, z: 0})),
+    particlesActive: 0,
+    gameStarted: false,
+    modelLoaded: false
+};
+window.__3D_STATE__ = state;
+
+// --- DOM ---
+const hud = document.getElementById('hud');
+const startButton = document.getElementById('startButton');
+const gameOverOverlay = document.getElementById('gameOverOverlay');
+const finalScore = document.getElementById('finalScore');
+const finalStats = document.getElementById('finalStats');
+const restartButton = document.getElementById('restartButton');
+
+// --- Three.js Setup ---
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x87ceeb);
+scene.fog = new THREE.Fog(0x87ceeb, 15, 30);
+
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+camera.position.set(0, 8, 10);
+camera.lookAt(0, 0, 0);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+
+// Lights
+const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
+scene.add(ambientLight);
+
+const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+dirLight.position.set(5, 10, 5);
+dirLight.castShadow = true;
+dirLight.shadow.mapSize.width = 2048;
+dirLight.shadow.mapSize.height = 2048;
+dirLight.shadow.camera.near = 0.5;
+dirLight.shadow.camera.far = 50;
+dirLight.shadow.camera.left = -10;
+dirLight.shadow.camera.right = 10;
+dirLight.shadow.camera.top = 10;
+dirLight.shadow.camera.bottom = -10;
+scene.add(dirLight);
+
+// Ground
+const groundGeo = new THREE.PlaneGeometry(20, 20);
+const groundMat = new THREE.MeshStandardMaterial({ color: 0x4caf50 });
+const ground = new THREE.Mesh(groundGeo, groundMat);
+ground.rotation.x = -Math.PI / 2;
+ground.position.y = 0;
+ground.receiveShadow = true;
+scene.add(ground);
+
+// Hole positions
+const holePositions = [];
+const spacing = 2.5;
+const offsets = [-2.5, 0, 2.5];
+for (let row = 0; row < 3; row++) {
+    for (let col = 0; col < 3; col++) {
+        holePositions.push({ x: offsets[col], z: offsets[row] });
+    }
+}
+
+// Create holes
+const holeMeshes = [];
+const holeGeo = new THREE.CylinderGeometry(0.6, 0.6, 0.15, 32);
+const holeMat = new THREE.MeshStandardMaterial({ color: 0x5d4037 });
+for (let i = 0; i < 9; i++) {
+    const hole = new THREE.Mesh(holeGeo, holeMat);
+    hole.position.set(holePositions[i].x, 0.075, holePositions[i].z);
+    hole.receiveShadow = true;
+    scene.add(hole);
+    holeMeshes.push(hole);
+
+    // Dark inner circle
+    const innerGeo = new THREE.CircleGeometry(0.55, 32);
+    const innerMat = new THREE.MeshStandardMaterial({ color: 0x1a1a1a });
+    const inner = new THREE.Mesh(innerGeo, innerMat);
+    inner.rotation.x = -Math.PI / 2;
+    inner.position.set(holePositions[i].x, 0.16, holePositions[i].z);
+    scene.add(inner);
+}
+
+// --- Mole Data ---
+const moles = [];
+let moleTemplate = null;
+
+// Mole state per hole
+for (let i = 0; i < 9; i++) {
+    moles.push({
+        index: i,
+        mesh: null,
+        state: 'hidden', // hidden, rising, up, falling, hit
+        y: -1.5,
+        targetY: -1.5,
+        timer: 0,
+        upDuration: 1.5,
+        animSpeed: 0.3,
+        animProgress: 0,
+        wasHit: false,
+        flashTimer: 0
+    });
+    state.molePositions[i] = { x: holePositions[i].x, y: -1.5, z: holePositions[i].z };
+}
+
+// Create fallback mole mesh
+function createFallbackMole() {
+    const group = new THREE.Group();
+    
+    // Body
+    const bodyGeo = new THREE.CapsuleGeometry(0.35, 0.5, 8, 16);
+    const bodyMat = new THREE.MeshStandardMaterial({ color: 0x8B4513 });
+    const body = new THREE.Mesh(bodyGeo, bodyMat);
+    body.castShadow = true;
+    body.position.y = 0.3;
+    group.add(body);
+    
+    // Head
+    const headGeo = new THREE.SphereGeometry(0.3, 16, 16);
+    const headMat = new THREE.MeshStandardMaterial({ color: 0x9B6B3D });
+    const head = new THREE.Mesh(headGeo, headMat);
+    head.castShadow = true;
+    head.position.y = 0.85;
+    group.add(head);
+    
+    // Eyes
+    const eyeGeo = new THREE.SphereGeometry(0.06, 8, 8);
+    const eyeMat = new THREE.MeshStandardMaterial({ color: 0x000000 });
+    const leftEye = new THREE.Mesh(eyeGeo, eyeMat);
+    leftEye.position.set(-0.12, 0.9, 0.25);
+    group.add(leftEye);
+    const rightEye = new THREE.Mesh(eyeGeo, eyeMat);
+    rightEye.position.set(0.12, 0.9, 0.25);
+    group.add(rightEye);
+    
+    // Nose
+    const noseGeo = new THREE.SphereGeometry(0.07, 8, 8);
+    const noseMat = new THREE.MeshStandardMaterial({ color: 0xff69b4 });
+    const nose = new THREE.Mesh(noseGeo, noseMat);
+    nose.position.set(0, 0.82, 0.28);
+    group.add(nose);
+    
+    return group;
+}
+
+// Load GLB model
+const loader = new GLTFLoader();
+loader.load(
+    '._BrainStem.glb',
+    (gltf) => {
+        moleTemplate = gltf.scene;
+        moleTemplate.scale.set(0.4, 0.4, 0.4);
+        moleTemplate.traverse((child) => {
+            if (child.isMesh) {
+                child.castShadow = true;
+                child.receiveShadow = true;
+            }
+        });
+        initMoles(moleTemplate);
+        state.modelLoaded = true;
+    },
+    undefined,
+    (error) => {
+        console.warn('GLB load failed, using fallback mole:', error);
+        moleTemplate = createFallbackMole();
+        initMoles(moleTemplate);
+        state.modelLoaded = true;
+    }
+);
+
+function initMoles(template) {
+    for (let i = 0; i < 9; i++) {
+        const moleMesh = template.clone();
+        moleMesh.position.set(holePositions[i].x, -1.5, holePositions[i].z);
+        moleMesh.userData.holeIndex = i;
+        moleMesh.userData.isMole = true;
+        scene.add(moleMesh);
+        moles[i].mesh = moleMesh;
+    }
+}
+
+// --- Raycaster ---
+const raycaster = new THREE.Raycaster();
+const mouse = new THREE.Vector2();
+
+function onMouseClick(event) {
+    if (state.phase !== 'playing') return;
+    
+    mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+    mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+    
+    raycaster.setFromCamera(mouse, camera);
+    
+    // Collect all mole meshes and their children
+    const moleObjects = [];
+    for (let i = 0; i < 9; i++) {
+        if (moles[i].mesh && (moles[i].state === 'up' || moles[i].state === 'rising')) {
+            moles[i].mesh.traverse((child) => {
+                if (child.isMesh) {
+                    child.userData.holeIndex = i;
+                    moleObjects.push(child);
+                }
+            });
+        }
+    }
+    
+    const intersects = raycaster.intersectObjects(moleObjects, false);
+    
+    if (intersects.length > 0) {
+        const hitIndex = intersects[0].object.userData.holeIndex;
+        if (hitIndex !== undefined && (moles[hitIndex].state === 'up' || moles[hitIndex].state === 'rising') && !moles[hitIndex].wasHit) {
+            whackMole(hitIndex);
+        }
+    }
+}
+
+window.addEventListener('click', onMouseClick);
+
+// --- Particles ---
+const particleBursts = [];
+
+function createParticleBurst(position) {
+    const particles = [];
+    for (let i = 0; i < 8; i++) {
+        const geo = new THREE.SphereGeometry(0.08, 8, 8);
+        const mat = new THREE.MeshBasicMaterial({ color: 0xffff00, transparent: true, opacity: 1 });
+        const mesh = new THREE.Mesh(geo, mat);
+        mesh.position.copy(position);
+        
+        const angle = (i / 8) * Math.PI * 2;
+        const speed = 2 + Math.random() * 2;
+        mesh.userData.velocity = new THREE.Vector3(
+            Math.cos(angle) * speed,
+            2 + Math.random() * 3,
+            Math.sin(angle) * speed
+        );
+        mesh.userData.life = 0.5;
+        mesh.userData.maxLife = 0.5;
+        
+        scene.add(mesh);
+        particles.push(mesh);
+    }
+    particleBursts.push({ particles, timer: 0.5 });
+}
+
+function updateParticles(dt) {
+    let activeCount = 0;
+    for (let i = particleBursts.length - 1; i >= 0; i--) {
+        const burst = particleBursts[i];
+        burst.timer -= dt;
+        
+        for (const p of burst.particles) {
+            p.userData.life -= dt;
+            const t = Math.max(0, p.userData.life / p.userData.maxLife);
+            p.material.opacity = t;
+            p.position.x += p.userData.velocity.x * dt;
+            p.position.y += p.userData.velocity.y * dt;
+            p.position.z += p.userData.velocity.z * dt;
+            p.userData.velocity.y -= 9.8 * dt;
+        }
+        
+        if (burst.timer <= 0) {
+            for (const p of burst.particles) {
+                scene.remove(p);
+                p.geometry.dispose();
+                p.material.dispose();
+            }
+            particleBursts.splice(i, 1);
+        } else {
+            activeCount++;
+        }
+    }
+    state.particlesActive = activeCount;
+}
+
+// --- Game Logic ---
+let gameTimer = 0;
+let popTimer = 0;
+const popInterval = 1.2;
+
+function whackMole(index) {
+    const mole = moles[index];
+    mole.wasHit = true;
+    mole.state = 'hit';
+    mole.animProgress = 0;
+    mole.targetY = -1.5;
+    
+    state.currentCombo++;
+    if (state.currentCombo > state.maxCombo) {
+        state.maxCombo = state.currentCombo;
+    }
+    
+    const points = 10 * state.currentCombo;
+    state.score += points;
+    state.molesWhacked++;
+    
+    // Flash red
+    mole.flashTimer = 0.2;
+    if (mole.mesh) {
+        setMoleColor(mole.mesh, 0xff0000);
+    }
+    
+    // Particle burst
+    const pos = new THREE.Vector3(holePositions[index].x, 0.5, holePositions[index].z);
+    createParticleBurst(pos);
+}
+
+function setMoleColor(mesh, color) {
+    mesh.traverse((child) => {
+        if (child.isMesh && child.material) {
+            if (!child.userData.originalColor) {
+                child.userData.originalColor = child.material.color.getHex();
+            }
+            child.material = child.material.clone();
+            child.material.color.setHex(color);
+        }
+    });
+}
+
+function resetMoleColor(mesh) {
+    mesh.traverse((child) => {
+        if (child.isMesh && child.material && child.userData.originalColor !== undefined) {
+            child.material.color.setHex(child.userData.originalColor);
+        }
+    });
+}
+
+function popRandomMole() {
+    // Count active moles
+    let activeCount = 0;
+    const availableIndices = [];
+    for (let i = 0; i < 9; i++) {
+        if (moles[i].state !== 'hidden') {
+            activeCount++;
+        } else {
+            availableIndices.push(i);
+        }
+    }
+    
+    if (activeCount >= 2 || availableIndices.length === 0) return;
+    
+    const idx = availableIndices[Math.floor(Math.random() * availableIndices.length)];
+    const mole = moles[idx];
+    mole.state = 'rising';
+    mole.targetY = 0.5;
+    mole.animProgress = 0;
+    mole.wasHit = false;
+    mole.timer = 0;
+    state.totalPops++;
+}
+
+function updateMoles(dt) {
+    let activeCount = 0;
+    
+    for (let i = 0; i < 9; i++) {
+        const mole = moles[i];
+        if (!mole.mesh) continue;
+        
+        // Flash timer
+        if (mole.flashTimer > 0) {
+            mole.flashTimer -= dt;
+            if (mole.flashTimer <= 0) {
+                resetMoleColor(mole.mesh);
+            }
+        }
+        
+        switch (mole.state) {
+            case 'rising':
+                mole.animProgress += dt / mole.animSpeed;
+                if (mole.animProgress >= 1) {
+                    mole.animProgress = 1;
+                    mole.state = 'up';
+                    mole.timer = 0;
+                }
+                mole.y = THREE.MathUtils.lerp(-1.5, 0.5, easeOutCubic(mole.animProgress));
+                activeCount++;
+                break;
+                
+            case 'up':
+                mole.y = 0.5;
+                mole.timer += dt;
+                if (mole.timer >= mole.upDuration) {
+                    mole.state = 'falling';
+                    mole.animProgress = 0;
+                    // Miss!
+                    state.misses++;
+                    state.currentCombo = 0;
+                }
+                activeCount++;
+                break;
+                
+            case 'falling':
+                mole.animProgress += dt / mole.animSpeed;
+                if (mole.animProgress >= 1) {
+                    mole.animProgress = 1;
+                    mole.state = 'hidden';
+                    mole.y = -1.5;
+                } else {
+                    mole.y = THREE.MathUtils.lerp(0.5, -1.5, easeInCubic(mole.animProgress));
+                    activeCount++;
+                }
+                break;
+                
+            case 'hit':
+                mole.animProgress += dt / mole.animSpeed;
+                if (mole.animProgress >= 1) {
+                    mole.animProgress = 1;
+                    mole.state = 'hidden';
+                    mole.y = -1.5;
+                } else {
+                    const startY = mole.y;
+                    mole.y = THREE.MathUtils.lerp(mole.y, -1.5, 0.15);
+                    activeCount++;
+                }
+                break;
+                
+            case 'hidden':
+                mole.y = -1.5;
+                break;
+        }
+        
+        mole.mesh.position.y = mole.y;
+        state.molePositions[i] = {
+            x: mole.mesh.position.x,
+            y: mole.mesh.position.y,
+            z: mole.mesh.position.z
+        };
+    }
+    
+    state.activeMoles = activeCount;
+}
+
+function easeOutCubic(t) {
+    return 1 - Math.pow(1 - t, 3);
+}
+
+function easeInCubic(t) {
+    return t * t * t;
+}
+
+function startGame() {
+    state.phase = 'playing';
+    state.score = 0;
+    state.timeLeft = 30;
+    state.molesWhacked = 0;
+    state.misses = 0;
+    state.currentCombo = 0;
+    state.maxCombo = 0;
+    state.totalPops = 0;
+    state.gameStarted = true;
+    
+    gameTimer = 30;
+    popTimer = 0;
+    
+    // Reset all moles
+    for (let i = 0; i < 9; i++) {
+        moles[i].state = 'hidden';
+        moles[i].y = -1.5;
+        moles[i].wasHit = false;
+        if (moles[i].mesh) {
+            moles[i].mesh.position.y = -1.5;
+            resetMoleColor(moles[i].mesh);
+        }
+    }
+    
+    startButton.style.display = 'none';
+    gameOverOverlay.classList.remove('show');
+}
+
+function endGame() {
+    state.phase = 'gameover';
+    state.timeLeft = 0;
+    
+    finalScore.textContent = `Score: ${state.score}`;
+    finalStats.textContent = `Moles Whacked: ${state.molesWhacked} | Misses: ${state.misses} | Max Combo: x${state.maxCombo}`;
+    gameOverOverlay.classList.add('show');
+    
+    // Hide all moles
+    for (let i = 0; i < 9; i++) {
+        moles[i].state = 'hidden';
+        moles[i].y = -1.5;
+        if (moles[i].mesh) {
+            moles[i].mesh.position.y = -1.5;
+        }
+    }
+}
+
+startButton.addEventListener('click', startGame);
+restartButton.addEventListener('click', startGame);
+
+// --- Resize ---
+window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// --- Animation Loop ---
+let lastTime = performance.now();
+
+function animate() {
+    requestAnimationFrame(animate);
+    
+    const now = performance.now();
+    const dt = Math.min((now - lastTime) / 1000, 0.1);
+    lastTime = now;
+    
+    if (state.phase === 'playing') {
+        gameTimer -= dt;
+        state.timeLeft = Math.max(0, Math.ceil(gameTimer));
+        
+        if (gameTimer <= 0) {
+            endGame();
+        } else {
+            popTimer += dt;
+            if (popTimer >= popInterval) {
+                popTimer -= popInterval;
+                popRandomMole();
+            }
+        }
+    }
+    
+    updateMoles(dt);
+    updateParticles(dt);
+    
+    // Update HUD
+    hud.textContent = `Score: ${state.score} | Time: ${state.timeLeft}s | Combo: x${state.currentCombo}`;
+    
+    renderer.render(scene, camera);
+}
+
+animate();
+</script>
+</body>
+</html>

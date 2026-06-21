@@ -1,0 +1,476 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Chemistry Lab</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #1a1a1a;
+            font-family: sans-serif;
+        }
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+        }
+        #ui-container {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            background: rgba(0, 0, 0, 0.7);
+            color: white;
+            padding: 15px;
+            border-radius: 8px;
+            pointer-events: none;
+            user-select: none;
+        }
+        .control-panel {
+            position: absolute;
+            bottom: 20px;
+            left: 20px;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 15px;
+            border-radius: 8px;
+        }
+        button {
+            background: #4CAF50;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            cursor: pointer;
+            border-radius: 4px;
+            font-size: 16px;
+            pointer-events: auto;
+        }
+        button:hover {
+            background: #45a049;
+        }
+        .instructions {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            background: rgba(0, 0, 0, 0.7);
+            color: #ccc;
+            padding: 15px;
+            border-radius: 8px;
+            max-width: 250px;
+            pointer-events: none;
+        }
+    </style>
+    <script type="importmap">
+    { "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+    } }
+    </script>
+</head>
+<body>
+    <div id="canvas-container"></div>
+    
+    <div id="ui-container">
+        <h2>状态监控</h2>
+        <div>温度: <span id="temperature">25.0</span> °C</div>
+        <div>混合结果: <span id="mixedResult">无</span></div>
+        <div>反应完成: <span id="reactionComplete">否</span></div>
+    </div>
+
+    <div class="control-panel">
+        <button id="heatToggle">加热开关 (Off)</button>
+    </div>
+
+    <div class="instructions">
+        <h3>操作说明</h3>
+        <p>1. 拖拽桌上的球体(试剂)到烧杯上方松开即可加入。</p>
+        <p>2. 红色=酸，蓝色=碱，黄色=指示剂。</p>
+        <p>3. 开启加热可加速粒子运动。</p>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { DragControls } from 'three/addons/controls/DragControls.js';
+
+        // --- State Initialization ---
+        window.__3D_STATE__ = {
+            chemicals: [],
+            mixedResult: null,
+            temperature: 25.0,
+            heatOn: false,
+            apparatus: [],
+            reactionComplete: false
+        };
+
+        let targetTemperature = 25.0;
+
+        // --- Scene Setup ---
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x2a2a35);
+        scene.fog = new THREE.Fog(0x2a2a35, 20, 60);
+
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+        camera.position.set(0, 15, 25);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        container.appendChild(renderer.domElement);
+
+        const orbitControls = new OrbitControls(camera, renderer.domElement);
+        orbitControls.enableDamping = true;
+        orbitControls.maxPolarAngle = Math.PI / 2 - 0.05;
+
+        // --- Lighting ---
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 1.5);
+        dirLight.position.set(10, 20, 10);
+        dirLight.castShadow = true;
+        dirLight.shadow.mapSize.width = 2048;
+        dirLight.shadow.mapSize.height = 2048;
+        scene.add(dirLight);
+
+        const pointLight = new THREE.PointLight(0xffaa00, 0, 10); // Burner light
+        scene.add(pointLight);
+
+        // --- Materials ---
+        const glassMat = new THREE.MeshPhysicalMaterial({
+            color: 0xffffff,
+            metalness: 0.1,
+            roughness: 0.1,
+            transmission: 0.9,
+            transparent: true,
+            opacity: 1,
+            side: THREE.DoubleSide
+        });
+        const woodMat = new THREE.MeshStandardMaterial({ color: 0x8b5a2b, roughness: 0.8 });
+        const metalMat = new THREE.MeshStandardMaterial({ color: 0xaaaaaa, metalness: 0.8, roughness: 0.2 });
+        const tableMat = new THREE.MeshStandardMaterial({ color: 0x3d3d3d, roughness: 0.9 });
+
+        // --- Procedural Geometry Construction ---
+        const apparatusList = [];
+
+        // 1. Table
+        const tableGeo = new THREE.BoxGeometry(30, 1, 15);
+        const table = new THREE.Mesh(tableGeo, tableMat);
+        table.position.y = -0.5;
+        table.receiveShadow = true;
+        scene.add(table);
+
+        // 2. Beaker (Target)
+        const beakerGroup = new THREE.Group();
+        beakerGroup.position.set(0, 0, 0);
+        
+        const beakerGeo = new THREE.CylinderGeometry(2, 2, 5, 32, 1, true);
+        const beakerMesh = new THREE.Mesh(beakerGeo, glassMat);
+        beakerMesh.position.y = 2.5;
+        beakerMesh.castShadow = true;
+        
+        const beakerBottomGeo = new THREE.CircleGeometry(2, 32);
+        const beakerBottom = new THREE.Mesh(beakerBottomGeo, glassMat);
+        beakerBottom.rotation.x = -Math.PI / 2;
+        
+        // Liquid inside beaker
+        const liquidGeo = new THREE.CylinderGeometry(1.9, 1.9, 1, 32);
+        liquidGeo.translate(0, 0.5, 0); // Origin at bottom
+        const liquidMat = new THREE.MeshPhysicalMaterial({
+            color: 0xffffff, transmission: 0.8, transparent: true, opacity: 0.9, roughness: 0
+        });
+        const liquidMesh = new THREE.Mesh(liquidGeo, liquidMat);
+        liquidMesh.position.y = 0.1;
+        liquidMesh.visible = false;
+        liquidMesh.scale.y = 0.01;
+
+        // Particles for boiling
+        const particleCount = 150;
+        const particleGeo = new THREE.BufferGeometry();
+        const particlePos = new Float32Array(particleCount * 3);
+        const particleVel = [];
+        for(let i=0; i<particleCount; i++) {
+            particlePos[i*3] = (Math.random() - 0.5) * 3;
+            particlePos[i*3+1] = Math.random() * 2;
+            particlePos[i*3+2] = (Math.random() - 0.5) * 3;
+            particleVel.push(0.02 + Math.random() * 0.05);
+        }
+        particleGeo.setAttribute('position', new THREE.BufferAttribute(particlePos, 3));
+        const particleMat = new THREE.PointsMaterial({ color: 0xffffff, size: 0.15, transparent: true, opacity: 0.6 });
+        const particleSystem = new THREE.Points(particleGeo, particleMat);
+        particleSystem.position.y = 0.2;
+        particleSystem.visible = false;
+
+        beakerGroup.add(beakerMesh, beakerBottom, liquidMesh, particleSystem);
+        scene.add(beakerGroup);
+        apparatusList.push({ name: 'beaker', obj: beakerGroup });
+
+        // 3. Erlenmeyer Flask
+        const flaskGroup = new THREE.Group();
+        flaskGroup.position.set(-6, 0, -2);
+        
+        const flaskPoints = [];
+        flaskPoints.push(new THREE.Vector2(0, 0));
+        flaskPoints.push(new THREE.Vector2(2, 0));
+        flaskPoints.push(new THREE.Vector2(2, 0.5));
+        flaskPoints.push(new THREE.Vector2(0.6, 3));
+        flaskPoints.push(new THREE.Vector2(0.6, 4.5));
+        flaskPoints.push(new THREE.Vector2(0.7, 4.6));
+        const flaskGeo = new THREE.LatheGeometry(flaskPoints, 32);
+        const flaskMesh = new THREE.Mesh(flaskGeo, glassMat);
+        flaskMesh.castShadow = true;
+        flaskGroup.add(flaskMesh);
+        scene.add(flaskGroup);
+        apparatusList.push({ name: 'flask', obj: flaskGroup });
+
+        // 4. Bunsen Burner
+        const burnerGroup = new THREE.Group();
+        burnerGroup.position.set(6, 0, -2);
+        
+        const burnerBaseGeo = new THREE.CylinderGeometry(1.5, 1.5, 0.5, 16);
+        const burnerBase = new THREE.Mesh(burnerBaseGeo, metalMat);
+        burnerBase.position.y = 0.25;
+        burnerBase.castShadow = true;
+        
+        const burnerTubeGeo = new THREE.CylinderGeometry(0.4, 0.4, 3, 16);
+        const burnerTube = new THREE.Mesh(burnerTubeGeo, metalMat);
+        burnerTube.position.y = 2;
+        burnerTube.castShadow = true;
+        
+        const flameGeo = new THREE.ConeGeometry(0.6, 2, 16);
+        const flameMat = new THREE.MeshBasicMaterial({ color: 0x33aaff, transparent: true, opacity: 0.8 });
+        const flameMesh = new THREE.Mesh(flameGeo, flameMat);
+        flameMesh.position.y = 4.5;
+        flameMesh.visible = false;
+
+        burnerGroup.add(burnerBase, burnerTube, flameMesh);
+        scene.add(burnerGroup);
+        apparatusList.push({ name: 'bunsen_burner', obj: burnerGroup });
+
+        // 5. Test Tube Rack
+        const rackGroup = new THREE.Group();
+        rackGroup.position.set(-8, 0, 4);
+        
+        const rackBaseGeo = new THREE.BoxGeometry(6, 0.5, 2);
+        const rackBase = new THREE.Mesh(rackBaseGeo, woodMat);
+        rackBase.position.y = 0.25;
+        rackBase.castShadow = true;
+        
+        const rackTopGeo = new THREE.BoxGeometry(6, 0.5, 2);
+        const rackTop = new THREE.Mesh(rackTopGeo, woodMat);
+        rackTop.position.y = 3;
+        rackTop.castShadow = true;
+        
+        const legGeo = new THREE.CylinderGeometry(0.2, 0.2, 3);
+        const leg1 = new THREE.Mesh(legGeo, woodMat); leg1.position.set(-2.8, 1.5, -0.8);
+        const leg2 = new THREE.Mesh(legGeo, woodMat); leg2.position.set(2.8, 1.5, -0.8);
+        const leg3 = new THREE.Mesh(legGeo, woodMat); leg3.position.set(-2.8, 1.5, 0.8);
+        const leg4 = new THREE.Mesh(legGeo, woodMat); leg4.position.set(2.8, 1.5, 0.8);
+        
+        rackGroup.add(rackBase, rackTop, leg1, leg2, leg3, leg4);
+
+        // Add some test tubes
+        const ttGeo = new THREE.CylinderGeometry(0.3, 0.3, 4, 16, 1, true);
+        const ttBottomGeo = new THREE.SphereGeometry(0.3, 16, 16, 0, Math.PI * 2, 0, Math.PI / 2);
+        for(let i=-2; i<=2; i+=2) {
+            const tt = new THREE.Mesh(ttGeo, glassMat);
+            tt.position.set(i, 2, 0);
+            const ttBot = new THREE.Mesh(ttBottomGeo, glassMat);
+            ttBot.position.set(i, 0, 0);
+            ttBot.rotation.x = Math.PI;
+            rackGroup.add(tt, ttBot);
+        }
+        scene.add(rackGroup);
+        apparatusList.push({ name: 'test_tube_rack', obj: rackGroup });
+
+        // --- Draggable Chemicals ---
+        const draggables = [];
+        const chemGeo = new THREE.SphereGeometry(0.6, 32, 32);
+        
+        const createChemical = (id, colorHex, x, z) => {
+            const mat = new THREE.MeshStandardMaterial({ color: colorHex, roughness: 0.3, metalness: 0.1 });
+            const mesh = new THREE.Mesh(chemGeo, mat);
+            mesh.position.set(x, 0.6, z);
+            mesh.castShadow = true;
+            mesh.userData = { id: id, startPos: new THREE.Vector3(x, 0.6, z) };
+            scene.add(mesh);
+            draggables.push(mesh);
+        };
+
+        createChemical('acid', 0xff0000, 5, 4);      // Red
+        createChemical('base', 0x0000ff, 7, 4);      // Blue
+        createChemical('indicator', 0xffff00, 9, 4); // Yellow
+
+        // --- Interaction (Drag & Drop) ---
+        const dragControls = new DragControls(draggables, camera, renderer.domElement);
+        
+        dragControls.addEventListener('dragstart', function (event) {
+            orbitControls.enabled = false;
+            event.object.position.y += 1; // Lift up slightly
+        });
+
+        dragControls.addEventListener('drag', function (event) {
+            // Keep above table
+            if (event.object.position.y < 0.6) event.object.position.y = 0.6;
+        });
+
+        dragControls.addEventListener('dragend', function (event) {
+            orbitControls.enabled = true;
+            const obj = event.object;
+            
+            // Check distance to beaker top center
+            const beakerTopCenter = new THREE.Vector3(beakerGroup.position.x, 5, beakerGroup.position.z);
+            const dist = obj.position.distanceTo(beakerTopCenter);
+
+            if (dist < 3.0) {
+                // Dropped in beaker
+                processReaction(obj.userData.id);
+                // Hide object
+                obj.position.set(0, -100, 0);
+                obj.visible = false;
+                // Remove from draggables to prevent re-dragging invisible object
+                const index = draggables.indexOf(obj);
+                if (index > -1) draggables.splice(index, 1);
+            } else {
+                // Return to start
+                obj.position.copy(obj.userData.startPos);
+            }
+        });
+
+        // --- Reaction Logic ---
+        function processReaction(chemId) {
+            if (!window.__3D_STATE__.chemicals.includes(chemId)) {
+                window.__3D_STATE__.chemicals.push(chemId);
+            }
+
+            const chems = window.__3D_STATE__.chemicals;
+            const hasAcid = chems.includes('acid');
+            const hasBase = chems.includes('base');
+            const hasInd = chems.includes('indicator');
+
+            let targetColor = 0xffffff;
+            let result = null;
+            let isComplete = false;
+
+            if (hasAcid && hasBase) {
+                targetColor = hasInd ? 0x00ff00 : 0x800080; // Green if indicator, Purple otherwise
+                result = 'neutral';
+                isComplete = true;
+            } else if (hasAcid) {
+                targetColor = hasInd ? 0xff66b2 : 0xff0000; // Pinkish if indicator
+                result = 'acidic';
+            } else if (hasBase) {
+                targetColor = hasInd ? 0x00ffff : 0x0000ff; // Cyan if indicator
+                result = 'basic';
+            } else if (hasInd) {
+                targetColor = 0xffff00;
+                result = 'indicator_only';
+            }
+
+            // Update Liquid Visuals
+            liquidMesh.visible = true;
+            liquidMesh.material.color.setHex(targetColor);
+            
+            // Animate liquid level
+            const targetScaleY = chems.length * 1.2;
+            liquidMesh.scale.y = targetScaleY;
+
+            // Update State
+            window.__3D_STATE__.mixedResult = result;
+            window.__3D_STATE__.reactionComplete = isComplete;
+
+            // Update DOM
+            document.getElementById('mixedResult').innerText = result || '无';
+            document.getElementById('reactionComplete').innerText = isComplete ? '是' : '否';
+        }
+
+        // --- Heating Logic ---
+        const heatBtn = document.getElementById('heatToggle');
+        heatBtn.addEventListener('click', () => {
+            window.__3D_STATE__.heatOn = !window.__3D_STATE__.heatOn;
+            const isOn = window.__3D_STATE__.heatOn;
+            
+            heatBtn.innerText = `加热开关 (${isOn ? 'On' : 'Off'})`;
+            heatBtn.style.background = isOn ? '#f44336' : '#4CAF50';
+            
+            flameMesh.visible = isOn;
+            targetTemperature = isOn ? 100.0 : 25.0;
+            
+            if(isOn) {
+                pointLight.position.copy(burnerGroup.position);
+                pointLight.position.y += 4;
+                pointLight.intensity = 2;
+            } else {
+                pointLight.intensity = 0;
+            }
+        });
+
+        // --- Resize Handler ---
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // --- Animation Loop ---
+        const clock = new THREE.Clock();
+
+        function animate() {
+            requestAnimationFrame(animate);
+            const delta = clock.getDelta();
+
+            orbitControls.update();
+
+            // 1. Update Temperature
+            window.__3D_STATE__.temperature += (targetTemperature - window.__3D_STATE__.temperature) * delta * 0.5;
+            document.getElementById('temperature').innerText = window.__3D_STATE__.temperature.toFixed(1);
+
+            // 2. Update Particles (Boiling)
+            const state = window.__3D_STATE__;
+            const hasLiquid = state.chemicals.length > 0;
+            const shouldBoil = hasLiquid && (state.reactionComplete || state.temperature > 60);
+
+            if (shouldBoil) {
+                particleSystem.visible = true;
+                const positions = particleSystem.geometry.attributes.position.array;
+                const liquidTop = liquidMesh.scale.y;
+                
+                // Speed multiplier based on temperature and reaction state
+                let speedMult = (state.temperature / 25.0);
+                if (state.reactionComplete && state.temperature < 60) speedMult = 2.0; // Initial reaction fizz
+
+                for (let i = 0; i < particleCount; i++) {
+                    positions[i * 3 + 1] += particleVel[i] * speedMult; // Move Y
+                    
+                    // Reset if too high
+                    if (positions[i * 3 + 1] > liquidTop + 1.5) {
+                        positions[i * 3 + 1] = 0;
+                        positions[i * 3] = (Math.random() - 0.5) * 3;
+                        positions[i * 3 + 2] = (Math.random() - 0.5) * 3;
+                    }
+                }
+                particleSystem.geometry.attributes.position.needsUpdate = true;
+                
+                // Color particles based on liquid
+                particleSystem.material.color.copy(liquidMesh.material.color);
+            } else {
+                particleSystem.visible = false;
+            }
+
+            // 3. Update Apparatus State Array
+            state.apparatus = apparatusList.map(item => ({
+                name: item.name,
+                x: item.obj.position.x,
+                y: item.obj.position.y,
+                z: item.obj.position.z
+            }));
+
+            renderer.render(scene, camera);
+        }
+
+        animate();
+    </script>
+</body>
+</html>

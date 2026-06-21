@@ -1,0 +1,708 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3D Soft Body Simulation</title>
+<style>
+  body { margin: 0; overflow: hidden; background: #000; font-family: 'Courier New', monospace; }
+  canvas { display: block; }
+  #hud {
+    position: absolute; top: 10px; left: 10px;
+    color: #0f0; background: rgba(0,0,0,0.7);
+    padding: 12px 16px; border-radius: 8px;
+    font-size: 13px; line-height: 1.6;
+    border: 1px solid #0f04;
+    pointer-events: none;
+    min-width: 280px;
+  }
+  #hud .label { color: #8f8; }
+  #hud .val { color: #fff; }
+  #controls {
+    position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%);
+    display: flex; gap: 12px;
+  }
+  #controls button {
+    padding: 10px 24px; font-size: 14px; cursor: pointer;
+    border: 1px solid #555; border-radius: 6px;
+    background: rgba(30,30,30,0.9); color: #fff;
+    transition: background 0.2s;
+  }
+  #controls button:hover { background: rgba(80,80,80,0.9); }
+</style>
+</head>
+<body>
+
+<div id="hud">
+  <div><span class="label">Ball A pos:</span> <span class="val" id="posA">-</span></div>
+  <div><span class="label">Ball B pos:</span> <span class="val" id="posB">-</span></div>
+  <div><span class="label">Vol ratio A:</span> <span class="val" id="volRatioA">-</span></div>
+  <div><span class="label">Vol ratio B:</span> <span class="val" id="volRatioB">-</span></div>
+  <div><span class="label">Sim time:</span> <span class="val" id="simTime">0.000</span></div>
+</div>
+
+<div id="controls">
+  <button id="resetBtn">Reset</button>
+  <button id="pushBtn">Push A → B</button>
+</div>
+
+<script type="importmap">
+{ "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+} }
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// Scene setup
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x111122);
+scene.fog = new THREE.Fog(0x111122, 20, 50);
+
+const camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 0.1, 100);
+camera.position.set(0, 5, 12);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 2, 0);
+controls.enableDamping = true;
+controls.dampingFactor = 0.05;
+
+// Lights
+const ambientLight = new THREE.AmbientLight(0x404060, 0.8);
+scene.add(ambientLight);
+
+const dirLight = new THREE.DirectionalLight(0xffffff, 1.2);
+dirLight.position.set(5, 10, 7);
+dirLight.castShadow = true;
+dirLight.shadow.mapSize.set(1024, 1024);
+dirLight.shadow.camera.near = 1;
+dirLight.shadow.camera.far = 30;
+dirLight.shadow.camera.left = -10;
+dirLight.shadow.camera.right = 10;
+dirLight.shadow.camera.top = 10;
+dirLight.shadow.camera.bottom = -10;
+scene.add(dirLight);
+
+const pointLight = new THREE.PointLight(0x8888ff, 0.5, 20);
+pointLight.position.set(-3, 8, -2);
+scene.add(pointLight);
+
+// Ground
+const groundGeo = new THREE.PlaneGeometry(30, 30, 30, 30);
+const groundMat = new THREE.MeshStandardMaterial({
+  color: 0x444444, roughness: 0.8, metalness: 0.2
+});
+const ground = new THREE.Mesh(groundGeo, groundMat);
+ground.rotation.x = -Math.PI / 2;
+ground.receiveShadow = true;
+scene.add(ground);
+
+const gridHelper = new THREE.GridHelper(30, 30, 0x666666, 0x333333);
+scene.add(gridHelper);
+
+// Soft Body class
+class SoftBody {
+  constructor(centerPos, color, opacity) {
+    this.color = color;
+    this.opacity = opacity;
+    this.centerPos = centerPos.clone();
+
+    // Create icosahedron geometry for surface
+    const icoGeo = new THREE.IcosahedronGeometry(1.0, 2);
+    this.surfaceVertexCount = icoGeo.attributes.position.count;
+
+    // Build unique vertices (IcosahedronGeometry has indexed geometry)
+    const posAttr = icoGeo.attributes.position;
+    const index = icoGeo.index;
+
+    // Get unique positions
+    const uniquePositions = [];
+    const posMap = new Map();
+    const vertexRemap = []; // maps original vertex index to unique index
+
+    for (let i = 0; i < posAttr.count; i++) {
+      const x = Math.round(posAttr.getX(i) * 10000) / 10000;
+      const y = Math.round(posAttr.getY(i) * 10000) / 10000;
+      const z = Math.round(posAttr.getZ(i) * 10000) / 10000;
+      const key = `${x},${y},${z}`;
+      if (!posMap.has(key)) {
+        posMap.set(key, uniquePositions.length);
+        uniquePositions.push(new THREE.Vector3(posAttr.getX(i), posAttr.getY(i), posAttr.getZ(i)));
+      }
+      vertexRemap[i] = posMap.get(key);
+    }
+
+    this.uniqueVertexCount = uniquePositions.length;
+    this.vertexRemap = vertexRemap;
+
+    // Total nodes: unique surface vertices + 1 center
+    const totalNodes = this.uniqueVertexCount + 1;
+    this.nodeCount = totalNodes;
+    this.centerIndex = this.uniqueVertexCount; // last node is center
+
+    // Initialize positions and previous positions
+    this.positions = new Float64Array(totalNodes * 3);
+    this.prevPositions = new Float64Array(totalNodes * 3);
+    this.velocities = new Float64Array(totalNodes * 3);
+    this.forces = new Float64Array(totalNodes * 3);
+    this.mass = 0.01;
+
+    // Set surface vertex positions
+    for (let i = 0; i < this.uniqueVertexCount; i++) {
+      const p = uniquePositions[i].clone().add(centerPos);
+      this.positions[i * 3] = p.x;
+      this.positions[i * 3 + 1] = p.y;
+      this.positions[i * 3 + 2] = p.z;
+      this.prevPositions[i * 3] = p.x;
+      this.prevPositions[i * 3 + 1] = p.y;
+      this.prevPositions[i * 3 + 2] = p.z;
+    }
+
+    // Set center position
+    this.positions[this.centerIndex * 3] = centerPos.x;
+    this.positions[this.centerIndex * 3 + 1] = centerPos.y;
+    this.positions[this.centerIndex * 3 + 2] = centerPos.z;
+    this.prevPositions[this.centerIndex * 3] = centerPos.x;
+    this.prevPositions[this.centerIndex * 3 + 1] = centerPos.y;
+    this.prevPositions[this.centerIndex * 3 + 2] = centerPos.z;
+
+    // Build springs
+    this.springs = [];
+
+    // Radial springs (center to each surface vertex)
+    for (let i = 0; i < this.uniqueVertexCount; i++) {
+      const dx = this.positions[i * 3] - this.positions[this.centerIndex * 3];
+      const dy = this.positions[i * 3 + 1] - this.positions[this.centerIndex * 3 + 1];
+      const dz = this.positions[i * 3 + 2] - this.positions[this.centerIndex * 3 + 2];
+      const restLength = Math.sqrt(dx * dx + dy * dy + dz * dz);
+      this.springs.push({
+        a: this.centerIndex,
+        b: i,
+        restLength: restLength,
+        k: 500,
+        d: 5.0,
+        type: 'radial'
+      });
+    }
+
+    // Surface springs (edges from the icosahedron)
+    const edgeSet = new Set();
+    if (index) {
+      for (let i = 0; i < index.count; i += 3) {
+        const i0 = vertexRemap[index.getX(i)];
+        const i1 = vertexRemap[index.getX(i + 1)];
+        const i2 = vertexRemap[index.getX(i + 2)];
+        const pairs = [[i0, i1], [i1, i2], [i0, i2]];
+        for (const [a, b] of pairs) {
+          if (a === b) continue;
+          const key = Math.min(a, b) + ',' + Math.max(a, b);
+          if (!edgeSet.has(key)) {
+            edgeSet.add(key);
+            const dx = this.positions[a * 3] - this.positions[b * 3];
+            const dy = this.positions[a * 3 + 1] - this.positions[b * 3 + 1];
+            const dz = this.positions[a * 3 + 2] - this.positions[b * 3 + 2];
+            const restLength = Math.sqrt(dx * dx + dy * dy + dz * dz);
+            this.springs.push({
+              a: a,
+              b: b,
+              restLength: restLength,
+              k: 300,
+              d: 5.0,
+              type: 'surface'
+            });
+          }
+        }
+      }
+    }
+
+    // Store faces for rendering (using unique indices)
+    this.faces = [];
+    if (index) {
+      for (let i = 0; i < index.count; i += 3) {
+        this.faces.push([
+          vertexRemap[index.getX(i)],
+          vertexRemap[index.getX(i + 1)],
+          vertexRemap[index.getX(i + 2)]
+        ]);
+      }
+    }
+
+    // Compute original volume
+    this.originalVolume = this.computeVolume();
+
+    // Create Three.js mesh
+    this.geometry = icoGeo.clone();
+    // Make it non-indexed for easier vertex updates
+    this.geometry = this.geometry.toNonIndexed();
+
+    const material = new THREE.MeshPhongMaterial({
+      color: color,
+      transparent: true,
+      opacity: opacity,
+      side: THREE.DoubleSide,
+      shininess: 60,
+      specular: 0x444444
+    });
+    this.mesh = new THREE.Mesh(this.geometry, material);
+    this.mesh.castShadow = true;
+    scene.add(this.mesh);
+
+    // Store face indices for non-indexed geometry update
+    this.nonIndexedFaces = [];
+    if (index) {
+      for (let i = 0; i < index.count; i += 3) {
+        this.nonIndexedFaces.push([
+          vertexRemap[index.getX(i)],
+          vertexRemap[index.getX(i + 1)],
+          vertexRemap[index.getX(i + 2)]
+        ]);
+      }
+    }
+
+    // Center marker
+    const markerGeo = new THREE.SphereGeometry(0.05, 8, 8);
+    const markerMat = new THREE.MeshBasicMaterial({ color: color });
+    this.centerMarker = new THREE.Mesh(markerGeo, markerMat);
+    scene.add(this.centerMarker);
+
+    // Radial spring lines
+    const linePositions = new Float32Array(this.uniqueVertexCount * 2 * 3);
+    const lineGeo = new THREE.BufferGeometry();
+    lineGeo.setAttribute('position', new THREE.BufferAttribute(linePositions, 3));
+    const lineMat = new THREE.LineBasicMaterial({ color: color, transparent: true, opacity: 0.3 });
+    this.springLines = new THREE.LineSegments(lineGeo, lineMat);
+    scene.add(this.springLines);
+  }
+
+  computeVolume() {
+    const cx = this.positions[this.centerIndex * 3];
+    const cy = this.positions[this.centerIndex * 3 + 1];
+    const cz = this.positions[this.centerIndex * 3 + 2];
+
+    let totalDist = 0;
+    for (let i = 0; i < this.uniqueVertexCount; i++) {
+      const dx = this.positions[i * 3] - cx;
+      const dy = this.positions[i * 3 + 1] - cy;
+      const dz = this.positions[i * 3 + 2] - cz;
+      totalDist += Math.sqrt(dx * dx + dy * dy + dz * dz);
+    }
+    const avgR = totalDist / this.uniqueVertexCount;
+    this.avgRadius = avgR;
+    return (4 / 3) * Math.PI * avgR * avgR * avgR;
+  }
+
+  getCenter() {
+    return new THREE.Vector3(
+      this.positions[this.centerIndex * 3],
+      this.positions[this.centerIndex * 3 + 1],
+      this.positions[this.centerIndex * 3 + 2]
+    );
+  }
+
+  getCenterSpeed() {
+    const vx = this.velocities[this.centerIndex * 3];
+    const vy = this.velocities[this.centerIndex * 3 + 1];
+    const vz = this.velocities[this.centerIndex * 3 + 2];
+    return Math.sqrt(vx * vx + vy * vy + vz * vz);
+  }
+
+  applyForces(dt) {
+    const gravity = -9.81;
+    const n = this.nodeCount;
+
+    // Reset forces
+    for (let i = 0; i < n * 3; i++) this.forces[i] = 0;
+
+    // Gravity
+    for (let i = 0; i < n; i++) {
+      this.forces[i * 3 + 1] += this.mass * gravity;
+    }
+
+    // Spring forces
+    for (const spring of this.springs) {
+      const a = spring.a;
+      const b = spring.b;
+      const ax = this.positions[a * 3], ay = this.positions[a * 3 + 1], az = this.positions[a * 3 + 2];
+      const bx = this.positions[b * 3], by = this.positions[b * 3 + 1], bz = this.positions[b * 3 + 2];
+
+      let dx = bx - ax, dy = by - ay, dz = bz - az;
+      const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+      if (dist < 1e-8) continue;
+
+      const nx = dx / dist, ny = dy / dist, nz = dz / dist;
+      const stretch = dist - spring.restLength;
+
+      // Compute relative velocity for damping
+      const vax = this.velocities[a * 3], vay = this.velocities[a * 3 + 1], vaz = this.velocities[a * 3 + 2];
+      const vbx = this.velocities[b * 3], vby = this.velocities[b * 3 + 1], vbz = this.velocities[b * 3 + 2];
+      const relVx = vbx - vax, relVy = vby - vay, relVz = vbz - vaz;
+      const relVn = relVx * nx + relVy * ny + relVz * nz;
+
+      const forceMag = spring.k * stretch + spring.d * relVn;
+
+      this.forces[a * 3] += forceMag * nx;
+      this.forces[a * 3 + 1] += forceMag * ny;
+      this.forces[a * 3 + 2] += forceMag * nz;
+      this.forces[b * 3] -= forceMag * nx;
+      this.forces[b * 3 + 1] -= forceMag * ny;
+      this.forces[b * 3 + 2] -= forceMag * nz;
+    }
+
+    // Pressure force (volume conservation)
+    const currentVolume = this.computeVolume();
+    this.volumeRatio = currentVolume / this.originalVolume;
+
+    if (this.volumeRatio < 0.7) {
+      const pressureCoeff = 200;
+      const cx = this.positions[this.centerIndex * 3];
+      const cy = this.positions[this.centerIndex * 3 + 1];
+      const cz = this.positions[this.centerIndex * 3 + 2];
+
+      for (let i = 0; i < this.uniqueVertexCount; i++) {
+        const dx = this.positions[i * 3] - cx;
+        const dy = this.positions[i * 3 + 1] - cy;
+        const dz = this.positions[i * 3 + 2] - cz;
+        const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        if (dist < 1e-8) continue;
+        const nx = dx / dist, ny = dy / dist, nz = dz / dist;
+        const fMag = pressureCoeff * (this.originalVolume - currentVolume) / this.originalVolume;
+        this.forces[i * 3] += fMag * nx;
+        this.forces[i * 3 + 1] += fMag * ny;
+        this.forces[i * 3 + 2] += fMag * nz;
+      }
+    }
+  }
+
+  integrate(dt) {
+    const n = this.nodeCount;
+    for (let i = 0; i < n; i++) {
+      const ix = i * 3, iy = i * 3 + 1, iz = i * 3 + 2;
+      const accX = this.forces[ix] / this.mass;
+      const accY = this.forces[iy] / this.mass;
+      const accZ = this.forces[iz] / this.mass;
+
+      const newX = 2 * this.positions[ix] - this.prevPositions[ix] + accX * dt * dt;
+      const newY = 2 * this.positions[iy] - this.prevPositions[iy] + accY * dt * dt;
+      const newZ = 2 * this.positions[iz] - this.prevPositions[iz] + accZ * dt * dt;
+
+      // Update velocity estimate (for damping calculations)
+      this.velocities[ix] = (newX - this.prevPositions[ix]) / (2 * dt);
+      this.velocities[iy] = (newY - this.prevPositions[iy]) / (2 * dt);
+      this.velocities[iz] = (newZ - this.prevPositions[iz]) / (2 * dt);
+
+      this.prevPositions[ix] = this.positions[ix];
+      this.prevPositions[iy] = this.positions[iy];
+      this.prevPositions[iz] = this.positions[iz];
+
+      this.positions[ix] = newX;
+      this.positions[iy] = newY;
+      this.positions[iz] = newZ;
+    }
+  }
+
+  handleGroundCollision() {
+    let contacts = 0;
+    const n = this.nodeCount;
+    for (let i = 0; i < n; i++) {
+      const iy = i * 3 + 1;
+      if (this.positions[iy] < 0) {
+        this.positions[iy] = 0;
+        // Reflect previous position for Verlet
+        if (this.prevPositions[iy] < 0) {
+          this.prevPositions[iy] = 0;
+        }
+        // Bounce: adjust prev position to reverse velocity with restitution
+        const vy = this.velocities[iy];
+        if (vy < 0) {
+          // Set prev position so that velocity becomes -vy * restitution
+          const restitution = 0.3;
+          this.velocities[iy] = -vy * restitution;
+          // For Verlet: prevY = currentY - vy_new * dt (approximate)
+          // Actually: v ≈ (pos - prev) / dt, so prev = pos - v*dt
+          // But we use 2dt estimate, let's just adjust prev
+          const dt = 0.002;
+          this.prevPositions[iy] = this.positions[iy] - this.velocities[iy] * dt;
+        }
+        contacts++;
+      }
+    }
+    return contacts;
+  }
+
+  updateMesh() {
+    const posAttr = this.geometry.attributes.position;
+    // Non-indexed: each face has 3 vertices
+    for (let f = 0; f < this.nonIndexedFaces.length; f++) {
+      const [i0, i1, i2] = this.nonIndexedFaces[f];
+      const base = f * 3;
+
+      posAttr.setXYZ(base,
+        this.positions[i0 * 3], this.positions[i0 * 3 + 1], this.positions[i0 * 3 + 2]);
+      posAttr.setXYZ(base + 1,
+        this.positions[i1 * 3], this.positions[i1 * 3 + 1], this.positions[i1 * 3 + 2]);
+      posAttr.setXYZ(base + 2,
+        this.positions[i2 * 3], this.positions[i2 * 3 + 1], this.positions[i2 * 3 + 2]);
+    }
+    posAttr.needsUpdate = true;
+    this.geometry.computeVertexNormals();
+
+    // Update center marker
+    this.centerMarker.position.set(
+      this.positions[this.centerIndex * 3],
+      this.positions[this.centerIndex * 3 + 1],
+      this.positions[this.centerIndex * 3 + 2]
+    );
+
+    // Update spring lines
+    const linePos = this.springLines.geometry.attributes.position;
+    const cx = this.positions[this.centerIndex * 3];
+    const cy = this.positions[this.centerIndex * 3 + 1];
+    const cz = this.positions[this.centerIndex * 3 + 2];
+    for (let i = 0; i < this.uniqueVertexCount; i++) {
+      linePos.setXYZ(i * 2, cx, cy, cz);
+      linePos.setXYZ(i * 2 + 1,
+        this.positions[i * 3], this.positions[i * 3 + 1], this.positions[i * 3 + 2]);
+    }
+    linePos.needsUpdate = true;
+  }
+
+  computeEnergy() {
+    let ke = 0, pe = 0, ge = 0;
+    const n = this.nodeCount;
+
+    // Kinetic energy
+    for (let i = 0; i < n; i++) {
+      const vx = this.velocities[i * 3];
+      const vy = this.velocities[i * 3 + 1];
+      const vz = this.velocities[i * 3 + 2];
+      ke += 0.5 * this.mass * (vx * vx + vy * vy + vz * vz);
+    }
+
+    // Gravitational PE
+    for (let i = 0; i < n; i++) {
+      ge += this.mass * 9.81 * this.positions[i * 3 + 1];
+    }
+
+    // Spring PE
+    for (const spring of this.springs) {
+      const a = spring.a, b = spring.b;
+      const dx = this.positions[b * 3] - this.positions[a * 3];
+      const dy = this.positions[b * 3 + 1] - this.positions[a * 3 + 1];
+      const dz = this.positions[b * 3 + 2] - this.positions[a * 3 + 2];
+      const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+      const stretch = dist - spring.restLength;
+      pe += 0.5 * spring.k * stretch * stretch;
+    }
+
+    return { ke, pe, ge };
+  }
+
+  getSampledNodes(count) {
+    const nodes = [];
+    const step = Math.max(1, Math.floor(this.uniqueVertexCount / count));
+    for (let i = 0; i < this.uniqueVertexCount && nodes.length < count; i += step) {
+      nodes.push({
+        x: this.positions[i * 3],
+        y: this.positions[i * 3 + 1],
+        z: this.positions[i * 3 + 2]
+      });
+    }
+    return nodes;
+  }
+}
+
+// Ball-ball collision
+function handleBallBallCollision(bodyA, bodyB, dt) {
+  const kContact = 1000;
+  const threshold = 0.1;
+
+  for (let i = 0; i < bodyA.uniqueVertexCount; i++) {
+    const ax = bodyA.positions[i * 3];
+    const ay = bodyA.positions[i * 3 + 1];
+    const az = bodyA.positions[i * 3 + 2];
+
+    for (let j = 0; j < bodyB.uniqueVertexCount; j++) {
+      const bx = bodyB.positions[j * 3];
+      const by = bodyB.positions[j * 3 + 1];
+      const bz = bodyB.positions[j * 3 + 2];
+
+      const dx = bx - ax, dy = by - ay, dz = bz - az;
+      const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+
+      if (dist < threshold && dist > 1e-8) {
+        const nx = dx / dist, ny = dy / dist, nz = dz / dist;
+        const fMag = kContact * (threshold - dist);
+
+        // Push A away (negative direction)
+        bodyA.forces[i * 3] -= fMag * nx;
+        bodyA.forces[i * 3 + 1] -= fMag * ny;
+        bodyA.forces[i * 3 + 2] -= fMag * nz;
+
+        // Push B away (positive direction)
+        bodyB.forces[j * 3] += fMag * nx;
+        bodyB.forces[j * 3 + 1] += fMag * ny;
+        bodyB.forces[j * 3 + 2] += fMag * nz;
+      }
+    }
+  }
+}
+
+let bodyA, bodyB;
+let simTime = 0;
+
+function createBodies() {
+  // Clean up old bodies
+  if (bodyA) {
+    scene.remove(bodyA.mesh);
+    scene.remove(bodyA.centerMarker);
+    scene.remove(bodyA.springLines);
+    bodyA.geometry.dispose();
+    bodyA.mesh.material.dispose();
+  }
+  if (bodyB) {
+    scene.remove(bodyB.mesh);
+    scene.remove(bodyB.centerMarker);
+    scene.remove(bodyB.springLines);
+    bodyB.geometry.dispose();
+    bodyB.mesh.material.dispose();
+  }
+
+  bodyA = new SoftBody(new THREE.Vector3(-1.5, 5, 0), 0xff3333, 0.7);
+  bodyB = new SoftBody(new THREE.Vector3(1.5, 6, 0), 0x3366ff, 0.7);
+  simTime = 0;
+}
+
+createBodies();
+
+// Simulation step
+function simulate() {
+  const dt = 0.002;
+  const subSteps = 5;
+
+  for (let step = 0; step < subSteps; step++) {
+    // Apply forces
+    bodyA.applyForces(dt);
+    bodyB.applyForces(dt);
+
+    // Ball-ball collision
+    handleBallBallCollision(bodyA, bodyB, dt);
+
+    // Integrate
+    bodyA.integrate(dt);
+    bodyB.integrate(dt);
+
+    // Ground collision
+    bodyA.handleGroundCollision();
+    bodyB.handleGroundCollision();
+
+    simTime += dt;
+  }
+}
+
+// HUD update
+function updateHUD() {
+  const cA = bodyA.getCenter();
+  const cB = bodyB.getCenter();
+
+  document.getElementById('posA').textContent =
+    `(${cA.x.toFixed(2)}, ${cA.y.toFixed(2)}, ${cA.z.toFixed(2)})`;
+  document.getElementById('posB').textContent =
+    `(${cB.x.toFixed(2)}, ${cB.y.toFixed(2)}, ${cB.z.toFixed(2)})`;
+  document.getElementById('volRatioA').textContent =
+    (bodyA.volumeRatio || 1).toFixed(3);
+  document.getElementById('volRatioB').textContent =
+    (bodyB.volumeRatio || 1).toFixed(3);
+  document.getElementById('simTime').textContent = simTime.toFixed(3);
+}
+
+// State exposure
+function updateState() {
+  const cA = bodyA.getCenter();
+  const cB = bodyB.getCenter();
+  const eA = bodyA.computeEnergy();
+  const eB = bodyB.computeEnergy();
+
+  let groundContacts = 0;
+  for (let i = 0; i < bodyA.nodeCount; i++) {
+    if (bodyA.positions[i * 3 + 1] <= 0.01) groundContacts++;
+  }
+  for (let i = 0; i < bodyB.nodeCount; i++) {
+    if (bodyB.positions[i * 3 + 1] <= 0.01) groundContacts++;
+  }
+
+  window.__3D_STATE__ = {
+    simTime: simTime,
+    bodyA: {
+      center: { x: cA.x, y: cA.y, z: cA.z },
+      avgRadius: bodyA.avgRadius,
+      volumeRatio: bodyA.volumeRatio || 1,
+      speed: bodyA.getCenterSpeed(),
+      nodeCount: bodyA.nodeCount,
+      nodes: bodyA.getSampledNodes(25)
+    },
+    bodyB: {
+      center: { x: cB.x, y: cB.y, z: cB.z },
+      avgRadius: bodyB.avgRadius,
+      volumeRatio: bodyB.volumeRatio || 1,
+      speed: bodyB.getCenterSpeed(),
+      nodeCount: bodyB.nodeCount,
+      nodes: bodyB.getSampledNodes(25)
+    },
+    totalEnergy: (eA.ke + eA.pe + eA.ge + eB.ke + eB.pe + eB.ge),
+    groundContacts: groundContacts
+  };
+}
+
+// Controls
+document.getElementById('resetBtn').addEventListener('click', () => {
+  createBodies();
+});
+
+document.getElementById('pushBtn').addEventListener('click', () => {
+  // Apply impulse to ball A: push right
+  const impulse = 5.0; // m/s
+  const dt = 0.002;
+  for (let i = 0; i < bodyA.nodeCount; i++) {
+    bodyA.velocities[i * 3] += impulse;
+    // For Verlet, adjust prevPositions
+    bodyA.prevPositions[i * 3] = bodyA.positions[i * 3] - bodyA.velocities[i * 3] * dt;
+  }
+});
+
+// Resize
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// Animation loop
+function animate() {
+  requestAnimationFrame(animate);
+
+  simulate();
+
+  bodyA.updateMesh();
+  bodyB.updateMesh();
+
+  updateHUD();
+  updateState();
+
+  controls.update();
+  renderer.render(scene, camera);
+}
+
+animate();
+</script>
+</body>
+</html>

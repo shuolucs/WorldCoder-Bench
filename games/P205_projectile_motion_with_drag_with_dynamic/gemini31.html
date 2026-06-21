@@ -1,0 +1,496 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Projectile Motion Simulator</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            font-family: 'Courier New', Courier, monospace;
+            background-color: #000;
+            user-select: none;
+        }
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+        }
+        #hud {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            color: #fff;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 15px;
+            border-radius: 8px;
+            pointer-events: none;
+            font-size: 14px;
+            line-height: 1.5;
+            min-width: 250px;
+            border: 1px solid #444;
+        }
+        #controls {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            display: flex;
+            gap: 10px;
+        }
+        button {
+            background: #333;
+            color: white;
+            border: 1px solid #666;
+            padding: 8px 15px;
+            cursor: pointer;
+            font-family: inherit;
+            border-radius: 4px;
+            transition: background 0.2s;
+        }
+        button:hover {
+            background: #555;
+        }
+        button.active {
+            background: #4CAF50;
+            border-color: #4CAF50;
+        }
+        #instructions {
+            position: absolute;
+            bottom: 10px;
+            left: 10px;
+            color: #fff;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 10px;
+            border-radius: 8px;
+            pointer-events: none;
+            font-size: 12px;
+        }
+        .highlight { color: #4CAF50; font-weight: bold; }
+        .warning { color: #FFC107; font-weight: bold; }
+    </style>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="canvas-container"></div>
+    
+    <div id="hud">
+        <div>Difficulty: <span id="hud-diff" class="highlight">Easy</span></div>
+        <div>Status: <span id="hud-status">Ready</span></div>
+        <hr style="border-color: #444; margin: 8px 0;">
+        <div>Elevation: <span id="hud-elev">45</span>°</div>
+        <div>Azimuth: <span id="hud-azim">0</span>°</div>
+        <div>Speed: <span id="hud-speed">20.0</span> m/s</div>
+        <div>Drag Coeff (Cd): <span id="hud-cd">0.1</span></div>
+        <hr style="border-color: #444; margin: 8px 0;">
+        <div>Score: <span id="hud-score">0 / 0</span></div>
+        <div>Last Distance: <span id="hud-dist">-</span></div>
+        <div>Pos: <span id="hud-pos">0.0, 0.0, 0.0</span></div>
+    </div>
+
+    <div id="controls">
+        <button id="btn-easy" class="active">Easy</button>
+        <button id="btn-medium">Medium</button>
+        <button id="btn-hard">Hard</button>
+    </div>
+
+    <div id="instructions">
+        [↑/↓] Elevation | [←/→] Azimuth | [W/S] Power | [SPACE] Fire | [R] Reset
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+        // --- State Management ---
+        window.__3D_STATE__ = {
+            difficulty: 'easy',
+            launchAngle: 45,
+            azimuthAngle: 0,
+            launchSpeed: 20,
+            dragCoefficient: 0.1,
+            projectileStatus: 'ready',
+            projectilePosition: {x: 0, y: 0, z: 0},
+            projectileVelocity: {x: 0, y: 0, z: 0},
+            targetPosition: {x: 15, y: 0, z: 0},
+            targetRadius: 4,
+            landingPosition: null,
+            distanceToTarget: null,
+            isHit: false,
+            score: {hits: 0, total: 0},
+            shotsFired: 0,
+            trailPoints: 0,
+            modelLoaded: false,
+            energy: {kinetic: 0, potential: 0},
+            dragForce: {x: 0, y: 0, z: 0},
+            timeInFlight: 0,
+            maxHeight: 0
+        };
+
+        const state = window.__3D_STATE__;
+
+        const DIFFICULTIES = {
+            easy:   { cd: 0.1, dist: 15, rad: 4 },
+            medium: { cd: 0.3, dist: 25, rad: 3 },
+            hard:   { cd: 0.6, dist: 35, rad: 2 }
+        };
+
+        // Physics Constants
+        const GRAVITY = 9.81;
+        const RHO = 1.225;
+        const RADIUS = 0.5;
+        const AREA = Math.PI * RADIUS * RADIUS;
+        const MASS = 1.0;
+        const DT = 1 / 60;
+
+        // --- Scene Setup ---
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x87CEEB); // Light blue sky
+
+        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.set(0, 15, 40);
+        camera.lookAt(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        container.appendChild(renderer.domElement);
+
+        // Lights
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+        dirLight.position.set(10, 20, 10);
+        scene.add(dirLight);
+
+        // Ground
+        const groundGeo = new THREE.PlaneGeometry(200, 200);
+        const groundMat = new THREE.MeshLambertMaterial({ color: 0x2d5a27 });
+        const ground = new THREE.Mesh(groundGeo, groundMat);
+        ground.rotation.x = -Math.PI / 2;
+        scene.add(ground);
+
+        // Grid Helper for better depth perception
+        const gridHelper = new THREE.GridHelper(200, 40, 0x000000, 0x000000);
+        gridHelper.material.opacity = 0.2;
+        gridHelper.material.transparent = true;
+        scene.add(gridHelper);
+
+        // Target
+        const targetGeo = new THREE.CylinderGeometry(1, 1, 0.3, 32);
+        const targetMat = new THREE.MeshBasicMaterial({ color: 0xff0000, transparent: true, opacity: 0.5 });
+        const targetMesh = new THREE.Mesh(targetGeo, targetMat);
+        targetMesh.position.set(state.targetPosition.x, 0.15, state.targetPosition.z);
+        targetMesh.scale.set(state.targetRadius, 1, state.targetRadius);
+        scene.add(targetMesh);
+
+        // Projectile
+        const projGeo = new THREE.SphereGeometry(RADIUS, 16, 16);
+        const projMat = new THREE.MeshStandardMaterial({ color: 0xffd700, roughness: 0.4, metalness: 0.8 });
+        const projectile = new THREE.Mesh(projGeo, projMat);
+        projectile.visible = false;
+        scene.add(projectile);
+
+        // Trajectory Trail
+        const MAX_TRAIL_POINTS = 2000;
+        const trailGeo = new THREE.BufferGeometry();
+        const trailPositions = new Float32Array(MAX_TRAIL_POINTS * 3);
+        trailGeo.setAttribute('position', new THREE.BufferAttribute(trailPositions, 3));
+        trailGeo.setDrawRange(0, 0);
+        const trailMat = new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.6 });
+        const trailLine = new THREE.Line(trailGeo, trailMat);
+        scene.add(trailLine);
+
+        // Launcher Model
+        const loader = new GLTFLoader();
+        loader.load(
+            'https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Models/master/2.0/AntiqueCamera/glTF-Binary/AntiqueCamera.glb',
+            (gltf) => {
+                const model = gltf.scene;
+                model.scale.set(2, 2, 2);
+                model.position.set(0, 0, 0);
+                // Rotate to face +X roughly
+                model.rotation.y = Math.PI / 2;
+                scene.add(model);
+                state.modelLoaded = true;
+            },
+            undefined,
+            (error) => {
+                console.error('Error loading model:', error);
+                // Fallback box if model fails
+                const boxGeo = new THREE.BoxGeometry(2, 2, 2);
+                const boxMat = new THREE.MeshStandardMaterial({ color: 0x555555 });
+                const box = new THREE.Mesh(boxGeo, boxMat);
+                box.position.set(0, 1, 0);
+                scene.add(box);
+                state.modelLoaded = true;
+            }
+        );
+
+        // --- Logic & Physics Variables ---
+        let currentPos = new THREE.Vector3();
+        let currentVel = new THREE.Vector3();
+        let trailIndex = 0;
+
+        // --- Input Handling ---
+        const keys = {};
+        window.addEventListener('keydown', (e) => {
+            keys[e.code] = true;
+            handleInput(e.code);
+        });
+        window.addEventListener('keyup', (e) => {
+            keys[e.code] = false;
+        });
+
+        function handleInput(code) {
+            if (state.projectileStatus === 'in_flight') return;
+
+            if (code === 'ArrowUp') {
+                state.launchAngle = Math.min(80, state.launchAngle + 1);
+            } else if (code === 'ArrowDown') {
+                state.launchAngle = Math.max(10, state.launchAngle - 1);
+            } else if (code === 'ArrowLeft') {
+                state.azimuthAngle = Math.max(-45, state.azimuthAngle - 1);
+            } else if (code === 'ArrowRight') {
+                state.azimuthAngle = Math.min(45, state.azimuthAngle + 1);
+            } else if (code === 'KeyW') {
+                state.launchSpeed = Math.min(30, state.launchSpeed + 0.5);
+            } else if (code === 'KeyS') {
+                state.launchSpeed = Math.max(10, state.launchSpeed - 0.5);
+            } else if (code === 'Space') {
+                if (state.projectileStatus === 'ready' || state.projectileStatus === 'landed') {
+                    launchProjectile();
+                }
+            } else if (code === 'KeyR') {
+                resetProjectile();
+            }
+            updateHUD();
+        }
+
+        // --- UI Buttons ---
+        document.getElementById('btn-easy').addEventListener('click', () => setDifficulty('easy'));
+        document.getElementById('btn-medium').addEventListener('click', () => setDifficulty('medium'));
+        document.getElementById('btn-hard').addEventListener('click', () => setDifficulty('hard'));
+
+        function setDifficulty(level) {
+            if (state.projectileStatus === 'in_flight') return;
+            
+            document.querySelectorAll('#controls button').forEach(b => b.classList.remove('active'));
+            document.getElementById(`btn-${level}`).classList.add('active');
+
+            state.difficulty = level;
+            const config = DIFFICULTIES[level];
+            state.dragCoefficient = config.cd;
+            state.targetPosition.x = config.dist;
+            state.targetRadius = config.rad;
+            
+            // Reset score for new difficulty
+            state.score.hits = 0;
+            state.score.total = 0;
+            state.shotsFired = 0;
+
+            // Update Target Mesh
+            targetMesh.position.set(state.targetPosition.x, 0.15, state.targetPosition.z);
+            targetMesh.scale.set(state.targetRadius, 1, state.targetRadius);
+
+            resetProjectile();
+            updateHUD();
+        }
+
+        // --- Actions ---
+        function launchProjectile() {
+            state.projectileStatus = 'in_flight';
+            state.shotsFired++;
+            state.score.total++;
+            state.timeInFlight = 0;
+            state.maxHeight = 0;
+            state.landingPosition = null;
+            state.distanceToTarget = null;
+            state.isHit = false;
+
+            // Initial Position (from launcher)
+            currentPos.set(0, RADIUS, 0);
+            projectile.position.copy(currentPos);
+            projectile.visible = true;
+
+            // Initial Velocity
+            const elevRad = THREE.MathUtils.degToRad(state.launchAngle);
+            const azimRad = THREE.MathUtils.degToRad(state.azimuthAngle);
+            const v0 = state.launchSpeed;
+
+            currentVel.set(
+                v0 * Math.cos(elevRad) * Math.cos(azimRad),
+                v0 * Math.sin(elevRad),
+                v0 * Math.cos(elevRad) * Math.sin(azimRad)
+            );
+
+            // Reset Trail
+            trailIndex = 0;
+            trailGeo.setDrawRange(0, 0);
+            addTrailPoint(currentPos);
+
+            updateHUD();
+        }
+
+        function resetProjectile() {
+            state.projectileStatus = 'ready';
+            projectile.visible = false;
+            trailIndex = 0;
+            trailGeo.setDrawRange(0, 0);
+            state.projectilePosition = {x: 0, y: 0, z: 0};
+            state.projectileVelocity = {x: 0, y: 0, z: 0};
+            state.timeInFlight = 0;
+            state.trailPoints = 0;
+            updateHUD();
+        }
+
+        function addTrailPoint(pos) {
+            if (trailIndex < MAX_TRAIL_POINTS) {
+                trailPositions[trailIndex * 3] = pos.x;
+                trailPositions[trailIndex * 3 + 1] = pos.y;
+                trailPositions[trailIndex * 3 + 2] = pos.z;
+                trailIndex++;
+                trailGeo.attributes.position.needsUpdate = true;
+                trailGeo.setDrawRange(0, trailIndex);
+                state.trailPoints = trailIndex;
+            }
+        }
+
+        // --- Physics Step ---
+        function updatePhysics() {
+            if (state.projectileStatus !== 'in_flight') return;
+
+            // Calculate Speed
+            const speed = currentVel.length();
+
+            // Calculate Drag Force
+            // F_drag = -0.5 * Cd * rho * A * |v| * v
+            const dragMag = 0.5 * state.dragCoefficient * RHO * AREA * speed;
+            const dragForce = currentVel.clone().normalize().multiplyScalar(-dragMag);
+            
+            state.dragForce = {x: dragForce.x, y: dragForce.y, z: dragForce.z};
+
+            // Calculate Acceleration (a = g + F_drag / m)
+            const gravityVec = new THREE.Vector3(0, -GRAVITY, 0);
+            const acceleration = gravityVec.add(dragForce.divideScalar(MASS));
+
+            // Euler Integration
+            currentVel.add(acceleration.multiplyScalar(DT));
+            currentPos.add(currentVel.clone().multiplyScalar(DT));
+
+            // Update State
+            state.timeInFlight += DT;
+            if (currentPos.y > state.maxHeight) state.maxHeight = currentPos.y;
+            
+            state.projectilePosition = {x: currentPos.x, y: currentPos.y, z: currentPos.z};
+            state.projectileVelocity = {x: currentVel.x, y: currentVel.y, z: currentVel.z};
+            
+            // Energy
+            state.energy.kinetic = 0.5 * MASS * speed * speed;
+            state.energy.potential = MASS * GRAVITY * Math.max(0, currentPos.y);
+
+            // Update Mesh
+            projectile.position.copy(currentPos);
+            
+            // Update Trail (every few frames or distance to save buffer, here every frame is fine for short flights)
+            addTrailPoint(currentPos);
+
+            // Ground Collision
+            if (currentPos.y <= RADIUS) {
+                currentPos.y = RADIUS;
+                projectile.position.y = RADIUS;
+                state.projectileStatus = 'landed';
+                
+                state.landingPosition = {x: currentPos.x, y: currentPos.y, z: currentPos.z};
+                
+                // Calculate distance to target center (ignoring Y)
+                const dx = currentPos.x - state.targetPosition.x;
+                const dz = currentPos.z - state.targetPosition.z;
+                const dist = Math.sqrt(dx * dx + dz * dz);
+                state.distanceToTarget = dist;
+
+                if (dist <= state.targetRadius) {
+                    state.isHit = true;
+                    state.score.hits++;
+                } else {
+                    state.isHit = false;
+                }
+            }
+
+            updateHUD();
+        }
+
+        // --- HUD Update ---
+        function updateHUD() {
+            document.getElementById('hud-diff').innerText = state.difficulty.charAt(0).toUpperCase() + state.difficulty.slice(1);
+            
+            const statusEl = document.getElementById('hud-status');
+            statusEl.innerText = state.projectileStatus === 'in_flight' ? 'In Flight' : 
+                                 state.projectileStatus === 'landed' ? 'Landed' : 'Ready';
+            statusEl.className = state.projectileStatus === 'in_flight' ? 'warning' : 
+                                 state.projectileStatus === 'landed' ? (state.isHit ? 'highlight' : '') : '';
+
+            document.getElementById('hud-elev').innerText = state.launchAngle;
+            document.getElementById('hud-azim').innerText = state.azimuthAngle;
+            document.getElementById('hud-speed').innerText = state.launchSpeed.toFixed(1);
+            document.getElementById('hud-cd').innerText = state.dragCoefficient.toFixed(1);
+            
+            document.getElementById('hud-score').innerText = `${state.score.hits} / ${state.score.total}`;
+            
+            document.getElementById('hud-dist').innerText = state.distanceToTarget !== null ? 
+                `${state.distanceToTarget.toFixed(2)} m ${state.isHit ? '(HIT)' : '(MISS)'}` : '-';
+            
+            document.getElementById('hud-pos').innerText = 
+                `${state.projectilePosition.x.toFixed(1)}, ${state.projectilePosition.y.toFixed(1)}, ${state.projectilePosition.z.toFixed(1)}`;
+        }
+
+        // --- Main Loop ---
+        // Fixed timestep accumulator
+        let accumulator = 0;
+        let lastTime = performance.now();
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const now = performance.now();
+            const frameTime = (now - lastTime) / 1000;
+            lastTime = now;
+
+            // Prevent spiral of death if tab is inactive
+            if (frameTime > 0.25) {
+                accumulator = 0;
+            } else {
+                accumulator += frameTime;
+            }
+
+            while (accumulator >= DT) {
+                updatePhysics();
+                accumulator -= DT;
+            }
+
+            renderer.render(scene, camera);
+        }
+
+        // Handle Resize
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // Init
+        updateHUD();
+        animate();
+
+    </script>
+</body>
+</html>

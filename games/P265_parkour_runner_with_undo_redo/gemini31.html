@@ -1,0 +1,439 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Parkour Runner</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #87CEEB;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            user-select: none;
+        }
+        #ui-container {
+            position: absolute;
+            top: 15px;
+            left: 15px;
+            color: white;
+            text-shadow: 1px 1px 3px rgba(0,0,0,0.8);
+            z-index: 100;
+            background: rgba(0, 0, 0, 0.3);
+            padding: 15px;
+            border-radius: 8px;
+            pointer-events: none;
+        }
+        #stats {
+            font-size: 18px;
+            font-weight: bold;
+            margin-bottom: 10px;
+        }
+        .controls {
+            pointer-events: auto;
+        }
+        button {
+            background-color: #44aa44;
+            color: white;
+            border: none;
+            padding: 8px 12px;
+            margin-right: 5px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-weight: bold;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.3);
+            transition: background 0.2s;
+        }
+        button:hover {
+            background-color: #55cc55;
+        }
+        button:active {
+            background-color: #338833;
+            transform: translateY(1px);
+        }
+        #resetBtn {
+            background-color: #aa4444;
+        }
+        #resetBtn:hover {
+            background-color: #cc5555;
+        }
+    </style>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="ui-container">
+        <div id="stats">Platform: 0/19 | Moves: 0 | Undos: 0 | Redos: 0</div>
+        <div class="controls">
+            <button id="undoBtn">Undo (Z)</button>
+            <button id="redoBtn">Redo (Y)</button>
+            <button id="resetBtn">Reset</button>
+        </div>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+        // --- State Management ---
+        window.__3D_STATE__ = {
+            runnerX: 0, runnerY: 0, runnerZ: 0,
+            velocityY: 0,
+            grounded: false,
+            currentPlatform: 0,
+            moveCount: 0,
+            undoCount: 0,
+            redoCount: 0,
+            undoStackSize: 0,
+            redoStackSize: 0,
+            platformCount: 20,
+            modelLoaded: false,
+            fallen: false,
+            gameTime: 0
+        };
+
+        let undoStack = [];
+        let redoStack = [];
+
+        // --- Scene Setup ---
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x87CEEB);
+
+        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.set(0, 8, 15);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        document.body.appendChild(renderer.domElement);
+
+        // --- Lighting ---
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+        dirLight.position.set(10, 20, 10);
+        dirLight.castShadow = true;
+        dirLight.shadow.camera.left = -30;
+        dirLight.shadow.camera.right = 30;
+        dirLight.shadow.camera.top = 30;
+        dirLight.shadow.camera.bottom = -30;
+        scene.add(dirLight);
+
+        // --- Platforms ---
+        const platforms = [];
+        const platformGeo = new THREE.BoxGeometry(3, 0.5, 3);
+        const platformMat = new THREE.MeshStandardMaterial({ color: 0x44aa44, roughness: 0.8 });
+
+        for (let i = 0; i < 20; i++) {
+            const mesh = new THREE.Mesh(platformGeo, platformMat);
+            mesh.position.set(
+                i * 4,
+                Math.sin(i * 0.5) * 2,
+                Math.cos(i * 0.3) * 3
+            );
+            mesh.receiveShadow = true;
+            mesh.castShadow = true;
+            scene.add(mesh);
+            platforms.push({
+                mesh: mesh,
+                x: mesh.position.x,
+                y: mesh.position.y,
+                z: mesh.position.z
+            });
+        }
+
+        // --- Runner (Player) ---
+        const runner = new THREE.Group();
+        scene.add(runner);
+
+        // Placeholder geometry while loading
+        const placeholderGeo = new THREE.BoxGeometry(1, 1, 1);
+        const placeholderMat = new THREE.MeshStandardMaterial({ color: 0xff5555 });
+        const placeholder = new THREE.Mesh(placeholderGeo, placeholderMat);
+        placeholder.position.y = 0.5; // Half height
+        placeholder.castShadow = true;
+        runner.add(placeholder);
+
+        // Load GLB
+        const loader = new GLTFLoader();
+        loader.load(
+            'MosquitoInAmber.glb',
+            (gltf) => {
+                runner.remove(placeholder);
+                const model = gltf.scene;
+                model.scale.set(0.5, 0.5, 0.5);
+                
+                // Center and align model to bottom
+                const box = new THREE.Box3().setFromObject(model);
+                const center = box.getCenter(new THREE.Vector3());
+                model.position.x = -center.x;
+                model.position.z = -center.z;
+                model.position.y = -box.min.y; 
+
+                model.traverse((child) => {
+                    if (child.isMesh) {
+                        child.castShadow = true;
+                        child.receiveShadow = true;
+                    }
+                });
+                
+                runner.add(model);
+                window.__3D_STATE__.modelLoaded = true;
+            },
+            undefined,
+            (error) => {
+                console.warn('Could not load MosquitoInAmber.glb, using placeholder.', error);
+            }
+        );
+
+        // Initial Placement
+        const startPlatform = platforms[0];
+        runner.position.set(startPlatform.x, startPlatform.y + 0.25 + 0.5, startPlatform.z);
+        
+        // Physics variables
+        const velocity = new THREE.Vector3(0, 0, 0);
+        let grounded = true;
+        let currentPlatform = 0;
+
+        // --- Undo / Redo Logic ---
+        function saveSnapshot() {
+            undoStack.push({
+                pos: runner.position.clone(),
+                vel: velocity.clone(),
+                platform: currentPlatform,
+                moves: window.__3D_STATE__.moveCount
+            });
+            redoStack = []; // Clear redo on new action
+        }
+
+        // Save initial state
+        saveSnapshot();
+
+        function performUndo() {
+            if (undoStack.length > 1) { // Keep at least the initial spawn point
+                // Push current to redo
+                redoStack.push({
+                    pos: runner.position.clone(),
+                    vel: velocity.clone(),
+                    platform: currentPlatform,
+                    moves: window.__3D_STATE__.moveCount
+                });
+
+                // Pop and apply undo
+                const state = undoStack.pop();
+                runner.position.copy(state.pos);
+                velocity.copy(state.vel);
+                currentPlatform = state.platform;
+                window.__3D_STATE__.moveCount = state.moves;
+                
+                window.__3D_STATE__.undoCount++;
+                window.__3D_STATE__.fallen = false;
+            } else if (undoStack.length === 1) {
+                // If only start state remains, just revert to it without popping
+                const state = undoStack[0];
+                runner.position.copy(state.pos);
+                velocity.set(0,0,0);
+                currentPlatform = state.platform;
+                window.__3D_STATE__.fallen = false;
+            }
+        }
+
+        function performRedo() {
+            if (redoStack.length > 0) {
+                // Push current to undo
+                undoStack.push({
+                    pos: runner.position.clone(),
+                    vel: velocity.clone(),
+                    platform: currentPlatform,
+                    moves: window.__3D_STATE__.moveCount
+                });
+
+                // Pop and apply redo
+                const state = redoStack.pop();
+                runner.position.copy(state.pos);
+                velocity.copy(state.vel);
+                currentPlatform = state.platform;
+                window.__3D_STATE__.moveCount = state.moves;
+                
+                window.__3D_STATE__.redoCount++;
+            }
+        }
+
+        function resetGame() {
+            undoStack = [];
+            redoStack = [];
+            window.__3D_STATE__.moveCount = 0;
+            window.__3D_STATE__.undoCount = 0;
+            window.__3D_STATE__.redoCount = 0;
+            window.__3D_STATE__.fallen = false;
+            currentPlatform = 0;
+            
+            runner.position.set(platforms[0].x, platforms[0].y + 0.25 + 0.5, platforms[0].z);
+            velocity.set(0, 0, 0);
+            
+            saveSnapshot();
+        }
+
+        // --- Input Handling ---
+        const keys = {
+            forward: false, backward: false, left: false, right: false, jump: false
+        };
+
+        window.addEventListener('keydown', (e) => {
+            switch(e.code) {
+                case 'KeyW': case 'ArrowUp': keys.forward = true; break;
+                case 'KeyS': case 'ArrowDown': keys.backward = true; break;
+                case 'KeyA': case 'ArrowLeft': keys.left = true; break;
+                case 'KeyD': case 'ArrowRight': keys.right = true; break;
+                case 'Space': keys.jump = true; break;
+                case 'KeyZ': performUndo(); break;
+                case 'KeyY': performRedo(); break;
+            }
+        });
+
+        window.addEventListener('keyup', (e) => {
+            switch(e.code) {
+                case 'KeyW': case 'ArrowUp': keys.forward = false; break;
+                case 'KeyS': case 'ArrowDown': keys.backward = false; break;
+                case 'KeyA': case 'ArrowLeft': keys.left = false; break;
+                case 'KeyD': case 'ArrowRight': keys.right = false; break;
+                case 'Space': keys.jump = false; break;
+            }
+        });
+
+        // UI Buttons
+        document.getElementById('undoBtn').addEventListener('click', performUndo);
+        document.getElementById('redoBtn').addEventListener('click', performRedo);
+        document.getElementById('resetBtn').addEventListener('click', resetGame);
+
+        // Handle window resize
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // --- Main Loop ---
+        const clock = new THREE.Clock();
+
+        function animate() {
+            requestAnimationFrame(animate);
+            
+            const dt = Math.min(clock.getDelta(), 0.1); // Cap dt to prevent huge jumps on lag
+            window.__3D_STATE__.gameTime += dt;
+
+            // 1. Apply Input to Velocity
+            let targetVx = 0;
+            let targetVz = 0;
+
+            if (keys.forward) targetVx += 8;
+            if (keys.backward) targetVx -= 4;
+            if (keys.left) targetVz -= 6;
+            if (keys.right) targetVz += 6;
+
+            velocity.x = targetVx;
+            velocity.z = targetVz;
+
+            if (keys.jump && grounded) {
+                velocity.y = 10;
+                grounded = false;
+                keys.jump = false; // Require re-press
+            }
+
+            // 2. Apply Gravity
+            velocity.y -= 25 * dt;
+
+            // 3. Update Position
+            runner.position.x += velocity.x * dt;
+            runner.position.y += velocity.y * dt;
+            runner.position.z += velocity.z * dt;
+
+            // 4. Collision Detection
+            grounded = false;
+            let onPlatformIndex = -1;
+
+            for (let i = 0; i < platforms.length; i++) {
+                const p = platforms[i];
+                
+                // Check X and Z overlap (platform size 3, half-size 1.5)
+                if (Math.abs(runner.position.x - p.x) <= 1.5 && 
+                    Math.abs(runner.position.z - p.z) <= 1.5) {
+                    
+                    // Check Y collision (top of platform + half height of runner)
+                    const surfaceY = p.y + 0.25 + 0.5;
+                    
+                    // If falling and crossing the surface
+                    if (velocity.y <= 0 && runner.position.y >= p.y && runner.position.y <= surfaceY + 0.2) {
+                        runner.position.y = surfaceY;
+                        velocity.y = 0;
+                        grounded = true;
+                        onPlatformIndex = i;
+                        break;
+                    }
+                }
+            }
+
+            // 5. Handle Platform Landing & Snapshots
+            if (onPlatformIndex !== -1) {
+                if (onPlatformIndex !== currentPlatform) {
+                    currentPlatform = onPlatformIndex;
+                    window.__3D_STATE__.moveCount++;
+                    saveSnapshot();
+                }
+            } else {
+                currentPlatform = -1; // Airborne
+            }
+
+            // 6. Handle Falling
+            if (runner.position.y < -10) {
+                window.__3D_STATE__.fallen = true;
+                // Auto-undo to last safe state
+                if (undoStack.length > 0) {
+                    const lastSafe = undoStack[undoStack.length - 1];
+                    runner.position.copy(lastSafe.pos);
+                    velocity.set(0,0,0);
+                    currentPlatform = lastSafe.platform;
+                } else {
+                    resetGame();
+                }
+            }
+
+            // 7. Camera Follow (Lerp)
+            const targetCamPos = new THREE.Vector3(
+                runner.position.x,
+                runner.position.y + 8,
+                runner.position.z + 15
+            );
+            camera.position.lerp(targetCamPos, 0.05);
+            camera.lookAt(runner.position);
+
+            // 8. Update State & UI
+            window.__3D_STATE__.runnerX = Number(runner.position.x.toFixed(2));
+            window.__3D_STATE__.runnerY = Number(runner.position.y.toFixed(2));
+            window.__3D_STATE__.runnerZ = Number(runner.position.z.toFixed(2));
+            window.__3D_STATE__.velocityY = Number(velocity.y.toFixed(2));
+            window.__3D_STATE__.grounded = grounded;
+            window.__3D_STATE__.currentPlatform = currentPlatform;
+            window.__3D_STATE__.undoStackSize = undoStack.length;
+            window.__3D_STATE__.redoStackSize = redoStack.length;
+
+            const displayPlatform = currentPlatform >= 0 ? currentPlatform : '-';
+            document.getElementById('stats').innerText = 
+                `Platform: ${displayPlatform}/19 | Moves: ${window.__3D_STATE__.moveCount} | Undos: ${window.__3D_STATE__.undoCount} | Redos: ${window.__3D_STATE__.redoCount}`;
+
+            // 9. Render
+            renderer.render(scene, camera);
+        }
+
+        animate();
+    </script>
+</body>
+</html>

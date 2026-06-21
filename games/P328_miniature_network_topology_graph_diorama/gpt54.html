@@ -1,0 +1,747 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>3D Network Topology Diorama</title>
+  <style>
+    html, body {
+      margin: 0;
+      overflow: hidden;
+      background: #0b0f14;
+      font-family: Arial, sans-serif;
+      color: white;
+    }
+
+    canvas {
+      display: block;
+    }
+
+    #hud {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      background: rgba(0, 0, 0, 0.55);
+      border: 1px solid rgba(255,255,255,0.15);
+      border-radius: 10px;
+      padding: 12px 14px;
+      font-size: 14px;
+      line-height: 1.5;
+      min-width: 220px;
+      backdrop-filter: blur(6px);
+      z-index: 10;
+    }
+
+    #hud button {
+      margin-top: 8px;
+      padding: 6px 10px;
+      background: #1f6feb;
+      color: white;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 13px;
+    }
+
+    #hud button:hover {
+      background: #388bfd;
+    }
+
+    #help {
+      position: absolute;
+      right: 12px;
+      top: 12px;
+      background: rgba(0, 0, 0, 0.45);
+      border-radius: 10px;
+      padding: 10px 12px;
+      font-size: 12px;
+      line-height: 1.45;
+      z-index: 10;
+    }
+  </style>
+</head>
+<body>
+  <div id="hud">
+    <div><strong>Selected:</strong> <span id="hud-selected">None</span></div>
+    <div><strong>Layout:</strong> <span id="hud-layout">hexagonal</span></div>
+    <div><strong>Traffic:</strong> <span id="hud-traffic">Off</span></div>
+    <div><strong>Nodes:</strong> <span id="hud-nodes">7</span></div>
+    <div><strong>Edges:</strong> <span id="hud-edges">8</span></div>
+    <button id="btn-toggle-traffic">Toggle Traffic</button>
+  </div>
+
+  <div id="help">
+    <div><strong>Controls</strong></div>
+    <div>Click: Select node</div>
+    <div>T: Toggle traffic</div>
+    <div>L: Cycle layout</div>
+    <div>V: Toggle labels</div>
+    <div>P: Highlight path to core</div>
+    <div>Space: Pulse</div>
+    <div>R: Reset</div>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
+    import { OrbitControls } from 'https://unpkg.com/three@0.160.0/examples/jsm/controls/OrbitControls.js';
+    import { GLTFLoader } from 'https://unpkg.com/three@0.160.0/examples/jsm/loaders/GLTFLoader.js';
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0b0f14);
+
+    const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+    camera.position.set(0, 8, 12);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    document.body.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.set(0, 0.8, 0);
+    controls.enableDamping = true;
+
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
+    scene.add(ambientLight);
+
+    const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+    dirLight.position.set(5, 10, 5);
+    dirLight.castShadow = true;
+    dirLight.shadow.mapSize.set(2048, 2048);
+    dirLight.shadow.camera.left = -12;
+    dirLight.shadow.camera.right = 12;
+    dirLight.shadow.camera.top = 12;
+    dirLight.shadow.camera.bottom = -12;
+    scene.add(dirLight);
+
+    const platform = new THREE.Mesh(
+      new THREE.CylinderGeometry(6, 6, 0.3, 64),
+      new THREE.MeshStandardMaterial({
+        color: 0x3a3a3a,
+        metalness: 0.85,
+        roughness: 0.35
+      })
+    );
+    platform.position.y = 0;
+    platform.receiveShadow = true;
+    platform.castShadow = true;
+    scene.add(platform);
+
+    const gridHelper = new THREE.GridHelper(14, 28, 0x333333, 0x222222);
+    gridHelper.position.y = -0.84;
+    scene.add(gridHelper);
+
+    const raycaster = new THREE.Raycaster();
+    const mouse = new THREE.Vector2();
+    const clock = new THREE.Clock();
+
+    const NODE_Y = 0.5;
+    const labels = [];
+    const nodes = [];
+    const nodeObjects = [];
+    const trafficParticles = [];
+    const edgeObjects = [];
+
+    const state = {
+      nodeCount: 7,
+      edgeCount: 8,
+      selectedNode: null,
+      trafficActive: false,
+      currentLayout: 'hexagonal',
+      labelsVisible: true,
+      pathHighlighted: false,
+      pulseActive: false,
+      modelLoaded: false,
+      nodePositions: []
+    };
+
+    window.__3D_STATE__ = state;
+
+    const nodeDefs = [
+      { index: 0, name: 'Core', type: 'router', color: 0xff3333 },
+      { index: 1, name: 'Server 1', type: 'server', color: 0x3388ff },
+      { index: 2, name: 'Server 2', type: 'server', color: 0x3388ff },
+      { index: 3, name: 'Workstation 1', type: 'workstation', color: 0x33cc66 },
+      { index: 4, name: 'Workstation 2', type: 'workstation', color: 0x33cc66 },
+      { index: 5, name: 'Firewall', type: 'firewall', color: 0xff9933 },
+      { index: 6, name: 'Gateway', type: 'gateway', color: 0xbb88ff }
+    ];
+
+    const layoutPositions = {
+      hexagonal: [
+        new THREE.Vector3(0, NODE_Y, 0),
+        new THREE.Vector3(3.5, NODE_Y, 0),
+        new THREE.Vector3(1.75, NODE_Y, 3.03),
+        new THREE.Vector3(-1.75, NODE_Y, 3.03),
+        new THREE.Vector3(-3.5, NODE_Y, 0),
+        new THREE.Vector3(-1.75, NODE_Y, -3.03),
+        new THREE.Vector3(1.75, 0.15, -3.03)
+      ],
+      circular: (() => {
+        const arr = [];
+        const radius = 3.5;
+        for (let i = 0; i < 7; i++) {
+          const angle = (i / 7) * Math.PI * 2;
+          const y = i === 6 ? 0.15 : NODE_Y;
+          arr.push(new THREE.Vector3(Math.cos(angle) * radius, y, Math.sin(angle) * radius));
+        }
+        return arr;
+      })(),
+      grid: [
+        new THREE.Vector3(-3.0, NODE_Y, 1.5),
+        new THREE.Vector3(0.0, NODE_Y, 1.5),
+        new THREE.Vector3(3.0, NODE_Y, 1.5),
+        new THREE.Vector3(-3.0, NODE_Y, -1.5),
+        new THREE.Vector3(0.0, NODE_Y, -1.5),
+        new THREE.Vector3(3.0, NODE_Y, -1.5),
+        new THREE.Vector3(0.0, 0.15, -3.6)
+      ]
+    };
+
+    let layoutTransition = null;
+
+    const edges = [
+      [0, 1],
+      [0, 2],
+      [0, 3],
+      [0, 4],
+      [0, 5],
+      [0, 6],
+      [5, 6],
+      [1, 6]
+    ];
+
+    const adjacency = {};
+    for (let i = 0; i < nodeDefs.length; i++) adjacency[i] = [];
+    for (const [a, b] of edges) {
+      adjacency[a].push(b);
+      adjacency[b].push(a);
+    }
+
+    function createLabelSprite(text) {
+      const canvas = document.createElement('canvas');
+      canvas.width = 256;
+      canvas.height = 96;
+      const ctx = canvas.getContext('2d');
+
+      ctx.fillStyle = 'rgba(0, 0, 0, 0.65)';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+      ctx.strokeStyle = 'rgba(255,255,255,0.5)';
+      ctx.lineWidth = 4;
+      ctx.strokeRect(4, 4, canvas.width - 8, canvas.height - 8);
+
+      ctx.fillStyle = 'white';
+      ctx.font = 'bold 28px Arial';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(text, canvas.width / 2, canvas.height / 2);
+
+      const texture = new THREE.CanvasTexture(canvas);
+      const material = new THREE.SpriteMaterial({ map: texture, transparent: true });
+      const sprite = new THREE.Sprite(material);
+      sprite.scale.set(1.8, 0.68, 1);
+      return sprite;
+    }
+
+    function createNodeMesh(def) {
+      let mesh;
+      if (def.type === 'router') {
+        mesh = new THREE.Mesh(
+          new THREE.SphereGeometry(0.4, 32, 32),
+          new THREE.MeshStandardMaterial({
+            color: def.color,
+            emissive: 0x000000,
+            metalness: 0.35,
+            roughness: 0.4
+          })
+        );
+      } else if (def.type === 'server') {
+        mesh = new THREE.Mesh(
+          new THREE.BoxGeometry(0.6, 0.6, 0.6),
+          new THREE.MeshStandardMaterial({
+            color: def.color,
+            emissive: 0x000000,
+            metalness: 0.3,
+            roughness: 0.35
+          })
+        );
+      } else if (def.type === 'workstation') {
+        mesh = new THREE.Mesh(
+          new THREE.SphereGeometry(0.3, 24, 24),
+          new THREE.MeshStandardMaterial({
+            color: def.color,
+            emissive: 0x000000,
+            metalness: 0.25,
+            roughness: 0.45
+          })
+        );
+      } else if (def.type === 'firewall') {
+        mesh = new THREE.Mesh(
+          new THREE.OctahedronGeometry(0.4),
+          new THREE.MeshStandardMaterial({
+            color: def.color,
+            emissive: 0x000000,
+            metalness: 0.35,
+            roughness: 0.35
+          })
+        );
+      }
+      mesh.castShadow = true;
+      mesh.receiveShadow = true;
+      mesh.userData.nodeIndex = def.index;
+      mesh.userData.nodeName = def.name;
+      return mesh;
+    }
+
+    for (let i = 0; i < 6; i++) {
+      const mesh = createNodeMesh(nodeDefs[i]);
+      mesh.position.copy(layoutPositions.hexagonal[i]);
+      nodes[i] = mesh;
+      nodeObjects.push(mesh);
+      scene.add(mesh);
+
+      const label = createLabelSprite(nodeDefs[i].name);
+      label.position.set(mesh.position.x, mesh.position.y + 0.95, mesh.position.z);
+      labels[i] = label;
+      scene.add(label);
+    }
+
+    const gatewayGroup = new THREE.Group();
+    gatewayGroup.position.copy(layoutPositions.hexagonal[6]);
+    gatewayGroup.userData.nodeIndex = 6;
+    gatewayGroup.userData.nodeName = nodeDefs[6].name;
+    nodes[6] = gatewayGroup;
+    nodeObjects.push(gatewayGroup);
+    scene.add(gatewayGroup);
+
+    const gatewayPlaceholder = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.25, 0.25, 0.25, 16),
+      new THREE.MeshStandardMaterial({
+        color: 0xbb88ff,
+        emissive: 0x000000,
+        metalness: 0.4,
+        roughness: 0.4
+      })
+    );
+    gatewayPlaceholder.castShadow = true;
+    gatewayPlaceholder.receiveShadow = true;
+    gatewayGroup.add(gatewayPlaceholder);
+
+    const gatewayLabel = createLabelSprite(nodeDefs[6].name);
+    gatewayLabel.position.set(gatewayGroup.position.x, gatewayGroup.position.y + 0.95, gatewayGroup.position.z);
+    labels[6] = gatewayLabel;
+    scene.add(gatewayLabel);
+
+    const loader = new GLTFLoader();
+    loader.load(
+      'Corset.glb',
+      (gltf) => {
+        gatewayGroup.clear();
+        const model = gltf.scene;
+        model.scale.set(0.015, 0.015, 0.015);
+        model.traverse((obj) => {
+          if (obj.isMesh) {
+            obj.castShadow = true;
+            obj.receiveShadow = true;
+            if (obj.material && obj.material.emissive === undefined) {
+              obj.material = new THREE.MeshStandardMaterial({ color: 0xbb88ff, metalness: 0.3, roughness: 0.5 });
+            }
+          }
+        });
+        gatewayGroup.add(model);
+        gatewayGroup.userData.modelRoot = model;
+        state.modelLoaded = true;
+      },
+      undefined,
+      () => {
+        state.modelLoaded = false;
+      }
+    );
+
+    function createEdgeObject(a, b) {
+      const geometry = new THREE.BufferGeometry();
+      const positions = new Float32Array(6);
+      geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+      const material = new THREE.LineBasicMaterial({ color: 0xffffff });
+      const line = new THREE.Line(geometry, material);
+      line.userData = { a, b, highlighted: false };
+      scene.add(line);
+      return line;
+    }
+
+    for (const [a, b] of edges) {
+      edgeObjects.push(createEdgeObject(a, b));
+    }
+
+    function createTrafficParticles() {
+      const particleGeom = new THREE.SphereGeometry(0.08, 12, 12);
+      for (let i = 0; i < edges.length; i++) {
+        const mat1 = new THREE.MeshStandardMaterial({ color: 0xffee55, emissive: 0x665500 });
+        const mat2 = new THREE.MeshStandardMaterial({ color: 0xffee55, emissive: 0x665500 });
+        const p1 = new THREE.Mesh(particleGeom, mat1);
+        const p2 = new THREE.Mesh(particleGeom, mat2);
+        p1.visible = false;
+        p2.visible = false;
+        p1.userData.edgeIndex = i;
+        p2.userData.edgeIndex = i;
+        p1.userData.offset = Math.random();
+        p2.userData.offset = Math.random();
+        scene.add(p1, p2);
+        trafficParticles.push({ forward: p1, backward: p2 });
+      }
+    }
+
+    createTrafficParticles();
+
+    let pulseMesh = null;
+    let pulseStartTime = 0;
+
+    function triggerPulse() {
+      if (pulseMesh) {
+        scene.remove(pulseMesh);
+        pulseMesh.geometry.dispose();
+        pulseMesh.material.dispose();
+        pulseMesh = null;
+      }
+
+      pulseMesh = new THREE.Mesh(
+        new THREE.TorusGeometry(0.1, 0.05, 16, 64),
+        new THREE.MeshBasicMaterial({
+          color: 0x33ddff,
+          transparent: true,
+          opacity: 0.9
+        })
+      );
+      pulseMesh.rotation.x = Math.PI / 2;
+      pulseMesh.position.set(nodes[0].position.x, 0.18, nodes[0].position.z);
+      scene.add(pulseMesh);
+      pulseStartTime = clock.getElapsedTime();
+      state.pulseActive = true;
+    }
+
+    function getNodeWorldPos(index) {
+      const v = new THREE.Vector3();
+      nodes[index].getWorldPosition(v);
+      return v;
+    }
+
+    function updateEdges() {
+      edgeObjects.forEach((edgeObj) => {
+        const aPos = getNodeWorldPos(edgeObj.userData.a);
+        const bPos = getNodeWorldPos(edgeObj.userData.b);
+        aPos.y = 0.5;
+        bPos.y = 0.5;
+        const arr = edgeObj.geometry.attributes.position.array;
+        arr[0] = aPos.x; arr[1] = aPos.y; arr[2] = aPos.z;
+        arr[3] = bPos.x; arr[4] = bPos.y; arr[5] = bPos.z;
+        edgeObj.geometry.attributes.position.needsUpdate = true;
+      });
+    }
+
+    function updateLabels() {
+      labels.forEach((label, i) => {
+        const pos = getNodeWorldPos(i);
+        label.position.set(pos.x, pos.y + 0.95, pos.z);
+        label.visible = state.labelsVisible;
+      });
+    }
+
+    function setNodeHighlight(index, highlighted) {
+      if (index == null || !nodes[index]) return;
+      const root = nodes[index];
+
+      root.traverse?.((obj) => {
+        if (obj.isMesh && obj.material) {
+          if (obj.material.emissive) {
+            obj.material.emissive.set(highlighted ? 0xffff00 : 0x000000);
+          }
+        }
+      });
+
+      if (root.isMesh && root.material && root.material.emissive) {
+        root.material.emissive.set(highlighted ? 0xffff00 : 0x000000);
+      }
+    }
+
+    function clearSelection() {
+      if (state.selectedNode !== null) setNodeHighlight(state.selectedNode, false);
+      state.selectedNode = null;
+      clearPathHighlight();
+    }
+
+    function selectNode(index) {
+      if (state.selectedNode !== null) setNodeHighlight(state.selectedNode, false);
+      state.selectedNode = index;
+      setNodeHighlight(index, true);
+      clearPathHighlight();
+    }
+
+    function setTrafficActive(active) {
+      state.trafficActive = active;
+      trafficParticles.forEach(({ forward, backward }) => {
+        forward.visible = active;
+        backward.visible = active;
+      });
+    }
+
+    function cycleLayout() {
+      const order = ['hexagonal', 'circular', 'grid'];
+      const idx = order.indexOf(state.currentLayout);
+      const next = order[(idx + 1) % order.length];
+      startLayoutTransition(next);
+    }
+
+    function startLayoutTransition(name) {
+      layoutTransition = {
+        name,
+        startTime: clock.getElapsedTime(),
+        duration: 1.0,
+        from: nodes.map((n) => {
+          const p = new THREE.Vector3();
+          n.getWorldPosition(p);
+          return p;
+        }),
+        to: layoutPositions[name].map(v => v.clone())
+      };
+      state.currentLayout = name;
+    }
+
+    function updateLayoutTransition(time) {
+      if (!layoutTransition) return;
+      const t = Math.min((time - layoutTransition.startTime) / layoutTransition.duration, 1);
+      const ease = t * t * (3 - 2 * t);
+
+      for (let i = 0; i < nodes.length; i++) {
+        const pos = new THREE.Vector3().lerpVectors(layoutTransition.from[i], layoutTransition.to[i], ease);
+        nodes[i].position.copy(pos);
+      }
+
+      if (t >= 1) {
+        layoutTransition = null;
+      }
+    }
+
+    function toggleLabels() {
+      state.labelsVisible = !state.labelsVisible;
+      updateLabels();
+    }
+
+    function edgeKey(a, b) {
+      return a < b ? `${a}-${b}` : `${b}-${a}`;
+    }
+
+    function clearPathHighlight() {
+      edgeObjects.forEach(edge => {
+        edge.material.color.set(0xffffff);
+        edge.userData.highlighted = false;
+      });
+      state.pathHighlighted = false;
+    }
+
+    function shortestPathToCore(fromNode) {
+      const target = 0;
+      if (fromNode === null || fromNode === undefined) return null;
+      if (fromNode === target) return [0];
+
+      const queue = [fromNode];
+      const visited = new Set([fromNode]);
+      const prev = {};
+
+      while (queue.length) {
+        const current = queue.shift();
+        for (const next of adjacency[current]) {
+          if (!visited.has(next)) {
+            visited.add(next);
+            prev[next] = current;
+            if (next === target) {
+              const path = [target];
+              let p = target;
+              while (p !== fromNode) {
+                p = prev[p];
+                path.push(p);
+              }
+              path.reverse();
+              return path;
+            }
+            queue.push(next);
+          }
+        }
+      }
+      return null;
+    }
+
+    function highlightPathToCore() {
+      if (state.selectedNode === null) return;
+      clearPathHighlight();
+      const path = shortestPathToCore(state.selectedNode);
+      if (!path || path.length < 2) return;
+
+      const pathEdges = new Set();
+      for (let i = 0; i < path.length - 1; i++) {
+        pathEdges.add(edgeKey(path[i], path[i + 1]));
+      }
+
+      edgeObjects.forEach(edge => {
+        const k = edgeKey(edge.userData.a, edge.userData.b);
+        if (pathEdges.has(k)) {
+          edge.material.color.set(0x00ffff);
+          edge.userData.highlighted = true;
+        }
+      });
+
+      state.pathHighlighted = true;
+    }
+
+    function resetAll() {
+      clearSelection();
+      setTrafficActive(false);
+      state.labelsVisible = true;
+      clearPathHighlight();
+      startLayoutTransition('hexagonal');
+      if (pulseMesh) {
+        scene.remove(pulseMesh);
+        pulseMesh.geometry.dispose();
+        pulseMesh.material.dispose();
+        pulseMesh = null;
+      }
+      state.pulseActive = false;
+      updateLabels();
+    }
+
+    function updateTraffic(time) {
+      trafficParticles.forEach((pair, i) => {
+        if (!state.trafficActive) return;
+
+        const [a, b] = edges[i];
+        const aPos = getNodeWorldPos(a);
+        const bPos = getNodeWorldPos(b);
+        aPos.y = 0.5;
+        bPos.y = 0.5;
+
+        const speed = 0.35;
+        const t1 = (time * speed + pair.forward.userData.offset) % 1;
+        const t2 = (time * speed + pair.backward.userData.offset) % 1;
+
+        pair.forward.position.lerpVectors(aPos, bPos, t1);
+        pair.backward.position.lerpVectors(bPos, aPos, t2);
+      });
+    }
+
+    function updatePulse(time) {
+      if (!pulseMesh) return;
+      const elapsed = time - pulseStartTime;
+      const duration = 1.5;
+      const t = elapsed / duration;
+      if (t >= 1) {
+        scene.remove(pulseMesh);
+        pulseMesh.geometry.dispose();
+        pulseMesh.material.dispose();
+        pulseMesh = null;
+        state.pulseActive = false;
+        return;
+      }
+
+      const radius = Math.max(0.1, 6 * t);
+      pulseMesh.geometry.dispose();
+      pulseMesh.geometry = new THREE.TorusGeometry(radius, 0.05, 16, 96);
+      pulseMesh.material.opacity = 1.0 - t;
+      pulseMesh.position.set(nodes[0].position.x, 0.18, nodes[0].position.z);
+      state.pulseActive = true;
+    }
+
+    function updateHUD() {
+      document.getElementById('hud-selected').textContent =
+        state.selectedNode === null ? 'None' : nodeDefs[state.selectedNode].name;
+      document.getElementById('hud-layout').textContent = state.currentLayout;
+      document.getElementById('hud-traffic').textContent = state.trafficActive ? 'On' : 'Off';
+      document.getElementById('hud-nodes').textContent = state.nodeCount;
+      document.getElementById('hud-edges').textContent = state.edgeCount;
+    }
+
+    function updateState() {
+      state.nodePositions = nodes.map((node) => {
+        const p = getNodeWorldPos(node.userData.nodeIndex);
+        return { x: p.x, y: p.y, z: p.z };
+      });
+      window.__3D_STATE__ = state;
+    }
+
+    renderer.domElement.addEventListener('click', (event) => {
+      const rect = renderer.domElement.getBoundingClientRect();
+      mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+      mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+
+      raycaster.setFromCamera(mouse, camera);
+
+      const intersects = raycaster.intersectObjects(nodeObjects, true);
+      if (intersects.length > 0) {
+        let obj = intersects[0].object;
+        while (obj && obj.userData.nodeIndex === undefined && obj.parent) {
+          obj = obj.parent;
+        }
+        if (obj && obj.userData.nodeIndex !== undefined) {
+          selectNode(obj.userData.nodeIndex);
+          return;
+        }
+      }
+
+      clearSelection();
+    });
+
+    window.addEventListener('keydown', (e) => {
+      const key = e.key.toLowerCase();
+      if (key === 't') {
+        setTrafficActive(!state.trafficActive);
+      } else if (key === 'l') {
+        cycleLayout();
+      } else if (key === 'v') {
+        toggleLabels();
+      } else if (key === 'p') {
+        highlightPathToCore();
+      } else if (key === 'r') {
+        resetAll();
+      } else if (e.code === 'Space') {
+        e.preventDefault();
+        triggerPulse();
+      }
+    });
+
+    document.getElementById('btn-toggle-traffic').addEventListener('click', () => {
+      setTrafficActive(!state.trafficActive);
+    });
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    updateEdges();
+    updateLabels();
+    updateHUD();
+    updateState();
+
+    function animate() {
+      requestAnimationFrame(animate);
+      const time = clock.getElapsedTime();
+
+      controls.update();
+      updateLayoutTransition(time);
+      updateEdges();
+      updateLabels();
+      updateTraffic(time);
+      updatePulse(time);
+      updateHUD();
+      updateState();
+
+      renderer.render(scene, camera);
+    }
+
+    animate();
+  </script>
+</body>
+</html>

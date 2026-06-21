@@ -1,0 +1,639 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>3D Supply Chain Diorama</title>
+  <style>
+    html, body {
+      margin: 0;
+      overflow: hidden;
+      background: #111;
+      font-family: Arial, sans-serif;
+      color: white;
+    }
+    canvas { display: block; }
+
+    #hud-stats {
+      position: absolute;
+      top: 16px;
+      left: 16px;
+      background: rgba(0,0,0,0.7);
+      padding: 10px 14px;
+      border-radius: 8px;
+      font-size: 14px;
+      z-index: 10;
+    }
+
+    .ui-btn {
+      position: absolute;
+      right: 16px;
+      background: #222;
+      color: #fff;
+      border: 1px solid #555;
+      padding: 10px 14px;
+      border-radius: 8px;
+      cursor: pointer;
+      z-index: 10;
+      font-size: 14px;
+    }
+    .ui-btn:hover { background: #333; }
+
+    #btn-play { top: 16px; }
+    #btn-speed { top: 60px; }
+    #btn-heatmap { top: 104px; }
+
+    #info-panel {
+      position: absolute;
+      right: 16px;
+      bottom: 16px;
+      min-width: 240px;
+      background: rgba(0,0,0,0.78);
+      padding: 12px 14px;
+      border-radius: 8px;
+      font-size: 14px;
+      z-index: 10;
+      display: none;
+      border: 1px solid #444;
+    }
+    #info-panel h3 {
+      margin: 0 0 8px 0;
+      font-size: 16px;
+    }
+    #hint {
+      position: absolute;
+      left: 16px;
+      bottom: 16px;
+      background: rgba(0,0,0,0.55);
+      padding: 8px 12px;
+      border-radius: 8px;
+      font-size: 13px;
+      z-index: 10;
+      color: #ddd;
+    }
+  </style>
+</head>
+<body>
+  <div id="hud-stats">Spawned: 0 | In-Transit: 0 | Delivered: 0</div>
+  <button id="btn-play" class="ui-btn">Play</button>
+  <button id="btn-speed" class="ui-btn">Speed: 1x</button>
+  <button id="btn-heatmap" class="ui-btn">Heatmap: Off</button>
+
+  <div id="info-panel"></div>
+  <div id="hint">Click buildings to inspect • R to reset • 1/2/3 camera presets</div>
+
+  <script type="module">
+    import * as THREE from "https://unpkg.com/three@0.160.0/build/three.module.js";
+    import { OrbitControls } from "https://unpkg.com/three@0.160.0/examples/jsm/controls/OrbitControls.js";
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x20242a);
+
+    const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+    camera.position.set(0, 12, 18);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    document.body.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.set(0, 0, 0);
+    controls.enableDamping = true;
+    controls.maxPolarAngle = Math.PI / 2.05;
+
+    // Lights
+    const ambient = new THREE.AmbientLight(0xffffff, 0.4);
+    scene.add(ambient);
+
+    const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+    dirLight.position.set(10, 15, 10);
+    dirLight.castShadow = true;
+    dirLight.shadow.mapSize.set(2048, 2048);
+    dirLight.shadow.camera.left = -25;
+    dirLight.shadow.camera.right = 25;
+    dirLight.shadow.camera.top = 25;
+    dirLight.shadow.camera.bottom = -25;
+    dirLight.shadow.camera.near = 1;
+    dirLight.shadow.camera.far = 50;
+    scene.add(dirLight);
+
+    // State
+    window.__3D_STATE__ = {
+      running: false,
+      speedMultiplier: 1,
+      totalSpawned: 0,
+      totalInTransit: 0,
+      totalDelivered: 0,
+      selectedBuilding: null,
+      cameraPreset: 1,
+      heatmapEnabled: false,
+      warehouseThroughput: [0, 0],
+      parcelCount: 0,
+      elapsedTime: 0
+    };
+
+    const state = window.__3D_STATE__;
+
+    // DOM
+    const hudStats = document.getElementById("hud-stats");
+    const btnPlay = document.getElementById("btn-play");
+    const btnSpeed = document.getElementById("btn-speed");
+    const btnHeatmap = document.getElementById("btn-heatmap");
+    const infoPanel = document.getElementById("info-panel");
+
+    // Helpers
+    const clock = new THREE.Clock();
+    const raycaster = new THREE.Raycaster();
+    const mouse = new THREE.Vector2();
+
+    const buildingMeshes = [];
+    const parcels = [];
+    const warehouses = [];
+    const factories = [];
+    const stores = [];
+    const paths = [];
+
+    let selectedObject = null;
+    let simTime = 0;
+    let spawnTimers = [0, 0];
+
+    // Materials
+    const tableMat = new THREE.MeshStandardMaterial({ color: 0x8B6914, roughness: 0.85 });
+    const factoryMat = new THREE.MeshStandardMaterial({ color: 0xcc3333, emissive: 0x000000 });
+    const warehouseMatBase = new THREE.MeshStandardMaterial({ color: 0xE5C84B, emissive: 0x000000 });
+    const storeMat = new THREE.MeshStandardMaterial({ color: 0x3ba44d, emissive: 0x000000 });
+    const chimneyMat = new THREE.MeshStandardMaterial({ color: 0x555555 });
+    const pathMat = new THREE.MeshStandardMaterial({ color: 0x888888 });
+    const parcelMat = new THREE.MeshStandardMaterial({ color: 0x2266CC, emissive: 0x112244 });
+
+    // Table
+    const tableGeo = new THREE.BoxGeometry(30, 0.5, 20);
+    const table = new THREE.Mesh(tableGeo, tableMat);
+    table.position.set(0, -0.25, 0);
+    table.receiveShadow = true;
+    scene.add(table);
+
+    // Ground edge trim feel
+    const edge = new THREE.LineSegments(
+      new THREE.EdgesGeometry(tableGeo),
+      new THREE.LineBasicMaterial({ color: 0x5e440f })
+    );
+    edge.position.copy(table.position);
+    scene.add(edge);
+
+    function createBuilding({ name, type, size, pos, colorMat, throughputIndex = null }) {
+      const group = new THREE.Group();
+      group.position.copy(pos);
+
+      const body = new THREE.Mesh(new THREE.BoxGeometry(size.x, size.y, size.z), colorMat.clone());
+      body.position.y = 0;
+      body.castShadow = true;
+      body.receiveShadow = true;
+      group.add(body);
+
+      group.userData = {
+        name,
+        type,
+        size,
+        throughputIndex,
+        body
+      };
+
+      if (type === "factory") {
+        const chimney1 = new THREE.Mesh(new THREE.CylinderGeometry(0.12, 0.12, 0.7, 16), chimneyMat);
+        chimney1.position.set(-0.35, size.y / 2 + 0.35, -0.25);
+        chimney1.castShadow = true;
+        group.add(chimney1);
+
+        const chimney2 = new THREE.Mesh(new THREE.CylinderGeometry(0.12, 0.12, 0.55, 16), chimneyMat);
+        chimney2.position.set(0.25, size.y / 2 + 0.275, 0.2);
+        chimney2.castShadow = true;
+        group.add(chimney2);
+      }
+
+      scene.add(group);
+      buildingMeshes.push(group);
+      return group;
+    }
+
+    // Buildings
+    const factoryData = [
+      { name: "Factory A", pos: new THREE.Vector3(-10, 0.75, -5) },
+      { name: "Factory B", pos: new THREE.Vector3(-10, 0.75, 5) }
+    ];
+
+    factoryData.forEach((f, i) => {
+      const obj = createBuilding({
+        name: f.name,
+        type: "factory",
+        size: { x: 1.5, y: 1.5, z: 1.5 },
+        pos: f.pos,
+        colorMat: factoryMat
+      });
+      obj.userData.index = i;
+      factories.push(obj);
+    });
+
+    const warehouseData = [
+      { name: "Warehouse North", pos: new THREE.Vector3(0, 0.6, -4), throughputIndex: 0 },
+      { name: "Warehouse South", pos: new THREE.Vector3(0, 0.6, 4), throughputIndex: 1 }
+    ];
+
+    warehouseData.forEach((w) => {
+      const obj = createBuilding({
+        name: w.name,
+        type: "warehouse",
+        size: { x: 2, y: 1.2, z: 1.5 },
+        pos: w.pos,
+        colorMat: warehouseMatBase,
+        throughputIndex: w.throughputIndex
+      });
+      warehouses.push(obj);
+    });
+
+    const storeData = [
+      { name: "Store 1", pos: new THREE.Vector3(10, 0.5, -6) },
+      { name: "Store 2", pos: new THREE.Vector3(10, 0.5, 0) },
+      { name: "Store 3", pos: new THREE.Vector3(10, 0.5, 6) }
+    ];
+
+    storeData.forEach((s) => {
+      const obj = createBuilding({
+        name: s.name,
+        type: "store",
+        size: { x: 1, y: 1, z: 1 },
+        pos: s.pos,
+        colorMat: storeMat
+      });
+      stores.push(obj);
+    });
+
+    // Path creation
+    function createPathStrip(start, end) {
+      const dx = end.x - start.x;
+      const dz = end.z - start.z;
+      const length = Math.sqrt(dx * dx + dz * dz);
+      const path = new THREE.Mesh(
+        new THREE.BoxGeometry(length, 0.05, 0.25),
+        pathMat
+      );
+      path.position.set((start.x + end.x) / 2, 0.025, (start.z + end.z) / 2);
+      path.rotation.y = Math.atan2(dz, dx);
+      path.receiveShadow = true;
+      scene.add(path);
+      paths.push(path);
+    }
+
+    function topConnectionPoint(building, isRightSide = true) {
+      const p = building.position.clone();
+      const type = building.userData.type;
+      if (type === "factory") {
+        return new THREE.Vector3(p.x + 0.9, 0.05, p.z);
+      } else if (type === "warehouse") {
+        return new THREE.Vector3(p.x + (isRightSide ? 1.1 : -1.1), 0.05, p.z);
+      } else {
+        return new THREE.Vector3(p.x - 0.7, 0.05, p.z);
+      }
+    }
+
+    factories.forEach(f => {
+      warehouses.forEach(w => {
+        createPathStrip(topConnectionPoint(f), topConnectionPoint(w, false));
+      });
+    });
+
+    warehouses.forEach(w => {
+      stores.forEach(s => {
+        createPathStrip(topConnectionPoint(w, true), topConnectionPoint(s));
+      });
+    });
+
+    // Parcel route helpers
+    function makeRoute(factoryIndex) {
+      const warehouseIndex = Math.floor(Math.random() * warehouses.length);
+      const storeIndex = Math.floor(Math.random() * stores.length);
+
+      const f = factories[factoryIndex];
+      const w = warehouses[warehouseIndex];
+      const s = stores[storeIndex];
+
+      const p0 = new THREE.Vector3(f.position.x + 0.9, 0.45, f.position.z);
+      const p1 = new THREE.Vector3(w.position.x - 1.1, 0.45, w.position.z);
+      const p2 = new THREE.Vector3(w.position.x + 1.1, 0.45, w.position.z);
+      const p3 = new THREE.Vector3(s.position.x - 0.7, 0.45, s.position.z);
+
+      return {
+        factoryIndex,
+        warehouseIndex,
+        storeIndex,
+        segments: [
+          { from: p0, to: p1, kind: "toWarehouse" },
+          { from: p2, to: p3, kind: "toStore" }
+        ]
+      };
+    }
+
+    function spawnParcel(factoryIndex) {
+      const route = makeRoute(factoryIndex);
+      const mesh = new THREE.Mesh(new THREE.BoxGeometry(0.4, 0.4, 0.4), parcelMat.clone());
+      mesh.castShadow = true;
+      mesh.receiveShadow = true;
+      mesh.position.copy(route.segments[0].from);
+      scene.add(mesh);
+
+      const firstLen = route.segments[0].from.distanceTo(route.segments[0].to);
+      parcels.push({
+        mesh,
+        route,
+        segmentIndex: 0,
+        progress: 0,
+        pauseTimer: 0,
+        waitingAtWarehouse: false,
+        currentSegmentLength: firstLen
+      });
+
+      state.totalSpawned++;
+      state.totalInTransit++;
+      state.parcelCount = parcels.length;
+      updateHUD();
+      refreshInfoPanel();
+    }
+
+    function removeParcel(idx) {
+      scene.remove(parcels[idx].mesh);
+      parcels[idx].mesh.geometry.dispose();
+      parcels[idx].mesh.material.dispose();
+      parcels.splice(idx, 1);
+      state.parcelCount = parcels.length;
+    }
+
+    function updateParcel(parcel, moveDist) {
+      if (parcel.waitingAtWarehouse) {
+        parcel.pauseTimer -= moveDist / 3; // normalized so 1 second uses speed-adjusted dt
+        if (parcel.pauseTimer <= 0) {
+          parcel.waitingAtWarehouse = false;
+          parcel.segmentIndex = 1;
+          parcel.progress = 0;
+          parcel.currentSegmentLength = parcel.route.segments[1].from.distanceTo(parcel.route.segments[1].to);
+          parcel.mesh.position.copy(parcel.route.segments[1].from);
+        }
+        return false;
+      }
+
+      let remainingMove = moveDist;
+
+      while (remainingMove > 0) {
+        const seg = parcel.route.segments[parcel.segmentIndex];
+        const len = parcel.currentSegmentLength;
+        const remainFrac = 1 - parcel.progress;
+        const remainDistOnSeg = len * remainFrac;
+
+        if (remainingMove >= remainDistOnSeg) {
+          parcel.progress = 1;
+          parcel.mesh.position.copy(seg.to);
+          remainingMove -= remainDistOnSeg;
+
+          if (parcel.segmentIndex === 0) {
+            parcel.waitingAtWarehouse = true;
+            parcel.pauseTimer = 1.0;
+            const wi = parcel.route.warehouseIndex;
+            state.warehouseThroughput[wi]++;
+            updateWarehouseHeatmap();
+            refreshInfoPanel();
+            return false;
+          } else {
+            state.totalDelivered++;
+            state.totalInTransit--;
+            updateHUD();
+            refreshInfoPanel();
+            return true;
+          }
+        } else {
+          parcel.progress += remainingMove / len;
+          parcel.mesh.position.lerpVectors(seg.from, seg.to, parcel.progress);
+          remainingMove = 0;
+        }
+      }
+
+      return false;
+    }
+
+    function updateHUD() {
+      hudStats.textContent = `Spawned: ${state.totalSpawned} | In-Transit: ${state.totalInTransit} | Delivered: ${state.totalDelivered}`;
+      btnPlay.textContent = state.running ? "Pause" : "Play";
+      btnSpeed.textContent = `Speed: ${state.speedMultiplier}x`;
+      btnHeatmap.textContent = `Heatmap: ${state.heatmapEnabled ? "On" : "Off"}`;
+    }
+
+    function updateWarehouseHeatmap() {
+      const max = Math.max(1, ...state.warehouseThroughput);
+      warehouses.forEach((w, i) => {
+        const t = state.heatmapEnabled ? (state.warehouseThroughput[i] / max) : 0;
+        const color = new THREE.Color().lerpColors(
+          new THREE.Color(0xE5C84B),
+          new THREE.Color(0xD6452A),
+          t
+        );
+        w.userData.body.material.color.copy(color);
+      });
+    }
+
+    function setSelected(obj) {
+      if (selectedObject) {
+        selectedObject.userData.body.material.emissive.setHex(0x000000);
+      }
+
+      selectedObject = obj;
+
+      if (!obj) {
+        state.selectedBuilding = null;
+        infoPanel.style.display = "none";
+        return;
+      }
+
+      obj.userData.body.material.emissive.setHex(0x333333);
+      state.selectedBuilding = obj.userData.name;
+      infoPanel.style.display = "block";
+      refreshInfoPanel();
+    }
+
+    function refreshInfoPanel() {
+      if (!selectedObject) return;
+
+      const data = selectedObject.userData;
+      let html = `<h3>${data.name}</h3>`;
+      html += `<div>Type: ${data.type}</div>`;
+
+      if (data.type === "factory") {
+        const idx = selectedObject.userData.index;
+        const spawnedFromThisFactory = parcels.filter(p => p.route.factoryIndex === idx).length;
+        html += `<div>Factory Index: ${idx}</div>`;
+        html += `<div>Active Parcels Originating Here: ${spawnedFromThisFactory}</div>`;
+        html += `<div>Spawn Rate: 1 parcel / 2s when running</div>`;
+      } else if (data.type === "warehouse") {
+        const wi = data.throughputIndex;
+        const queued = parcels.filter(p => p.route.warehouseIndex === wi && p.waitingAtWarehouse).length;
+        const heading = parcels.filter(p => p.route.warehouseIndex === wi && !p.waitingAtWarehouse).length;
+        html += `<div>Throughput Processed: ${state.warehouseThroughput[wi]}</div>`;
+        html += `<div>Currently Paused Here: ${queued}</div>`;
+        html += `<div>Parcels Assigned Here: ${heading}</div>`;
+      } else if (data.type === "store") {
+        const si = stores.indexOf(selectedObject);
+        const heading = parcels.filter(p => p.route.storeIndex === si).length;
+        html += `<div>Incoming Parcels: ${heading}</div>`;
+        html += `<div>Total Delivered (global): ${state.totalDelivered}</div>`;
+      }
+
+      html += `<div style="margin-top:8px;color:#bbb;">Simulation ${state.running ? "Running" : "Paused"} • Speed ${state.speedMultiplier}x</div>`;
+      infoPanel.innerHTML = html;
+    }
+
+    function resetSimulation() {
+      for (let i = parcels.length - 1; i >= 0; i--) {
+        scene.remove(parcels[i].mesh);
+        parcels[i].mesh.geometry.dispose();
+        parcels[i].mesh.material.dispose();
+        parcels.splice(i, 1);
+      }
+
+      state.running = false;
+      state.speedMultiplier = 1;
+      state.totalSpawned = 0;
+      state.totalInTransit = 0;
+      state.totalDelivered = 0;
+      state.warehouseThroughput = [0, 0];
+      state.parcelCount = 0;
+      state.elapsedTime = 0;
+      simTime = 0;
+      spawnTimers = [0, 0];
+
+      updateWarehouseHeatmap();
+      updateHUD();
+      refreshInfoPanel();
+    }
+
+    function setCameraPreset(n) {
+      state.cameraPreset = n;
+      if (n === 1) {
+        camera.position.set(0, 12, 18);
+      } else if (n === 2) {
+        camera.position.set(0, 20, 0.1);
+      } else if (n === 3) {
+        camera.position.set(25, 5, 0);
+      }
+      controls.target.set(0, 0, 0);
+      controls.update();
+    }
+
+    // UI events
+    btnPlay.addEventListener("click", () => {
+      state.running = !state.running;
+      updateHUD();
+      refreshInfoPanel();
+    });
+
+    btnSpeed.addEventListener("click", () => {
+      const speeds = [1, 2, 3];
+      const idx = speeds.indexOf(state.speedMultiplier);
+      state.speedMultiplier = speeds[(idx + 1) % speeds.length];
+      updateHUD();
+      refreshInfoPanel();
+    });
+
+    btnHeatmap.addEventListener("click", () => {
+      state.heatmapEnabled = !state.heatmapEnabled;
+      updateWarehouseHeatmap();
+      updateHUD();
+    });
+
+    window.addEventListener("keydown", (e) => {
+      const key = e.key.toLowerCase();
+      if (key === "r") {
+        resetSimulation();
+      } else if (key === "1") {
+        setCameraPreset(1);
+      } else if (key === "2") {
+        setCameraPreset(2);
+      } else if (key === "3") {
+        setCameraPreset(3);
+      }
+    });
+
+    renderer.domElement.addEventListener("pointerdown", (event) => {
+      const rect = renderer.domElement.getBoundingClientRect();
+      mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+      mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+
+      raycaster.setFromCamera(mouse, camera);
+
+      const intersects = raycaster.intersectObjects(buildingMeshes, true);
+
+      if (intersects.length > 0) {
+        let obj = intersects[0].object;
+        while (obj && !buildingMeshes.includes(obj)) obj = obj.parent;
+        setSelected(obj || null);
+      } else {
+        setSelected(null);
+      }
+    });
+
+    // Visual base extras
+    const grid = new THREE.GridHelper(30, 30, 0x333333, 0x222222);
+    grid.position.y = 0.001;
+    scene.add(grid);
+
+    // Initialize
+    updateHUD();
+    updateWarehouseHeatmap();
+    setCameraPreset(1);
+
+    // Animation
+    function animate() {
+      requestAnimationFrame(animate);
+
+      const dt = Math.min(clock.getDelta(), 0.05);
+
+      if (state.running) {
+        const scaledDt = dt * state.speedMultiplier;
+        simTime += scaledDt;
+        state.elapsedTime += scaledDt;
+
+        // Spawn parcels every 2 seconds per factory
+        for (let i = 0; i < factories.length; i++) {
+          spawnTimers[i] += scaledDt;
+          while (spawnTimers[i] >= 2.0) {
+            spawnParcel(i);
+            spawnTimers[i] -= 2.0;
+          }
+        }
+
+        const speed = 3 * state.speedMultiplier;
+        const moveDist = speed * dt;
+
+        for (let i = parcels.length - 1; i >= 0; i--) {
+          const delivered = updateParcel(parcels[i], moveDist);
+          if (delivered) {
+            removeParcel(i);
+          }
+        }
+
+        state.parcelCount = parcels.length;
+      }
+
+      controls.update();
+      renderer.render(scene, camera);
+    }
+
+    animate();
+
+    window.addEventListener("resize", () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+  </script>
+</body>
+</html>

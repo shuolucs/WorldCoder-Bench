@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Rotational Inertia Physics - Three.js</title>
+  <style>
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #1a1a2e;
+      font-family: Arial, sans-serif;
+    }
+
+    canvas {
+      display: block;
+    }
+
+    #debug-overlay {
+      position: fixed;
+      top: 12px;
+      left: 12px;
+      padding: 10px 12px;
+      background: rgba(0, 0, 0, 0.65);
+      color: #fff;
+      font: 13px/1.45 monospace;
+      border-radius: 6px;
+      z-index: 10;
+      white-space: pre-line;
+      user-select: none;
+    }
+
+    #instructions {
+      position: fixed;
+      bottom: 12px;
+      left: 12px;
+      padding: 10px 12px;
+      background: rgba(0, 0, 0, 0.5);
+      color: #ddd;
+      font: 12px/1.5 monospace;
+      border-radius: 6px;
+      z-index: 10;
+      white-space: pre-line;
+    }
+  </style>
+</head>
+<body>
+  <div id="debug-overlay"></div>
+  <div id="instructions">R/F: Red in/out
+U/J: Blue in/out
+T: Torque impulse
+B: Brake toggle
+Space: Reset
+D: Toggle debug</div>
+
+  <script type="module">
+    import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js';
+    import { GLTFLoader } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/GLTFLoader.js';
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color('#1a1a2e');
+
+    const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+    camera.position.set(0, 5, 10);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    document.body.appendChild(renderer.domElement);
+
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+    scene.add(ambientLight);
+
+    const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
+    directionalLight.position.set(5, 10, 5);
+    scene.add(directionalLight);
+
+    const ground = new THREE.Mesh(
+      new THREE.PlaneGeometry(20, 20),
+      new THREE.MeshStandardMaterial({ color: '#2d2d44' })
+    );
+    ground.rotation.x = -Math.PI / 2;
+    ground.position.y = 0;
+    scene.add(ground);
+
+    const turntableGroup = new THREE.Group();
+    scene.add(turntableGroup);
+
+    const platform = new THREE.Mesh(
+      new THREE.CylinderGeometry(3, 3, 0.3, 64),
+      new THREE.MeshStandardMaterial({ color: '#4a90d9' })
+    );
+    platform.position.set(0, 0.15, 0);
+    turntableGroup.add(platform);
+
+    const redMass = new THREE.Mesh(
+      new THREE.BoxGeometry(0.5, 0.5, 0.5),
+      new THREE.MeshStandardMaterial({ color: '#e74c3c' })
+    );
+    turntableGroup.add(redMass);
+
+    const blueMass = new THREE.Mesh(
+      new THREE.BoxGeometry(0.5, 0.5, 0.5),
+      new THREE.MeshStandardMaterial({ color: '#3498db' })
+    );
+    turntableGroup.add(blueMass);
+
+    const redDir = new THREE.Vector3(1, 0, 0);
+    const blueDir = new THREE.Vector3(-1, 0, 0);
+
+    let michelle = null;
+    let modelLoaded = false;
+
+    const loader = new GLTFLoader();
+    loader.load(
+      'Michelle.glb',
+      (gltf) => {
+        michelle = gltf.scene;
+        michelle.scale.setScalar(2);
+        michelle.position.set(0, 0.3, 0);
+        turntableGroup.add(michelle);
+        modelLoaded = true;
+      },
+      undefined,
+      (err) => {
+        console.warn('Failed to load Michelle.glb:', err);
+      }
+    );
+
+    const debugOverlay = document.getElementById('debug-overlay');
+
+    const CONSTANTS = {
+      I_PLATFORM: 5.0,
+      I_MICHELLE: 3.0,
+      M_RED: 2.0,
+      M_BLUE: 2.0,
+      INITIAL_OMEGA: 2.0,
+      NORMAL_FRICTION: 0.02,
+      BRAKE_FRICTION: 0.5,
+      MIN_RADIUS: 0.3,
+      MAX_RADIUS: 2.8,
+      STEP_RADIUS: 0.3,
+      TORQUE_IMPULSE: 5.0
+    };
+
+    const state = {
+      omega: 0,
+      momentOfInertia: 0,
+      angularMomentum: 0,
+      redMassRadius: 1.5,
+      blueMassRadius: 1.5,
+      turntableAngle: 0,
+      brakeActive: false,
+      debugVisible: true,
+      modelLoaded: false,
+      simRunning: false,
+      totalEnergy: 0,
+      frictionLoss: 0,
+      torqueImpulseCount: 0,
+      resetCount: 0
+    };
+
+    function safeNumber(n, fallback = 0) {
+      return Number.isFinite(n) ? n : fallback;
+    }
+
+    function clamp(n, min, max) {
+      return Math.min(max, Math.max(min, n));
+    }
+
+    function computeMomentOfInertia() {
+      const rr = safeNumber(state.redMassRadius, 1.5);
+      const rb = safeNumber(state.blueMassRadius, 1.5);
+      const I = CONSTANTS.I_PLATFORM +
+                CONSTANTS.I_MICHELLE +
+                CONSTANTS.M_RED * rr * rr +
+                CONSTANTS.M_BLUE * rb * rb;
+      return Math.max(0.0001, safeNumber(I, 0.0001));
+    }
+
+    function updateMassPositions() {
+      redMass.position.copy(redDir.clone().multiplyScalar(state.redMassRadius));
+      redMass.position.y = 0.55;
+
+      blueMass.position.copy(blueDir.clone().multiplyScalar(state.blueMassRadius));
+      blueMass.position.y = 0.55;
+    }
+
+    function resetSimulation(countReset = false) {
+      state.redMassRadius = 1.5;
+      state.blueMassRadius = 1.5;
+      state.turntableAngle = 0;
+      state.brakeActive = false;
+
+      state.momentOfInertia = computeMomentOfInertia();
+      state.omega = CONSTANTS.INITIAL_OMEGA;
+      state.angularMomentum = state.momentOfInertia * state.omega;
+      state.totalEnergy = 0.5 * state.momentOfInertia * state.omega * state.omega;
+      state.frictionLoss = 0;
+      state.torqueImpulseCount = 0;
+
+      if (countReset) state.resetCount += 1;
+
+      turntableGroup.rotation.y = 0;
+      updateMassPositions();
+      syncState();
+    }
+
+    function recalcOmegaFromL() {
+      state.momentOfInertia = computeMomentOfInertia();
+      state.angularMomentum = Math.max(0, safeNumber(state.angularMomentum, 0));
+      state.omega = state.momentOfInertia > 0 ? state.angularMomentum / state.momentOfInertia : 0;
+      state.omega = Math.max(0, safeNumber(state.omega, 0));
+    }
+
+    function moveMass(which, delta) {
+      if (which === 'red') {
+        state.redMassRadius = clamp(
+          safeNumber(state.redMassRadius, 1.5) + delta,
+          CONSTANTS.MIN_RADIUS,
+          CONSTANTS.MAX_RADIUS
+        );
+      } else {
+        state.blueMassRadius = clamp(
+          safeNumber(state.blueMassRadius, 1.5) + delta,
+          CONSTANTS.MIN_RADIUS,
+          CONSTANTS.MAX_RADIUS
+        );
+      }
+      updateMassPositions();
+      recalcOmegaFromL();
+      syncState();
+    }
+
+    function applyTorqueImpulse() {
+      state.angularMomentum = Math.max(0, safeNumber(state.angularMomentum, 0) + CONSTANTS.TORQUE_IMPULSE);
+      state.torqueImpulseCount += 1;
+      recalcOmegaFromL();
+      syncState();
+    }
+
+    function syncState() {
+      state.modelLoaded = modelLoaded;
+      state.momentOfInertia = computeMomentOfInertia();
+      state.angularMomentum = Math.max(0, safeNumber(state.angularMomentum, 0));
+      state.omega = state.momentOfInertia > 0 ? state.angularMomentum / state.momentOfInertia : 0;
+      state.omega = Math.max(0, safeNumber(state.omega, 0));
+      state.turntableAngle = safeNumber(state.turntableAngle, 0);
+      state.totalEnergy = 0.5 * state.momentOfInertia * state.omega * state.omega;
+      state.totalEnergy = Math.max(0, safeNumber(state.totalEnergy, 0));
+      state.frictionLoss = Math.max(0, safeNumber(state.frictionLoss, 0));
+
+      window.__3D_STATE__ = {
+        omega: state.omega,
+        momentOfInertia: state.momentOfInertia,
+        angularMomentum: state.angularMomentum,
+        redMassRadius: state.redMassRadius,
+        blueMassRadius: state.blueMassRadius,
+        turntableAngle: state.turntableAngle,
+        brakeActive: state.brakeActive,
+        debugVisible: state.debugVisible,
+        modelLoaded: state.modelLoaded,
+        simRunning: state.simRunning,
+        totalEnergy: state.totalEnergy,
+        frictionLoss: state.frictionLoss,
+        torqueImpulseCount: state.torqueImpulseCount,
+        resetCount: state.resetCount
+      };
+    }
+
+    let fps = 0;
+    let fpsAccumulator = 0;
+    let fpsFrames = 0;
+    let lastTime = performance.now();
+
+    function updateDebugOverlay() {
+      debugOverlay.style.display = state.debugVisible ? 'block' : 'none';
+      debugOverlay.textContent =
+`Angular Velocity: ${state.omega.toFixed(3)} rad/s
+Moment of Inertia: ${state.momentOfInertia.toFixed(3)}
+Angular Momentum: ${state.angularMomentum.toFixed(3)}
+Red Mass Radius: ${state.redMassRadius.toFixed(3)}
+Blue Mass Radius: ${state.blueMassRadius.toFixed(3)}
+Brake: ${state.brakeActive ? 'ON' : 'OFF'}
+FPS: ${fps.toFixed(1)}`;
+    }
+
+    window.addEventListener('keydown', (e) => {
+      if (e.code === 'KeyR') moveMass('red', -CONSTANTS.STEP_RADIUS);
+      else if (e.code === 'KeyF') moveMass('red', CONSTANTS.STEP_RADIUS);
+      else if (e.code === 'KeyU') moveMass('blue', -CONSTANTS.STEP_RADIUS);
+      else if (e.code === 'KeyJ') moveMass('blue', CONSTANTS.STEP_RADIUS);
+      else if (e.code === 'KeyT') applyTorqueImpulse();
+      else if (e.code === 'KeyB') {
+        state.brakeActive = !state.brakeActive;
+        syncState();
+      }
+      else if (e.code === 'Space') {
+        e.preventDefault();
+        resetSimulation(true);
+      }
+      else if (e.code === 'KeyD') {
+        state.debugVisible = !state.debugVisible;
+        syncState();
+      }
+    });
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    resetSimulation(false);
+    state.simRunning = true;
+
+    function animate(now) {
+      requestAnimationFrame(animate);
+
+      let dt = (now - lastTime) / 1000;
+      lastTime = now;
+      dt = Math.min(Math.max(dt, 0), 0.05);
+
+      fpsAccumulator += dt;
+      fpsFrames += 1;
+      if (fpsAccumulator >= 0.25) {
+        fps = fpsFrames / fpsAccumulator;
+        fpsAccumulator = 0;
+        fpsFrames = 0;
+      }
+
+      const prevEnergy = 0.5 * state.momentOfInertia * state.omega * state.omega;
+
+      const friction = state.brakeActive ? CONSTANTS.BRAKE_FRICTION : CONSTANTS.NORMAL_FRICTION;
+      state.angularMomentum = safeNumber(state.angularMomentum, 0) * (1 - friction * dt);
+      if (!Number.isFinite(state.angularMomentum) || state.angularMomentum < 0) state.angularMomentum = 0;
+
+      state.momentOfInertia = computeMomentOfInertia();
+      state.omega = state.momentOfInertia > 0 ? state.angularMomentum / state.momentOfInertia : 0;
+      if (!Number.isFinite(state.omega) || state.omega < 0) state.omega = 0;
+
+      state.turntableAngle += state.omega * dt;
+      if (!Number.isFinite(state.turntableAngle)) state.turntableAngle = 0;
+
+      turntableGroup.rotation.y = state.turntableAngle;
+
+      const newEnergy = 0.5 * state.momentOfInertia * state.omega * state.omega;
+      const loss = Math.max(0, safeNumber(prevEnergy - newEnergy, 0));
+      state.frictionLoss += loss;
+
+      syncState();
+      updateDebugOverlay();
+      renderer.render(scene, camera);
+    }
+
+    syncState();
+    updateDebugOverlay();
+    requestAnimationFrame(animate);
+  </script>
+</body>
+</html>

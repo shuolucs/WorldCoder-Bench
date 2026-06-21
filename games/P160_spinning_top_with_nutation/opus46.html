@@ -1,0 +1,553 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Spinning Top - Precession & Nutation</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { overflow: hidden; font-family: 'Courier New', monospace; background: #1a1a2e; }
+  canvas { display: block; }
+
+  #hud {
+    position: absolute;
+    top: 15px;
+    left: 15px;
+    background: rgba(0, 0, 0, 0.75);
+    color: #00ff88;
+    padding: 15px 20px;
+    border-radius: 8px;
+    font-size: 14px;
+    line-height: 1.8;
+    border: 1px solid rgba(0, 255, 136, 0.3);
+    min-width: 280px;
+    pointer-events: none;
+    z-index: 10;
+  }
+  #hud .label { color: #88aacc; }
+  #hud .value { color: #00ff88; font-weight: bold; }
+  #hud .status-line { margin-top: 5px; padding-top: 5px; border-top: 1px solid rgba(255,255,255,0.15); }
+
+  .controls {
+    position: absolute;
+    bottom: 20px;
+    left: 50%;
+    transform: translateX(-50%);
+    display: flex;
+    gap: 12px;
+    z-index: 10;
+  }
+  .controls button {
+    padding: 10px 24px;
+    font-size: 15px;
+    font-family: 'Courier New', monospace;
+    border: 2px solid #00ff88;
+    background: rgba(0, 0, 0, 0.7);
+    color: #00ff88;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+  .controls button:hover {
+    background: rgba(0, 255, 136, 0.2);
+  }
+
+  .keyhints {
+    position: absolute;
+    bottom: 70px;
+    left: 50%;
+    transform: translateX(-50%);
+    color: rgba(255,255,255,0.5);
+    font-size: 12px;
+    font-family: 'Courier New', monospace;
+    text-align: center;
+    z-index: 10;
+    pointer-events: none;
+  }
+</style>
+</head>
+<body>
+
+<div id="hud">
+  <div><span class="label">Spin Rate:</span> <span class="value" id="hudSpin">0.00</span> <span class="label">rad/s</span></div>
+  <div><span class="label">Precession Rate:</span> <span class="value" id="hudPrec">0.000</span> <span class="label">rad/s</span></div>
+  <div><span class="label">Tilt Angle:</span> <span class="value" id="hudTilt">0.0</span> <span class="label">°</span></div>
+  <div><span class="label">Nutation Amp:</span> <span class="value" id="hudNut">0.000</span> <span class="label">rad</span></div>
+  <div class="status-line"><span class="label">Status:</span> <span class="value" id="hudStatus">Idle</span></div>
+</div>
+
+<div class="keyhints">
+  [B] Boost Spin &nbsp; [T] Increase Tilt &nbsp; [Space] Pause/Resume
+</div>
+
+<div class="controls">
+  <button id="launchBtn">Launch Top</button>
+  <button id="frictionBtn">Friction: ON</button>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+
+<script>
+// ============================================================
+// Global State
+// ============================================================
+window.__3D_STATE__ = {
+  spinRate: 0,
+  precessionRate: 0,
+  tiltAngle: 0,
+  nutationAmplitude: 0,
+  status: 'idle',
+  frictionEnabled: true,
+  elapsedTime: 0,
+  topPosition: { x: 0, y: 0, z: 0 },
+  spinBoostCount: 0,
+  totalEnergy: 0
+};
+
+// ============================================================
+// Physics Parameters
+// ============================================================
+const MASS = 0.5;
+const GRAVITY = 9.81;
+const D_CM = 0.5; // distance from tip to center of mass
+const I_SPIN = 0.02;
+const I_PERP = 0.05;
+const INITIAL_SPIN = 15;
+const INITIAL_TILT = 0.3;
+const INITIAL_NUTATION_AMP = 0.05;
+const SPIN_DECAY = 0.3; // rad/s per second
+const TOPPLE_ANGLE = Math.PI / 4;
+
+// ============================================================
+// Simulation State
+// ============================================================
+let sim = {
+  spinning: false,
+  paused: false,
+  toppled: false,
+  frictionEnabled: true,
+  spinRate: 0,
+  precessionAngle: 0,
+  tiltAngle: INITIAL_TILT,
+  spinAngle: 0,
+  nutationAmplitude: INITIAL_NUTATION_AMP,
+  nutationPhase: 0,
+  elapsedTime: 0,
+  spinBoostCount: 0,
+  baseTilt: INITIAL_TILT,
+  toppleProgress: 0
+};
+
+// ============================================================
+// Scene Setup
+// ============================================================
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x1a1a2e);
+
+const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 100);
+camera.position.set(4, 3, 4);
+camera.lookAt(0, 0, 0);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+
+const controls = new THREE.OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+controls.target.set(0, 0.5, 0);
+controls.update();
+
+// ============================================================
+// Lights
+// ============================================================
+const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+scene.add(ambientLight);
+
+const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+dirLight.position.set(5, 10, 5);
+dirLight.castShadow = true;
+dirLight.shadow.mapSize.width = 2048;
+dirLight.shadow.mapSize.height = 2048;
+dirLight.shadow.camera.near = 0.5;
+dirLight.shadow.camera.far = 30;
+dirLight.shadow.camera.left = -5;
+dirLight.shadow.camera.right = 5;
+dirLight.shadow.camera.top = 5;
+dirLight.shadow.camera.bottom = -5;
+scene.add(dirLight);
+
+// ============================================================
+// Ground
+// ============================================================
+const groundGeo = new THREE.PlaneGeometry(20, 20);
+const groundMat = new THREE.MeshStandardMaterial({
+  color: 0x556B2F,
+  roughness: 0.8,
+  metalness: 0.1
+});
+const ground = new THREE.Mesh(groundGeo, groundMat);
+ground.rotation.x = -Math.PI / 2;
+ground.position.y = 0;
+ground.receiveShadow = true;
+scene.add(ground);
+
+// Grid
+const gridHelper = new THREE.GridHelper(20, 40, 0x3a5a2a, 0x3a5a2a);
+gridHelper.position.y = 0.001;
+gridHelper.material.opacity = 0.3;
+gridHelper.material.transparent = true;
+scene.add(gridHelper);
+
+// ============================================================
+// Spinning Top Construction
+// ============================================================
+// The top group's origin is at the tip (contact point with ground)
+const topGroup = new THREE.Group();
+topGroup.position.set(0, 0, 0);
+scene.add(topGroup);
+
+// Inner group for applying Euler rotations
+const topPivot = new THREE.Group();
+topGroup.add(topPivot);
+
+// Tip sphere at origin (the contact point)
+const tipGeo = new THREE.SphereGeometry(0.05, 16, 16);
+const tipMat = new THREE.MeshStandardMaterial({ color: 0xC0C0C0, metalness: 0.8, roughness: 0.2 });
+const tipMesh = new THREE.Mesh(tipGeo, tipMat);
+tipMesh.position.set(0, 0, 0);
+tipMesh.castShadow = true;
+topPivot.add(tipMesh);
+
+// Cone body: tip at bottom (y=0), wide part at top
+// ConeGeometry points up by default. We want tip at bottom.
+// Default cone: tip at +y, base at -y. We'll flip it.
+const coneGeo = new THREE.ConeGeometry(0.5, 1.5, 32);
+const coneMat = new THREE.MeshStandardMaterial({
+  color: 0xDAA520,
+  metalness: 0.6,
+  roughness: 0.3
+});
+const coneMesh = new THREE.Mesh(coneGeo, coneMat);
+// Default cone: center at origin, tip at y=+0.75, base at y=-0.75
+// We want tip at y=0 (our origin), so rotate 180° around X to flip, then move up
+coneMesh.rotation.x = Math.PI; // flip upside down: now tip at y=-0.75, base at y=+0.75
+coneMesh.position.y = 0.75; // move so tip is at y=0
+coneMesh.castShadow = true;
+topPivot.add(coneMesh);
+
+// Disc at the widest part of the cone (the base of the flipped cone)
+// After flipping and positioning, the base (wide part) is at y = 0.75 + 0.75 = 1.5
+const discGeo = new THREE.CylinderGeometry(0.6, 0.6, 0.08, 32);
+const discMat = new THREE.MeshStandardMaterial({
+  color: 0xB22222,
+  metalness: 0.5,
+  roughness: 0.4
+});
+const discMesh = new THREE.Mesh(discGeo, discMat);
+discMesh.position.y = 1.5;
+discMesh.castShadow = true;
+topPivot.add(discMesh);
+
+// Handle on top
+const handleGeo = new THREE.CylinderGeometry(0.08, 0.08, 0.3, 16);
+const handleMat = new THREE.MeshStandardMaterial({
+  color: 0x8B4513,
+  metalness: 0.3,
+  roughness: 0.7
+});
+const handleMesh = new THREE.Mesh(handleGeo, handleMat);
+handleMesh.position.y = 1.5 + 0.04 + 0.15; // on top of disc
+handleMesh.castShadow = true;
+topPivot.add(handleMesh);
+
+// ============================================================
+// Shadow contact point indicator
+// ============================================================
+const contactGeo = new THREE.CircleGeometry(0.03, 16);
+const contactMat = new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.5 });
+const contactMesh = new THREE.Mesh(contactGeo, contactMat);
+contactMesh.rotation.x = -Math.PI / 2;
+contactMesh.position.y = 0.002;
+scene.add(contactMesh);
+
+// ============================================================
+// Trail for precession visualization
+// ============================================================
+const trailPoints = [];
+const MAX_TRAIL = 500;
+const trailGeo = new THREE.BufferGeometry();
+const trailMat = new THREE.LineBasicMaterial({ color: 0x00ff88, transparent: true, opacity: 0.4 });
+const trailLine = new THREE.Line(trailGeo, trailMat);
+trailLine.position.y = 0.01;
+scene.add(trailLine);
+
+// ============================================================
+// Functions
+// ============================================================
+function resetSimulation() {
+  sim.spinning = true;
+  sim.paused = false;
+  sim.toppled = false;
+  sim.spinRate = INITIAL_SPIN;
+  sim.precessionAngle = 0;
+  sim.tiltAngle = INITIAL_TILT;
+  sim.baseTilt = INITIAL_TILT;
+  sim.spinAngle = 0;
+  sim.nutationAmplitude = INITIAL_NUTATION_AMP;
+  sim.nutationPhase = 0;
+  sim.elapsedTime = 0;
+  sim.spinBoostCount = 0;
+  sim.toppleProgress = 0;
+
+  topGroup.position.set(0, 0, 0);
+  topPivot.rotation.set(0, 0, 0);
+  topPivot.quaternion.identity();
+
+  // Clear trail
+  trailPoints.length = 0;
+  trailGeo.setAttribute('position', new THREE.Float32BufferAttribute([], 3));
+
+  document.getElementById('launchBtn').textContent = 'Reset';
+}
+
+function computePrecessionRate() {
+  if (sim.spinRate < 0.01) return 0;
+  const torque = MASS * GRAVITY * D_CM * Math.sin(sim.tiltAngle);
+  return torque / (I_SPIN * sim.spinRate);
+}
+
+function computeNutationFrequency() {
+  if (sim.spinRate < 0.01) return 1;
+  return (I_SPIN * sim.spinRate) / I_PERP;
+}
+
+function computeTotalEnergy() {
+  const rotKE = 0.5 * I_SPIN * sim.spinRate * sim.spinRate;
+  const precRate = computePrecessionRate();
+  const precKE = 0.5 * I_PERP * precRate * precRate;
+  const h_cm = D_CM * Math.cos(sim.tiltAngle);
+  const PE = MASS * GRAVITY * Math.max(0, h_cm);
+  return rotKE + precKE + PE;
+}
+
+// ============================================================
+// Update HUD
+// ============================================================
+function updateHUD() {
+  const precRate = sim.spinning && !sim.toppled ? computePrecessionRate() : 0;
+
+  let status = 'Idle';
+  if (sim.toppled) status = 'Toppled';
+  else if (sim.paused && sim.spinning) status = 'Paused';
+  else if (sim.spinning) status = 'Spinning';
+
+  document.getElementById('hudSpin').textContent = sim.spinRate.toFixed(2);
+  document.getElementById('hudPrec').textContent = precRate.toFixed(3);
+  document.getElementById('hudTilt').textContent = (sim.tiltAngle * 180 / Math.PI).toFixed(1);
+  document.getElementById('hudNut').textContent = sim.nutationAmplitude.toFixed(3);
+  document.getElementById('hudStatus').textContent = status;
+
+  // Update global state
+  const state = window.__3D_STATE__;
+  state.spinRate = sim.spinRate;
+  state.precessionRate = precRate;
+  state.tiltAngle = sim.tiltAngle;
+  state.nutationAmplitude = sim.nutationAmplitude;
+  state.status = status.toLowerCase();
+  state.frictionEnabled = sim.frictionEnabled;
+  state.elapsedTime = sim.elapsedTime;
+  state.topPosition = {
+    x: topGroup.position.x,
+    y: topGroup.position.y,
+    z: topGroup.position.z
+  };
+  state.spinBoostCount = sim.spinBoostCount;
+  state.totalEnergy = computeTotalEnergy();
+}
+
+// ============================================================
+// Physics Update
+// ============================================================
+function updatePhysics(dt) {
+  if (!sim.spinning || sim.paused) return;
+
+  if (sim.toppled) {
+    // Topple animation
+    sim.toppleProgress += dt * 2;
+    sim.tiltAngle = Math.min(sim.tiltAngle + dt * 2, Math.PI / 2);
+    sim.spinRate = Math.max(0, sim.spinRate - dt * 5);
+    return;
+  }
+
+  // Friction: decay spin
+  if (sim.frictionEnabled) {
+    sim.spinRate -= SPIN_DECAY * dt;
+    if (sim.spinRate < 0) sim.spinRate = 0;
+  }
+
+  // When spin drops below 2, increase nutation amplitude (wobble)
+  if (sim.spinRate < 2 && sim.spinRate > 0) {
+    const wobbleFactor = (2 - sim.spinRate) / 2;
+    sim.nutationAmplitude = INITIAL_NUTATION_AMP + wobbleFactor * 0.4;
+  } else if (sim.spinRate >= 2) {
+    // Nutation amplitude stays near initial when spinning fast
+    sim.nutationAmplitude = INITIAL_NUTATION_AMP;
+  }
+
+  // Check topple condition
+  if (sim.tiltAngle > TOPPLE_ANGLE) {
+    sim.toppled = true;
+    return;
+  }
+
+  // Precession
+  const precRate = computePrecessionRate();
+  sim.precessionAngle += precRate * dt;
+
+  // Nutation
+  const nutFreq = computeNutationFrequency();
+  sim.nutationPhase += nutFreq * dt;
+  const nutOffset = sim.nutationAmplitude * Math.sin(sim.nutationPhase);
+  sim.tiltAngle = sim.baseTilt + nutOffset;
+
+  // Keep tilt positive
+  if (sim.tiltAngle < 0.01) sim.tiltAngle = 0.01;
+
+  // Spin angle
+  sim.spinAngle += sim.spinRate * dt;
+
+  // Elapsed time
+  sim.elapsedTime += dt;
+
+  // If spin reaches 0, topple
+  if (sim.spinRate <= 0 && sim.frictionEnabled) {
+    sim.spinRate = 0;
+    sim.toppled = true;
+  }
+}
+
+// ============================================================
+// Apply rotation to top mesh
+// ============================================================
+function applyTopRotation() {
+  // Euler angles: precession (φ) around Y, then tilt (θ) around Z, then spin (ψ) around Y
+  // We build this with quaternions for correctness
+
+  const qPrecession = new THREE.Quaternion();
+  qPrecession.setFromAxisAngle(new THREE.Vector3(0, 1, 0), sim.precessionAngle);
+
+  const qTilt = new THREE.Quaternion();
+  qTilt.setFromAxisAngle(new THREE.Vector3(0, 0, 1), sim.tiltAngle);
+
+  const qSpin = new THREE.Quaternion();
+  qSpin.setFromAxisAngle(new THREE.Vector3(0, 1, 0), sim.spinAngle);
+
+  // Combined: precession * tilt * spin
+  const qTotal = new THREE.Quaternion();
+  qTotal.copy(qPrecession).multiply(qTilt).multiply(qSpin);
+
+  topPivot.quaternion.copy(qTotal);
+
+  // Keep the tip on the ground: the tip is at the origin of topPivot,
+  // so topGroup stays at y=0
+  topGroup.position.y = 0;
+
+  // Update trail - track where the top of the handle projects onto the ground
+  if (sim.spinning && !sim.toppled && !sim.paused) {
+    const handleTop = new THREE.Vector3(0, 1.69, 0);
+    handleTop.applyQuaternion(qTotal);
+
+    trailPoints.push(handleTop.x, handleTop.z);
+    if (trailPoints.length > MAX_TRAIL * 2) {
+      trailPoints.splice(0, 2);
+    }
+
+    // Build trail geometry (project onto ground)
+    const positions = [];
+    for (let i = 0; i < trailPoints.length; i += 2) {
+      positions.push(trailPoints[i], 0, trailPoints[i + 1]);
+    }
+    trailGeo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  }
+}
+
+// ============================================================
+// Animation Loop
+// ============================================================
+let lastTime = performance.now();
+
+function animate(now) {
+  requestAnimationFrame(animate);
+
+  let dt = (now - lastTime) / 1000;
+  lastTime = now;
+  dt = Math.min(dt, 0.05); // clamp
+
+  updatePhysics(dt);
+  applyTopRotation();
+  updateHUD();
+
+  controls.update();
+  renderer.render(scene, camera);
+}
+
+// ============================================================
+// Event Listeners
+// ============================================================
+document.getElementById('launchBtn').addEventListener('click', () => {
+  resetSimulation();
+});
+
+document.getElementById('frictionBtn').addEventListener('click', () => {
+  sim.frictionEnabled = !sim.frictionEnabled;
+  document.getElementById('frictionBtn').textContent = sim.frictionEnabled ? 'Friction: ON' : 'Friction: OFF';
+});
+
+document.addEventListener('keydown', (e) => {
+  const key = e.key.toLowerCase();
+
+  if (key === 'b') {
+    if (sim.spinning && !sim.toppled && !sim.paused) {
+      sim.spinRate += 5;
+      sim.spinBoostCount++;
+    }
+  }
+
+  if (key === 't') {
+    if (sim.spinning && !sim.toppled && !sim.paused) {
+      sim.baseTilt += 0.05;
+      sim.tiltAngle = sim.baseTilt;
+    }
+  }
+
+  if (key === ' ') {
+    e.preventDefault();
+    if (sim.spinning && !sim.toppled) {
+      sim.paused = !sim.paused;
+    }
+  }
+});
+
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// ============================================================
+// Initial state: top standing still, not spinning
+// ============================================================
+sim.tiltAngle = 0.001; // nearly vertical
+applyTopRotation();
+updateHUD();
+
+// Start animation
+requestAnimationFrame(animate);
+</script>
+</body>
+</html>

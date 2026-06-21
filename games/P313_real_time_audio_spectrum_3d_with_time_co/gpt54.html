@@ -1,0 +1,552 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>3D Audio Spectrum Visualizer with Time Controls</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      background: #0a0a1a;
+      font-family: Arial, Helvetica, sans-serif;
+      color: #fff;
+    }
+
+    canvas {
+      display: block;
+    }
+
+    #hud {
+      position: fixed;
+      top: 16px;
+      right: 16px;
+      background: rgba(10, 10, 26, 0.8);
+      border: 1px solid rgba(255,255,255,0.15);
+      border-radius: 10px;
+      padding: 12px 14px;
+      min-width: 180px;
+      backdrop-filter: blur(6px);
+      z-index: 10;
+      font-size: 14px;
+      line-height: 1.6;
+    }
+
+    #controls {
+      position: fixed;
+      left: 50%;
+      bottom: 16px;
+      transform: translateX(-50%);
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+      justify-content: center;
+      background: rgba(10, 10, 26, 0.88);
+      border: 1px solid rgba(255,255,255,0.15);
+      border-radius: 12px;
+      padding: 12px 16px;
+      backdrop-filter: blur(6px);
+      z-index: 10;
+    }
+
+    button, input[type="range"] {
+      cursor: pointer;
+    }
+
+    button {
+      background: #1f2a44;
+      color: #fff;
+      border: 1px solid rgba(255,255,255,0.15);
+      border-radius: 8px;
+      padding: 8px 12px;
+      font-size: 14px;
+    }
+
+    button:hover {
+      background: #2a3a5e;
+    }
+
+    .control-group {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    #time-display, #speed-label {
+      min-width: 70px;
+      text-align: center;
+      font-size: 14px;
+    }
+
+    .hint {
+      position: fixed;
+      left: 16px;
+      bottom: 16px;
+      background: rgba(10, 10, 26, 0.65);
+      border: 1px solid rgba(255,255,255,0.12);
+      border-radius: 10px;
+      padding: 10px 12px;
+      z-index: 10;
+      font-size: 12px;
+      line-height: 1.5;
+      color: rgba(255,255,255,0.85);
+    }
+  </style>
+</head>
+<body>
+  <div id="hud">
+    <div><strong>Avg Amp:</strong> <span id="hud-avg-amp">0.00</span></div>
+    <div><strong>Peak Band:</strong> <span id="hud-peak-band">0</span></div>
+    <div><strong>Bars:</strong> <span id="hud-bar-count">256</span></div>
+  </div>
+
+  <div id="controls">
+    <button id="btn-play-pause">Pause</button>
+    <button id="btn-rewind">Rewind</button>
+
+    <div class="control-group">
+      <label for="slider-speed">Speed</label>
+      <input id="slider-speed" type="range" min="0.25" max="3.0" step="0.25" value="1.0" />
+      <span id="speed-label">1.00x</span>
+    </div>
+
+    <button id="btn-reset">Reset</button>
+    <div id="time-display">T: 0.0s</div>
+  </div>
+
+  <div class="hint">
+    Keys: Space = Play/Pause, R = Rewind, X = Reset, ↑/↓ = Speed
+  </div>
+
+  <script type="module">
+    import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js';
+    import { OrbitControls } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js';
+    import { GLTFLoader } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/GLTFLoader.js';
+
+    // --------------------------------------------------
+    // Basic setup
+    // --------------------------------------------------
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0a0a1a);
+
+    const camera = new THREE.PerspectiveCamera(
+      60,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      1000
+    );
+    camera.position.set(0, 8, 20);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    document.body.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.set(0, 0, 0);
+    controls.enableDamping = true;
+
+    const ambientLight = new THREE.AmbientLight(0x334466, 0.5);
+    scene.add(ambientLight);
+
+    const directionalLight = new THREE.DirectionalLight(0xffffff, 1.0);
+    directionalLight.position.set(5, 10, 7);
+    scene.add(directionalLight);
+
+    // --------------------------------------------------
+    // Constants
+    // --------------------------------------------------
+    const GRID_SIZE = 16;
+    const BAR_COUNT = GRID_SIZE * GRID_SIZE;
+    const BAR_WIDTH = 0.4;
+    const BAR_DEPTH = 0.4;
+    const SPACING = 0.6;
+    const MIN_BAR_HEIGHT = 0.1;
+    const MAX_SIM_HEIGHT = 5.0;
+    const SAMPLE_INTERVAL = 0.2; // 200ms
+    const REWIND_MULTIPLIER = 2.0;
+
+    // --------------------------------------------------
+    // DOM refs
+    // --------------------------------------------------
+    const btnPlayPause = document.getElementById('btn-play-pause');
+    const btnRewind = document.getElementById('btn-rewind');
+    const btnReset = document.getElementById('btn-reset');
+    const sliderSpeed = document.getElementById('slider-speed');
+    const speedLabel = document.getElementById('speed-label');
+    const timeDisplay = document.getElementById('time-display');
+
+    const hudAvgAmp = document.getElementById('hud-avg-amp');
+    const hudPeakBand = document.getElementById('hud-peak-band');
+    const hudBarCount = document.getElementById('hud-bar-count');
+
+    hudBarCount.textContent = String(BAR_COUNT);
+
+    // --------------------------------------------------
+    // State
+    // --------------------------------------------------
+    let playbackState = 'playing';
+    let simTime = 0;
+    let speed = 1.0;
+    let sampleAccumulator = 0;
+
+    let stork = null;
+    let storkLoaded = false;
+
+    const historyRows = [];
+    for (let z = 0; z < GRID_SIZE; z++) {
+      historyRows.push(new Array(GRID_SIZE).fill(MIN_BAR_HEIGHT));
+    }
+
+    const bars = [];
+    const barData = [];
+
+    // --------------------------------------------------
+    // Helpers
+    // --------------------------------------------------
+    function clamp(v, min, max) {
+      return Math.max(min, Math.min(max, v));
+    }
+
+    function formatTime(t) {
+      return `T: ${Math.max(0, t).toFixed(1)}s`;
+    }
+
+    function updateSpeedLabel() {
+      speedLabel.textContent = `${speed.toFixed(2)}x`;
+      sliderSpeed.value = speed.toFixed(2);
+    }
+
+    function generateSpectrum(time) {
+      const values = [];
+      for (let i = 0; i < GRID_SIZE; i++) {
+        let value =
+          Math.abs(Math.sin(time * (0.5 + i * 0.3)) * Math.cos(time * 0.2 + i)) * 3 +
+          Math.sin(time * 0.1 + i * 0.5) * 2;
+
+        value = clamp(value, MIN_BAR_HEIGHT, MAX_SIM_HEIGHT);
+        values.push(value);
+      }
+      return values;
+    }
+
+    function getPeakBand(row) {
+      let peakIndex = 0;
+      let peakValue = -Infinity;
+      for (let i = 0; i < row.length; i++) {
+        if (row[i] > peakValue) {
+          peakValue = row[i];
+          peakIndex = i;
+        }
+      }
+      return peakIndex;
+    }
+
+    function getAvgAmplitude(row) {
+      let sum = 0;
+      for (let i = 0; i < row.length; i++) sum += row[i];
+      return sum / row.length;
+    }
+
+    function computeHistoryAtTime(currentTime) {
+      const rows = [];
+      for (let z = 0; z < GRID_SIZE; z++) {
+        const t = Math.max(0, currentTime - z * SAMPLE_INTERVAL);
+        rows.push(generateSpectrum(t));
+      }
+      return rows;
+    }
+
+    function resetHistory() {
+      for (let z = 0; z < GRID_SIZE; z++) {
+        for (let x = 0; x < GRID_SIZE; x++) {
+          historyRows[z][x] = MIN_BAR_HEIGHT;
+        }
+      }
+    }
+
+    function rebuildHistoryFromSimTime() {
+      const rows = computeHistoryAtTime(simTime);
+      for (let z = 0; z < GRID_SIZE; z++) {
+        for (let x = 0; x < GRID_SIZE; x++) {
+          historyRows[z][x] = rows[z][x];
+        }
+      }
+    }
+
+    function setPlaybackState(newState) {
+      playbackState = newState;
+      btnPlayPause.textContent = playbackState === 'playing' ? 'Pause' : 'Play';
+    }
+
+    function updateSampling(dt) {
+      const effectiveSpeed = speed * (playbackState === 'rewinding' ? REWIND_MULTIPLIER : 1.0);
+      const signedDt = playbackState === 'rewinding' ? -dt * effectiveSpeed : dt * effectiveSpeed;
+
+      simTime += signedDt;
+      if (simTime < 0) simTime = 0;
+
+      sampleAccumulator += dt * effectiveSpeed;
+
+      if (sampleAccumulator >= SAMPLE_INTERVAL) {
+        while (sampleAccumulator >= SAMPLE_INTERVAL) {
+          sampleAccumulator -= SAMPLE_INTERVAL;
+
+          if (playbackState === 'playing') {
+            const newFront = generateSpectrum(simTime);
+            historyRows.pop();
+            historyRows.unshift(newFront);
+          } else if (playbackState === 'rewinding') {
+            rebuildHistoryFromSimTime();
+          }
+        }
+      }
+    }
+
+    // --------------------------------------------------
+    // Grid
+    // --------------------------------------------------
+    const barGeometry = new THREE.BoxGeometry(BAR_WIDTH, 1, BAR_DEPTH);
+
+    const gridOffset = ((GRID_SIZE - 1) * SPACING) / 2;
+
+    for (let z = 0; z < GRID_SIZE; z++) {
+      bars[z] = [];
+      barData[z] = [];
+
+      for (let x = 0; x < GRID_SIZE; x++) {
+        const material = new THREE.MeshStandardMaterial({
+          color: new THREE.Color().setHSL(0, 1, 0.5),
+          roughness: 0.35,
+          metalness: 0.15
+        });
+
+        const mesh = new THREE.Mesh(barGeometry, material);
+        mesh.position.set(
+          x * SPACING - gridOffset,
+          MIN_BAR_HEIGHT / 2,
+          z * SPACING - gridOffset
+        );
+        scene.add(mesh);
+
+        bars[z][x] = mesh;
+        barData[z][x] = {
+          currentHeight: MIN_BAR_HEIGHT,
+          targetHeight: MIN_BAR_HEIGHT
+        };
+      }
+    }
+
+    // --------------------------------------------------
+    // Ground reference
+    // --------------------------------------------------
+    const ground = new THREE.Mesh(
+      new THREE.PlaneGeometry(20, 20),
+      new THREE.MeshStandardMaterial({
+        color: 0x111122,
+        roughness: 0.9,
+        metalness: 0.0
+      })
+    );
+    ground.rotation.x = -Math.PI / 2;
+    ground.position.y = 0;
+    scene.add(ground);
+
+    // --------------------------------------------------
+    // Stork model
+    // --------------------------------------------------
+    const loader = new GLTFLoader();
+    loader.load(
+      '._stork.glb',
+      (gltf) => {
+        stork = gltf.scene;
+
+        const box = new THREE.Box3().setFromObject(stork);
+        const size = new THREE.Vector3();
+        box.getSize(size);
+
+        const currentHeight = size.y || 1;
+        const scaleFactor = 2 / currentHeight;
+        stork.scale.setScalar(scaleFactor);
+
+        const scaledBox = new THREE.Box3().setFromObject(stork);
+        const center = new THREE.Vector3();
+        scaledBox.getCenter(center);
+        stork.position.set(-center.x, 7 - center.y, -center.z);
+
+        scene.add(stork);
+        storkLoaded = true;
+      },
+      undefined,
+      (err) => {
+        console.warn('Failed to load ._stork.glb:', err);
+      }
+    );
+
+    // --------------------------------------------------
+    // UI actions
+    // --------------------------------------------------
+    btnPlayPause.addEventListener('click', () => {
+      if (playbackState === 'playing') {
+        setPlaybackState('paused');
+      } else {
+        setPlaybackState('playing');
+      }
+    });
+
+    btnRewind.addEventListener('click', () => {
+      setPlaybackState('rewinding');
+    });
+
+    btnReset.addEventListener('click', () => {
+      simTime = 0;
+      sampleAccumulator = 0;
+      resetHistory();
+      setPlaybackState('playing');
+    });
+
+    sliderSpeed.addEventListener('input', (e) => {
+      speed = clamp(parseFloat(e.target.value), 0.25, 3.0);
+      updateSpeedLabel();
+    });
+
+    window.addEventListener('keydown', (e) => {
+      if (e.code === 'Space') {
+        e.preventDefault();
+        if (playbackState === 'playing') {
+          setPlaybackState('paused');
+        } else {
+          setPlaybackState('playing');
+        }
+      } else if (e.key === 'r' || e.key === 'R') {
+        setPlaybackState('rewinding');
+      } else if (e.key === 'x' || e.key === 'X') {
+        simTime = 0;
+        sampleAccumulator = 0;
+        resetHistory();
+        setPlaybackState('playing');
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        speed = clamp(speed + 0.25, 0.25, 3.0);
+        updateSpeedLabel();
+      } else if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        speed = clamp(speed - 0.25, 0.25, 3.0);
+        updateSpeedLabel();
+      }
+    });
+
+    updateSpeedLabel();
+    timeDisplay.textContent = formatTime(simTime);
+
+    // --------------------------------------------------
+    // Exposed state
+    // --------------------------------------------------
+    window.__3D_STATE__ = {
+      playbackState: 'playing',
+      simTime: 0,
+      speed: 1.0,
+      avgAmplitude: MIN_BAR_HEIGHT,
+      peakBand: 0,
+      barCount: BAR_COUNT,
+      storkPosition: { x: 0, y: 7, z: 0 },
+      storkLoaded: false,
+      frontRowHeights: new Array(GRID_SIZE).fill(MIN_BAR_HEIGHT),
+      maxBarHeight: MIN_BAR_HEIGHT,
+      gridSize: GRID_SIZE,
+      isInitialized: false
+    };
+
+    // --------------------------------------------------
+    // Resize
+    // --------------------------------------------------
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    // --------------------------------------------------
+    // Animation loop
+    // --------------------------------------------------
+    const clock = new THREE.Clock();
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      const dt = clock.getDelta();
+
+      if (playbackState === 'playing' || playbackState === 'rewinding') {
+        updateSampling(dt);
+      }
+
+      let maxBarHeight = MIN_BAR_HEIGHT;
+
+      for (let z = 0; z < GRID_SIZE; z++) {
+        for (let x = 0; x < GRID_SIZE; x++) {
+          const target = historyRows[z][x];
+          barData[z][x].targetHeight = target;
+
+          barData[z][x].currentHeight = THREE.MathUtils.lerp(
+            barData[z][x].currentHeight,
+            barData[z][x].targetHeight,
+            0.1
+          );
+
+          const h = Math.max(MIN_BAR_HEIGHT, barData[z][x].currentHeight);
+          maxBarHeight = Math.max(maxBarHeight, h);
+
+          const mesh = bars[z][x];
+          mesh.scale.y = h;
+          mesh.position.y = h / 2;
+
+          const hue = (h / MAX_SIM_HEIGHT) * 0.7;
+          mesh.material.color.setHSL(hue, 1.0, 0.5);
+        }
+      }
+
+      const frontRow = historyRows[0].slice();
+      const avgAmplitude = getAvgAmplitude(frontRow);
+      const peakBand = getPeakBand(frontRow);
+
+      if (storkLoaded && stork) {
+        stork.rotation.y += dt * 0.5;
+        stork.position.y = 7 + avgAmplitude * 0.5;
+      }
+
+      controls.update();
+
+      hudAvgAmp.textContent = avgAmplitude.toFixed(2);
+      hudPeakBand.textContent = String(peakBand);
+      timeDisplay.textContent = formatTime(simTime);
+      btnPlayPause.textContent = playbackState === 'playing' ? 'Pause' : 'Play';
+
+      const storkPos = stork
+        ? { x: stork.position.x, y: stork.position.y, z: stork.position.z }
+        : { x: 0, y: 7, z: 0 };
+
+      window.__3D_STATE__ = {
+        playbackState,
+        simTime,
+        speed,
+        avgAmplitude,
+        peakBand,
+        barCount: BAR_COUNT,
+        storkPosition: storkPos,
+        storkLoaded,
+        frontRowHeights: frontRow.slice(),
+        maxBarHeight,
+        gridSize: GRID_SIZE,
+        isInitialized: true
+      };
+
+      renderer.render(scene, camera);
+    }
+
+    animate();
+  </script>
+</body>
+</html>

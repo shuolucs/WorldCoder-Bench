@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Crystal Growth Diorama</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #1a0a2e;
+            font-family: monospace;
+        }
+        #ui-panel {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(10, 5, 20, 0.8);
+            padding: 15px;
+            border-radius: 8px;
+            color: white;
+            border: 1px solid #4444aa;
+            pointer-events: auto;
+            z-index: 10;
+        }
+        .ui-row {
+            margin-bottom: 10px;
+        }
+        .ui-row:last-child {
+            margin-bottom: 0;
+        }
+        button {
+            background: #4444aa;
+            color: white;
+            border: none;
+            padding: 5px 10px;
+            cursor: pointer;
+            font-family: monospace;
+            border-radius: 4px;
+            margin-right: 5px;
+        }
+        button:hover {
+            background: #6666cc;
+        }
+        input[type=range] {
+            vertical-align: middle;
+        }
+    </style>
+    <!-- Import maps polyfill -->
+    <script async src="https://unpkg.com/es-module-shims@1.8.0/dist/es-module-shims.js"></script>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="ui-panel">
+        <div class="ui-row">
+            <button id="btn-grow">Grow Crystals (G)</button>
+            <button id="btn-reset">Reset (R)</button>
+        </div>
+        <div class="ui-row">
+            <label for="slider-speed">Speed:</label>
+            <input type="range" id="slider-speed" min="0.5" max="3.0" step="0.1" value="1.0">
+        </div>
+        <div class="ui-row">Crystals: <span id="stat-crystals">0</span></div>
+        <div class="ui-row">Wave: <span id="stat-wave">0</span>/4</div>
+        <div class="ui-row">Growth Speed: <span id="stat-speed">1.0</span>x</div>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+        // --- State Management ---
+        window.__3D_STATE__ = {
+            crystalCount: 0,
+            currentWave: 0,
+            maxWaves: 4,
+            growthSpeed: 1.0,
+            helmetLoaded: false,
+            helmetRotation: 0,
+            glowMode: false,
+            averageCrystalHeight: 0,
+            totalCrystalTargetHeight: 0,
+            isGrowing: false
+        };
+
+        // --- Scene Setup ---
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x1a0a2e);
+
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+        camera.position.set(0, 4, 8);
+        camera.lookAt(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        document.body.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.target.set(0, 1, 0);
+
+        // --- Lighting ---
+        const ambientLight = new THREE.AmbientLight(0x4444aa, 0.3);
+        scene.add(ambientLight);
+
+        const pointLight1 = new THREE.PointLight(0xaa88ff, 2);
+        pointLight1.position.set(3, 6, 3);
+        scene.add(pointLight1);
+
+        const pointLight2 = new THREE.PointLight(0x44ffaa, 1.5);
+        pointLight2.position.set(-3, 4, -2);
+        scene.add(pointLight2);
+
+        // --- Ground & Pedestal ---
+        const groundGeo = new THREE.CircleGeometry(6, 64);
+        const groundMat = new THREE.MeshStandardMaterial({ color: 0x222233, roughness: 0.8 });
+        const ground = new THREE.Mesh(groundGeo, groundMat);
+        ground.rotation.x = -Math.PI / 2;
+        scene.add(ground);
+
+        const pedestalGeo = new THREE.CylinderGeometry(1.2, 1.2, 0.8, 6);
+        const pedestalMat = new THREE.MeshStandardMaterial({
+            color: 0x333344,
+            metalness: 0.7,
+            roughness: 0.3
+        });
+        const pedestal = new THREE.Mesh(pedestalGeo, pedestalMat);
+        pedestal.position.y = 0.4; // Half height to sit on ground
+        scene.add(pedestal);
+
+        // --- Helmet Model ---
+        let helmetModel = null;
+        const loader = new GLTFLoader();
+        const helmetUrl = 'https://raw.githubusercontent.com/mrdoob/three.js/master/examples/models/gltf/DamagedHelmet/glTF-Binary/DamagedHelmet.glb';
+        
+        loader.load(helmetUrl, (gltf) => {
+            helmetModel = gltf.scene;
+            helmetModel.scale.set(0.8, 0.8, 0.8);
+            helmetModel.position.set(0, 1.2, 0);
+            scene.add(helmetModel);
+            window.__3D_STATE__.helmetLoaded = true;
+        });
+
+        // --- Crystal System ---
+        const crystals = [];
+        const crystalGroup = new THREE.Group();
+        scene.add(crystalGroup);
+        
+        const palette = [0xff44ff, 0x44ffff, 0x88ff44, 0xffaa22, 0xaa44ff];
+        const crystalGeo = new THREE.OctahedronGeometry(1, 0);
+
+        function spawnWave() {
+            if (window.__3D_STATE__.currentWave >= window.__3D_STATE__.maxWaves) return;
+            if (crystals.length >= 30) return;
+
+            window.__3D_STATE__.currentWave++;
+            const radius = window.__3D_STATE__.currentWave + 1;
+            const numCrystals = Math.floor(Math.random() * 4) + 5; // 5 to 8
+
+            for (let i = 0; i < numCrystals; i++) {
+                if (crystals.length >= 30) break;
+
+                const angle = (i / numCrystals) * Math.PI * 2 + (Math.random() * 0.5);
+                const color = palette[Math.floor(Math.random() * palette.length)];
+                const targetHeight = 0.5 + Math.random() * 1.5;
+                
+                const mat = new THREE.MeshStandardMaterial({
+                    color: 0x111111,
+                    emissive: color,
+                    emissiveIntensity: window.__3D_STATE__.glowMode ? 2.0 : 0.5,
+                    transparent: true,
+                    opacity: 0.7,
+                    metalness: 0.9,
+                    roughness: 0.1
+                });
+
+                const mesh = new THREE.Mesh(crystalGeo, mat);
+                
+                // Position in ring
+                const x = Math.cos(angle) * radius;
+                const z = Math.sin(angle) * radius;
+                
+                // Initial scale and position
+                const startHeight = 0.1;
+                mesh.scale.set(0.2, startHeight / 2, 0.2);
+                mesh.position.set(x, startHeight / 2, z);
+                
+                // Random rotation around Y
+                mesh.rotation.y = Math.random() * Math.PI;
+
+                crystalGroup.add(mesh);
+                
+                crystals.push({
+                    mesh: mesh,
+                    targetHeight: targetHeight,
+                    currentHeight: startHeight
+                });
+            }
+            updateUI();
+        }
+
+        function resetCrystals() {
+            crystals.forEach(c => {
+                crystalGroup.remove(c.mesh);
+                c.mesh.geometry.dispose();
+                c.mesh.material.dispose();
+            });
+            crystals.length = 0;
+            window.__3D_STATE__.currentWave = 0;
+            updateUI();
+        }
+
+        function toggleGlow() {
+            window.__3D_STATE__.glowMode = !window.__3D_STATE__.glowMode;
+            const intensity = window.__3D_STATE__.glowMode ? 2.0 : 0.5;
+            crystals.forEach(c => {
+                c.mesh.material.emissiveIntensity = intensity;
+            });
+        }
+
+        // --- Interactions ---
+        const btnGrow = document.getElementById('btn-grow');
+        const btnReset = document.getElementById('btn-reset');
+        const sliderSpeed = document.getElementById('slider-speed');
+        
+        const statCrystals = document.getElementById('stat-crystals');
+        const statWave = document.getElementById('stat-wave');
+        const statSpeed = document.getElementById('stat-speed');
+
+        btnGrow.addEventListener('click', spawnWave);
+        btnReset.addEventListener('click', resetCrystals);
+        
+        sliderSpeed.addEventListener('input', (e) => {
+            window.__3D_STATE__.growthSpeed = parseFloat(e.target.value);
+            updateUI();
+        });
+
+        window.addEventListener('keydown', (e) => {
+            if (e.key.toLowerCase() === 'g') spawnWave();
+            if (e.key.toLowerCase() === 'r') resetCrystals();
+        });
+
+        // Raycasting for Helmet
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+
+        window.addEventListener('click', (event) => {
+            // Don't raycast if clicking UI
+            if (event.target.tagName === 'BUTTON' || event.target.tagName === 'INPUT') return;
+
+            mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+            raycaster.setFromCamera(mouse, camera);
+
+            if (helmetModel) {
+                const intersects = raycaster.intersectObject(helmetModel, true);
+                if (intersects.length > 0) {
+                    toggleGlow();
+                }
+            }
+        });
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        function updateUI() {
+            statCrystals.innerText = crystals.length;
+            statWave.innerText = window.__3D_STATE__.currentWave;
+            statSpeed.innerText = window.__3D_STATE__.growthSpeed.toFixed(1);
+        }
+
+        // --- Animation Loop ---
+        const clock = new THREE.Clock();
+
+        function animate() {
+            requestAnimationFrame(animate);
+            
+            const delta = clock.getDelta();
+
+            // Rotate Helmet
+            if (helmetModel) {
+                helmetModel.rotation.y += 0.005;
+                window.__3D_STATE__.helmetRotation = helmetModel.rotation.y;
+            }
+
+            // Grow Crystals
+            let isGrowing = false;
+            let totalHeight = 0;
+            let totalTarget = 0;
+
+            crystals.forEach(c => {
+                if (Math.abs(c.targetHeight - c.currentHeight) > 0.001) {
+                    c.currentHeight = THREE.MathUtils.lerp(
+                        c.currentHeight, 
+                        c.targetHeight, 
+                        0.02 * window.__3D_STATE__.growthSpeed
+                    );
+                    isGrowing = true;
+                }
+                
+                // Octahedron height is 2 * scale.y. We want total height to be c.currentHeight.
+                // So scale.y = c.currentHeight / 2
+                c.mesh.scale.set(0.2, c.currentHeight / 2, 0.2);
+                c.mesh.position.y = c.currentHeight / 2;
+
+                totalHeight += c.currentHeight;
+                totalTarget += c.targetHeight;
+            });
+
+            // Update State
+            window.__3D_STATE__.crystalCount = crystals.length;
+            window.__3D_STATE__.isGrowing = isGrowing;
+            window.__3D_STATE__.averageCrystalHeight = crystals.length > 0 ? totalHeight / crystals.length : 0;
+            window.__3D_STATE__.totalCrystalTargetHeight = totalTarget;
+
+            controls.update();
+            renderer.render(scene, camera);
+        }
+
+        animate();
+    </script>
+</body>
+</html>

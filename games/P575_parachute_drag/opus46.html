@@ -1,0 +1,679 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Parachute Descent Simulation</title>
+<script type="importmap">
+{ "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+} }
+</script>
+<style>
+body { margin: 0; overflow: hidden; font-family: monospace; }
+canvas { display: block; }
+
+#hud {
+  position: fixed;
+  top: 10px;
+  left: 10px;
+  background: rgba(0,0,0,0.6);
+  color: #0f0;
+  font-family: monospace;
+  padding: 10px;
+  border-radius: 6px;
+  z-index: 100;
+  pointer-events: none;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+#controls {
+  position: fixed;
+  bottom: 10px;
+  right: 10px;
+  background: rgba(0,0,0,0.7);
+  color: #fff;
+  padding: 14px;
+  border-radius: 8px;
+  z-index: 100;
+  min-width: 250px;
+  font-family: monospace;
+  font-size: 12px;
+}
+
+#controls label {
+  display: block;
+  margin-bottom: 2px;
+  margin-top: 8px;
+}
+
+#controls input[type="range"] {
+  width: 100%;
+  margin-bottom: 2px;
+}
+
+#controls .val {
+  text-align: right;
+  font-size: 11px;
+  color: #aaa;
+}
+
+#instructions {
+  position: fixed;
+  top: 10px;
+  right: 10px;
+  background: rgba(0,0,0,0.6);
+  color: #fff;
+  padding: 10px;
+  border-radius: 6px;
+  z-index: 100;
+  font-family: monospace;
+  font-size: 12px;
+  pointer-events: none;
+}
+</style>
+</head>
+<body>
+
+<div id="hud">
+  <div>Altitude: <span id="hud-altitude">500.0</span> m</div>
+  <div>Velocity: <span id="hud-velocity">0.0</span> m/s</div>
+  <div>Terminal V: <span id="hud-terminal">0.0</span> m/s</div>
+  <div>Drag Force: <span id="hud-drag">0.0</span> N</div>
+  <div>Phase: <span id="hud-phase">Freefall</span></div>
+  <div>Frame: <span id="hud-framecount">0</span></div>
+  <div>Paused: <span id="hud-paused">No</span></div>
+</div>
+
+<div id="instructions">
+  [SPACE] Deploy Parachute<br>
+  [R] Reset<br>
+  [P] Pause/Unpause
+</div>
+
+<div id="controls">
+  <strong>Simulation Controls</strong>
+  <label>Parachute Area (m²)</label>
+  <input type="range" id="slider-area" min="10" max="80" value="30" step="1">
+  <div class="val" id="val-area">30 m²</div>
+
+  <label>Drag Coefficient</label>
+  <input type="range" id="slider-cd" min="0.5" max="3.0" value="1.5" step="0.1">
+  <div class="val" id="val-cd">1.5</div>
+
+  <label>Skydiver Mass (kg)</label>
+  <input type="range" id="slider-mass" min="50" max="120" value="80" step="1">
+  <div class="val" id="val-mass">80 kg</div>
+
+  <label>Time Scale</label>
+  <input type="range" id="slider-timescale" min="0.5" max="5.0" value="1.0" step="0.5">
+  <div class="val" id="val-timescale">1.0x</div>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+// Scene setup
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x87ceeb);
+scene.fog = new THREE.Fog(0x87ceeb, 100, 600);
+
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 2000);
+camera.position.set(15, 5, 15);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.shadowMap.enabled = true;
+document.body.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.05;
+
+// Lights
+const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+dirLight.position.set(5, 20, 10);
+dirLight.castShadow = true;
+scene.add(dirLight);
+
+const ambLight = new THREE.AmbientLight(0xffffff, 0.5);
+scene.add(ambLight);
+
+// Sky gradient sphere
+const skyGeo = new THREE.SphereGeometry(900, 32, 32);
+const skyMat = new THREE.ShaderMaterial({
+  side: THREE.BackSide,
+  uniforms: {
+    topColor: { value: new THREE.Color(0x4a90d9) },
+    bottomColor: { value: new THREE.Color(0xffffff) }
+  },
+  vertexShader: `
+    varying vec3 vWorldPosition;
+    void main() {
+      vec4 worldPos = modelMatrix * vec4(position, 1.0);
+      vWorldPosition = worldPos.xyz;
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    }
+  `,
+  fragmentShader: `
+    uniform vec3 topColor;
+    uniform vec3 bottomColor;
+    varying vec3 vWorldPosition;
+    void main() {
+      float h = normalize(vWorldPosition).y;
+      float t = clamp(h * 0.5 + 0.5, 0.0, 1.0);
+      gl_FragColor = vec4(mix(bottomColor, topColor, t), 1.0);
+    }
+  `
+});
+const sky = new THREE.Mesh(skyGeo, skyMat);
+scene.add(sky);
+
+// Ground plane
+const groundGeo = new THREE.PlaneGeometry(200, 200);
+const groundMat = new THREE.MeshLambertMaterial({ color: 0x4caf50 });
+const ground = new THREE.Mesh(groundGeo, groundMat);
+ground.rotation.x = -Math.PI / 2;
+ground.position.y = 0;
+ground.receiveShadow = true;
+scene.add(ground);
+
+// Grid on ground
+const gridHelper = new THREE.GridHelper(200, 40, 0x388e3c, 0x388e3c);
+gridHelper.position.y = 0.01;
+scene.add(gridHelper);
+
+// Landing target
+const targetGeo = new THREE.RingGeometry(2, 3, 32);
+const targetMat = new THREE.MeshBasicMaterial({ color: 0xff0000, side: THREE.DoubleSide });
+const target = new THREE.Mesh(targetGeo, targetMat);
+target.rotation.x = -Math.PI / 2;
+target.position.y = 0.02;
+scene.add(target);
+
+const targetInner = new THREE.RingGeometry(0.5, 1.2, 32);
+const targetInnerMesh = new THREE.Mesh(targetInner, targetMat);
+targetInnerMesh.rotation.x = -Math.PI / 2;
+targetInnerMesh.position.y = 0.03;
+scene.add(targetInnerMesh);
+
+// Clouds
+const clouds = [];
+function createCloud(x, y, z) {
+  const group = new THREE.Group();
+  const cloudMat = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.6 });
+  for (let i = 0; i < 5; i++) {
+    const s = 3 + Math.random() * 5;
+    const sphere = new THREE.Mesh(new THREE.SphereGeometry(s, 8, 8), cloudMat);
+    sphere.position.set((Math.random() - 0.5) * 8, (Math.random() - 0.5) * 2, (Math.random() - 0.5) * 8);
+    group.add(sphere);
+  }
+  group.position.set(x, y, z);
+  scene.add(group);
+  clouds.push(group);
+}
+
+for (let i = 0; i < 30; i++) {
+  createCloud(
+    (Math.random() - 0.5) * 300,
+    50 + Math.random() * 400,
+    (Math.random() - 0.5) * 300
+  );
+}
+
+// Simulation state
+let simState = {
+  altitude: 500,
+  velocity: 0,
+  phase: 'freefall',
+  parachuteDeployed: false,
+  deploymentProgress: 0,
+  deploymentStartTime: -1,
+  elapsedTime: 0,
+  frameCount: 0,
+  isPaused: false,
+  landed: false
+};
+
+// Physics constants
+const g = 9.81;
+const rho = 1.225;
+const bodyCD = 0.5;
+const bodyA = 0.7;
+
+// Slider references
+const sliderArea = document.getElementById('slider-area');
+const sliderCd = document.getElementById('slider-cd');
+const sliderMass = document.getElementById('slider-mass');
+const sliderTimescale = document.getElementById('slider-timescale');
+
+function getArea() { return parseFloat(sliderArea.value); }
+function getCd() { return parseFloat(sliderCd.value); }
+function getMass() { return parseFloat(sliderMass.value); }
+function getTimeScale() { return parseFloat(sliderTimescale.value); }
+
+sliderArea.addEventListener('input', () => { document.getElementById('val-area').textContent = sliderArea.value + ' m²'; });
+sliderCd.addEventListener('input', () => { document.getElementById('val-cd').textContent = sliderCd.value; });
+sliderMass.addEventListener('input', () => { document.getElementById('val-mass').textContent = sliderMass.value + ' kg'; });
+sliderTimescale.addEventListener('input', () => { document.getElementById('val-timescale').textContent = sliderTimescale.value + 'x'; });
+
+// Skydiver group
+const skydiverGroup = new THREE.Group();
+skydiverGroup.position.set(0, 500, 0);
+scene.add(skydiverGroup);
+
+// Fallback skydiver (box figure)
+let skydiverModel = null;
+let useFallback = false;
+
+function createFallbackSkydiver() {
+  const group = new THREE.Group();
+  // Body
+  const bodyMat = new THREE.MeshLambertMaterial({ color: 0x333333 });
+  const torso = new THREE.Mesh(new THREE.BoxGeometry(0.6, 0.8, 0.3), bodyMat);
+  torso.position.y = 0.4;
+  group.add(torso);
+  // Head
+  const head = new THREE.Mesh(new THREE.SphereGeometry(0.2, 8, 8), new THREE.MeshLambertMaterial({ color: 0xffcc99 }));
+  head.position.y = 1.0;
+  group.add(head);
+  // Legs
+  const legGeo = new THREE.BoxGeometry(0.2, 0.7, 0.2);
+  const leftLeg = new THREE.Mesh(legGeo, bodyMat);
+  leftLeg.position.set(-0.15, -0.35, 0);
+  group.add(leftLeg);
+  const rightLeg = new THREE.Mesh(legGeo, bodyMat);
+  rightLeg.position.set(0.15, -0.35, 0);
+  group.add(rightLeg);
+  // Arms
+  const armGeo = new THREE.BoxGeometry(0.15, 0.6, 0.15);
+  const leftArm = new THREE.Mesh(armGeo, bodyMat);
+  leftArm.position.set(-0.45, 0.5, 0);
+  leftArm.rotation.z = Math.PI / 4;
+  group.add(leftArm);
+  const rightArm = new THREE.Mesh(armGeo, bodyMat);
+  rightArm.position.set(0.45, 0.5, 0);
+  rightArm.rotation.z = -Math.PI / 4;
+  group.add(rightArm);
+  return group;
+}
+
+// Load soldier model
+const loader = new GLTFLoader();
+loader.load(
+  'https://raw.githubusercontent.com/nicobailon/CodingWithVision/main/shared_assets/glb/soldier.glb',
+  (gltf) => {
+    skydiverModel = gltf.scene;
+    skydiverModel.scale.set(1.2, 1.2, 1.2);
+    skydiverModel.traverse(child => {
+      if (child.isMesh) {
+        child.castShadow = true;
+      }
+    });
+    skydiverGroup.add(skydiverModel);
+  },
+  undefined,
+  (error) => {
+    console.warn('Failed to load soldier model, using fallback:', error);
+    useFallback = true;
+    skydiverModel = createFallbackSkydiver();
+    skydiverGroup.add(skydiverModel);
+  }
+);
+
+// Timeout fallback
+setTimeout(() => {
+  if (!skydiverModel) {
+    useFallback = true;
+    skydiverModel = createFallbackSkydiver();
+    skydiverGroup.add(skydiverModel);
+  }
+}, 5000);
+
+// Parachute
+const parachuteGroup = new THREE.Group();
+parachuteGroup.position.y = 3.5;
+skydiverGroup.add(parachuteGroup);
+
+// Canopy
+const canopyGeo = new THREE.SphereGeometry(3, 32, 16, 0, Math.PI * 2, 0, Math.PI / 2);
+const canopyMat = new THREE.MeshLambertMaterial({
+  color: 0xff6600,
+  transparent: true,
+  opacity: 0.8,
+  side: THREE.DoubleSide
+});
+const canopy = new THREE.Mesh(canopyGeo, canopyMat);
+canopy.rotation.x = Math.PI;
+parachuteGroup.add(canopy);
+
+// Store original canopy vertices for animation
+const canopyPositions = canopyGeo.attributes.position.array.slice();
+
+// Shroud lines
+const shroudLines = [];
+for (let i = 0; i < 8; i++) {
+  const angle = (i / 8) * Math.PI * 2;
+  const lineGeo = new THREE.BufferGeometry();
+  const positions = new Float32Array(6);
+  // Top point (canopy rim)
+  positions[0] = Math.cos(angle) * 3;
+  positions[1] = 0;
+  positions[2] = Math.sin(angle) * 3;
+  // Bottom point (skydiver shoulders)
+  positions[3] = Math.cos(angle) * 0.3;
+  positions[4] = -3.5;
+  positions[5] = Math.sin(angle) * 0.3;
+  lineGeo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  const lineMat = new THREE.LineBasicMaterial({ color: 0x888888 });
+  const line = new THREE.Line(lineGeo, lineMat);
+  parachuteGroup.add(line);
+  shroudLines.push({ mesh: line, angle: angle });
+}
+
+parachuteGroup.scale.set(0, 0, 0);
+
+// Velocity trail
+const trailMaxPoints = 60;
+const trailPositions = new Float32Array(trailMaxPoints * 3);
+const trailGeo = new THREE.BufferGeometry();
+trailGeo.setAttribute('position', new THREE.BufferAttribute(trailPositions, 3));
+trailGeo.setDrawRange(0, 0);
+const trailMat = new THREE.LineBasicMaterial({ color: 0xff4444, transparent: true, opacity: 0.6 });
+const trail = new THREE.Line(trailGeo, trailMat);
+scene.add(trail);
+let trailPoints = [];
+
+// Wind streamlines (particles flowing upward past skydiver)
+const streamlineCount = 30;
+const streamlines = [];
+const streamlineGeo = new THREE.SphereGeometry(0.05, 4, 4);
+const streamlineMat = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.4 });
+
+for (let i = 0; i < streamlineCount; i++) {
+  const mesh = new THREE.Mesh(streamlineGeo, streamlineMat.clone());
+  mesh.userData = {
+    offsetX: (Math.random() - 0.5) * 6,
+    offsetZ: (Math.random() - 0.5) * 6,
+    phase: Math.random() * 20,
+    speed: 0.5 + Math.random() * 0.5
+  };
+  scene.add(mesh);
+  streamlines.push(mesh);
+}
+
+// Compute terminal velocity
+function computeTerminalVelocity(cd, area, mass) {
+  return Math.sqrt((2 * mass * g) / (cd * area * rho));
+}
+
+// Compute drag force
+function computeDragForce(cd, area, velocity) {
+  return 0.5 * cd * area * rho * velocity * velocity;
+}
+
+// Get current effective drag parameters
+function getCurrentDrag() {
+  if (simState.phase === 'freefall') {
+    return { cd: bodyCD, area: bodyA };
+  } else if (simState.phase === 'deploying') {
+    const t = simState.deploymentProgress;
+    const cd = bodyCD + (getCd() - bodyCD) * t;
+    const area = bodyA + (getArea() - bodyA) * t;
+    return { cd, area };
+  } else {
+    return { cd: getCd(), area: getArea() };
+  }
+}
+
+// Reset simulation
+function resetSimulation() {
+  simState.altitude = 500;
+  simState.velocity = 0;
+  simState.phase = 'freefall';
+  simState.parachuteDeployed = false;
+  simState.deploymentProgress = 0;
+  simState.deploymentStartTime = -1;
+  simState.elapsedTime = 0;
+  simState.landed = false;
+  skydiverGroup.position.set(0, 500, 0);
+  parachuteGroup.scale.set(0, 0, 0);
+  trailPoints = [];
+  trailGeo.setDrawRange(0, 0);
+  if (skydiverModel) {
+    skydiverModel.rotation.x = -Math.PI / 6;
+  }
+}
+
+// Deploy parachute
+function deployParachute() {
+  if (simState.parachuteDeployed || simState.phase === 'landed') return;
+  simState.parachuteDeployed = true;
+  simState.phase = 'deploying';
+  simState.deploymentStartTime = simState.elapsedTime;
+}
+
+// Keyboard
+document.addEventListener('keydown', (e) => {
+  if (e.code === 'Space') {
+    e.preventDefault();
+    deployParachute();
+  } else if (e.code === 'KeyR') {
+    resetSimulation();
+  } else if (e.code === 'KeyP') {
+    simState.isPaused = !simState.isPaused;
+  }
+});
+
+// HUD elements
+const hudAltitude = document.getElementById('hud-altitude');
+const hudVelocity = document.getElementById('hud-velocity');
+const hudTerminal = document.getElementById('hud-terminal');
+const hudDrag = document.getElementById('hud-drag');
+const hudPhase = document.getElementById('hud-phase');
+const hudFramecount = document.getElementById('hud-framecount');
+const hudPaused = document.getElementById('hud-paused');
+
+// Initialize state
+window.__3D_STATE__ = {};
+
+function updateState() {
+  const { cd, area } = getCurrentDrag();
+  const mass = getMass();
+  const tv = computeTerminalVelocity(cd, area, mass);
+  const df = computeDragForce(cd, area, simState.velocity);
+
+  const phaseDisplay = {
+    'freefall': 'Freefall',
+    'deploying': 'Deploying',
+    'descent': 'Descent',
+    'landed': 'Landed'
+  };
+
+  hudAltitude.textContent = simState.altitude.toFixed(1);
+  hudVelocity.textContent = simState.velocity.toFixed(1);
+  hudTerminal.textContent = tv.toFixed(1);
+  hudDrag.textContent = df.toFixed(1);
+  hudPhase.textContent = phaseDisplay[simState.phase] || simState.phase;
+  hudFramecount.textContent = simState.frameCount;
+  hudPaused.textContent = simState.isPaused ? 'Yes' : 'No';
+
+  const isValid = isFinite(simState.altitude) && isFinite(simState.velocity) &&
+                  !isNaN(simState.altitude) && !isNaN(simState.velocity);
+
+  window.__3D_STATE__ = {
+    frameCount: simState.frameCount,
+    isPaused: simState.isPaused,
+    altitude: simState.altitude,
+    velocity: simState.velocity,
+    terminalVelocity: tv,
+    dragForce: df,
+    phase: simState.phase,
+    parachuteArea: getArea(),
+    dragCoefficient: getCd(),
+    mass: mass,
+    timeScale: getTimeScale(),
+    parachuteDeployed: simState.parachuteDeployed,
+    elapsedTime: simState.elapsedTime,
+    isValid: isValid
+  };
+}
+
+// Set initial skydiver rotation
+if (skydiverModel) {
+  skydiverModel.rotation.x = -Math.PI / 6;
+}
+
+// Animation loop
+const clock = new THREE.Clock();
+
+function animate() {
+  requestAnimationFrame(animate);
+
+  const rawDt = clock.getDelta();
+  simState.frameCount++;
+
+  if (!simState.isPaused && simState.phase !== 'landed') {
+    const timeScale = getTimeScale();
+    const dt = (1 / 60) * timeScale;
+    simState.elapsedTime += dt;
+
+    const mass = getMass();
+
+    // Handle deployment progress
+    if (simState.phase === 'deploying') {
+      const deployDuration = 1.5;
+      simState.deploymentProgress = Math.min(1.0, (simState.elapsedTime - simState.deploymentStartTime) / deployDuration);
+      if (simState.deploymentProgress >= 1.0) {
+        simState.phase = 'descent';
+      }
+    }
+
+    // Get current drag params
+    const { cd, area } = getCurrentDrag();
+
+    // Physics: Euler integration
+    const fGravity = mass * g;
+    const fDrag = computeDragForce(cd, area, simState.velocity);
+    const netForce = fGravity - fDrag; // positive = downward
+    const acceleration = netForce / mass;
+
+    simState.velocity += acceleration * dt;
+    if (simState.velocity < 0) simState.velocity = 0;
+
+    simState.altitude -= simState.velocity * dt;
+
+    // Landing check
+    if (simState.altitude <= 0) {
+      simState.altitude = 0;
+      simState.velocity = 0;
+      simState.phase = 'landed';
+    }
+
+    // Update skydiver position
+    skydiverGroup.position.y = simState.altitude;
+
+    // Skydiver rotation
+    if (skydiverModel) {
+      if (simState.phase === 'freefall') {
+        skydiverModel.rotation.x = -Math.PI / 6;
+      } else if (simState.phase === 'deploying') {
+        skydiverModel.rotation.x = THREE.MathUtils.lerp(-Math.PI / 6, 0, simState.deploymentProgress);
+      } else {
+        skydiverModel.rotation.x = 0;
+      }
+    }
+
+    // Parachute scale
+    if (simState.parachuteDeployed) {
+      const s = simState.phase === 'deploying' ? simState.deploymentProgress : 1.0;
+      parachuteGroup.scale.set(s, s, s);
+    }
+
+    // Canopy billowing animation
+    if (simState.parachuteDeployed && simState.phase !== 'landed') {
+      const posAttr = canopyGeo.attributes.position;
+      const time = simState.elapsedTime;
+      for (let i = 0; i < posAttr.count; i++) {
+        const ox = canopyPositions[i * 3];
+        const oy = canopyPositions[i * 3 + 1];
+        const oz = canopyPositions[i * 3 + 2];
+        const dist = Math.sqrt(ox * ox + oz * oz);
+        const billowAmount = 0.1 * Math.sin(time * 3 + dist * 2) * (dist / 3);
+        posAttr.setY(i, oy + billowAmount);
+      }
+      posAttr.needsUpdate = true;
+    }
+
+    // Update shroud lines
+    for (const sl of shroudLines) {
+      const posAttr = sl.mesh.geometry.attributes.position;
+      const s = parachuteGroup.scale.x;
+      posAttr.setXYZ(0, Math.cos(sl.angle) * 3 * s, 0, Math.sin(sl.angle) * 3 * s);
+      posAttr.setXYZ(1, Math.cos(sl.angle) * 0.3, -3.5, Math.sin(sl.angle) * 0.3);
+      posAttr.needsUpdate = true;
+    }
+
+    // Trail
+    trailPoints.push(new THREE.Vector3(
+      skydiverGroup.position.x,
+      skydiverGroup.position.y,
+      skydiverGroup.position.z
+    ));
+    if (trailPoints.length > trailMaxPoints) {
+      trailPoints.shift();
+    }
+    const tPos = trailGeo.attributes.position;
+    for (let i = 0; i < trailPoints.length; i++) {
+      tPos.setXYZ(i, trailPoints[i].x, trailPoints[i].y, trailPoints[i].z);
+    }
+    tPos.needsUpdate = true;
+    trailGeo.setDrawRange(0, trailPoints.length);
+
+    // Wind streamlines
+    for (const s of streamlines) {
+      const ud = s.userData;
+      ud.phase += simState.velocity * 0.05 * ud.speed;
+      const range = 15;
+      let localY = ((ud.phase % range) + range) % range - range / 2;
+      s.position.set(
+        skydiverGroup.position.x + ud.offsetX,
+        skydiverGroup.position.y + localY,
+        skydiverGroup.position.z + ud.offsetZ
+      );
+      s.material.opacity = 0.15 + Math.min(simState.velocity / 60, 1) * 0.35;
+      const sc = 0.5 + Math.min(simState.velocity / 60, 1) * 1.5;
+      s.scale.set(1, sc, 1);
+    }
+  }
+
+  // Camera tracking
+  const targetY = skydiverGroup.position.y;
+  camera.position.y += (targetY + 5 - camera.position.y) * 0.05;
+  controls.target.set(skydiverGroup.position.x, targetY, skydiverGroup.position.z);
+  controls.update();
+
+  // Move sky with camera
+  sky.position.y = camera.position.y;
+
+  updateState();
+  renderer.render(scene, camera);
+}
+
+// Handle resize
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// Initial state
+updateState();
+animate();
+</script>
+</body>
+</html>

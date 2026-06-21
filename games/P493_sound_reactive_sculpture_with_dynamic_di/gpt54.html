@@ -1,0 +1,528 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>3D Sound-Reactive Sculpture</title>
+  <style>
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #0a0a0a;
+      font-family: monospace;
+    }
+
+    canvas {
+      display: block;
+    }
+
+    .hud {
+      position: fixed;
+      color: white;
+      background: rgba(0,0,0,0.45);
+      padding: 10px 12px;
+      border-radius: 8px;
+      font-size: 13px;
+      line-height: 1.45;
+      pointer-events: none;
+      white-space: pre-line;
+      z-index: 10;
+    }
+
+    #hud-left {
+      top: 12px;
+      left: 12px;
+    }
+
+    #hud-right {
+      top: 12px;
+      right: 12px;
+      text-align: right;
+    }
+
+    #hud-bottom {
+      bottom: 12px;
+      left: 50%;
+      transform: translateX(-50%);
+      text-align: center;
+    }
+
+    #help {
+      position: fixed;
+      left: 12px;
+      bottom: 12px;
+      color: rgba(255,255,255,0.85);
+      background: rgba(0,0,0,0.35);
+      padding: 8px 10px;
+      border-radius: 8px;
+      font-size: 12px;
+      line-height: 1.4;
+      z-index: 10;
+      pointer-events: none;
+    }
+  </style>
+</head>
+<body>
+  <div id="hud-left" class="hud"></div>
+  <div id="hud-right" class="hud"></div>
+  <div id="hud-bottom" class="hud"></div>
+  <div id="help">
+    1/2/3: difficulty &nbsp; C: color mode &nbsp; Space: pause &nbsp; R: reset<br>
+    Move mouse: orbit camera &nbsp; Click core: explosion
+  </div>
+
+  <script type="module">
+    import * as THREE from "https://unpkg.com/three@0.160.0/build/three.module.js";
+
+    // --------------------------------------------------
+    // Renderer / Scene / Camera
+    // --------------------------------------------------
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0a0a0a);
+
+    const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+    camera.position.set(0, 5, 12);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    document.body.appendChild(renderer.domElement);
+
+    // --------------------------------------------------
+    // Lights
+    // --------------------------------------------------
+    const ambientLight = new THREE.AmbientLight(0x222244, 0.3);
+    scene.add(ambientLight);
+
+    const pointLight = new THREE.PointLight(0xffffff, 1.5);
+    pointLight.position.set(5, 10, 5);
+    scene.add(pointLight);
+
+    // --------------------------------------------------
+    // Core
+    // --------------------------------------------------
+    const baseCoreGeometry = new THREE.IcosahedronGeometry(1.5, 2);
+    const coreGeometry = baseCoreGeometry.clone();
+    const coreMaterial = new THREE.MeshStandardMaterial({
+      color: 0x00ffaa,
+      emissive: 0x003322,
+      wireframe: true
+    });
+    const core = new THREE.Mesh(coreGeometry, coreMaterial);
+    scene.add(core);
+
+    const coreBasePositions = coreGeometry.attributes.position.array.slice();
+
+    // --------------------------------------------------
+    // Rings / Spheres
+    // --------------------------------------------------
+    const sphereGeometry = new THREE.SphereGeometry(0.15, 16, 16);
+    const ringConfigs = [
+      { count: 12, radius: 3 },
+      { count: 18, radius: 5 },
+      { count: 24, radius: 7 }
+    ];
+
+    const rings = [];
+    const totalSphereCount = ringConfigs.reduce((sum, r) => sum + r.count, 0);
+
+    ringConfigs.forEach((cfg, ringIndex) => {
+      const group = new THREE.Group();
+      scene.add(group);
+
+      const spheres = [];
+      for (let i = 0; i < cfg.count; i++) {
+        const material = new THREE.MeshStandardMaterial({
+          color: 0xffffff,
+          emissive: 0x222222,
+          metalness: 0.15,
+          roughness: 0.35
+        });
+        const sphere = new THREE.Mesh(sphereGeometry, material);
+        group.add(sphere);
+        spheres.push({
+          mesh: sphere,
+          index: i,
+          angleOffset: (i / cfg.count) * Math.PI * 2
+        });
+      }
+
+      rings.push({
+        group,
+        spheres,
+        baseRadius: cfg.radius,
+        count: cfg.count,
+        orbitAngle: 0
+      });
+    });
+
+    // --------------------------------------------------
+    // Audio Simulation
+    // --------------------------------------------------
+    const frequencyBins = new Array(64).fill(0);
+
+    function updateFrequencyBins(time) {
+      let sum = 0;
+      for (let i = 0; i < 64; i++) {
+        const v = Math.abs(Math.sin(time * (0.5 + i * 0.1) + i * 0.3));
+        frequencyBins[i] = v;
+        sum += v;
+      }
+      return sum / 64;
+    }
+
+    // --------------------------------------------------
+    // Modes / Difficulty
+    // --------------------------------------------------
+    const difficulties = {
+      easy: {
+        scaleMin: 0.5,
+        scaleMax: 1.5,
+        coreRotationSpeed: 0.5,
+        ringOrbitSpeeds: [0.3, 0.2, 0.1],
+        radialAmplitude: 0.0,
+        coreMorph: false
+      },
+      medium: {
+        scaleMin: 0.3,
+        scaleMax: 2.5,
+        coreRotationSpeed: 1.0,
+        ringOrbitSpeeds: [0.6, 0.4, 0.2],
+        radialAmplitude: 0.5,
+        coreMorph: false
+      },
+      hard: {
+        scaleMin: 0.1,
+        scaleMax: 3.5,
+        coreRotationSpeed: 2.0,
+        ringOrbitSpeeds: [1.2, 0.8, 0.4],
+        radialAmplitude: 1.5,
+        coreMorph: true
+      }
+    };
+
+    const colorModes = ["spectrum", "pulse", "monochrome"];
+
+    // --------------------------------------------------
+    // State
+    // --------------------------------------------------
+    let difficulty = "easy";
+    let colorMode = "spectrum";
+    let paused = false;
+    let elapsedTime = 0;
+    let avgFrequency = 0;
+    let cameraAngle = Math.PI / 2;
+
+    let explosionActive = false;
+    let explosionTime = 0;
+    let explosionProgress = 0;
+
+    let fps = 0;
+    let fpsAccumulator = 0;
+    let fpsFrames = 0;
+    let ringAvgScales = [1, 1, 1];
+
+    window.__3D_STATE__ = {
+      difficulty,
+      colorMode,
+      paused,
+      elapsedTime,
+      avgFrequency,
+      coreRotationSpeed: difficulties[difficulty].coreRotationSpeed,
+      ringOrbitSpeeds: [...difficulties[difficulty].ringOrbitSpeeds],
+      sphereCount: totalSphereCount,
+      explosionActive,
+      explosionProgress,
+      cameraAngle,
+      ring1AvgScale: 1,
+      ring2AvgScale: 1,
+      ring3AvgScale: 1,
+      coreVerticesDisplaced: false,
+      fps: 0
+    };
+
+    // --------------------------------------------------
+    // HUD
+    // --------------------------------------------------
+    const hudLeft = document.getElementById("hud-left");
+    const hudRight = document.getElementById("hud-right");
+    const hudBottom = document.getElementById("hud-bottom");
+
+    function updateHUD() {
+      hudLeft.textContent =
+`Difficulty: ${difficulty}
+Color Mode: ${colorMode}
+Paused: ${paused ? "Yes" : "No"}`;
+
+      hudRight.textContent =
+`Average Frequency: ${avgFrequency.toFixed(3)}`;
+
+      hudBottom.textContent =
+`Spheres: ${totalSphereCount} | FPS: ${fps.toFixed(1)}`;
+    }
+
+    // --------------------------------------------------
+    // Helpers
+    // --------------------------------------------------
+    function lerp(a, b, t) {
+      return a + (b - a) * t;
+    }
+
+    function getExplosionMultiplier() {
+      if (!explosionActive) return 1;
+      const p = explosionProgress; // 0..1
+      if (p <= 0.5) {
+        return lerp(1, 2, p / 0.5);
+      }
+      return lerp(2, 1, (p - 0.5) / 0.5);
+    }
+
+    function applyColor(material, ringIndex, sphereIndex, sphereCount, freq, time) {
+      if (colorMode === "spectrum") {
+        const hue = sphereIndex / sphereCount;
+        material.color.setHSL(hue, 0.9, 0.55);
+        material.emissive.setHSL(hue, 0.9, 0.2 + freq * 0.35);
+      } else if (colorMode === "pulse") {
+        const hue = (time * 0.1) % 1;
+        material.color.setHSL(hue, 0.9, 0.55);
+        material.emissive.setHSL(hue, 0.95, 0.2 + freq * 0.4);
+      } else {
+        const lightness = 0.35 + freq * 0.4;
+        material.color.setHSL(0.5, 1.0, lightness);
+        material.emissive.setHSL(0.5, 1.0, 0.1 + freq * 0.35);
+      }
+    }
+
+    function updateCoreMorph(time) {
+      const cfg = difficulties[difficulty];
+      const pos = coreGeometry.attributes.position;
+      const arr = pos.array;
+
+      if (!cfg.coreMorph) {
+        for (let i = 0; i < arr.length; i++) {
+          arr[i] = coreBasePositions[i];
+        }
+        pos.needsUpdate = true;
+        coreGeometry.computeVertexNormals();
+        return false;
+      }
+
+      for (let i = 0; i < arr.length; i += 3) {
+        const vx = coreBasePositions[i];
+        const vy = coreBasePositions[i + 1];
+        const vz = coreBasePositions[i + 2];
+
+        const vertexIndex = i / 3;
+        const freq = frequencyBins[vertexIndex % 64];
+        const len = Math.sqrt(vx * vx + vy * vy + vz * vz) || 1;
+        const nx = vx / len;
+        const ny = vy / len;
+        const nz = vz / len;
+
+        const displacement = freq * 0.6 + Math.sin(time * 2 + vertexIndex * 0.35) * 0.05;
+
+        arr[i] = vx + nx * displacement;
+        arr[i + 1] = vy + ny * displacement;
+        arr[i + 2] = vz + nz * displacement;
+      }
+
+      pos.needsUpdate = true;
+      coreGeometry.computeVertexNormals();
+      return true;
+    }
+
+    function resetState() {
+      difficulty = "easy";
+      colorMode = "spectrum";
+      paused = false;
+      elapsedTime = 0;
+      avgFrequency = updateFrequencyBins(0);
+      explosionActive = false;
+      explosionTime = 0;
+      explosionProgress = 0;
+      cameraAngle = Math.PI / 2;
+
+      camera.position.set(Math.cos(cameraAngle) * 12, 5, Math.sin(cameraAngle) * 12);
+      camera.lookAt(0, 0, 0);
+
+      core.rotation.set(0, 0, 0);
+      for (let i = 0; i < rings.length; i++) {
+        rings[i].orbitAngle = 0;
+      }
+
+      const pos = coreGeometry.attributes.position.array;
+      for (let i = 0; i < pos.length; i++) {
+        pos[i] = coreBasePositions[i];
+      }
+      coreGeometry.attributes.position.needsUpdate = true;
+      coreGeometry.computeVertexNormals();
+    }
+
+    // --------------------------------------------------
+    // Input
+    // --------------------------------------------------
+    window.addEventListener("keydown", (e) => {
+      const key = e.key.toLowerCase();
+
+      if (key === "1") difficulty = "easy";
+      if (key === "2") difficulty = "medium";
+      if (key === "3") difficulty = "hard";
+
+      if (key === "c") {
+        const idx = colorModes.indexOf(colorMode);
+        colorMode = colorModes[(idx + 1) % colorModes.length];
+      }
+
+      if (e.code === "Space") {
+        e.preventDefault();
+        paused = !paused;
+      }
+
+      if (key === "r") {
+        resetState();
+      }
+    });
+
+    window.addEventListener("mousemove", (e) => {
+      const xNorm = e.clientX / window.innerWidth;
+      cameraAngle = xNorm * Math.PI * 2;
+      camera.position.set(Math.cos(cameraAngle) * 12, 5, Math.sin(cameraAngle) * 12);
+      camera.lookAt(0, 0, 0);
+    });
+
+    // Raycasting for clicking core
+    const raycaster = new THREE.Raycaster();
+    const mouse = new THREE.Vector2();
+
+    window.addEventListener("click", (e) => {
+      mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
+      mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+
+      raycaster.setFromCamera(mouse, camera);
+      const hits = raycaster.intersectObject(core, false);
+      if (hits.length > 0) {
+        explosionActive = true;
+        explosionTime = 0;
+        explosionProgress = 0;
+      }
+    });
+
+    window.addEventListener("resize", () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    // --------------------------------------------------
+    // Animation Loop
+    // --------------------------------------------------
+    const clock = new THREE.Clock();
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      const deltaRaw = clock.getDelta();
+      const delta = Math.min(deltaRaw, 0.05);
+
+      fpsAccumulator += deltaRaw;
+      fpsFrames++;
+      if (fpsAccumulator >= 0.5) {
+        fps = fpsFrames / fpsAccumulator;
+        fpsAccumulator = 0;
+        fpsFrames = 0;
+      }
+
+      const cfg = difficulties[difficulty];
+
+      if (!paused) {
+        elapsedTime += delta;
+        avgFrequency = updateFrequencyBins(elapsedTime);
+
+        core.rotation.y += cfg.coreRotationSpeed * delta;
+        core.rotation.x += cfg.coreRotationSpeed * 0.35 * delta;
+
+        for (let r = 0; r < rings.length; r++) {
+          rings[r].orbitAngle += cfg.ringOrbitSpeeds[r] * delta;
+        }
+
+        if (explosionActive) {
+          explosionTime += delta;
+          explosionProgress = Math.min(explosionTime / 2, 1);
+          if (explosionTime >= 2) {
+            explosionActive = false;
+            explosionTime = 0;
+            explosionProgress = 0;
+          }
+        }
+      }
+
+      const explosionMultiplier = getExplosionMultiplier();
+
+      for (let r = 0; r < rings.length; r++) {
+        const ring = rings[r];
+        let scaleSum = 0;
+
+        for (let i = 0; i < ring.spheres.length; i++) {
+          const sphereData = ring.spheres[i];
+          const mesh = sphereData.mesh;
+
+          const globalSphereIndex = (r * 20 + i) % 64;
+          const freq = frequencyBins[globalSphereIndex];
+
+          const scale = lerp(cfg.scaleMin, cfg.scaleMax, freq);
+          mesh.scale.setScalar(scale);
+          scaleSum += scale;
+
+          const radialOffset = cfg.radialAmplitude * (freq * 2 - 1);
+          const radius = (ring.baseRadius + radialOffset) * explosionMultiplier;
+
+          const angle = sphereData.angleOffset + ring.orbitAngle;
+          const yWave = Math.sin(elapsedTime * (0.8 + r * 0.2) + i * 0.5) * 0.2 * freq;
+
+          mesh.position.set(
+            Math.cos(angle) * radius,
+            yWave,
+            Math.sin(angle) * radius
+          );
+
+          applyColor(mesh.material, r, i, ring.count, freq, elapsedTime);
+        }
+
+        ringAvgScales[r] = scaleSum / ring.spheres.length;
+      }
+
+      const coreVerticesDisplaced = updateCoreMorph(elapsedTime);
+
+      window.__3D_STATE__ = {
+        difficulty,
+        colorMode,
+        paused,
+        elapsedTime,
+        avgFrequency,
+        coreRotationSpeed: cfg.coreRotationSpeed,
+        ringOrbitSpeeds: [...cfg.ringOrbitSpeeds],
+        sphereCount: totalSphereCount,
+        explosionActive,
+        explosionProgress,
+        cameraAngle,
+        ring1AvgScale: ringAvgScales[0],
+        ring2AvgScale: ringAvgScales[1],
+        ring3AvgScale: ringAvgScales[2],
+        coreVerticesDisplaced,
+        fps
+      };
+
+      updateHUD();
+      renderer.render(scene, camera);
+    }
+
+    // Initial setup
+    avgFrequency = updateFrequencyBins(0);
+    updateHUD();
+    animate();
+  </script>
+</body>
+</html>

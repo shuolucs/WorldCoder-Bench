@@ -1,0 +1,720 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3D Predator-Prey Ecosystem</title>
+<script type="importmap">
+{ "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+} }
+</script>
+<style>
+body { margin: 0; overflow: hidden; font-family: Arial, sans-serif; }
+canvas { display: block; }
+#hud {
+    position: absolute; top: 10px; left: 10px;
+    background: rgba(0,0,0,0.7); color: #fff; padding: 15px;
+    border-radius: 8px; font-size: 14px; min-width: 220px;
+    user-select: none;
+}
+#hud div { margin: 4px 0; }
+#hud label { display: block; margin-top: 8px; }
+#hud input[type="range"] { width: 100%; }
+#controls-info {
+    position: absolute; bottom: 10px; left: 10px;
+    background: rgba(0,0,0,0.6); color: #ccc; padding: 10px;
+    border-radius: 6px; font-size: 12px;
+}
+.stat-value { color: #4fc; font-weight: bold; }
+</style>
+</head>
+<body>
+<div id="hud">
+    <div style="font-size:16px; font-weight:bold; margin-bottom:8px;">🦊 Ecosystem 🐦</div>
+    <div>Foxes: <span id="hud-foxes" class="stat-value">0</span></div>
+    <div>Storks: <span id="hud-storks" class="stat-value">0</span></div>
+    <div>Catches: <span id="hud-catches" class="stat-value">0</span></div>
+    <div>Births: <span id="hud-births" class="stat-value">0</span></div>
+    <div>Deaths: <span id="hud-deaths" class="stat-value">0</span></div>
+    <div>Models loaded: <span id="hud-models" class="stat-value">No</span></div>
+    <label>Fox Speed: <span id="fox-speed-val">4</span>
+        <input type="range" id="slider-fox-speed" min="1" max="8" step="0.5" value="4">
+    </label>
+    <label>Stork Speed: <span id="stork-speed-val">3</span>
+        <input type="range" id="slider-stork-speed" min="1" max="6" step="0.5" value="3">
+    </label>
+</div>
+<div id="controls-info">
+    [Space] Pause/Play &nbsp; [R] Reset &nbsp; [F] Spawn Fox &nbsp; [S] Spawn 5 Storks
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+// ─── Global State ───
+let isPaused = false;
+let totalCatches = 0;
+let totalBirths = 0;
+let totalDeaths = 0;
+let frameCount = 0;
+let foxSpeed = 4;
+let storkSpeed = 3;
+let modelsLoaded = false;
+let foxModelData = null;
+let storkModelData = null;
+
+const foxes = [];
+const storks = [];
+const foodPatches = [];
+const trees = [];
+
+const BOUNDARY = 23;
+const GROUND_SIZE = 50;
+const MAX_POP = 30;
+
+// ─── Scene Setup ───
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x88bbdd);
+
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 200);
+camera.position.set(0, 25, 35);
+camera.lookAt(0, 0, 0);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.shadowMap.enabled = true;
+document.body.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 0, 0);
+controls.update();
+
+// Lights
+const ambientLight = new THREE.AmbientLight(0x668877, 0.5);
+scene.add(ambientLight);
+
+const dirLight = new THREE.DirectionalLight(0xffffff, 0.7);
+dirLight.position.set(10, 15, 10);
+dirLight.castShadow = true;
+scene.add(dirLight);
+
+// ─── Ground ───
+const groundGeom = new THREE.PlaneGeometry(GROUND_SIZE, GROUND_SIZE);
+const groundCanvas = document.createElement('canvas');
+groundCanvas.width = 256;
+groundCanvas.height = 256;
+const gctx = groundCanvas.getContext('2d');
+// Create a brick-like pattern tinted green
+for (let y = 0; y < 256; y += 32) {
+    for (let x = 0; x < 256; x += 64) {
+        const offset = (Math.floor(y / 32) % 2) * 32;
+        const bx = x + offset;
+        const g = 100 + Math.random() * 60;
+        gctx.fillStyle = `rgb(${30 + Math.random()*20}, ${g}, ${20 + Math.random()*15})`;
+        gctx.fillRect(bx % 256, y, 62, 30);
+        gctx.strokeStyle = `rgb(30, 80, 20)`;
+        gctx.strokeRect(bx % 256, y, 62, 30);
+    }
+}
+const groundTex = new THREE.CanvasTexture(groundCanvas);
+groundTex.wrapS = THREE.RepeatWrapping;
+groundTex.wrapT = THREE.RepeatWrapping;
+groundTex.repeat.set(8, 8);
+
+const groundMat = new THREE.MeshLambertMaterial({ map: groundTex, color: 0x44aa44 });
+const ground = new THREE.Mesh(groundGeom, groundMat);
+ground.rotation.x = -Math.PI / 2;
+ground.receiveShadow = true;
+scene.add(ground);
+
+// ─── Trees ───
+function createTree(x, z) {
+    const group = new THREE.Group();
+    const height = 1.5 + Math.random() * 1.5;
+    const trunkGeom = new THREE.CylinderGeometry(0.1, 0.15, height, 6);
+    const trunkMat = new THREE.MeshLambertMaterial({ color: 0x8B4513 });
+    const trunk = new THREE.Mesh(trunkGeom, trunkMat);
+    trunk.position.y = height / 2;
+    trunk.castShadow = true;
+    group.add(trunk);
+
+    const coneH = height * 0.8;
+    const coneGeom = new THREE.ConeGeometry(0.6 + Math.random() * 0.4, coneH, 6);
+    const coneMat = new THREE.MeshLambertMaterial({ color: new THREE.Color(0x228833).lerp(new THREE.Color(0x115522), Math.random()) });
+    const cone = new THREE.Mesh(coneGeom, coneMat);
+    cone.position.y = height + coneH / 2 - 0.2;
+    cone.castShadow = true;
+    group.add(cone);
+
+    group.position.set(x, 0, z);
+    scene.add(group);
+    trees.push(group);
+    return group;
+}
+
+for (let i = 0; i < 20; i++) {
+    const x = (Math.random() - 0.5) * 44;
+    const z = (Math.random() - 0.5) * 44;
+    createTree(x, z);
+}
+
+// ─── Food Patches ───
+function createFoodPatch(x, z) {
+    const geom = new THREE.CircleGeometry(1.5, 16);
+    const mat = new THREE.MeshLambertMaterial({ color: 0x22dd44, transparent: true, opacity: 0.5 });
+    const mesh = new THREE.Mesh(geom, mat);
+    mesh.rotation.x = -Math.PI / 2;
+    mesh.position.set(x, 0.02, z);
+    scene.add(mesh);
+    return { mesh, x, z, radius: 1.5 };
+}
+
+for (let i = 0; i < 10; i++) {
+    const x = (Math.random() - 0.5) * 40;
+    const z = (Math.random() - 0.5) * 40;
+    foodPatches.push(createFoodPatch(x, z));
+}
+
+// ─── Animal Class ───
+class Animal {
+    constructor(type, x, z, model3d) {
+        this.type = type; // 'fox' or 'stork'
+        this.position = new THREE.Vector3(x, 0, z);
+        this.velocity = new THREE.Vector3((Math.random() - 0.5) * 2, 0, (Math.random() - 0.5) * 2);
+        this.acceleration = new THREE.Vector3();
+        this.energy = type === 'fox' ? 60 : 80;
+        this.alive = true;
+        this.wanderAngle = Math.random() * Math.PI * 2;
+        this.reproductionCooldown = 5; // seconds before can reproduce
+
+        this.maxSpeed = type === 'fox' ? foxSpeed : storkSpeed;
+        this.maxForce = type === 'fox' ? 0.3 : 0.25;
+
+        // 3D model
+        this.mesh = null;
+        this.mixer = null;
+        if (model3d) {
+            this.setModel(model3d);
+        } else {
+            this.createPlaceholder();
+        }
+    }
+
+    createPlaceholder() {
+        const color = this.type === 'fox' ? 0xff6600 : 0xffffff;
+        const geom = this.type === 'fox'
+            ? new THREE.ConeGeometry(0.3, 0.6, 6)
+            : new THREE.ConeGeometry(0.2, 0.5, 6);
+        const mat = new THREE.MeshLambertMaterial({ color });
+        this.mesh = new THREE.Mesh(geom, mat);
+        this.mesh.rotation.x = Math.PI / 2;
+        const group = new THREE.Group();
+        group.add(this.mesh);
+        this.mesh = group;
+        this.mesh.position.copy(this.position);
+        scene.add(this.mesh);
+    }
+
+    setModel(modelData) {
+        const cloned = modelData.scene.clone();
+        // Deep clone with skeleton support
+        this.mesh = cloned;
+        const scale = this.type === 'fox' ? 0.5 : 0.4;
+
+        // For fox.glb the model might need different scaling
+        if (this.type === 'fox') {
+            this.mesh.scale.set(0.02, 0.02, 0.02); // Fox GLB is usually large
+        } else {
+            this.mesh.scale.set(0.4, 0.4, 0.4);
+        }
+
+        this.mesh.position.copy(this.position);
+        scene.add(this.mesh);
+
+        // Animations
+        if (modelData.animations && modelData.animations.length > 0) {
+            this.mixer = new THREE.AnimationMixer(this.mesh);
+            // Try to find walk or first animation
+            let clip = modelData.animations.find(a => /walk|run|idle/i.test(a.name)) || modelData.animations[0];
+            if (clip) {
+                const action = this.mixer.clipAction(clip);
+                action.play();
+            }
+        }
+    }
+
+    applyForce(force) {
+        this.acceleration.add(force);
+    }
+
+    seek(target) {
+        const desired = new THREE.Vector3().subVectors(target, this.position);
+        const dist = desired.length();
+        desired.normalize().multiplyScalar(this.maxSpeed);
+        const steer = new THREE.Vector3().subVectors(desired, this.velocity);
+        if (steer.length() > this.maxForce) steer.normalize().multiplyScalar(this.maxForce);
+        return steer;
+    }
+
+    flee(target) {
+        const desired = new THREE.Vector3().subVectors(this.position, target);
+        desired.normalize().multiplyScalar(this.maxSpeed);
+        const steer = new THREE.Vector3().subVectors(desired, this.velocity);
+        if (steer.length() > this.maxForce) steer.normalize().multiplyScalar(this.maxForce);
+        return steer;
+    }
+
+    wander() {
+        this.wanderAngle += (Math.random() - 0.5) * 0.6;
+        const wanderDist = 3;
+        const wanderRadius = 1.5;
+        const vel = this.velocity.clone().normalize().multiplyScalar(wanderDist);
+        const circleCenter = this.position.clone().add(vel);
+        const offset = new THREE.Vector3(
+            Math.cos(this.wanderAngle) * wanderRadius,
+            0,
+            Math.sin(this.wanderAngle) * wanderRadius
+        );
+        const target = circleCenter.add(offset);
+        return this.seek(target);
+    }
+
+    separation(others, minDist) {
+        const steer = new THREE.Vector3();
+        let count = 0;
+        for (const other of others) {
+            if (other === this || !other.alive) continue;
+            const d = this.position.distanceTo(other.position);
+            if (d > 0 && d < minDist) {
+                const diff = new THREE.Vector3().subVectors(this.position, other.position);
+                diff.normalize().divideScalar(d);
+                steer.add(diff);
+                count++;
+            }
+        }
+        if (count > 0) {
+            steer.divideScalar(count);
+            steer.normalize().multiplyScalar(this.maxSpeed);
+            steer.sub(this.velocity);
+            if (steer.length() > this.maxForce) steer.normalize().multiplyScalar(this.maxForce);
+        }
+        return steer;
+    }
+
+    boundaryForce() {
+        const steer = new THREE.Vector3();
+        const margin = BOUNDARY;
+        const strength = 0.5;
+        if (this.position.x > margin) steer.x = -strength * (this.position.x - margin);
+        if (this.position.x < -margin) steer.x = -strength * (this.position.x + margin);
+        if (this.position.z > margin) steer.z = -strength * (this.position.z - margin);
+        if (this.position.z < -margin) steer.z = -strength * (this.position.z + margin);
+        return steer;
+    }
+
+    update(dt) {
+        if (!this.alive) return;
+
+        this.maxSpeed = this.type === 'fox' ? foxSpeed : storkSpeed;
+
+        this.velocity.add(this.acceleration);
+        this.velocity.y = 0;
+        if (this.velocity.length() > this.maxSpeed) {
+            this.velocity.normalize().multiplyScalar(this.maxSpeed);
+        }
+        this.position.add(this.velocity.clone().multiplyScalar(dt));
+        this.position.y = 0;
+        this.acceleration.set(0, 0, 0);
+
+        // Face movement direction
+        if (this.mesh && this.velocity.lengthSq() > 0.001) {
+            const angle = Math.atan2(this.velocity.x, this.velocity.z);
+            this.mesh.rotation.y = angle;
+        }
+
+        if (this.mesh) {
+            this.mesh.position.copy(this.position);
+            if (this.type === 'stork') {
+                this.mesh.position.y = 0.3; // slight hover for storks
+            }
+        }
+
+        if (this.mixer) {
+            this.mixer.update(dt);
+        }
+
+        // Energy decay
+        this.energy -= 1 * dt;
+
+        // Reproduction cooldown
+        if (this.reproductionCooldown > 0) {
+            this.reproductionCooldown -= dt;
+        }
+    }
+
+    destroy() {
+        this.alive = false;
+        if (this.mesh) {
+            scene.remove(this.mesh);
+            // Dispose geometry/materials
+            this.mesh.traverse(child => {
+                if (child.geometry) child.geometry.dispose();
+                if (child.material) {
+                    if (Array.isArray(child.material)) child.material.forEach(m => m.dispose());
+                    else child.material.dispose();
+                }
+            });
+        }
+    }
+}
+
+// ─── Model Loading ───
+const loader = new GLTFLoader();
+let foxLoaded = false;
+let storkLoaded = false;
+
+function checkModelsLoaded() {
+    if (foxLoaded && storkLoaded) {
+        modelsLoaded = true;
+        document.getElementById('hud-models').textContent = 'Yes';
+    }
+}
+
+// Load Fox
+loader.load(
+    'https://threejs.org/examples/models/gltf/Fox.glb',
+    (gltf) => {
+        foxModelData = {
+            scene: gltf.scene,
+            animations: gltf.animations
+        };
+        // Apply model to existing foxes
+        foxes.forEach(fox => {
+            if (fox.mesh) {
+                scene.remove(fox.mesh);
+            }
+            fox.setModel(foxModelData);
+        });
+        foxLoaded = true;
+        checkModelsLoaded();
+    },
+    undefined,
+    (err) => {
+        console.warn('Fox model failed to load, using placeholders', err);
+        foxLoaded = true;
+        checkModelsLoaded();
+    }
+);
+
+// Load Stork
+loader.load(
+    'https://threejs.org/examples/models/gltf/Stork.glb',
+    (gltf) => {
+        storkModelData = {
+            scene: gltf.scene,
+            animations: gltf.animations
+        };
+        storks.forEach(stork => {
+            if (stork.mesh) {
+                scene.remove(stork.mesh);
+            }
+            stork.setModel(storkModelData);
+        });
+        storkLoaded = true;
+        checkModelsLoaded();
+    },
+    undefined,
+    (err) => {
+        console.warn('Stork model failed to load, using placeholders', err);
+        storkLoaded = true;
+        checkModelsLoaded();
+    }
+);
+
+// ─── Spawn Functions ───
+function randomPos() {
+    return (Math.random() - 0.5) * 40;
+}
+
+function spawnFox(x, z) {
+    if (foxes.filter(f => f.alive).length >= MAX_POP) return null;
+    x = x !== undefined ? x : randomPos();
+    z = z !== undefined ? z : randomPos();
+    const fox = new Animal('fox', x, z, foxModelData);
+    foxes.push(fox);
+    return fox;
+}
+
+function spawnStork(x, z) {
+    if (storks.filter(s => s.alive).length >= MAX_POP) return null;
+    x = x !== undefined ? x : randomPos();
+    z = z !== undefined ? z : randomPos();
+    const stork = new Animal('stork', x, z, storkModelData);
+    storks.push(stork);
+    return stork;
+}
+
+// ─── Initialize ───
+function initEcosystem() {
+    // Clear existing
+    foxes.forEach(f => f.destroy());
+    storks.forEach(s => s.destroy());
+    foxes.length = 0;
+    storks.length = 0;
+    totalCatches = 0;
+    totalBirths = 0;
+    totalDeaths = 0;
+
+    for (let i = 0; i < 5; i++) spawnFox();
+    for (let i = 0; i < 20; i++) spawnStork();
+}
+
+initEcosystem();
+
+// ─── Simulation Update ───
+function updateSimulation(dt) {
+    if (isPaused) return;
+
+    dt = Math.min(dt, 0.05); // cap dt
+
+    const aliveFoxes = foxes.filter(f => f.alive);
+    const aliveStorks = storks.filter(s => s.alive);
+
+    // ─── Fox behaviors ───
+    for (const fox of aliveFoxes) {
+        // Find nearest stork
+        let nearestStork = null;
+        let nearestDist = Infinity;
+        for (const stork of aliveStorks) {
+            const d = fox.position.distanceTo(stork.position);
+            if (d < nearestDist) {
+                nearestDist = d;
+                nearestStork = stork;
+            }
+        }
+
+        if (nearestStork && nearestDist < 15) {
+            // Pursue: predict stork's future position
+            const lookAhead = nearestDist / fox.maxSpeed;
+            const predictedPos = nearestStork.position.clone().add(
+                nearestStork.velocity.clone().multiplyScalar(lookAhead)
+            );
+            const pursueForce = fox.seek(predictedPos).multiplyScalar(1.5);
+            fox.applyForce(pursueForce);
+        } else {
+            fox.applyForce(fox.wander());
+        }
+
+        fox.applyForce(fox.separation(aliveFoxes, 3).multiplyScalar(1.2));
+        fox.applyForce(fox.boundaryForce());
+
+        // Hunting check
+        if (nearestStork && nearestDist < 0.8) {
+            nearestStork.alive = false;
+            nearestStork.destroy();
+            fox.energy += 30;
+            if (fox.energy > 100) fox.energy = 100;
+            totalCatches++;
+        }
+
+        fox.update(dt);
+
+        // Starvation
+        if (fox.energy <= 0) {
+            fox.destroy();
+            totalDeaths++;
+        }
+
+        // Reproduction
+        if (fox.energy > 70 && fox.reproductionCooldown <= 0 && aliveFoxes.length < MAX_POP) {
+            const child = spawnFox(
+                fox.position.x + (Math.random() - 0.5) * 3,
+                fox.position.z + (Math.random() - 0.5) * 3
+            );
+            if (child) {
+                fox.energy = 40;
+                fox.reproductionCooldown = 5;
+                child.energy = 40;
+                child.reproductionCooldown = 5;
+                totalBirths++;
+            }
+        }
+    }
+
+    // ─── Stork behaviors ───
+    for (const stork of aliveStorks) {
+        if (!stork.alive) continue;
+
+        // Find nearest fox
+        let nearestFox = null;
+        let nearestFoxDist = Infinity;
+        for (const fox of aliveFoxes) {
+            if (!fox.alive) continue;
+            const d = stork.position.distanceTo(fox.position);
+            if (d < nearestFoxDist) {
+                nearestFoxDist = d;
+                nearestFox = fox;
+            }
+        }
+
+        if (nearestFox && nearestFoxDist < 8) {
+            const fleeForce = stork.flee(nearestFox.position).multiplyScalar(2.0);
+            stork.applyForce(fleeForce);
+        } else {
+            stork.applyForce(stork.wander());
+        }
+
+        stork.applyForce(stork.separation(aliveStorks, 2).multiplyScalar(1.0));
+        stork.applyForce(stork.boundaryForce());
+
+        // Food patches
+        for (const patch of foodPatches) {
+            const dx = stork.position.x - patch.x;
+            const dz = stork.position.z - patch.z;
+            if (dx * dx + dz * dz < patch.radius * patch.radius) {
+                stork.energy += 5 * dt;
+                if (stork.energy > 100) stork.energy = 100;
+                break;
+            }
+        }
+
+        stork.update(dt);
+
+        // Starvation
+        if (stork.energy <= 0) {
+            stork.destroy();
+            totalDeaths++;
+        }
+
+        // Reproduction
+        if (stork.alive && stork.energy > 70 && stork.reproductionCooldown <= 0 && aliveStorks.length < MAX_POP) {
+            const child = spawnStork(
+                stork.position.x + (Math.random() - 0.5) * 3,
+                stork.position.z + (Math.random() - 0.5) * 3
+            );
+            if (child) {
+                stork.energy = 40;
+                stork.reproductionCooldown = 5;
+                child.energy = 40;
+                child.reproductionCooldown = 5;
+                totalBirths++;
+            }
+        }
+    }
+
+    // Clean up dead animals from arrays periodically
+    for (let i = foxes.length - 1; i >= 0; i--) {
+        if (!foxes[i].alive) foxes.splice(i, 1);
+    }
+    for (let i = storks.length - 1; i >= 0; i--) {
+        if (!storks[i].alive) storks.splice(i, 1);
+    }
+}
+
+// ─── HUD Update ───
+function updateHUD() {
+    const aliveFoxes = foxes.filter(f => f.alive);
+    const aliveStorks = storks.filter(s => s.alive);
+
+    document.getElementById('hud-foxes').textContent = aliveFoxes.length;
+    document.getElementById('hud-storks').textContent = aliveStorks.length;
+    document.getElementById('hud-catches').textContent = totalCatches;
+    document.getElementById('hud-births').textContent = totalBirths;
+    document.getElementById('hud-deaths').textContent = totalDeaths;
+}
+
+// ─── State Management ───
+window.__3D_STATE__ = {};
+
+function updateState() {
+    const aliveFoxes = foxes.filter(f => f.alive);
+    const aliveStorks = storks.filter(s => s.alive);
+
+    let animalsValid = true;
+    for (const a of [...aliveFoxes, ...aliveStorks]) {
+        if (isNaN(a.position.x) || isNaN(a.position.y) || isNaN(a.position.z)) {
+            animalsValid = false;
+            break;
+        }
+    }
+
+    const avgFoxEnergy = aliveFoxes.length > 0
+        ? Math.round(aliveFoxes.reduce((s, f) => s + f.energy, 0) / aliveFoxes.length * 10) / 10
+        : 0;
+    const avgStorkEnergy = aliveStorks.length > 0
+        ? Math.round(aliveStorks.reduce((s, st) => s + st.energy, 0) / aliveStorks.length * 10) / 10
+        : 0;
+
+    window.__3D_STATE__ = {
+        foxCount: aliveFoxes.length,
+        storkCount: aliveStorks.length,
+        totalCatches,
+        totalBirths,
+        totalDeaths,
+        modelsLoaded,
+        isPaused,
+        foxSpeed,
+        storkSpeed,
+        frameCount,
+        animalsValid,
+        avgFoxEnergy,
+        avgStorkEnergy
+    };
+}
+
+// ─── Controls ───
+document.getElementById('slider-fox-speed').addEventListener('input', (e) => {
+    foxSpeed = parseFloat(e.target.value);
+    document.getElementById('fox-speed-val').textContent = foxSpeed;
+});
+
+document.getElementById('slider-stork-speed').addEventListener('input', (e) => {
+    storkSpeed = parseFloat(e.target.value);
+    document.getElementById('stork-speed-val').textContent = storkSpeed;
+});
+
+document.addEventListener('keydown', (e) => {
+    if (e.code === 'Space') {
+        e.preventDefault();
+        isPaused = !isPaused;
+    } else if (e.code === 'KeyR') {
+        initEcosystem();
+    } else if (e.code === 'KeyF') {
+        spawnFox();
+    } else if (e.code === 'KeyS') {
+        for (let i = 0; i < 5; i++) spawnStork();
+    }
+});
+
+window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// ─── Animation Loop ───
+const clock = new THREE.Clock();
+
+function animate() {
+    requestAnimationFrame(animate);
+
+    const dt = clock.getDelta();
+    frameCount++;
+
+    updateSimulation(dt);
+    updateState();
+    updateHUD();
+
+    controls.update();
+    renderer.render(scene, camera);
+}
+
+animate();
+</script>
+</body>
+</html>

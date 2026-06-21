@@ -1,0 +1,398 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GPU Water Surface Simulation</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { overflow: hidden; background: #000; font-family: 'Segoe UI', Arial, sans-serif; }
+  canvas { display: block; }
+  #hud {
+    position: absolute; top: 16px; left: 16px;
+    background: rgba(0,0,0,0.7); color: #e0e0e0;
+    padding: 16px 20px; border-radius: 10px;
+    font-size: 14px; line-height: 1.8;
+    backdrop-filter: blur(8px);
+    border: 1px solid rgba(255,255,255,0.1);
+    min-width: 260px;
+  }
+  #hud h3 { color: #64B5F6; margin-bottom: 8px; font-size: 15px; }
+  #hud .stat { display: flex; justify-content: space-between; }
+  #hud .stat span:first-child { color: #90CAF9; }
+  #hud .stat span:last-child { color: #fff; font-weight: 600; }
+  #hud hr { border: none; border-top: 1px solid rgba(255,255,255,0.1); margin: 8px 0; }
+  #hud label { display: flex; align-items: center; justify-content: space-between; margin-top: 6px; }
+  #hud input[type="range"] { width: 140px; cursor: pointer; }
+  #hud input[type="checkbox"] { width: 18px; height: 18px; cursor: pointer; }
+  .hint {
+    position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%);
+    color: rgba(255,255,255,0.5); font-size: 13px; font-family: 'Segoe UI', Arial, sans-serif;
+    pointer-events: none;
+  }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+
+<div id="hud">
+  <h3>🌊 Water Simulation</h3>
+  <div class="stat"><span>Max Height:</span><span id="maxHeight">0.000</span></div>
+  <div class="stat"><span>Wave Energy:</span><span id="waveEnergy">0.000</span></div>
+  <div class="stat"><span>Frame:</span><span id="frameNum">0</span></div>
+  <hr>
+  <label>
+    <span>Damping: <span id="dampVal">0.995</span></span>
+    <input type="range" id="dampingSlider" min="0.98" max="1.0" step="0.001" value="0.995">
+  </label>
+  <label>
+    <span>Wind (+X)</span>
+    <input type="checkbox" id="windToggle">
+  </label>
+</div>
+
+<div class="hint">Click on the water surface to create ripples</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+const GRID = 256;
+const DX = 1.0 / GRID;
+const C = 2.0;
+const DT = 1.0 / 60.0;
+const VISCOSITY = 0.3;
+
+let damping = 0.995;
+let windEnabled = false;
+let frameNum = 0;
+
+// Height fields: store in Float32Arrays (R channel used)
+const currentH = new Float32Array(GRID * GRID);
+const previousH = new Float32Array(GRID * GRID);
+const tempH = new Float32Array(GRID * GRID);
+
+// Pending disturbances
+const disturbances = [];
+
+// Scene setup
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.2;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0a1628);
+
+const camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 0.1, 100);
+camera.position.set(0.8, 0.7, 1.0);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, -0.05, 0);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+controls.minDistance = 0.3;
+controls.maxDistance = 4;
+controls.update();
+
+// Lights
+const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+dirLight.position.set(5, 10, 5);
+scene.add(dirLight);
+
+const ambLight = new THREE.AmbientLight(0xffffff, 0.3);
+scene.add(ambLight);
+
+// Environment map from gradient
+function createEnvMap() {
+  const pmrem = new THREE.PMREMGenerator(renderer);
+  pmrem.compileEquirectangularShader();
+
+  const size = 256;
+  const data = new Uint8Array(size * size * 4);
+  for (let y = 0; y < size; y++) {
+    const t = y / (size - 1);
+    // bottom = sky blue, top = white
+    const r = Math.floor(THREE.MathUtils.lerp(135, 255, t));
+    const g = Math.floor(THREE.MathUtils.lerp(206, 255, t));
+    const b = Math.floor(THREE.MathUtils.lerp(250, 255, t));
+    for (let x = 0; x < size; x++) {
+      const i = (y * size + x) * 4;
+      data[i] = r;
+      data[i + 1] = g;
+      data[i + 2] = b;
+      data[i + 3] = 255;
+    }
+  }
+  const tex = new THREE.DataTexture(data, size, size, THREE.RGBAFormat);
+  tex.mapping = THREE.EquirectangularReflectionMapping;
+  tex.needsUpdate = true;
+
+  const envMap = pmrem.fromEquirectangular(tex).texture;
+  pmrem.dispose();
+  tex.dispose();
+  return envMap;
+}
+
+const envMap = createEnvMap();
+scene.environment = envMap;
+
+// Water plane geometry
+const waterGeo = new THREE.PlaneGeometry(1, 1, GRID - 1, GRID - 1);
+waterGeo.rotateX(-Math.PI / 2);
+
+// Normal map texture (will be updated each frame)
+const normalData = new Float32Array(GRID * GRID * 4);
+const normalTex = new THREE.DataTexture(normalData, GRID, GRID, THREE.RGBAFormat, THREE.FloatType);
+normalTex.minFilter = THREE.LinearFilter;
+normalTex.magFilter = THREE.LinearFilter;
+normalTex.wrapS = THREE.ClampToEdgeWrapping;
+normalTex.wrapT = THREE.ClampToEdgeWrapping;
+normalTex.needsUpdate = true;
+
+// Water material
+const waterMat = new THREE.MeshPhysicalMaterial({
+  color: 0x1565C0,
+  metalness: 0.1,
+  roughness: 0.05,
+  normalMap: normalTex,
+  normalScale: new THREE.Vector2(1.0, 1.0),
+  transparent: true,
+  opacity: 0.85,
+  envMap: envMap,
+  envMapIntensity: 1.0,
+  side: THREE.DoubleSide,
+});
+
+const waterMesh = new THREE.Mesh(waterGeo, waterMat);
+scene.add(waterMesh);
+
+// Ground plane below water
+const groundGeo = new THREE.PlaneGeometry(2, 2);
+groundGeo.rotateX(-Math.PI / 2);
+const groundMat = new THREE.MeshStandardMaterial({
+  color: 0x0a1a2e,
+  roughness: 0.9,
+  metalness: 0.0,
+});
+const groundMesh = new THREE.Mesh(groundGeo, groundMat);
+groundMesh.position.y = -0.15;
+scene.add(groundMesh);
+
+// Raycaster for click interaction
+const raycaster = new THREE.Raycaster();
+const mouse = new THREE.Vector2();
+const clickPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+
+renderer.domElement.addEventListener('pointerdown', (e) => {
+  mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
+  mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+
+  raycaster.setFromCamera(mouse, camera);
+
+  const intersectPoint = new THREE.Vector3();
+  if (raycaster.ray.intersectPlane(clickPlane, intersectPoint)) {
+    // Convert world position to grid coordinates
+    // Water plane is 1x1 centered at origin, so x,z in [-0.5, 0.5]
+    const gx = Math.round((intersectPoint.x + 0.5) * GRID);
+    const gy = Math.round((intersectPoint.z + 0.5) * GRID);
+    if (gx >= 0 && gx < GRID && gy >= 0 && gy < GRID) {
+      disturbances.push({ x: gx, y: gy, radius: 5, amplitude: 0.3 });
+    }
+  }
+});
+
+// UI controls
+const dampingSlider = document.getElementById('dampingSlider');
+const dampValSpan = document.getElementById('dampVal');
+const windToggleEl = document.getElementById('windToggle');
+
+dampingSlider.addEventListener('input', () => {
+  damping = parseFloat(dampingSlider.value);
+  dampValSpan.textContent = damping.toFixed(3);
+});
+
+windToggleEl.addEventListener('change', () => {
+  windEnabled = windToggleEl.checked;
+});
+
+// Apply disturbances
+function applyDisturbances() {
+  while (disturbances.length > 0) {
+    const d = disturbances.pop();
+    const r = d.radius;
+    for (let dy = -r; dy <= r; dy++) {
+      for (let dx = -r; dx <= r; dx++) {
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        if (dist < r) {
+          const gx = d.x + dx;
+          const gy = d.y + dy;
+          if (gx >= 0 && gx < GRID && gy >= 0 && gy < GRID) {
+            const cosVal = Math.cos((Math.PI * dist) / (2 * r));
+            currentH[gy * GRID + gx] += d.amplitude * cosVal * cosVal;
+          }
+        }
+      }
+    }
+  }
+}
+
+// Wave equation update
+function updateWaveEquation() {
+  const c2dt2 = C * C * DT * DT;
+  const invDx2 = 1.0 / (DX * DX);
+
+  for (let y = 0; y < GRID; y++) {
+    for (let x = 0; x < GRID; x++) {
+      const idx = y * GRID + x;
+
+      // Neighbor indices with clamping
+      const xp = x < GRID - 1 ? idx + 1 : idx;
+      const xm = x > 0 ? idx - 1 : idx;
+      const yp = y < GRID - 1 ? idx + GRID : idx;
+      const ym = y > 0 ? idx - GRID : idx;
+
+      // Laplacian
+      const laplacian = (currentH[xp] + currentH[xm] + currentH[yp] + currentH[ym] - 4.0 * currentH[idx]) * invDx2;
+
+      // Wave equation
+      let hNew = 2.0 * currentH[idx] - previousH[idx] + c2dt2 * laplacian;
+
+      // Damping
+      hNew *= damping;
+
+      // Viscosity: blend with neighbor average
+      const avgNeighbors = (currentH[xp] + currentH[xm] + currentH[yp] + currentH[ym]) * 0.25;
+      hNew = hNew * (1.0 - VISCOSITY) + avgNeighbors * VISCOSITY;
+
+      tempH[idx] = hNew;
+    }
+  }
+
+  // Wind effect
+  if (windEnabled) {
+    for (let y = 0; y < GRID; y++) {
+      for (let x = GRID - 1; x >= 1; x--) {
+        const idx = y * GRID + x;
+        const srcIdx = y * GRID + (x - 1);
+        tempH[idx] += 0.001 * currentH[srcIdx];
+      }
+    }
+  }
+
+  // Swap buffers
+  previousH.set(currentH);
+  currentH.set(tempH);
+}
+
+// Update geometry and normal map from height field
+function updateGeometryAndNormals() {
+  const positions = waterGeo.attributes.position.array;
+  const vertCount = GRID; // vertices per side = GRID
+
+  for (let y = 0; y < GRID; y++) {
+    for (let x = 0; x < GRID; x++) {
+      const hIdx = y * GRID + x;
+      const vIdx = y * GRID + x;
+      // PlaneGeometry vertices: after rotateX(-PI/2), positions are (x, y_height, z)
+      positions[vIdx * 3 + 1] = currentH[hIdx];
+    }
+  }
+  waterGeo.attributes.position.needsUpdate = true;
+  waterGeo.computeBoundingSphere();
+
+  // Compute normals via central differences and write to normal texture
+  const scale = 2.0; // normal strength
+  for (let y = 0; y < GRID; y++) {
+    for (let x = 0; x < GRID; x++) {
+      const idx = y * GRID + x;
+
+      const xp = x < GRID - 1 ? currentH[idx + 1] : currentH[idx];
+      const xm = x > 0 ? currentH[idx - 1] : currentH[idx];
+      const yp = y < GRID - 1 ? currentH[idx + GRID] : currentH[idx];
+      const ym = y > 0 ? currentH[idx - GRID] : currentH[idx];
+
+      // Normal from height field: n = normalize(-dh/dx, 1, -dh/dy)
+      const dhdx = (xp - xm) / (2.0 * DX) * scale;
+      const dhdy = (yp - ym) / (2.0 * DX) * scale;
+
+      // Tangent space normal for normalMap: (nx, ny, nz) mapped to [0,1]
+      // In Three.js tangent space: x=tangent, y=bitangent, z=normal
+      const len = Math.sqrt(dhdx * dhdx + dhdy * dhdy + 1.0);
+      const pIdx = idx * 4;
+      normalData[pIdx] = (-dhdx / len) * 0.5 + 0.5;
+      normalData[pIdx + 1] = (-dhdy / len) * 0.5 + 0.5;
+      normalData[pIdx + 2] = (1.0 / len) * 0.5 + 0.5;
+      normalData[pIdx + 3] = 1.0;
+    }
+  }
+  normalTex.needsUpdate = true;
+}
+
+// Compute stats
+function computeStats() {
+  let maxH = 0;
+  let energy = 0;
+  for (let i = 0; i < GRID * GRID; i++) {
+    const h = currentH[i];
+    const absH = Math.abs(h);
+    if (absH > maxH) maxH = absH;
+    energy += h * h;
+  }
+  return { maxHeight: maxH, waveEnergy: energy };
+}
+
+// Initial ripple to show something
+disturbances.push({ x: GRID / 2, y: GRID / 2, radius: 5, amplitude: 0.3 });
+
+// Animation loop
+function animate() {
+  requestAnimationFrame(animate);
+
+  applyDisturbances();
+  updateWaveEquation();
+  updateGeometryAndNormals();
+
+  const stats = computeStats();
+
+  // Update HUD
+  document.getElementById('maxHeight').textContent = stats.maxHeight.toFixed(4);
+  document.getElementById('waveEnergy').textContent = stats.waveEnergy.toFixed(4);
+  document.getElementById('frameNum').textContent = frameNum;
+
+  // Expose state
+  window.__3D_STATE__ = {
+    maxHeight: stats.maxHeight,
+    waveEnergy: stats.waveEnergy,
+    frameNum: frameNum,
+    dampingValue: damping,
+    windEnabled: windEnabled,
+    gridSize: GRID,
+  };
+
+  controls.update();
+  renderer.render(scene, camera);
+
+  frameNum++;
+}
+
+// Handle resize
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+animate();
+</script>
+</body>
+</html>

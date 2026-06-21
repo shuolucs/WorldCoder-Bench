@@ -1,0 +1,415 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Print Slicer Visualization</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #1a1a2e;
+            font-family: monospace;
+            color: white;
+        }
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+        }
+        #ui-container {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 15px;
+            border-radius: 8px;
+            border: 1px solid #444;
+            width: 300px;
+            pointer-events: auto;
+        }
+        #hud {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 15px;
+            border-radius: 8px;
+            border: 1px solid #444;
+            pointer-events: none;
+        }
+        .control-group {
+            margin-bottom: 15px;
+        }
+        .control-group label {
+            display: block;
+            margin-bottom: 5px;
+        }
+        input[type="range"] {
+            width: 100%;
+        }
+        .instructions {
+            margin-top: 15px;
+            font-size: 0.9em;
+            color: #aaa;
+            line-height: 1.4;
+        }
+        .hud-line {
+            margin: 5px 0;
+        }
+        .val {
+            color: #4488ff;
+            font-weight: bold;
+        }
+    </style>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+                "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="canvas-container"></div>
+    
+    <div id="hud">
+        <div class="hud-line">Slice Height: <span id="hud-height" class="val">0.00</span></div>
+        <div class="hud-line">Layer: <span id="hud-layer" class="val">0</span> / <span id="hud-layers" class="val">0</span></div>
+        <div class="hud-line">Layer Height: <span id="hud-lh" class="val">0.20</span></div>
+        <div class="hud-line">Model Loaded: <span id="hud-model" class="val">No</span></div>
+        <div class="hud-line">Mode: <span id="hud-mode" class="val">Slice</span></div>
+    </div>
+
+    <div id="ui-container">
+        <div class="control-group">
+            <label for="slider-height">Slice Height</label>
+            <input type="range" id="slider-height" min="0" max="3" step="0.01" value="1.5">
+        </div>
+        <div class="control-group">
+            <label for="slider-layer-height">Layer Height</label>
+            <input type="range" id="slider-layer-height" min="0.05" max="0.5" step="0.01" value="0.2">
+        </div>
+        <div class="instructions">
+            <strong>Controls:</strong><br>
+            [A] Auto-animate slice<br>
+            [S] Stop animation<br>
+            [T] Toggle Slice/Solid mode<br>
+            [R] Reset to bottom
+        </div>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+        // --- State Management ---
+        window.__3D_STATE__ = {
+            sliceHeight: 0,
+            layerNumber: 0,
+            totalLayers: 0,
+            layerHeight: 0.2,
+            modelLoaded: false,
+            isSliceMode: true,
+            isAnimating: false,
+            modelMinY: 0,
+            modelMaxY: 0,
+            frameCount: 0,
+            sliceValid: false
+        };
+
+        let internalSliceHeight = 0;
+
+        // --- Scene Setup ---
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x1a1a2e);
+
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+        camera.position.set(5, 5, 5);
+        camera.lookAt(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        renderer.localClippingEnabled = true;
+        container.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+
+        // Lights
+        const ambientLight = new THREE.AmbientLight(0x556677, 0.5);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+        dirLight.position.set(5, 10, 5);
+        scene.add(dirLight);
+
+        // Grid
+        const gridHelper = new THREE.GridHelper(6, 20, 0x444444, 0x222222);
+        gridHelper.position.y = 0;
+        scene.add(gridHelper);
+
+        // --- Slicing Setup ---
+        const mainClipPlane = new THREE.Plane(new THREE.Vector3(0, -1, 0), 0);
+        const sliceClipPlaneDown = new THREE.Plane(new THREE.Vector3(0, -1, 0), 0);
+        const sliceClipPlaneUp = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+
+        const mainMeshGroup = new THREE.Group();
+        const sliceMeshGroup = new THREE.Group();
+        scene.add(mainMeshGroup);
+        scene.add(sliceMeshGroup);
+
+        // Visual Cutting Plane
+        const planeGeom = new THREE.PlaneGeometry(10, 10);
+        planeGeom.rotateX(-Math.PI / 2);
+        const visualPlaneMat = new THREE.MeshBasicMaterial({
+            color: 0x4488ff,
+            transparent: true,
+            opacity: 0.2,
+            side: THREE.DoubleSide,
+            depthWrite: false
+        });
+        const visualPlane = new THREE.Mesh(planeGeom, visualPlaneMat);
+        scene.add(visualPlane);
+
+        // Custom Uniforms for Layer Lines Shader
+        const shaderUniforms = {
+            layerHeight: { value: window.__3D_STATE__.layerHeight },
+            minY: { value: 0.0 }
+        };
+
+        // Materials
+        const mainMaterial = new THREE.MeshStandardMaterial({
+            color: 0xaaaaaa,
+            roughness: 0.6,
+            metalness: 0.1,
+            transparent: true,
+            opacity: 0.3,
+            side: THREE.DoubleSide,
+            clippingPlanes: [mainClipPlane]
+        });
+
+        // Inject custom shader code to draw accumulated layer lines
+        mainMaterial.onBeforeCompile = (shader) => {
+            shader.uniforms.layerHeight = shaderUniforms.layerHeight;
+            shader.uniforms.minY = shaderUniforms.minY;
+            
+            shader.vertexShader = `
+                varying vec3 vWorldPos;
+                ${shader.vertexShader}
+            `.replace(
+                `#include <worldpos_vertex>`,
+                `#include <worldpos_vertex>
+                vWorldPos = (modelMatrix * vec4(transformed, 1.0)).xyz;`
+            );
+
+            shader.fragmentShader = `
+                uniform float layerHeight;
+                uniform float minY;
+                varying vec3 vWorldPos;
+                ${shader.fragmentShader}
+            `.replace(
+                `vec4 diffuseColor = vec4( diffuse, opacity );`,
+                `
+                vec4 diffuseColor = vec4( diffuse, opacity );
+                // Calculate distance to nearest layer boundary
+                float dist = mod(vWorldPos.y - minY, layerHeight);
+                // Draw a thin line
+                if (dist < 0.015 || dist > layerHeight - 0.015) {
+                    diffuseColor.rgb = mix(diffuseColor.rgb, vec3(0.0, 0.8, 1.0), 0.7); // Cyan lines
+                    diffuseColor.a = max(diffuseColor.a, 0.6); // Make lines more opaque
+                }
+                `
+            );
+        };
+
+        const sliceMaterial = new THREE.MeshBasicMaterial({
+            color: 0xff4444,
+            side: THREE.DoubleSide,
+            clippingPlanes: [sliceClipPlaneDown, sliceClipPlaneUp]
+        });
+
+        // --- Model Loading ---
+        const loader = new GLTFLoader();
+        const modelUrl = 'https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Models/master/2.0/Duck/glTF-Binary/Duck.glb';
+
+        loader.load(modelUrl, (gltf) => {
+            const model = gltf.scene;
+
+            // Normalize Model
+            const box = new THREE.Box3().setFromObject(model);
+            const size = box.getSize(new THREE.Vector3());
+            const center = box.getCenter(new THREE.Vector3());
+            
+            const maxDim = Math.max(size.x, size.y, size.z);
+            const scale = 3.0 / maxDim;
+            
+            model.scale.setScalar(scale);
+            model.position.sub(center.multiplyScalar(scale));
+            
+            // Recompute box after scale/center to align base to y=0
+            const tempBox = new THREE.Box3().setFromObject(model);
+            model.position.y -= tempBox.min.y;
+
+            // Final Bounding Box
+            const finalBox = new THREE.Box3().setFromObject(model);
+            const minY = finalBox.min.y;
+            const maxY = finalBox.max.y;
+
+            window.__3D_STATE__.modelMinY = Number(minY.toFixed(3));
+            window.__3D_STATE__.modelMaxY = Number(maxY.toFixed(3));
+            shaderUniforms.minY.value = minY;
+
+            internalSliceHeight = minY + (maxY - minY) * 0.5;
+            window.__3D_STATE__.sliceHeight = Number(internalSliceHeight.toFixed(3));
+
+            // Setup UI Sliders
+            const heightSlider = document.getElementById('slider-height');
+            heightSlider.min = minY;
+            heightSlider.max = maxY;
+            heightSlider.value = internalSliceHeight;
+
+            // Process Meshes
+            model.traverse((child) => {
+                if (child.isMesh) {
+                    // Main transparent/solid mesh
+                    const mainClone = child.clone();
+                    mainClone.material = mainMaterial;
+                    mainMeshGroup.add(mainClone);
+
+                    // Thin slice cross-section mesh
+                    const sliceClone = child.clone();
+                    sliceClone.material = sliceMaterial;
+                    sliceMeshGroup.add(sliceClone);
+                }
+            });
+
+            window.__3D_STATE__.modelLoaded = true;
+            updateSlicerVisuals();
+        });
+
+        // --- Logic & Updates ---
+        function updateSlicerVisuals() {
+            const state = window.__3D_STATE__;
+            const h = internalSliceHeight;
+
+            // Update Clipping Planes
+            // mainClipPlane normal (0, -1, 0) clips y > constant
+            mainClipPlane.constant = h;
+            
+            // sliceClipPlaneDown normal (0, -1, 0) clips y > constant
+            sliceClipPlaneDown.constant = h + 0.02;
+            
+            // sliceClipPlaneUp normal (0, 1, 0) clips -y > constant => y < -constant
+            sliceClipPlaneUp.constant = -(h - 0.02);
+
+            visualPlane.position.y = h;
+
+            // Update Materials based on mode
+            mainMeshGroup.children.forEach(mesh => {
+                if (state.isSliceMode) {
+                    mesh.material.transparent = true;
+                    mesh.material.opacity = 0.3;
+                    mesh.material.clippingPlanes = [mainClipPlane];
+                } else {
+                    mesh.material.transparent = false;
+                    mesh.material.opacity = 1.0;
+                    mesh.material.clippingPlanes = [];
+                }
+            });
+
+            sliceMeshGroup.visible = state.isSliceMode;
+            visualPlane.visible = state.isSliceMode;
+        }
+
+        // --- Event Listeners ---
+        document.getElementById('slider-height').addEventListener('input', (e) => {
+            internalSliceHeight = parseFloat(e.target.value);
+            window.__3D_STATE__.isAnimating = false;
+            updateSlicerVisuals();
+        });
+
+        document.getElementById('slider-layer-height').addEventListener('input', (e) => {
+            window.__3D_STATE__.layerHeight = parseFloat(e.target.value);
+            shaderUniforms.layerHeight.value = window.__3D_STATE__.layerHeight;
+        });
+
+        window.addEventListener('keydown', (e) => {
+            const key = e.key.toLowerCase();
+            const state = window.__3D_STATE__;
+            
+            if (key === 'a') state.isAnimating = true;
+            if (key === 's') state.isAnimating = false;
+            if (key === 't') {
+                state.isSliceMode = !state.isSliceMode;
+                updateSlicerVisuals();
+            }
+            if (key === 'r') {
+                internalSliceHeight = state.modelMinY;
+                document.getElementById('slider-height').value = internalSliceHeight;
+                state.isAnimating = false;
+                updateSlicerVisuals();
+            }
+        });
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // --- Animation Loop ---
+        const clock = new THREE.Clock();
+
+        function animate() {
+            requestAnimationFrame(animate);
+            const delta = clock.getDelta();
+            const state = window.__3D_STATE__;
+
+            if (state.modelLoaded) {
+                // Handle Animation
+                if (state.isAnimating) {
+                    const speed = (state.modelMaxY - state.modelMinY) / 5.0; // 5 seconds full height
+                    internalSliceHeight += speed * delta;
+                    
+                    if (internalSliceHeight >= state.modelMaxY) {
+                        internalSliceHeight = state.modelMaxY;
+                        state.isAnimating = false;
+                    }
+                    
+                    document.getElementById('slider-height').value = internalSliceHeight;
+                    updateSlicerVisuals();
+                }
+
+                // Update State Object
+                state.frameCount++;
+                state.sliceHeight = Number(internalSliceHeight.toFixed(3));
+                
+                // Calculate layers
+                const heightDiff = Math.max(0, internalSliceHeight - state.modelMinY);
+                state.layerNumber = Math.floor(heightDiff / state.layerHeight) + 1;
+                state.totalLayers = Math.ceil((state.modelMaxY - state.modelMinY) / state.layerHeight);
+                
+                state.sliceValid = internalSliceHeight >= state.modelMinY && internalSliceHeight <= state.modelMaxY;
+
+                // Update HUD DOM
+                document.getElementById('hud-height').innerText = state.sliceHeight.toFixed(2);
+                document.getElementById('hud-layer').innerText = state.layerNumber;
+                document.getElementById('hud-layers').innerText = state.totalLayers;
+                document.getElementById('hud-lh').innerText = state.layerHeight.toFixed(2);
+                document.getElementById('hud-model').innerText = state.modelLoaded ? 'Yes' : 'No';
+                document.getElementById('hud-mode').innerText = state.isSliceMode ? 'Slice' : 'Solid';
+            }
+
+            controls.update();
+            renderer.render(scene, camera);
+        }
+
+        animate();
+    </script>
+</body>
+</html>

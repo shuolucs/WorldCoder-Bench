@@ -1,0 +1,558 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Drone Parts Assembly Configurator</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #1a1a1a;
+            color: #ffffff;
+        }
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+        }
+        #ui-panel {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            width: 320px;
+            background: rgba(30, 30, 30, 0.85);
+            backdrop-filter: blur(10px);
+            border: 1px solid #444;
+            border-radius: 8px;
+            padding: 20px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.5);
+            pointer-events: auto;
+            max-height: calc(100vh - 80px);
+            overflow-y: auto;
+        }
+        h2 {
+            margin-top: 0;
+            margin-bottom: 15px;
+            font-size: 22px;
+            border-bottom: 1px solid #555;
+            padding-bottom: 10px;
+        }
+        .progress-container {
+            width: 100%;
+            height: 10px;
+            background-color: #444;
+            border-radius: 5px;
+            margin-bottom: 10px;
+            overflow: hidden;
+        }
+        #progress-bar {
+            height: 100%;
+            width: 0%;
+            background-color: #00CC00;
+            transition: width 0.3s ease;
+        }
+        #assembly-count {
+            font-size: 14px;
+            margin-bottom: 20px;
+            color: #aaa;
+            text-align: right;
+        }
+        .btn {
+            display: block;
+            width: 100%;
+            padding: 10px;
+            margin-bottom: 10px;
+            background-color: #3a3a3a;
+            color: white;
+            border: 1px solid #555;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: background-color 0.2s;
+        }
+        .btn:hover {
+            background-color: #505050;
+        }
+        .btn:active {
+            background-color: #2a2a2a;
+        }
+        .btn:disabled {
+            background-color: #222;
+            color: #666;
+            cursor: not-allowed;
+            border-color: #333;
+        }
+        #btn-assemble { background-color: #0066cc; border-color: #0055aa; }
+        #btn-assemble:hover:not(:disabled) { background-color: #0077ee; }
+        
+        #parts-list {
+            list-style: none;
+            padding: 0;
+            margin: 0 0 20px 0;
+            font-size: 14px;
+        }
+        #parts-list li {
+            display: flex;
+            justify-content: space-between;
+            padding: 8px 0;
+            border-bottom: 1px solid #333;
+        }
+        .status-tray { color: #aaa; }
+        .status-assembled { color: #00CC00; font-weight: bold; }
+        .controls-hint {
+            font-size: 12px;
+            color: #888;
+            margin-top: 15px;
+            text-align: center;
+        }
+    </style>
+    <!-- Import maps polyfill -->
+    <script async src="https://unpkg.com/es-module-shims@1.8.0/dist/es-module-shims.js"></script>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="canvas-container"></div>
+    
+    <div id="ui-panel">
+        <h2>Drone Assembly</h2>
+        <div class="progress-container">
+            <div id="progress-bar"></div>
+        </div>
+        <div id="assembly-count">0 / 7 parts assembled</div>
+        
+        <ul id="parts-list">
+            <!-- Populated by JS -->
+        </ul>
+        
+        <button id="btn-assemble" class="btn">Assemble Next (N)</button>
+        <div style="display: flex; gap: 10px;">
+            <button id="btn-undo" class="btn" disabled>Undo (Z)</button>
+            <button id="btn-redo" class="btn" disabled>Redo (Y)</button>
+        </div>
+        <button id="btn-reset" class="btn" disabled>Reset All (R)</button>
+        
+        <div class="controls-hint">
+            Left Click: Rotate | Right Click: Pan | Scroll: Zoom<br>
+            Click parts in tray to assemble
+        </div>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+        // --- State Management ---
+        window.__3D_STATE__ = {
+            partsAssembled: 0,
+            assemblyOrder: [],
+            undoStackSize: 0,
+            redoStackSize: 0,
+            progressPercent: 0,
+            frameAssembled: false,
+            allMotorsAssembled: false,
+            batteryAssembled: false,
+            cameraAssembled: false,
+            droneComplete: false,
+            soldierLoaded: false,
+            partPositions: {}
+        };
+
+        const historyStack = [];
+        const redoStack = [];
+
+        // --- Configuration ---
+        const PART_ORDER = ['FRAME', 'MOTOR_FL', 'MOTOR_FR', 'MOTOR_BL', 'MOTOR_BR', 'BATTERY', 'CAMERA_MODULE'];
+        
+        const partsConfig = {
+            FRAME: { 
+                geo: new THREE.BoxGeometry(2, 0.2, 2), 
+                color: 0x333333, 
+                tray: new THREE.Vector3(5, 0.5, 3), 
+                asm: new THREE.Vector3(0, 2, 0) 
+            },
+            MOTOR_FL: { 
+                geo: new THREE.CylinderGeometry(0.15, 0.15, 0.4, 16), 
+                color: 0xFF4444, 
+                tray: new THREE.Vector3(4, 0.5, 5), 
+                asm: new THREE.Vector3(-0.8, 2.3, -0.8) 
+            },
+            MOTOR_FR: { 
+                geo: new THREE.CylinderGeometry(0.15, 0.15, 0.4, 16), 
+                color: 0xFF4444, 
+                tray: new THREE.Vector3(6, 0.5, 5), 
+                asm: new THREE.Vector3(0.8, 2.3, -0.8) 
+            },
+            MOTOR_BL: { 
+                geo: new THREE.CylinderGeometry(0.15, 0.15, 0.4, 16), 
+                color: 0x4444FF, 
+                tray: new THREE.Vector3(4, 0.5, 6), 
+                asm: new THREE.Vector3(-0.8, 2.3, 0.8) 
+            },
+            MOTOR_BR: { 
+                geo: new THREE.CylinderGeometry(0.15, 0.15, 0.4, 16), 
+                color: 0x4444FF, 
+                tray: new THREE.Vector3(6, 0.5, 6), 
+                asm: new THREE.Vector3(0.8, 2.3, 0.8) 
+            },
+            BATTERY: { 
+                geo: new THREE.BoxGeometry(0.6, 0.3, 0.4), 
+                color: 0x00CC00, 
+                tray: new THREE.Vector3(5, 0.5, 7), 
+                asm: new THREE.Vector3(0, 1.85, 0) 
+            },
+            CAMERA_MODULE: { 
+                geo: new THREE.SphereGeometry(0.2, 16, 16), 
+                color: 0xFFAA00, 
+                tray: new THREE.Vector3(5, 0.5, 8), 
+                asm: new THREE.Vector3(0, 1.6, -0.5) 
+            }
+        };
+
+        const partMeshes = {};
+        const tweens = [];
+
+        // --- Scene Setup ---
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x1a1a1a);
+
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+        camera.position.set(0, 5, 10);
+        camera.lookAt(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        renderer.shadowMap.enabled = true;
+        container.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.05;
+        controls.maxPolarAngle = Math.PI / 2 - 0.05; // Don't go below ground
+
+        // Lights
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+        dirLight.position.set(5, 10, 5);
+        dirLight.castShadow = true;
+        dirLight.shadow.camera.top = 10;
+        dirLight.shadow.camera.bottom = -10;
+        dirLight.shadow.camera.left = -10;
+        dirLight.shadow.camera.right = 10;
+        scene.add(dirLight);
+
+        // Ground
+        const groundGeo = new THREE.PlaneGeometry(20, 20);
+        const groundMat = new THREE.MeshStandardMaterial({ color: 0x888888, roughness: 0.8 });
+        const ground = new THREE.Mesh(groundGeo, groundMat);
+        ground.rotation.x = -Math.PI / 2;
+        ground.receiveShadow = true;
+        scene.add(ground);
+
+        // Grid Helper
+        const gridHelper = new THREE.GridHelper(20, 20, 0x444444, 0x222222);
+        gridHelper.position.y = 0.01;
+        scene.add(gridHelper);
+
+        // --- Create Parts ---
+        const partsGroup = new THREE.Group();
+        scene.add(partsGroup);
+
+        for (const [name, config] of Object.entries(partsConfig)) {
+            const mat = new THREE.MeshStandardMaterial({ color: config.color });
+            const mesh = new THREE.Mesh(config.geo, mat);
+            mesh.position.copy(config.tray);
+            mesh.castShadow = true;
+            mesh.receiveShadow = true;
+            mesh.userData = { name: name, originalEmissive: mat.emissive.clone() };
+            partMeshes[name] = mesh;
+            partsGroup.add(mesh);
+            
+            // Init state position
+            window.__3D_STATE__.partPositions[name] = { x: mesh.position.x, y: mesh.position.y, z: mesh.position.z };
+        }
+
+        // --- Load Soldier ---
+        const loader = new GLTFLoader();
+        loader.load(
+            'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/models/gltf/Soldier.glb',
+            (gltf) => {
+                const soldier = gltf.scene;
+                soldier.position.set(-5, 0, 0);
+                soldier.scale.set(2.0, 2.0, 2.0);
+                
+                soldier.traverse((child) => {
+                    if (child.isMesh) {
+                        child.castShadow = true;
+                        child.receiveShadow = true;
+                    }
+                });
+                
+                scene.add(soldier);
+                window.__3D_STATE__.soldierLoaded = true;
+            },
+            undefined,
+            (error) => console.error('Error loading soldier:', error)
+        );
+
+        // --- UI Initialization ---
+        const partsListEl = document.getElementById('parts-list');
+        PART_ORDER.forEach(name => {
+            const li = document.createElement('li');
+            li.id = `list-item-${name}`;
+            li.innerHTML = `<span>${name.replace('_', ' ')}</span> <span class="status-tray">In Tray</span>`;
+            partsListEl.appendChild(li);
+        });
+
+        // --- Logic & Validation ---
+        function canAssemble(partName) {
+            if (historyStack.includes(partName)) return false; // Already assembled
+            
+            if (partName === 'FRAME') return true;
+            if (!historyStack.includes('FRAME')) return false; // Everything else needs FRAME
+            
+            if (partName.startsWith('MOTOR_')) return true;
+            if (partName === 'BATTERY') return true;
+            
+            if (partName === 'CAMERA_MODULE') {
+                return historyStack.includes('BATTERY'); // Camera needs Battery
+            }
+            
+            return false;
+        }
+
+        function getNextValidPart() {
+            for (const name of PART_ORDER) {
+                if (!historyStack.includes(name) && canAssemble(name)) {
+                    return name;
+                }
+            }
+            return null;
+        }
+
+        // --- Animation System ---
+        function animatePart(mesh, targetPos, duration = 500) {
+            // Remove existing tween for this mesh
+            const existingIndex = tweens.findIndex(t => t.mesh === mesh);
+            if (existingIndex > -1) tweens.splice(existingIndex, 1);
+
+            tweens.push({
+                mesh: mesh,
+                startPos: mesh.position.clone(),
+                targetPos: targetPos.clone(),
+                startTime: performance.now(),
+                duration: duration
+            });
+        }
+
+        function flashRed(mesh) {
+            const mat = mesh.material;
+            mat.emissive.setHex(0xff0000);
+            setTimeout(() => {
+                mat.emissive.copy(mesh.userData.originalEmissive);
+            }, 300);
+        }
+
+        // --- Actions ---
+        function assemble(partName) {
+            if (!canAssemble(partName)) return;
+            
+            historyStack.push(partName);
+            redoStack.length = 0; // Clear redo stack on new action
+            
+            const mesh = partMeshes[partName];
+            animatePart(mesh, partsConfig[partName].asm);
+            
+            updateStateAndUI();
+        }
+
+        function undo() {
+            if (historyStack.length === 0) return;
+            
+            const partName = historyStack.pop();
+            redoStack.push(partName);
+            
+            const mesh = partMeshes[partName];
+            animatePart(mesh, partsConfig[partName].tray);
+            
+            updateStateAndUI();
+        }
+
+        function redo() {
+            if (redoStack.length === 0) return;
+            
+            const partName = redoStack.pop();
+            historyStack.push(partName);
+            
+            const mesh = partMeshes[partName];
+            animatePart(mesh, partsConfig[partName].asm);
+            
+            updateStateAndUI();
+        }
+
+        function resetAll() {
+            if (historyStack.length === 0) return;
+            
+            while (historyStack.length > 0) {
+                const partName = historyStack.pop();
+                const mesh = partMeshes[partName];
+                animatePart(mesh, partsConfig[partName].tray);
+            }
+            redoStack.length = 0;
+            
+            updateStateAndUI();
+        }
+
+        // --- State & UI Update ---
+        function updateStateAndUI() {
+            const state = window.__3D_STATE__;
+            
+            // Update State Object
+            state.partsAssembled = historyStack.length;
+            state.assemblyOrder = [...historyStack];
+            state.undoStackSize = historyStack.length;
+            state.redoStackSize = redoStack.length;
+            state.progressPercent = Math.round((historyStack.length / 7) * 100) || 0;
+            
+            state.frameAssembled = historyStack.includes('FRAME');
+            state.batteryAssembled = historyStack.includes('BATTERY');
+            state.cameraAssembled = historyStack.includes('CAMERA_MODULE');
+            
+            const motors = ['MOTOR_FL', 'MOTOR_FR', 'MOTOR_BL', 'MOTOR_BR'];
+            state.allMotorsAssembled = motors.every(m => historyStack.includes(m));
+            
+            state.droneComplete = historyStack.length === 7;
+
+            // Update UI DOM
+            document.getElementById('progress-bar').style.width = `${state.progressPercent}%`;
+            document.getElementById('assembly-count').innerText = `${state.partsAssembled} / 7 parts assembled`;
+            
+            PART_ORDER.forEach(name => {
+                const li = document.getElementById(`list-item-${name}`);
+                const statusSpan = li.querySelector('span:nth-child(2)');
+                if (historyStack.includes(name)) {
+                    statusSpan.innerText = 'Assembled';
+                    statusSpan.className = 'status-assembled';
+                } else {
+                    statusSpan.innerText = 'In Tray';
+                    statusSpan.className = 'status-tray';
+                }
+            });
+
+            const nextPart = getNextValidPart();
+            const btnAssemble = document.getElementById('btn-assemble');
+            btnAssemble.disabled = !nextPart;
+            btnAssemble.innerText = nextPart ? `Assemble Next (${nextPart.replace('_', ' ')})` : 'Assembly Complete';
+
+            document.getElementById('btn-undo').disabled = historyStack.length === 0;
+            document.getElementById('btn-redo').disabled = redoStack.length === 0;
+            document.getElementById('btn-reset').disabled = historyStack.length === 0;
+        }
+
+        // --- Event Listeners ---
+        document.getElementById('btn-assemble').addEventListener('click', () => {
+            const next = getNextValidPart();
+            if (next) assemble(next);
+        });
+        document.getElementById('btn-undo').addEventListener('click', undo);
+        document.getElementById('btn-redo').addEventListener('click', redo);
+        document.getElementById('btn-reset').addEventListener('click', resetAll);
+
+        window.addEventListener('keydown', (e) => {
+            const key = e.key.toLowerCase();
+            if (key === 'n') {
+                const next = getNextValidPart();
+                if (next) assemble(next);
+            }
+            else if (key === 'z') undo();
+            else if (key === 'y') redo();
+            else if (key === 'r') resetAll();
+        });
+
+        // Raycaster for clicking parts
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+
+        window.addEventListener('pointerdown', (event) => {
+            // Don't trigger if clicking UI
+            if (event.target.closest('#ui-panel')) return;
+
+            mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+            raycaster.setFromCamera(mouse, camera);
+            const intersects = raycaster.intersectObjects(partsGroup.children);
+
+            if (intersects.length > 0) {
+                const mesh = intersects[0].object;
+                const partName = mesh.userData.name;
+                
+                if (!historyStack.includes(partName)) {
+                    if (canAssemble(partName)) {
+                        assemble(partName);
+                    } else {
+                        flashRed(mesh);
+                    }
+                }
+            }
+        });
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // --- Render Loop ---
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const now = performance.now();
+            
+            // Process Tweens
+            for (let i = tweens.length - 1; i >= 0; i--) {
+                const t = tweens[i];
+                let progress = (now - t.startTime) / t.duration;
+                
+                if (progress >= 1) {
+                    t.mesh.position.copy(t.targetPos);
+                    tweens.splice(i, 1);
+                } else {
+                    // Ease in out quad
+                    const ease = progress < 0.5 ? 2 * progress * progress : 1 - Math.pow(-2 * progress + 2, 2) / 2;
+                    t.mesh.position.lerpVectors(t.startPos, t.targetPos, ease);
+                }
+            }
+
+            // Update state positions continuously to avoid NaNs and keep state accurate during animation
+            for (const name in partMeshes) {
+                const pos = partMeshes[name].position;
+                window.__3D_STATE__.partPositions[name].x = pos.x || 0;
+                window.__3D_STATE__.partPositions[name].y = pos.y || 0;
+                window.__3D_STATE__.partPositions[name].z = pos.z || 0;
+            }
+
+            controls.update();
+            renderer.render(scene, camera);
+        }
+
+        // Initialize UI state
+        updateStateAndUI();
+        animate();
+
+    </script>
+</body>
+</html>

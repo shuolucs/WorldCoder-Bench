@@ -1,0 +1,358 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Bowling Game</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #000;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            user-select: none;
+        }
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+        }
+        #ui-layer {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+            color: white;
+            text-shadow: 1px 1px 2px black;
+        }
+        .hud-element {
+            position: absolute;
+            padding: 15px;
+            font-size: 24px;
+            font-weight: bold;
+            background: rgba(0, 0, 0, 0.5);
+            border-radius: 8px;
+            margin: 15px;
+        }
+        #score-display {
+            top: 0;
+            left: 0;
+        }
+        #throw-display {
+            top: 0;
+            right: 0;
+        }
+        #instructions {
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            font-size: 18px;
+            text-align: center;
+            white-space: nowrap;
+        }
+        #undo-count {
+            bottom: 80px;
+            left: 20px;
+            font-size: 18px;
+        }
+        #redo-count {
+            bottom: 80px;
+            right: 20px;
+            font-size: 18px;
+        }
+    </style>
+</head>
+<body>
+    <div id="canvas-container"></div>
+    <div id="ui-layer">
+        <div id="score-display" class="hud-element">Score: 0</div>
+        <div id="throw-display" class="hud-element">Throw: 0</div>
+        <div id="undo-count" class="hud-element">Undo: 0</div>
+        <div id="redo-count" class="hud-element">Redo: 0</div>
+        <div id="instructions" class="hud-element">Press SPACE to launch | Arrows to aim | U=Undo R=Redo</div>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.152.2/build/three.module.js';
+        import { GLTFLoader } from 'https://cdn.jsdelivr.net/npm/three@0.152.2/examples/jsm/loaders/GLTFLoader.js';
+
+        // --- STATE MANAGEMENT ---
+        window.__3D_STATE__ = {
+            ballX: 0,
+            ballZ: 6,
+            ballLaunched: false,
+            throwCount: 0,
+            score: 0,
+            pinsDown: new Array(10).fill(false),
+            undoStackSize: 0,
+            redoStackSize: 0,
+            nefertitiLoaded: false,
+            gamePhase: 'aiming' // 'aiming' | 'rolling' | 'complete'
+        };
+
+        let undoStack = [];
+        let redoStack = [];
+
+        // --- SCENE SETUP ---
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x111122);
+
+        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+        camera.position.set(0, 8, 18);
+        camera.lookAt(0, 0, -8);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.shadowMap.enabled = true;
+        document.getElementById('canvas-container').appendChild(renderer.domElement);
+
+        // --- LIGHTS ---
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 1.2);
+        dirLight.position.set(5, 15, 10);
+        dirLight.castShadow = true;
+        dirLight.shadow.camera.top = 10;
+        dirLight.shadow.camera.bottom = -15;
+        dirLight.shadow.camera.left = -10;
+        dirLight.shadow.camera.right = 10;
+        scene.add(dirLight);
+
+        // --- ENVIRONMENT ---
+        // Bowling Lane
+        const laneGeo = new THREE.BoxGeometry(3, 0.2, 20);
+        const laneMat = new THREE.MeshStandardMaterial({ color: 0xC4A36E, roughness: 0.2 });
+        const lane = new THREE.Mesh(laneGeo, laneMat);
+        lane.position.set(0, -0.1, 0);
+        lane.receiveShadow = true;
+        scene.add(lane);
+
+        // Gutters
+        const gutterGeo = new THREE.BoxGeometry(0.5, 0.1, 20);
+        const gutterMat = new THREE.MeshStandardMaterial({ color: 0x222222 });
+        const gutterLeft = new THREE.Mesh(gutterGeo, gutterMat);
+        gutterLeft.position.set(-1.75, -0.15, 0);
+        gutterLeft.receiveShadow = true;
+        scene.add(gutterLeft);
+
+        const gutterRight = new THREE.Mesh(gutterGeo, gutterMat);
+        gutterRight.position.set(1.75, -0.15, 0);
+        gutterRight.receiveShadow = true;
+        scene.add(gutterRight);
+
+        // --- PINS ---
+        const pins = [];
+        const pinGeo = new THREE.CylinderGeometry(0.15, 0.15, 0.6, 16);
+        const pinMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.1 });
+        
+        let pinIndex = 0;
+        for (let row = 0; row < 4; row++) {
+            for (let col = 0; col <= row; col++) {
+                const pin = new THREE.Mesh(pinGeo, pinMat);
+                pin.name = 'pin_' + pinIndex;
+                pin.castShadow = true;
+                pin.receiveShadow = true;
+                
+                const xPos = (col - row / 2) * 0.4;
+                const zPos = -8 - row * 0.35;
+                
+                pin.position.set(xPos, 0.3, zPos);
+                scene.add(pin);
+                
+                pins.push({
+                    mesh: pin,
+                    initialX: xPos,
+                    initialY: 0.3,
+                    initialZ: zPos
+                });
+                pinIndex++;
+            }
+        }
+
+        // --- BALL ---
+        const ballGeo = new THREE.SphereGeometry(0.35, 32, 32);
+        const ballMat = new THREE.MeshStandardMaterial({ color: 0x1a1a6e, roughness: 0.1, metalness: 0.3 });
+        const ball = new THREE.Mesh(ballGeo, ballMat);
+        ball.position.set(0, 0.55, 6);
+        ball.castShadow = true;
+        scene.add(ball);
+
+        // --- TROPHY (Nefertiti) ---
+        const pedestalGeo = new THREE.CylinderGeometry(0.5, 0.5, 1.5, 32);
+        const pedestalMat = new THREE.MeshStandardMaterial({ color: 0xffd700, metalness: 0.8, roughness: 0.2 });
+        const pedestal = new THREE.Mesh(pedestalGeo, pedestalMat);
+        pedestal.position.set(4, 0.75, -4);
+        pedestal.castShadow = true;
+        pedestal.receiveShadow = true;
+        scene.add(pedestal);
+
+        const loader = new GLTFLoader();
+        loader.load('https://raw.githubusercontent.com/mrdoob/three.js/master/examples/models/gltf/Nefertiti/Nefertiti.glb', function (gltf) {
+            const nefertiti = gltf.scene;
+            nefertiti.scale.set(0.015, 0.015, 0.015);
+            nefertiti.position.set(4, 1.5, -4);
+            
+            nefertiti.traverse((child) => {
+                if (child.isMesh) {
+                    child.castShadow = true;
+                    child.receiveShadow = true;
+                }
+            });
+            
+            scene.add(nefertiti);
+            window.__3D_STATE__.nefertitiLoaded = true;
+        });
+
+        // --- UI UPDATE ---
+        const scoreEl = document.getElementById('score-display');
+        const throwEl = document.getElementById('throw-display');
+        const undoEl = document.getElementById('undo-count');
+        const redoEl = document.getElementById('redo-count');
+
+        function updateUI() {
+            scoreEl.innerText = `Score: ${window.__3D_STATE__.score}`;
+            throwEl.innerText = `Throw: ${window.__3D_STATE__.throwCount}`;
+            undoEl.innerText = `Undo: ${window.__3D_STATE__.undoStackSize}`;
+            redoEl.innerText = `Redo: ${window.__3D_STATE__.redoStackSize}`;
+        }
+
+        // --- UNDO / REDO LOGIC ---
+        function createSnapshot() {
+            return {
+                ballX: ball.position.x,
+                pinsDown: [...window.__3D_STATE__.pinsDown],
+                score: window.__3D_STATE__.score,
+                throwCount: window.__3D_STATE__.throwCount
+            };
+        }
+
+        function applySnapshot(snapshot) {
+            window.__3D_STATE__.pinsDown = [...snapshot.pinsDown];
+            window.__3D_STATE__.score = snapshot.score;
+            window.__3D_STATE__.throwCount = snapshot.throwCount;
+            
+            ball.position.set(snapshot.ballX, 0.55, 6);
+            window.__3D_STATE__.ballX = snapshot.ballX;
+            window.__3D_STATE__.ballZ = 6;
+            window.__3D_STATE__.ballLaunched = false;
+            window.__3D_STATE__.gamePhase = 'aiming';
+
+            pins.forEach((pinObj, idx) => {
+                if (window.__3D_STATE__.pinsDown[idx]) {
+                    pinObj.mesh.rotation.x = -Math.PI / 2;
+                    pinObj.mesh.position.y = 0.15;
+                } else {
+                    pinObj.mesh.rotation.x = 0;
+                    pinObj.mesh.position.y = pinObj.initialY;
+                }
+            });
+            
+            updateUI();
+        }
+
+        // --- INPUT HANDLING ---
+        window.addEventListener('keydown', (e) => {
+            const state = window.__3D_STATE__;
+            
+            if (state.gamePhase === 'aiming') {
+                if (e.code === 'ArrowLeft') {
+                    ball.position.x = Math.max(-1.2, ball.position.x - 0.1);
+                    state.ballX = ball.position.x;
+                } 
+                else if (e.code === 'ArrowRight') {
+                    ball.position.x = Math.min(1.2, ball.position.x + 0.1);
+                    state.ballX = ball.position.x;
+                } 
+                else if (e.code === 'Space') {
+                    undoStack.push(createSnapshot());
+                    redoStack = [];
+                    state.undoStackSize = undoStack.length;
+                    state.redoStackSize = redoStack.length;
+                    
+                    state.gamePhase = 'rolling';
+                    state.ballLaunched = true;
+                    updateUI();
+                }
+                else if (e.code === 'KeyU' || e.key === 'u') {
+                    if (undoStack.length > 0) {
+                        redoStack.push(createSnapshot());
+                        applySnapshot(undoStack.pop());
+                        state.undoStackSize = undoStack.length;
+                        state.redoStackSize = redoStack.length;
+                        updateUI();
+                    }
+                }
+                else if (e.code === 'KeyR' || e.key === 'r') {
+                    if (redoStack.length > 0) {
+                        undoStack.push(createSnapshot());
+                        applySnapshot(redoStack.pop());
+                        state.undoStackSize = undoStack.length;
+                        state.redoStackSize = redoStack.length;
+                        updateUI();
+                    }
+                }
+            }
+        });
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // --- ANIMATION LOOP ---
+        function animate() {
+            requestAnimationFrame(animate);
+            
+            const state = window.__3D_STATE__;
+
+            if (state.gamePhase === 'rolling') {
+                ball.position.z -= 0.3;
+                ball.rotation.x -= 0.3 / 0.35; // Roll animation
+                state.ballZ = ball.position.z;
+
+                // Collision Check
+                if (ball.position.z < -7 && ball.position.z > -10) {
+                    pins.forEach((pinObj, idx) => {
+                        if (!state.pinsDown[idx]) {
+                            if (Math.abs(pinObj.mesh.position.x - ball.position.x) < 0.7) {
+                                state.pinsDown[idx] = true;
+                                state.score++;
+                                
+                                pinObj.mesh.rotation.x = -Math.PI / 2;
+                                pinObj.mesh.position.y = 0.15;
+                                
+                                updateUI();
+                            }
+                        }
+                    });
+                }
+
+                // Throw Complete
+                if (ball.position.z < -10) {
+                    state.gamePhase = 'complete';
+                    state.throwCount++;
+                    state.ballLaunched = false;
+                    
+                    // Reset ball for next throw
+                    ball.position.set(0, 0.55, 6);
+                    ball.rotation.set(0, 0, 0);
+                    state.ballX = 0;
+                    state.ballZ = 6;
+                    
+                    state.gamePhase = 'aiming';
+                    updateUI();
+                }
+            }
+
+            renderer.render(scene, camera);
+        }
+
+        updateUI();
+        animate();
+    </script>
+</body>
+</html>

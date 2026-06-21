@@ -1,0 +1,638 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Abstract Particle Art Scene</title>
+<style>
+  body { margin: 0; overflow: hidden; background: #000; }
+  canvas { display: block; }
+  #hud {
+    position: absolute;
+    top: 10px;
+    left: 10px;
+    color: #fff;
+    background: rgba(0, 0, 0, 0.6);
+    font-family: monospace;
+    font-size: 13px;
+    padding: 10px 14px;
+    border-radius: 6px;
+    line-height: 1.6;
+    pointer-events: none;
+    z-index: 10;
+    min-width: 260px;
+  }
+</style>
+</head>
+<body>
+<div id="hud"></div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.163.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.163.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// ─── State ───
+const MODE_NAMES = ['ORBIT', 'EXPLODE', 'ATTRACT', 'WAVE'];
+const THEME_NAMES = ['NEON', 'FIRE', 'ICE', 'MONO'];
+
+const state = {
+  modelLoaded: false,
+  particleCount: 2000,
+  currentMode: 0,
+  currentModeName: 'ORBIT',
+  currentTheme: 0,
+  currentThemeName: 'NEON',
+  sizeMultiplier: 1.0,
+  dragonRotationSpeed: 0.5,
+  isPaused: false,
+  burstCount: 0,
+  activeburstParticles: 0,
+  elapsedTime: 0,
+  dragonOpacity: 0.4,
+  dragonScale: 1,
+  cameraDistance: 8
+};
+window.__3D_STATE__ = state;
+
+// ─── Scene ───
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x000000);
+
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+camera.position.set(0, 2, 8);
+camera.lookAt(0, 0, 0);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+document.body.appendChild(renderer.domElement);
+
+// ─── Lights ───
+const ambientLight = new THREE.AmbientLight(0x222244, 0.3);
+scene.add(ambientLight);
+const pointLight = new THREE.PointLight(0xffffff, 1.5);
+pointLight.position.set(5, 5, 5);
+scene.add(pointLight);
+
+// ─── Controls (optional orbit) ───
+// Not specified but useful; we won't add orbit controls to keep interactions clean.
+
+// ─── Generate circular particle texture ───
+function createParticleTexture() {
+  const size = 64;
+  const canvas = document.createElement('canvas');
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext('2d');
+  const half = size / 2;
+  const gradient = ctx.createRadialGradient(half, half, 0, half, half, half);
+  gradient.addColorStop(0, 'rgba(255,255,255,1)');
+  gradient.addColorStop(0.3, 'rgba(255,255,255,0.8)');
+  gradient.addColorStop(1, 'rgba(255,255,255,0)');
+  ctx.fillStyle = gradient;
+  ctx.fillRect(0, 0, size, size);
+  const tex = new THREE.CanvasTexture(canvas);
+  return tex;
+}
+
+const particleTexture = createParticleTexture();
+
+// ─── Dragon Model ───
+let dragonGroup = new THREE.Group();
+scene.add(dragonGroup);
+let dragonMeshes = [];
+
+const loader = new GLTFLoader();
+loader.load(
+  'https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/DragonAttenuation/glTF-Binary/DragonAttenuation.glb',
+  (gltf) => {
+    const model = gltf.scene;
+
+    // Compute bounding box
+    const box = new THREE.Box3().setFromObject(model);
+    const size = new THREE.Vector3();
+    box.getSize(size);
+    const center = new THREE.Vector3();
+    box.getCenter(center);
+
+    // Center model
+    model.position.sub(center);
+
+    // Scale so longest axis ~ 3
+    const longest = Math.max(size.x, size.y, size.z);
+    const scaleFactor = 3 / longest;
+    model.scale.setScalar(scaleFactor);
+    state.dragonScale = scaleFactor;
+
+    // Apply semi-transparent + wireframe overlay
+    model.traverse((child) => {
+      if (child.isMesh) {
+        dragonMeshes.push(child);
+
+        // Semi-transparent material
+        child.material = new THREE.MeshStandardMaterial({
+          color: 0x8888cc,
+          transparent: true,
+          opacity: 0.4,
+          side: THREE.DoubleSide,
+          depthWrite: false
+        });
+
+        // Wireframe overlay
+        const wireGeo = child.geometry.clone();
+        const wireMat = new THREE.MeshBasicMaterial({
+          color: 0x4444aa,
+          wireframe: true,
+          transparent: true,
+          opacity: 0.3
+        });
+        const wireMesh = new THREE.Mesh(wireGeo, wireMat);
+        wireMesh.position.copy(child.position);
+        wireMesh.rotation.copy(child.rotation);
+        wireMesh.scale.copy(child.scale);
+        child.parent.add(wireMesh);
+      }
+    });
+
+    dragonGroup.add(model);
+    state.modelLoaded = true;
+    console.log('Dragon model loaded');
+  },
+  undefined,
+  (err) => {
+    console.error('Error loading dragon model:', err);
+    // Create a placeholder
+    const geo = new THREE.TorusKnotGeometry(1, 0.3, 100, 16);
+    const mat = new THREE.MeshStandardMaterial({
+      color: 0x8888cc,
+      transparent: true,
+      opacity: 0.4,
+      side: THREE.DoubleSide,
+      depthWrite: false
+    });
+    const mesh = new THREE.Mesh(geo, mat);
+    const wireMat = new THREE.MeshBasicMaterial({ color: 0x4444aa, wireframe: true, transparent: true, opacity: 0.3 });
+    const wireMesh = new THREE.Mesh(geo.clone(), wireMat);
+    dragonGroup.add(mesh);
+    dragonGroup.add(wireMesh);
+    dragonMeshes.push(mesh);
+    state.modelLoaded = true;
+    state.dragonScale = 1;
+  }
+);
+
+// ─── Main Particle System ───
+const PARTICLE_COUNT = 2000;
+const positions = new Float32Array(PARTICLE_COUNT * 3);
+const velocities = new Float32Array(PARTICLE_COUNT * 3);
+const colors = new Float32Array(PARTICLE_COUNT * 3);
+const sizes = new Float32Array(PARTICLE_COUNT);
+const initialPositions = new Float32Array(PARTICLE_COUNT * 3);
+const baseSizes = new Float32Array(PARTICLE_COUNT);
+const particleHues = new Float32Array(PARTICLE_COUNT);
+
+// Initialize particles in a sphere of radius 5
+const tmpColor = new THREE.Color();
+for (let i = 0; i < PARTICLE_COUNT; i++) {
+  // Random point in sphere
+  const theta = Math.random() * Math.PI * 2;
+  const phi = Math.acos(2 * Math.random() - 1);
+  const r = Math.cbrt(Math.random()) * 5;
+  const x = r * Math.sin(phi) * Math.cos(theta);
+  const y = r * Math.sin(phi) * Math.sin(theta);
+  const z = r * Math.cos(phi);
+
+  positions[i * 3] = x;
+  positions[i * 3 + 1] = y;
+  positions[i * 3 + 2] = z;
+
+  initialPositions[i * 3] = x;
+  initialPositions[i * 3 + 1] = y;
+  initialPositions[i * 3 + 2] = z;
+
+  velocities[i * 3] = 0;
+  velocities[i * 3 + 1] = 0;
+  velocities[i * 3 + 2] = 0;
+
+  // Random HSL color
+  const hue = Math.random();
+  particleHues[i] = hue;
+  tmpColor.setHSL(hue, 0.8, 0.6);
+  colors[i * 3] = tmpColor.r;
+  colors[i * 3 + 1] = tmpColor.g;
+  colors[i * 3 + 2] = tmpColor.b;
+
+  const s = 0.02 + Math.random() * 0.06;
+  sizes[i] = s;
+  baseSizes[i] = s;
+}
+
+const particleGeometry = new THREE.BufferGeometry();
+particleGeometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+particleGeometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+particleGeometry.setAttribute('size', new THREE.BufferAttribute(sizes, 1));
+
+const particleMaterial = new THREE.PointsMaterial({
+  size: 0.05,
+  map: particleTexture,
+  blending: THREE.AdditiveBlending,
+  transparent: true,
+  depthWrite: false,
+  vertexColors: true,
+  sizeAttenuation: true
+});
+
+const particleSystem = new THREE.Points(particleGeometry, particleMaterial);
+scene.add(particleSystem);
+
+// ─── Burst Particles ───
+const burstParticles = []; // Array of { mesh: THREE.Points, startTime, lifetime }
+const MAX_BURST = 50;
+
+function createBurstAt(worldPos) {
+  state.burstCount++;
+  const count = MAX_BURST;
+  const bPositions = new Float32Array(count * 3);
+  const bColors = new Float32Array(count * 3);
+  const bVelocities = [];
+  const bSizes = new Float32Array(count);
+
+  for (let i = 0; i < count; i++) {
+    bPositions[i * 3] = worldPos.x;
+    bPositions[i * 3 + 1] = worldPos.y;
+    bPositions[i * 3 + 2] = worldPos.z;
+
+    const vx = (Math.random() - 0.5) * 4;
+    const vy = (Math.random() - 0.5) * 4;
+    const vz = (Math.random() - 0.5) * 4;
+    bVelocities.push(new THREE.Vector3(vx, vy, vz));
+
+    tmpColor.setHSL(Math.random(), 1.0, 0.7);
+    bColors[i * 3] = tmpColor.r;
+    bColors[i * 3 + 1] = tmpColor.g;
+    bColors[i * 3 + 2] = tmpColor.b;
+
+    bSizes[i] = 0.03 + Math.random() * 0.05;
+  }
+
+  const bGeo = new THREE.BufferGeometry();
+  bGeo.setAttribute('position', new THREE.BufferAttribute(bPositions, 3));
+  bGeo.setAttribute('color', new THREE.BufferAttribute(bColors, 3));
+
+  const bMat = new THREE.PointsMaterial({
+    size: 0.06,
+    map: particleTexture,
+    blending: THREE.AdditiveBlending,
+    transparent: true,
+    opacity: 1.0,
+    depthWrite: false,
+    vertexColors: true,
+    sizeAttenuation: true
+  });
+
+  const bPoints = new THREE.Points(bGeo, bMat);
+  scene.add(bPoints);
+
+  burstParticles.push({
+    mesh: bPoints,
+    velocities: bVelocities,
+    startTime: state.elapsedTime,
+    lifetime: 2.0,
+    count: count,
+    sizes: bSizes
+  });
+}
+
+// ─── Raycaster for click ───
+const raycaster = new THREE.Raycaster();
+const clickPlane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0);
+const mouse = new THREE.Vector2();
+
+renderer.domElement.addEventListener('click', (event) => {
+  mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+  mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+  raycaster.setFromCamera(mouse, camera);
+  const intersection = new THREE.Vector3();
+  raycaster.ray.intersectPlane(clickPlane, intersection);
+  if (intersection) {
+    createBurstAt(intersection);
+  }
+});
+
+// ─── Key Handling ───
+let modeJustChanged = false;
+
+document.addEventListener('keydown', (event) => {
+  const key = event.key.toLowerCase();
+
+  if (key === 'm') {
+    state.currentMode = (state.currentMode + 1) % 4;
+    state.currentModeName = MODE_NAMES[state.currentMode];
+    modeJustChanged = true;
+
+    // If explode, set random velocities
+    if (state.currentMode === 1) {
+      for (let i = 0; i < PARTICLE_COUNT; i++) {
+        const speed = 2 + Math.random() * 3;
+        const theta = Math.random() * Math.PI * 2;
+        const phi = Math.acos(2 * Math.random() - 1);
+        velocities[i * 3] = speed * Math.sin(phi) * Math.cos(theta);
+        velocities[i * 3 + 1] = speed * Math.sin(phi) * Math.sin(theta);
+        velocities[i * 3 + 2] = speed * Math.cos(phi);
+      }
+    }
+  }
+
+  if (key === 'c') {
+    state.currentTheme = (state.currentTheme + 1) % 4;
+    state.currentThemeName = THEME_NAMES[state.currentTheme];
+  }
+
+  if (key === 'r') {
+    // Reset
+    for (let i = 0; i < PARTICLE_COUNT; i++) {
+      positions[i * 3] = initialPositions[i * 3];
+      positions[i * 3 + 1] = initialPositions[i * 3 + 1];
+      positions[i * 3 + 2] = initialPositions[i * 3 + 2];
+      velocities[i * 3] = 0;
+      velocities[i * 3 + 1] = 0;
+      velocities[i * 3 + 2] = 0;
+      sizes[i] = baseSizes[i];
+    }
+    state.currentMode = 0;
+    state.currentModeName = 'ORBIT';
+    state.currentTheme = 0;
+    state.currentThemeName = 'NEON';
+    state.sizeMultiplier = 1.0;
+    state.dragonRotationSpeed = 0.5;
+    particleGeometry.attributes.position.needsUpdate = true;
+  }
+
+  if (key === ' ' || event.code === 'Space') {
+    event.preventDefault();
+    state.isPaused = !state.isPaused;
+  }
+
+  if (event.key === 'ArrowUp') {
+    state.sizeMultiplier = Math.min(3.0, state.sizeMultiplier + 0.25);
+  }
+  if (event.key === 'ArrowDown') {
+    state.sizeMultiplier = Math.max(0.5, state.sizeMultiplier - 0.25);
+  }
+  if (event.key === 'ArrowRight') {
+    state.dragonRotationSpeed = Math.min(2.0, parseFloat((state.dragonRotationSpeed + 0.1).toFixed(1)));
+  }
+  if (event.key === 'ArrowLeft') {
+    state.dragonRotationSpeed = Math.max(0.0, parseFloat((state.dragonRotationSpeed - 0.1).toFixed(1)));
+  }
+});
+
+// ─── HUD ───
+const hudEl = document.getElementById('hud');
+
+// ─── FPS ───
+let frameCount = 0;
+let fpsTime = 0;
+let fps = 0;
+
+// ─── Animation ───
+const clock = new THREE.Clock();
+let lastTime = 0;
+
+function updateColors() {
+  const posAttr = particleGeometry.attributes.color;
+  for (let i = 0; i < PARTICLE_COUNT; i++) {
+    let h, s, l;
+    switch (state.currentTheme) {
+      case 0: // NEON
+        h = (i / PARTICLE_COUNT + state.elapsedTime * 0.05) % 1.0;
+        s = 0.8;
+        l = 0.6;
+        break;
+      case 1: // FIRE
+        h = Math.random() * 0.1;
+        s = 1.0;
+        l = 0.5 + Math.random() * 0.2;
+        break;
+      case 2: // ICE
+        h = 0.5 + Math.random() * 0.2;
+        s = 0.8;
+        l = 0.6;
+        break;
+      case 3: // MONO
+        h = 0;
+        s = 0;
+        l = 0.3 + Math.random() * 0.7;
+        break;
+    }
+    tmpColor.setHSL(h, s, l);
+    colors[i * 3] = tmpColor.r;
+    colors[i * 3 + 1] = tmpColor.g;
+    colors[i * 3 + 2] = tmpColor.b;
+  }
+  posAttr.needsUpdate = true;
+}
+
+function updateParticles(dt) {
+  const time = state.elapsedTime;
+
+  for (let i = 0; i < PARTICLE_COUNT; i++) {
+    const ix = i * 3;
+    const iy = i * 3 + 1;
+    const iz = i * 3 + 2;
+
+    let px = positions[ix];
+    let py = positions[iy];
+    let pz = positions[iz];
+
+    switch (state.currentMode) {
+      case 0: { // ORBIT - swirl around Y axis with pull toward center
+        const dist = Math.sqrt(px * px + py * py + pz * pz);
+        const pullStrength = 0.5;
+
+        // Swirl force (tangential around Y)
+        const swirlSpeed = 1.0;
+        const tx = -pz;
+        const tz = px;
+        const tLen = Math.sqrt(tx * tx + tz * tz) || 1;
+
+        velocities[ix] += (tx / tLen * swirlSpeed - px * pullStrength * (dist > 3 ? 0.1 : -0.05)) * dt;
+        velocities[iy] += (-py * 0.3) * dt; // gentle pull to y=0
+        velocities[iz] += (tz / tLen * swirlSpeed - pz * pullStrength * (dist > 3 ? 0.1 : -0.05)) * dt;
+
+        // Damping
+        velocities[ix] *= 0.99;
+        velocities[iy] *= 0.99;
+        velocities[iz] *= 0.99;
+
+        positions[ix] += velocities[ix] * dt;
+        positions[iy] += velocities[iy] * dt;
+        positions[iz] += velocities[iz] * dt;
+        break;
+      }
+      case 1: { // EXPLODE
+        velocities[ix] *= 0.98;
+        velocities[iy] *= 0.98;
+        velocities[iz] *= 0.98;
+
+        positions[ix] += velocities[ix] * dt;
+        positions[iy] += velocities[iy] * dt;
+        positions[iz] += velocities[iz] * dt;
+        break;
+      }
+      case 2: { // ATTRACT to center
+        const force = 3.0;
+        const dx = -px;
+        const dy = -py;
+        const dz = -pz;
+        const d = Math.sqrt(dx * dx + dy * dy + dz * dz) || 0.01;
+
+        velocities[ix] += (dx / d) * force * dt;
+        velocities[iy] += (dy / d) * force * dt;
+        velocities[iz] += (dz / d) * force * dt;
+
+        velocities[ix] *= 0.95;
+        velocities[iy] *= 0.95;
+        velocities[iz] *= 0.95;
+
+        positions[ix] += velocities[ix] * dt;
+        positions[iy] += velocities[iy] * dt;
+        positions[iz] += velocities[iz] * dt;
+        break;
+      }
+      case 3: { // WAVE
+        const spread = 10;
+        const targetX = (i / PARTICLE_COUNT - 0.5) * spread;
+        const targetY = 2 * Math.sin(targetX * 0.5 + time);
+        const targetZ = 2 * Math.cos(targetX * 0.5 + time);
+
+        const lerpSpeed = 2.0;
+        positions[ix] += (targetX - px) * lerpSpeed * dt;
+        positions[iy] += (targetY - py) * lerpSpeed * dt;
+        positions[iz] += (targetZ - pz) * lerpSpeed * dt;
+
+        velocities[ix] = 0;
+        velocities[iy] = 0;
+        velocities[iz] = 0;
+        break;
+      }
+    }
+
+    // Update sizes
+    sizes[i] = baseSizes[i] * state.sizeMultiplier;
+  }
+
+  particleGeometry.attributes.position.needsUpdate = true;
+  particleGeometry.attributes.size.needsUpdate = true;
+}
+
+function updateBurstParticles(dt) {
+  let activeCount = 0;
+
+  for (let b = burstParticles.length - 1; b >= 0; b--) {
+    const burst = burstParticles[b];
+    const age = state.elapsedTime - burst.startTime;
+
+    if (age >= burst.lifetime) {
+      scene.remove(burst.mesh);
+      burst.mesh.geometry.dispose();
+      burst.mesh.material.dispose();
+      burstParticles.splice(b, 1);
+      continue;
+    }
+
+    const fade = 1.0 - age / burst.lifetime;
+    burst.mesh.material.opacity = fade;
+
+    const bPos = burst.mesh.geometry.attributes.position.array;
+    for (let i = 0; i < burst.count; i++) {
+      const vel = burst.velocities[i];
+      vel.multiplyScalar(0.98);
+      bPos[i * 3] += vel.x * dt;
+      bPos[i * 3 + 1] += vel.y * dt;
+      bPos[i * 3 + 2] += vel.z * dt;
+    }
+    burst.mesh.geometry.attributes.position.needsUpdate = true;
+    activeCount += burst.count;
+  }
+
+  state.activeburstParticles = activeCount;
+}
+
+function updateHUD() {
+  hudEl.innerHTML = `
+Mode: <b>${state.currentModeName}</b> [M]<br>
+Theme: <b>${state.currentThemeName}</b> [C]<br>
+Particles: ${state.particleCount} + ${state.activeburstParticles} burst<br>
+Size: ${state.sizeMultiplier.toFixed(2)} [↑↓]<br>
+Dragon Speed: ${state.dragonRotationSpeed.toFixed(1)} [←→]<br>
+FPS: ${fps}<br>
+${state.isPaused ? '<span style="color:#ff4444">⏸ PAUSED</span> [Space]' : '<span style="color:#44ff44">▶ RUNNING</span> [Space]'}<br>
+<span style="font-size:11px;color:#888">[R] Reset | Click to burst</span>
+  `.trim();
+}
+
+// ─── Resize ───
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// ─── Main Loop ───
+let prevTimestamp = 0;
+
+function animate(timestamp) {
+  requestAnimationFrame(animate);
+
+  const rawDt = (timestamp - prevTimestamp) / 1000 || 0.016;
+  prevTimestamp = timestamp;
+  const dt = Math.min(rawDt, 0.05);
+
+  // FPS
+  frameCount++;
+  fpsTime += dt;
+  if (fpsTime >= 1.0) {
+    fps = frameCount;
+    frameCount = 0;
+    fpsTime = 0;
+  }
+
+  if (!state.isPaused) {
+    state.elapsedTime += dt;
+
+    // Rotate dragon
+    dragonGroup.rotation.y += state.dragonRotationSpeed * dt;
+
+    // Update particles
+    updateParticles(dt);
+    updateColors();
+    updateBurstParticles(dt);
+
+    // Update particle material size
+    particleMaterial.size = 0.05 * state.sizeMultiplier;
+  }
+
+  // Update state
+  state.cameraDistance = camera.position.length();
+
+  updateHUD();
+
+  renderer.render(scene, camera);
+}
+
+requestAnimationFrame(animate);
+</script>
+</body>
+</html>

@@ -1,0 +1,475 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Cloth Simulation</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #223344;
+            color: #ffffff;
+            font-family: monospace;
+            user-select: none;
+        }
+        #hud {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(0, 0, 0, 0.6);
+            padding: 15px;
+            border-radius: 8px;
+            pointer-events: none;
+            font-size: 14px;
+            line-height: 1.5;
+            border: 1px solid #445566;
+        }
+        #controls {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            background: rgba(0, 0, 0, 0.6);
+            padding: 15px;
+            border-radius: 8px;
+            font-size: 14px;
+            border: 1px solid #445566;
+        }
+        .control-group {
+            margin-bottom: 12px;
+            display: flex;
+            align-items: center;
+        }
+        label {
+            display: inline-block;
+            width: 80px;
+        }
+        input[type=range] {
+            vertical-align: middle;
+            width: 120px;
+        }
+        .instructions {
+            margin-top: 15px;
+            font-size: 12px;
+            color: #aaaaaa;
+            line-height: 1.6;
+        }
+        .key {
+            background: #334455;
+            padding: 2px 6px;
+            border-radius: 4px;
+            color: #fff;
+        }
+    </style>
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+            "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+        }
+    }
+    </script>
+</head>
+<body>
+    <div id="hud">
+        <div>Particles: <span id="hud-particles"></span></div>
+        <div>Wind: <span id="hud-wind"></span></div>
+        <div>Stiffness: <span id="hud-stiffness"></span></div>
+        <div>Sphere Pos: <span id="hud-sphere"></span></div>
+        <div>Max Stretch: <span id="hud-stretch"></span></div>
+        <div>Status: <span id="hud-paused" style="font-weight: bold; color: #ffcc00;"></span></div>
+    </div>
+
+    <div id="controls">
+        <div class="control-group">
+            <label for="slider-wind">Wind</label>
+            <input type="range" id="slider-wind" min="0" max="20" step="0.5" value="5">
+        </div>
+        <div class="control-group">
+            <label for="slider-stiffness">Stiffness</label>
+            <input type="range" id="slider-stiffness" min="50" max="500" step="10" value="200">
+        </div>
+        <div class="instructions">
+            <div><span class="key">W</span><span class="key">A</span><span class="key">S</span><span class="key">D</span> Move Sphere XZ</div>
+            <div><span class="key">Q</span><span class="key">E</span> Move Sphere Y</div>
+            <div><span class="key">R</span> Reset Cloth</div>
+            <div><span class="key">Space</span> Pause / Play</div>
+            <div><span class="key">C</span> Toggle Sphere</div>
+        </div>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        // --- State Management ---
+        window.__3D_STATE__ = {
+            particleCount: 625,
+            windStrength: 5,
+            stiffness: 200,
+            spherePosition: { x: 0, y: 4, z: 3 },
+            maxStretchRatio: 0,
+            isPaused: false,
+            sphereVisible: true,
+            frameCount: 0,
+            clothValid: true,
+            avgY: 0,
+            pinnedCount: 9
+        };
+
+        // --- Scene Setup ---
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x223344);
+
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+        camera.position.set(0, 5, 12);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        document.body.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.target.set(0, 2, 0);
+        controls.update();
+
+        // --- Lights ---
+        const ambientLight = new THREE.AmbientLight(0x445566, 0.4);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+        dirLight.position.set(5, 10, 5);
+        dirLight.castShadow = true;
+        dirLight.shadow.mapSize.width = 2048;
+        dirLight.shadow.mapSize.height = 2048;
+        dirLight.shadow.camera.near = 0.5;
+        dirLight.shadow.camera.far = 50;
+        dirLight.shadow.camera.left = -10;
+        dirLight.shadow.camera.right = 10;
+        dirLight.shadow.camera.top = 10;
+        dirLight.shadow.camera.bottom = -10;
+        scene.add(dirLight);
+
+        // --- Environment ---
+        const floorGeo = new THREE.PlaneGeometry(20, 20);
+        const floorMat = new THREE.MeshStandardMaterial({ color: 0x445544, roughness: 0.8 });
+        const floor = new THREE.Mesh(floorGeo, floorMat);
+        floor.rotation.x = -Math.PI / 2;
+        floor.receiveShadow = true;
+        scene.add(floor);
+
+        const rodGeo = new THREE.CylinderGeometry(0.05, 0.05, 7, 16);
+        const rodMat = new THREE.MeshStandardMaterial({ color: 0x888888, roughness: 0.4 });
+        const rod = new THREE.Mesh(rodGeo, rodMat);
+        rod.position.set(0, 8, 0);
+        rod.rotation.z = Math.PI / 2;
+        rod.castShadow = true;
+        scene.add(rod);
+
+        // --- Collision Sphere ---
+        const sphereGeo = new THREE.SphereGeometry(1.0, 32, 32);
+        const sphereMat = new THREE.MeshStandardMaterial({ 
+            color: 0xff4444, 
+            transparent: true, 
+            opacity: 0.8,
+            roughness: 0.2
+        });
+        const sphere = new THREE.Mesh(sphereGeo, sphereMat);
+        sphere.position.set(0, 4, 3);
+        sphere.castShadow = true;
+        scene.add(sphere);
+
+        // --- Cloth Physics Setup ---
+        const gridX = 25;
+        const gridY = 25;
+        const clothWidth = 6;
+        const clothHeight = 6;
+        const mass = 0.05;
+        
+        const particles = [];
+        const springs = [];
+
+        // Initialize Particles
+        for (let y = 0; y < gridY; y++) {
+            for (let x = 0; x < gridX; x++) {
+                let px = (x / (gridX - 1)) * clothWidth - (clothWidth / 2);
+                let py = 8 - (y / (gridY - 1)) * clothHeight;
+                let pz = 0;
+                
+                // Pin every 3rd particle in the top row
+                let pinned = (y === 0 && x % 3 === 0);
+                
+                particles.push({
+                    pos: new THREE.Vector3(px, py, pz),
+                    prev: new THREE.Vector3(px, py, pz),
+                    orig: new THREE.Vector3(px, py, pz),
+                    acc: new THREE.Vector3(0, 0, 0),
+                    mass: mass,
+                    invMass: pinned ? 0 : 1 / mass,
+                    pinned: pinned
+                });
+            }
+        }
+
+        // Initialize Springs
+        const getIndex = (x, y) => y * gridX + x;
+        const restStruct = clothWidth / (gridX - 1); // 6/24 = 0.25
+        const restShear = restStruct * Math.SQRT2;  // ~0.3535
+        const restBend = restStruct * 2;            // 0.5
+
+        for (let y = 0; y < gridY; y++) {
+            for (let x = 0; x < gridX; x++) {
+                // Structural (k=200 default, controlled by slider)
+                if (x < gridX - 1) springs.push({ p1: particles[getIndex(x, y)], p2: particles[getIndex(x + 1, y)], rest: restStruct, type: 0, k: 200 });
+                if (y < gridY - 1) springs.push({ p1: particles[getIndex(x, y)], p2: particles[getIndex(x, y + 1)], rest: restStruct, type: 0, k: 200 });
+                
+                // Shear (k=100)
+                if (x < gridX - 1 && y < gridY - 1) springs.push({ p1: particles[getIndex(x, y)], p2: particles[getIndex(x + 1, y + 1)], rest: restShear, type: 1, k: 100 });
+                if (x > 0 && y < gridY - 1) springs.push({ p1: particles[getIndex(x, y)], p2: particles[getIndex(x - 1, y + 1)], rest: restShear, type: 1, k: 100 });
+                
+                // Bending (k=50)
+                if (x < gridX - 2) springs.push({ p1: particles[getIndex(x, y)], p2: particles[getIndex(x + 2, y)], rest: restBend, type: 2, k: 50 });
+                if (y < gridY - 2) springs.push({ p1: particles[getIndex(x, y)], p2: particles[getIndex(x, y + 2)], rest: restBend, type: 2, k: 50 });
+            }
+        }
+
+        // --- Cloth Rendering Setup ---
+        const clothGeo = new THREE.PlaneGeometry(clothWidth, clothHeight, gridX - 1, gridY - 1);
+        
+        const textureLoader = new THREE.TextureLoader();
+        const normalMap = textureLoader.load('https://raw.githubusercontent.com/mrdoob/three.js/master/examples/textures/disturb.jpg');
+        normalMap.wrapS = THREE.RepeatWrapping;
+        normalMap.wrapT = THREE.RepeatWrapping;
+
+        const matFront = new THREE.MeshStandardMaterial({ 
+            color: 0x4488cc, 
+            side: THREE.FrontSide, 
+            normalMap: normalMap,
+            normalScale: new THREE.Vector2(0.3, 0.3),
+            roughness: 0.6
+        });
+        const matBack = new THREE.MeshStandardMaterial({ 
+            color: 0xcc8844, 
+            side: THREE.BackSide, 
+            normalMap: normalMap,
+            normalScale: new THREE.Vector2(0.3, 0.3),
+            roughness: 0.6
+        });
+
+        const clothMeshFront = new THREE.Mesh(clothGeo, matFront);
+        clothMeshFront.castShadow = true;
+        clothMeshFront.receiveShadow = true;
+        scene.add(clothMeshFront);
+
+        const clothMeshBack = new THREE.Mesh(clothGeo, matBack);
+        clothMeshBack.castShadow = true;
+        clothMeshBack.receiveShadow = true;
+        scene.add(clothMeshBack);
+
+        // --- Input Handling ---
+        const keys = { w: false, a: false, s: false, d: false, q: false, e: false };
+
+        window.addEventListener('keydown', (e) => {
+            const k = e.key.toLowerCase();
+            if (keys.hasOwnProperty(k)) keys[k] = true;
+            
+            if (k === 'r') {
+                particles.forEach(p => {
+                    p.pos.copy(p.orig);
+                    p.prev.copy(p.orig);
+                    p.acc.set(0, 0, 0);
+                });
+            }
+            if (k === ' ') {
+                window.__3D_STATE__.isPaused = !window.__3D_STATE__.isPaused;
+                e.preventDefault();
+            }
+            if (k === 'c') {
+                window.__3D_STATE__.sphereVisible = !window.__3D_STATE__.sphereVisible;
+                sphere.visible = window.__3D_STATE__.sphereVisible;
+            }
+        });
+
+        window.addEventListener('keyup', (e) => {
+            const k = e.key.toLowerCase();
+            if (keys.hasOwnProperty(k)) keys[k] = false;
+        });
+
+        document.getElementById('slider-wind').addEventListener('input', (e) => {
+            window.__3D_STATE__.windStrength = parseFloat(e.target.value);
+        });
+
+        document.getElementById('slider-stiffness').addEventListener('input', (e) => {
+            window.__3D_STATE__.stiffness = parseFloat(e.target.value);
+        });
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // --- Animation Loop ---
+        const clock = new THREE.Clock();
+        const dt = 0.005;
+        const substeps = 8;
+        const damping_factor = 0.01;
+        const drag_coeff = -0.02;
+        const spring_damping = 2.0;
+
+        function animate() {
+            requestAnimationFrame(animate);
+            
+            const time = clock.getElapsedTime();
+            window.__3D_STATE__.frameCount++;
+
+            // Move Sphere
+            const speed = 5.0 * 0.016;
+            if (keys.w) sphere.position.z -= speed;
+            if (keys.s) sphere.position.z += speed;
+            if (keys.a) sphere.position.x -= speed;
+            if (keys.d) sphere.position.x += speed;
+            if (keys.q) sphere.position.y += speed;
+            if (keys.e) sphere.position.y -= speed;
+            
+            window.__3D_STATE__.spherePosition = { 
+                x: parseFloat(sphere.position.x.toFixed(2)), 
+                y: parseFloat(sphere.position.y.toFixed(2)), 
+                z: parseFloat(sphere.position.z.toFixed(2)) 
+            };
+
+            let globalMaxStretch = 0;
+
+            if (!window.__3D_STATE__.isPaused) {
+                const windScalar = window.__3D_STATE__.windStrength * (1 + 0.3 * Math.sin(time * 2));
+                const normals = clothGeo.attributes.normal.array;
+
+                for (let step = 0; step < substeps; step++) {
+                    
+                    // 1. Forces
+                    for (let i = 0; i < particles.length; i++) {
+                        let p = particles[i];
+                        if (p.pinned) continue;
+                        
+                        p.acc.set(0, -9.81, 0); // Gravity
+
+                        // Drag
+                        let vel = p.pos.clone().sub(p.prev).divideScalar(dt);
+                        p.acc.add(vel.multiplyScalar(drag_coeff * p.invMass));
+
+                        // Wind
+                        let nx = normals[i * 3];
+                        let ny = normals[i * 3 + 1];
+                        let nz = normals[i * 3 + 2];
+                        let normal = new THREE.Vector3(nx, ny, nz);
+                        let f_wind = normal.multiplyScalar(windScalar);
+                        p.acc.add(f_wind.multiplyScalar(p.invMass));
+                    }
+
+                    // 2. Spring Forces
+                    for (let s of springs) {
+                        let p1 = s.p1;
+                        let p2 = s.p2;
+                        let delta = p2.pos.clone().sub(p1.pos);
+                        let dist = delta.length();
+                        if (dist === 0) continue;
+                        let dir = delta.divideScalar(dist);
+
+                        let v1 = p1.pos.clone().sub(p1.prev).divideScalar(dt);
+                        let v2 = p2.pos.clone().sub(p2.prev).divideScalar(dt);
+                        let v_rel = v2.sub(v1);
+
+                        let k = s.type === 0 ? window.__3D_STATE__.stiffness : s.k;
+                        
+                        let f_spring = k * (dist - s.rest) + spring_damping * v_rel.dot(dir);
+                        let force_vec = dir.multiplyScalar(f_spring);
+
+                        if (!p1.pinned) p1.acc.add(force_vec.clone().multiplyScalar(p1.invMass));
+                        if (!p2.pinned) p2.acc.sub(force_vec.clone().multiplyScalar(p2.invMass));
+
+                        let stretch = dist / s.rest;
+                        if (stretch > globalMaxStretch) globalMaxStretch = stretch;
+                    }
+
+                    // 3. Verlet Integration
+                    for (let p of particles) {
+                        if (p.pinned) continue;
+                        let temp = p.pos.clone();
+                        let vel_term = p.pos.clone().sub(p.prev).multiplyScalar(1 - damping_factor);
+                        let acc_term = p.acc.clone().multiplyScalar(dt * dt);
+                        p.pos.add(vel_term).add(acc_term);
+                        p.prev.copy(temp);
+                    }
+
+                    // 4. Constraints (Over-stretch projection)
+                    for (let s of springs) {
+                        let p1 = s.p1;
+                        let p2 = s.p2;
+                        let delta = p2.pos.clone().sub(p1.pos);
+                        let dist = delta.length();
+                        if (dist > 1.5 * s.rest) {
+                            let diff = dist - 1.5 * s.rest;
+                            let dir = delta.normalize();
+                            let correction = dir.multiplyScalar(diff);
+                            if (!p1.pinned && !p2.pinned) {
+                                p1.pos.add(correction.clone().multiplyScalar(0.5));
+                                p2.pos.sub(correction.clone().multiplyScalar(0.5));
+                            } else if (!p1.pinned) {
+                                p1.pos.add(correction);
+                            } else if (!p2.pinned) {
+                                p2.pos.sub(correction);
+                            }
+                        }
+                    }
+
+                    // 5. Collision
+                    if (window.__3D_STATE__.sphereVisible) {
+                        let C = sphere.position;
+                        let R = 1.0;
+                        for (let p of particles) {
+                            if (p.pinned) continue;
+                            let dist = p.pos.distanceTo(C);
+                            if (dist < R + 0.05) {
+                                let dir = p.pos.clone().sub(C).normalize();
+                                p.pos.copy(C).add(dir.multiplyScalar(R + 0.05));
+                            }
+                        }
+                    }
+                }
+                window.__3D_STATE__.maxStretchRatio = parseFloat(globalMaxStretch.toFixed(4));
+            }
+
+            // Update Geometry
+            const positions = clothGeo.attributes.position.array;
+            let sumY = 0;
+            for (let i = 0; i < particles.length; i++) {
+                positions[i * 3] = particles[i].pos.x;
+                positions[i * 3 + 1] = particles[i].pos.y;
+                positions[i * 3 + 2] = particles[i].pos.z;
+                sumY += particles[i].pos.y;
+            }
+            clothGeo.attributes.position.needsUpdate = true;
+            clothGeo.computeVertexNormals();
+
+            // Update State
+            window.__3D_STATE__.avgY = parseFloat((sumY / particles.length).toFixed(3));
+            window.__3D_STATE__.clothValid = !isNaN(particles[0].pos.x);
+
+            // Update HUD
+            document.getElementById('hud-particles').innerText = window.__3D_STATE__.particleCount;
+            document.getElementById('hud-wind').innerText = window.__3D_STATE__.windStrength.toFixed(1);
+            document.getElementById('hud-stiffness').innerText = window.__3D_STATE__.stiffness;
+            document.getElementById('hud-sphere').innerText = `${window.__3D_STATE__.spherePosition.x.toFixed(1)}, ${window.__3D_STATE__.spherePosition.y.toFixed(1)}, ${window.__3D_STATE__.spherePosition.z.toFixed(1)}`;
+            document.getElementById('hud-stretch').innerText = window.__3D_STATE__.maxStretchRatio.toFixed(3);
+            document.getElementById('hud-paused').innerText = window.__3D_STATE__.isPaused ? 'Paused' : 'Playing';
+            document.getElementById('hud-paused').style.color = window.__3D_STATE__.isPaused ? '#ff4444' : '#44ff44';
+
+            renderer.render(scene, camera);
+        }
+
+        animate();
+    </script>
+</body>
+</html>

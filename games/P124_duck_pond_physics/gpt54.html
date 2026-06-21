@@ -1,0 +1,554 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Duck Pond Water Ripple Simulation</title>
+  <style>
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      font-family: Arial, Helvetica, sans-serif;
+      background: #87ceeb;
+    }
+    #app {
+      width: 100%;
+      height: 100%;
+      position: relative;
+    }
+    canvas {
+      display: block;
+    }
+    #hud {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      z-index: 10;
+      color: #fff;
+      background: rgba(0, 0, 0, 0.35);
+      padding: 12px 14px;
+      border-radius: 10px;
+      min-width: 260px;
+      backdrop-filter: blur(4px);
+      box-shadow: 0 4px 16px rgba(0,0,0,0.2);
+      line-height: 1.6;
+      user-select: none;
+    }
+    #hud .title {
+      font-weight: bold;
+      margin-bottom: 8px;
+      font-size: 15px;
+    }
+    #controlsPanel {
+      margin-top: 10px;
+      padding-top: 8px;
+      border-top: 1px solid rgba(255,255,255,0.2);
+    }
+    #controlsPanel label {
+      display: block;
+      margin-bottom: 6px;
+    }
+    #windSlider {
+      width: 100%;
+    }
+    .row {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .row span:first-child {
+      opacity: 0.9;
+    }
+    .hint {
+      margin-top: 8px;
+      font-size: 12px;
+      opacity: 0.85;
+    }
+  </style>
+
+  <script type="importmap">
+  { "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+  } }
+  </script>
+</head>
+<body>
+  <div id="app">
+    <div id="hud">
+      <div class="title">鸭塘水波模拟</div>
+      <div class="row"><span>平均水面高度</span><span id="avgWaterHeight">0.000</span></div>
+      <div class="row"><span>鸭子平均速度</span><span id="avgDuckVelocity">0.000</span></div>
+      <div class="row"><span>波纹计数</span><span id="rippleCount">0</span></div>
+      <div class="row"><span>当前风速</span><span id="windDisplay">0.0 m/s</span></div>
+      <div class="row"><span>模型加载状态</span><span id="loadStatus">加载中...</span></div>
+
+      <div id="controlsPanel">
+        <label for="windSlider">风速 (m/s)</label>
+        <input id="windSlider" type="range" min="0" max="10" step="0.5" value="0" />
+      </div>
+      <div class="hint">点击水面可创建波纹；拖拽可旋转视角。</div>
+    </div>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+    const app = document.getElementById('app');
+
+    window.__3D_STATE__ = {
+      modelLoaded: false,
+      duckCount: 0,
+      avgWaterHeight: 0,
+      avgDuckVelocity: 0,
+      rippleCount: 0,
+      windSpeed: 0,
+      duckPositions: []
+    };
+
+    const avgWaterHeightEl = document.getElementById('avgWaterHeight');
+    const avgDuckVelocityEl = document.getElementById('avgDuckVelocity');
+    const rippleCountEl = document.getElementById('rippleCount');
+    const windDisplayEl = document.getElementById('windDisplay');
+    const loadStatusEl = document.getElementById('loadStatus');
+    const windSlider = document.getElementById('windSlider');
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x87ceeb);
+
+    const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 500);
+    camera.position.set(22, 22, 22);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.shadowMap.enabled = true;
+    app.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.set(0, 0, 0);
+    controls.enableDamping = true;
+    controls.minDistance = 10;
+    controls.maxDistance = 80;
+    controls.maxPolarAngle = Math.PI * 0.495;
+    controls.update();
+
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.7);
+    scene.add(ambientLight);
+
+    const dirLight = new THREE.DirectionalLight(0xffffff, 1.2);
+    dirLight.position.set(20, 30, 10);
+    dirLight.castShadow = true;
+    dirLight.shadow.mapSize.set(2048, 2048);
+    dirLight.shadow.camera.left = -40;
+    dirLight.shadow.camera.right = 40;
+    dirLight.shadow.camera.top = 40;
+    dirLight.shadow.camera.bottom = -40;
+    scene.add(dirLight);
+
+    const pondSize = 20;
+    const waterSegments = 120;
+    const waterGeometry = new THREE.PlaneGeometry(pondSize, pondSize, waterSegments, waterSegments);
+    waterGeometry.rotateX(-Math.PI / 2);
+
+    const waterMaterial = new THREE.MeshPhongMaterial({
+      color: 0x2288cc,
+      transparent: true,
+      opacity: 0.7,
+      shininess: 80,
+      side: THREE.DoubleSide
+    });
+
+    const waterMesh = new THREE.Mesh(waterGeometry, waterMaterial);
+    waterMesh.receiveShadow = true;
+    scene.add(waterMesh);
+
+    const bottomGeometry = new THREE.PlaneGeometry(pondSize + 4, pondSize + 4, 1, 1);
+    bottomGeometry.rotateX(-Math.PI / 2);
+    const bottomMaterial = new THREE.MeshPhongMaterial({
+      color: 0xcdbb7c
+    });
+    const bottomMesh = new THREE.Mesh(bottomGeometry, bottomMaterial);
+    bottomMesh.position.y = -2.2;
+    bottomMesh.receiveShadow = true;
+    scene.add(bottomMesh);
+
+    const bankGeometry = new THREE.RingGeometry(pondSize * 0.65, pondSize * 0.9, 64);
+    bankGeometry.rotateX(-Math.PI / 2);
+    const bankMaterial = new THREE.MeshPhongMaterial({ color: 0x6fa85d });
+    const bank = new THREE.Mesh(bankGeometry, bankMaterial);
+    bank.position.y = -2.15;
+    scene.add(bank);
+
+    const gridSize = waterSegments + 1;
+    const currentHeight = Array.from({ length: gridSize }, () => new Float32Array(gridSize));
+    const previousHeight = Array.from({ length: gridSize }, () => new Float32Array(gridSize));
+    const nextHeight = Array.from({ length: gridSize }, () => new Float32Array(gridSize));
+
+    const positionAttr = waterGeometry.attributes.position;
+    const raycaster = new THREE.Raycaster();
+    const mouse = new THREE.Vector2();
+
+    const windDirection = new THREE.Vector3(1, 0, 0);
+    let windSpeed = parseFloat(windSlider.value) || 0;
+
+    const ducks = [];
+    const loader = new GLTFLoader();
+
+    function rand(min, max) {
+      return min + Math.random() * (max - min);
+    }
+
+    function clamp(v, min, max) {
+      return Math.max(min, Math.min(max, v));
+    }
+
+    function worldToGrid(x, z) {
+      const half = pondSize / 2;
+      const fx = (x + half) / pondSize;
+      const fz = (z + half) / pondSize;
+      const gx = fx * waterSegments;
+      const gz = fz * waterSegments;
+      return { gx, gz };
+    }
+
+    function gridToIndex(i, j) {
+      return j * gridSize + i;
+    }
+
+    function sampleHeight(x, z) {
+      const half = pondSize / 2;
+      const fx = clamp((x + half) / pondSize, 0, 1);
+      const fz = clamp((z + half) / pondSize, 0, 1);
+
+      const gx = fx * waterSegments;
+      const gz = fz * waterSegments;
+
+      const x0 = Math.floor(gx);
+      const z0 = Math.floor(gz);
+      const x1 = Math.min(x0 + 1, waterSegments);
+      const z1 = Math.min(z0 + 1, waterSegments);
+
+      const tx = gx - x0;
+      const tz = gz - z0;
+
+      const h00 = currentHeight[x0][z0];
+      const h10 = currentHeight[x1][z0];
+      const h01 = currentHeight[x0][z1];
+      const h11 = currentHeight[x1][z1];
+
+      const hx0 = h00 * (1 - tx) + h10 * tx;
+      const hx1 = h01 * (1 - tx) + h11 * tx;
+      return hx0 * (1 - tz) + hx1 * tz;
+    }
+
+    function sampleNormal(x, z) {
+      const eps = pondSize / waterSegments;
+      const hL = sampleHeight(x - eps, z);
+      const hR = sampleHeight(x + eps, z);
+      const hD = sampleHeight(x, z - eps);
+      const hU = sampleHeight(x, z + eps);
+
+      const dx = (hR - hL) / (2 * eps);
+      const dz = (hU - hD) / (2 * eps);
+
+      const n = new THREE.Vector3(-dx, 1, -dz).normalize();
+      return n;
+    }
+
+    function addRipple(worldX, worldZ, strength = 1.2, radius = 3) {
+      const { gx, gz } = worldToGrid(worldX, worldZ);
+      const centerX = Math.round(gx);
+      const centerZ = Math.round(gz);
+      const gridRadius = Math.max(1, Math.floor((radius / pondSize) * waterSegments));
+
+      for (let i = centerX - gridRadius; i <= centerX + gridRadius; i++) {
+        if (i < 1 || i >= waterSegments) continue;
+        for (let j = centerZ - gridRadius; j <= centerZ + gridRadius; j++) {
+          if (j < 1 || j >= waterSegments) continue;
+          const dx = i - centerX;
+          const dz = j - centerZ;
+          const dist = Math.sqrt(dx * dx + dz * dz);
+          if (dist <= gridRadius) {
+            const falloff = Math.cos((dist / gridRadius) * Math.PI) * 0.5 + 0.5;
+            currentHeight[i][j] += strength * falloff;
+          }
+        }
+      }
+
+      window.__3D_STATE__.rippleCount++;
+    }
+
+    function updateWaterSimulation() {
+      const damping = 0.992;
+      const waveStrength = 0.16;
+      const windBias = windSpeed * 0.015;
+
+      for (let i = 1; i < waterSegments; i++) {
+        for (let j = 1; j < waterSegments; j++) {
+          const center = currentHeight[i][j];
+          const prev = previousHeight[i][j];
+
+          const laplacian =
+            currentHeight[i - 1][j] +
+            currentHeight[i + 1][j] +
+            currentHeight[i][j - 1] +
+            currentHeight[i][j + 1] -
+            4 * center;
+
+          const windLap =
+            currentHeight[Math.min(i + 1, waterSegments)][j] - center;
+
+          let value = 2 * center - prev + waveStrength * laplacian;
+          value += windBias * windLap;
+          value *= damping;
+
+          nextHeight[i][j] = value;
+        }
+      }
+
+      for (let i = 0; i < gridSize; i++) {
+        nextHeight[i][0] = 0;
+        nextHeight[i][waterSegments] = 0;
+        nextHeight[0][i] = 0;
+        nextHeight[waterSegments][i] = 0;
+      }
+
+      for (let i = 0; i < gridSize; i++) {
+        for (let j = 0; j < gridSize; j++) {
+          previousHeight[i][j] = currentHeight[i][j];
+          currentHeight[i][j] = nextHeight[i][j];
+        }
+      }
+    }
+
+    function applyWaterToMesh() {
+      for (let j = 0; j < gridSize; j++) {
+        for (let i = 0; i < gridSize; i++) {
+          const index = gridToIndex(i, j);
+          positionAttr.setY(index, currentHeight[i][j]);
+        }
+      }
+      positionAttr.needsUpdate = true;
+      waterGeometry.computeVertexNormals();
+    }
+
+    function createFallbackDuck() {
+      const group = new THREE.Group();
+
+      const bodyMat = new THREE.MeshStandardMaterial({ color: 0xffe08a });
+      const beakMat = new THREE.MeshStandardMaterial({ color: 0xff9933 });
+      const eyeMat = new THREE.MeshStandardMaterial({ color: 0x111111 });
+
+      const body = new THREE.Mesh(new THREE.SphereGeometry(0.45, 24, 18), bodyMat);
+      body.scale.set(1.2, 0.9, 1.6);
+      body.castShadow = true;
+      group.add(body);
+
+      const head = new THREE.Mesh(new THREE.SphereGeometry(0.24, 20, 16), bodyMat);
+      head.position.set(0.35, 0.35, 0);
+      head.castShadow = true;
+      group.add(head);
+
+      const beak = new THREE.Mesh(new THREE.ConeGeometry(0.08, 0.22, 12), beakMat);
+      beak.rotation.z = -Math.PI / 2;
+      beak.position.set(0.58, 0.32, 0);
+      beak.castShadow = true;
+      group.add(beak);
+
+      const eye1 = new THREE.Mesh(new THREE.SphereGeometry(0.025, 8, 8), eyeMat);
+      eye1.position.set(0.44, 0.4, 0.09);
+      group.add(eye1);
+
+      const eye2 = eye1.clone();
+      eye2.position.z = -0.09;
+      group.add(eye2);
+
+      return group;
+    }
+
+    function placeDuck(duck, x, z) {
+      duck.position.x = x;
+      duck.position.z = z;
+      duck.position.y = sampleHeight(x, z) + 0.15;
+    }
+
+    function createDuckInstances(source) {
+      const duckAreaHalf = 10;
+      for (let i = 0; i < 10; i++) {
+        const duck = source.clone(true);
+        duck.traverse(obj => {
+          if (obj.isMesh) {
+            obj.castShadow = true;
+            obj.receiveShadow = true;
+          }
+        });
+
+        duck.scale.setScalar(0.9);
+        const x = rand(-duckAreaHalf, duckAreaHalf);
+        const z = rand(-duckAreaHalf, duckAreaHalf);
+        placeDuck(duck, x, z);
+        duck.rotation.y = rand(0, Math.PI * 2);
+
+        duck.userData.prevPosition = new THREE.Vector3(duck.position.x, duck.position.y, duck.position.z);
+        duck.userData.velocity = 0;
+
+        ducks.push(duck);
+        scene.add(duck);
+      }
+
+      window.__3D_STATE__.duckCount = ducks.length;
+      window.__3D_STATE__.modelLoaded = true;
+      loadStatusEl.textContent = '已加载';
+    }
+
+    loader.load(
+      'assets/Duck.glb',
+      (gltf) => {
+        const source = gltf.scene;
+        source.updateMatrixWorld(true);
+
+        const box = new THREE.Box3().setFromObject(source);
+        const size = new THREE.Vector3();
+        box.getSize(size);
+        const maxDim = Math.max(size.x, size.y, size.z) || 1;
+        const scale = 1.2 / maxDim;
+        source.scale.setScalar(scale);
+
+        const centered = new THREE.Group();
+        centered.add(source);
+        source.position.y -= box.min.y * scale;
+        createDuckInstances(centered);
+      },
+      undefined,
+      () => {
+        const fallback = createFallbackDuck();
+        createDuckInstances(fallback);
+      }
+    );
+
+    function updateDucks(delta) {
+      let sumHeight = 0;
+      let sumVelocity = 0;
+      const positions = [];
+      const boundary = pondSize * 0.5 - 0.7;
+      const driftSpeed = windSpeed * 0.12;
+
+      for (const duck of ducks) {
+        const prev = duck.userData.prevPosition;
+
+        if (driftSpeed > 0) {
+          const nextX = duck.position.x + driftSpeed * delta * windDirection.x;
+          if (nextX < boundary) {
+            duck.position.x = nextX;
+          } else {
+            duck.position.x = boundary;
+          }
+        }
+
+        duck.position.z = clamp(duck.position.z, -boundary, boundary);
+
+        const h = sampleHeight(duck.position.x, duck.position.z);
+        duck.position.y = h + 0.15;
+
+        const normal = sampleNormal(duck.position.x, duck.position.z);
+        const tiltX = Math.atan2(normal.z, normal.y) * 0.35;
+        const tiltZ = -Math.atan2(normal.x, normal.y) * 0.35;
+        duck.rotation.x = tiltX;
+        duck.rotation.z = tiltZ;
+
+        if (windSpeed > 0.01) {
+          duck.rotation.y = 0;
+        }
+
+        const dist = duck.position.distanceTo(prev);
+        duck.userData.velocity = dist / Math.max(delta, 1e-5);
+        prev.copy(duck.position);
+
+        sumHeight += h;
+        sumVelocity += duck.userData.velocity;
+        positions.push({
+          x: Number(duck.position.x.toFixed(3)),
+          y: Number(duck.position.y.toFixed(3)),
+          z: Number(duck.position.z.toFixed(3))
+        });
+      }
+
+      const avgHeight = ducks.length ? sumHeight / ducks.length : 0;
+      const avgVelocity = ducks.length ? sumVelocity / ducks.length : 0;
+
+      window.__3D_STATE__.avgWaterHeight = avgHeight;
+      window.__3D_STATE__.avgDuckVelocity = avgVelocity;
+      window.__3D_STATE__.duckPositions = positions;
+
+      avgWaterHeightEl.textContent = avgHeight.toFixed(3);
+      avgDuckVelocityEl.textContent = avgVelocity.toFixed(3);
+    }
+
+    function updateHUDAndState() {
+      window.__3D_STATE__.windSpeed = windSpeed;
+      rippleCountEl.textContent = String(window.__3D_STATE__.rippleCount);
+      windDisplayEl.textContent = `${windSpeed.toFixed(1)} m/s`;
+      loadStatusEl.textContent = window.__3D_STATE__.modelLoaded ? '已加载' : '加载中...';
+    }
+
+    renderer.domElement.addEventListener('pointerdown', (event) => {
+      const rect = renderer.domElement.getBoundingClientRect();
+      mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+      mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+
+      raycaster.setFromCamera(mouse, camera);
+      const intersects = raycaster.intersectObject(waterMesh, false);
+      if (intersects.length > 0) {
+        const p = intersects[0].point;
+        addRipple(p.x, p.z, 1.4 + windSpeed * 0.05, 2.5);
+      }
+    });
+
+    windSlider.addEventListener('input', () => {
+      windSpeed = parseFloat(windSlider.value) || 0;
+      window.__3D_STATE__.windSpeed = windSpeed;
+      windDisplayEl.textContent = `${windSpeed.toFixed(1)} m/s`;
+    });
+
+    addRipple(-4, -2, 0.8, 2.0);
+    addRipple(3, 4, 0.7, 2.2);
+
+    const clock = new THREE.Clock();
+    let ambientRippleTimer = 0;
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      const delta = Math.min(clock.getDelta(), 0.033);
+      ambientRippleTimer += delta;
+
+      if (ambientRippleTimer > 2.5) {
+        ambientRippleTimer = 0;
+        addRipple(rand(-7, 7), rand(-7, 7), 0.4, 1.8);
+      }
+
+      updateWaterSimulation();
+      applyWaterToMesh();
+      updateDucks(delta);
+      updateHUDAndState();
+
+      controls.update();
+      renderer.render(scene, camera);
+    }
+
+    animate();
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+  </script>
+</body>
+</html>

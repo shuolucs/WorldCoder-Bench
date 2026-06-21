@@ -1,0 +1,921 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3D Chess Game</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { overflow: hidden; background: #1a1a2e; font-family: 'Segoe UI', Arial, sans-serif; }
+  canvas { display: block; }
+  #hud {
+    position: absolute; top: 20px; left: 20px;
+    background: rgba(0,0,0,0.75); color: #fff;
+    padding: 18px 24px; border-radius: 12px;
+    font-size: 15px; line-height: 2;
+    backdrop-filter: blur(10px);
+    border: 1px solid rgba(255,255,255,0.1);
+    min-width: 220px;
+    z-index: 10;
+  }
+  #hud .label { color: #aaa; font-size: 13px; }
+  #hud .value { color: #fff; font-weight: bold; }
+  #hud .turn-white { color: #f0e68c; }
+  #hud .turn-black { color: #dda0dd; }
+  #loading {
+    position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%);
+    color: #fff; font-size: 24px; z-index: 100;
+    background: rgba(0,0,0,0.8); padding: 30px 50px; border-radius: 16px;
+    text-align: center;
+  }
+  #loading .spinner {
+    border: 4px solid rgba(255,255,255,0.2);
+    border-top: 4px solid #fff;
+    border-radius: 50%; width: 40px; height: 40px;
+    animation: spin 1s linear infinite;
+    margin: 0 auto 15px;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+<script type="importmap">
+{ "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="loading"><div class="spinner"></div>Loading Chess Game...</div>
+<div id="hud">
+  <div><span class="label">Turn: </span><span id="currentTurn" class="value turn-white">白方</span></div>
+  <div><span class="label">Moves: </span><span id="moveCount" class="value">0</span></div>
+  <div><span class="label">Captured: </span><span id="capturedCount" class="value">0</span></div>
+  <div><span class="label">Selected: </span><span id="selectedPiece" class="value">—</span></div>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// ─── Global State ───
+window.__3D_STATE__ = {
+  modelLoaded: false,
+  currentTurn: "white",
+  moveCount: 0,
+  capturedCount: 0,
+  selectedPiece: "",
+  boardState: Array.from({length:8}, () => Array(8).fill(""))
+};
+
+// ─── Scene Setup ───
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x1a1a2e);
+scene.fog = new THREE.FogExp2(0x1a1a2e, 0.015);
+
+const camera = new THREE.PerspectiveCamera(45, window.innerWidth/window.innerHeight, 0.1, 1000);
+camera.position.set(0, 12, 12);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.2;
+document.body.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+controls.minDistance = 5;
+controls.maxDistance = 30;
+controls.maxPolarAngle = Math.PI / 2.1;
+controls.target.set(0, 0, 0);
+
+// ─── Lighting ───
+const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
+scene.add(ambientLight);
+
+const dirLight = new THREE.DirectionalLight(0xffffff, 1.5);
+dirLight.position.set(8, 15, 8);
+dirLight.castShadow = true;
+dirLight.shadow.mapSize.set(2048, 2048);
+dirLight.shadow.camera.near = 0.5;
+dirLight.shadow.camera.far = 50;
+dirLight.shadow.camera.left = -15;
+dirLight.shadow.camera.right = 15;
+dirLight.shadow.camera.top = 15;
+dirLight.shadow.camera.bottom = -15;
+scene.add(dirLight);
+
+const fillLight = new THREE.DirectionalLight(0x8888ff, 0.3);
+fillLight.position.set(-5, 8, -5);
+scene.add(fillLight);
+
+const pointLight = new THREE.PointLight(0xffa500, 0.5, 30);
+pointLight.position.set(0, 10, 0);
+scene.add(pointLight);
+
+// ─── Chess Logic ───
+let currentTurn = "white";
+let moveCount = 0;
+let capturedCount = 0;
+let selectedPieceObj = null;
+let selectedBoardPos = null;
+let highlightSquares = [];
+let boardPieces = Array.from({length:8}, () => Array(8).fill(null));
+
+// Board geometry info - will be computed from model
+let boardCenter = new THREE.Vector3(0, 0, 0);
+let squareSize = 1;
+let boardOrigin = new THREE.Vector3(0, 0, 0); // corner a1
+
+const chessPieces = []; // {mesh, color, type, row, col}
+let boardMeshes = [];
+
+const raycaster = new THREE.Raycaster();
+const mouse = new THREE.Vector2();
+
+// ─── Piece type detection from name ───
+function detectPieceType(name) {
+  const n = name.toLowerCase();
+  if (n.includes('king')) return 'K';
+  if (n.includes('queen')) return 'Q';
+  if (n.includes('bishop')) return 'B';
+  if (n.includes('knight') || n.includes('horse')) return 'N';
+  if (n.includes('rook') || n.includes('castle') || n.includes('tower')) return 'R';
+  if (n.includes('pawn')) return 'P';
+  return '?';
+}
+
+function detectPieceColor(mesh) {
+  // Try name first
+  const n = mesh.name.toLowerCase();
+  if (n.includes('white') || n.startsWith('w_') || n.startsWith('w ')) return 'white';
+  if (n.includes('black') || n.startsWith('b_') || n.startsWith('b ')) return 'black';
+
+  // Try material color - lighter pieces are white
+  let totalBrightness = 0;
+  let count = 0;
+  mesh.traverse(child => {
+    if (child.isMesh && child.material) {
+      const mat = Array.isArray(child.material) ? child.material[0] : child.material;
+      if (mat.color) {
+        const c = mat.color;
+        totalBrightness += (c.r + c.g + c.b) / 3;
+        count++;
+      }
+    }
+  });
+  if (count > 0) {
+    return (totalBrightness / count) > 0.35 ? 'white' : 'black';
+  }
+  return 'white';
+}
+
+// ─── Board coordinate mapping ───
+function worldToBoard(worldPos) {
+  const relX = (worldPos.x - boardOrigin.x) / squareSize;
+  const relZ = (worldPos.z - boardOrigin.z) / squareSize;
+  const col = Math.round(relX);
+  const row = Math.round(relZ);
+  if (col >= 0 && col < 8 && row >= 0 && row < 8) {
+    return { row, col };
+  }
+  return null;
+}
+
+function boardToWorld(row, col, y) {
+  return new THREE.Vector3(
+    boardOrigin.x + col * squareSize,
+    y !== undefined ? y : 0,
+    boardOrigin.z + row * squareSize
+  );
+}
+
+// ─── Highlight squares ───
+function clearHighlights() {
+  highlightSquares.forEach(sq => scene.remove(sq));
+  highlightSquares = [];
+}
+
+function showMoveHighlights(piece) {
+  clearHighlights();
+  const moves = getValidMoves(piece);
+  moves.forEach(({row, col}) => {
+    const geo = new THREE.BoxGeometry(squareSize * 0.9, 0.05, squareSize * 0.9);
+    const mat = new THREE.MeshBasicMaterial({
+      color: boardPieces[row][col] ? 0xff4444 : 0x44ff44,
+      transparent: true,
+      opacity: 0.5,
+      depthWrite: false
+    });
+    const sq = new THREE.Mesh(geo, mat);
+    const pos = boardToWorld(row, col, piece.mesh.position.y - 0.1);
+    sq.position.copy(pos);
+    sq.position.y = 0.15;
+    sq.userData.isHighlight = true;
+    sq.userData.row = row;
+    sq.userData.col = col;
+    scene.add(sq);
+    highlightSquares.push(sq);
+  });
+}
+
+// ─── Simple move validation ───
+function getValidMoves(piece) {
+  const moves = [];
+  const {row, col, type, color} = piece;
+  const dir = color === 'white' ? -1 : 1; // white moves in -z direction typically
+
+  function inBounds(r, c) { return r >= 0 && r < 8 && c >= 0 && c < 8; }
+  function isEmpty(r, c) { return !boardPieces[r][c]; }
+  function isEnemy(r, c) { return boardPieces[r][c] && boardPieces[r][c].color !== color; }
+  function canMoveTo(r, c) {
+    if (!inBounds(r, c)) return false;
+    if (boardPieces[r][c] && boardPieces[r][c].color === color) return false;
+    return true;
+  }
+
+  function addLineMoves(dr, dc) {
+    for (let i = 1; i < 8; i++) {
+      const nr = row + dr * i, nc = col + dc * i;
+      if (!inBounds(nr, nc)) break;
+      if (boardPieces[nr][nc]) {
+        if (isEnemy(nr, nc)) moves.push({row: nr, col: nc});
+        break;
+      }
+      moves.push({row: nr, col: nc});
+    }
+  }
+
+  switch(type) {
+    case 'P': { // Pawn
+      const nr = row + dir;
+      if (inBounds(nr, col) && isEmpty(nr, col)) {
+        moves.push({row: nr, col});
+        // Double move from starting position
+        const startRow = color === 'white' ? 6 : 1;
+        const nr2 = row + dir * 2;
+        if (row === startRow && inBounds(nr2, col) && isEmpty(nr2, col)) {
+          moves.push({row: nr2, col});
+        }
+      }
+      // Captures
+      [-1, 1].forEach(dc => {
+        const nc = col + dc;
+        if (inBounds(nr, nc) && isEnemy(nr, nc)) {
+          moves.push({row: nr, col: nc});
+        }
+      });
+      break;
+    }
+    case 'R': // Rook
+      addLineMoves(1, 0); addLineMoves(-1, 0);
+      addLineMoves(0, 1); addLineMoves(0, -1);
+      break;
+    case 'B': // Bishop
+      addLineMoves(1, 1); addLineMoves(1, -1);
+      addLineMoves(-1, 1); addLineMoves(-1, -1);
+      break;
+    case 'Q': // Queen
+      addLineMoves(1, 0); addLineMoves(-1, 0);
+      addLineMoves(0, 1); addLineMoves(0, -1);
+      addLineMoves(1, 1); addLineMoves(1, -1);
+      addLineMoves(-1, 1); addLineMoves(-1, -1);
+      break;
+    case 'N': // Knight
+      [[-2,-1],[-2,1],[-1,-2],[-1,2],[1,-2],[1,2],[2,-1],[2,1]].forEach(([dr,dc]) => {
+        if (canMoveTo(row+dr, col+dc)) moves.push({row: row+dr, col: col+dc});
+      });
+      break;
+    case 'K': // King
+      for (let dr = -1; dr <= 1; dr++) {
+        for (let dc = -1; dc <= 1; dc++) {
+          if (dr === 0 && dc === 0) continue;
+          if (canMoveTo(row+dr, col+dc)) moves.push({row: row+dr, col: col+dc});
+        }
+      }
+      break;
+    default: // Unknown piece - allow any empty/enemy square adjacent
+      for (let dr = -1; dr <= 1; dr++) {
+        for (let dc = -1; dc <= 1; dc++) {
+          if (dr === 0 && dc === 0) continue;
+          if (canMoveTo(row+dr, col+dc)) moves.push({row: row+dr, col: col+dc});
+        }
+      }
+  }
+  return moves;
+}
+
+// ─── Selection & Move ───
+function setEmissive(obj, color) {
+  obj.traverse(child => {
+    if (child.isMesh && child.material) {
+      const mats = Array.isArray(child.material) ? child.material : [child.material];
+      mats.forEach(m => {
+        if (!m._origEmissive) m._origEmissive = m.emissive ? m.emissive.clone() : new THREE.Color(0);
+        if (color === null) {
+          m.emissive.copy(m._origEmissive);
+        } else {
+          m.emissive.set(color);
+          m.emissiveIntensity = 0.6;
+        }
+      });
+    }
+  });
+}
+
+function selectPiece(piece) {
+  if (selectedPieceObj) {
+    setEmissive(selectedPieceObj.mesh, null);
+  }
+  selectedPieceObj = piece;
+  if (piece) {
+    setEmissive(piece.mesh, 0xffff00);
+    showMoveHighlights(piece);
+    window.__3D_STATE__.selectedPiece = piece.type + '_' + piece.color;
+    document.getElementById('selectedPiece').textContent = `${piece.color} ${piece.type}`;
+  } else {
+    clearHighlights();
+    window.__3D_STATE__.selectedPiece = "";
+    document.getElementById('selectedPiece').textContent = "—";
+  }
+}
+
+// Smooth animation
+const animations = [];
+function animateMove(mesh, targetPos, onComplete) {
+  const startPos = mesh.position.clone();
+  const duration = 500;
+  const startTime = performance.now();
+  const peakY = Math.max(startPos.y, targetPos.y) + 1.0;
+
+  animations.push({
+    update(now) {
+      const t = Math.min((now - startTime) / duration, 1);
+      const ease = t < 0.5 ? 2*t*t : -1+(4-2*t)*t;
+      mesh.position.lerpVectors(startPos, targetPos, ease);
+      // Arc
+      const arc = Math.sin(t * Math.PI);
+      mesh.position.y += arc * 0.8;
+      if (t >= 1) {
+        mesh.position.copy(targetPos);
+        if (onComplete) onComplete();
+        return true; // done
+      }
+      return false;
+    }
+  });
+}
+
+function movePiece(piece, targetRow, targetCol) {
+  const validMoves = getValidMoves(piece);
+  const isValid = validMoves.some(m => m.row === targetRow && m.col === targetCol);
+  if (!isValid) return false;
+
+  // Capture
+  const targetPiece = boardPieces[targetRow][targetCol];
+  if (targetPiece && targetPiece.color !== piece.color) {
+    scene.remove(targetPiece.mesh);
+    const idx = chessPieces.indexOf(targetPiece);
+    if (idx >= 0) chessPieces.splice(idx, 1);
+    capturedCount++;
+  }
+
+  // Update board
+  boardPieces[piece.row][piece.col] = null;
+  boardPieces[targetRow][targetCol] = piece;
+
+  const targetWorld = boardToWorld(targetRow, targetCol, piece.mesh.position.y);
+
+  // Animate
+  animateMove(piece.mesh, targetWorld, () => {
+    piece.row = targetRow;
+    piece.col = targetCol;
+  });
+
+  // Deselect
+  setEmissive(piece.mesh, null);
+  selectedPieceObj = null;
+  clearHighlights();
+
+  // Switch turn
+  moveCount++;
+  currentTurn = currentTurn === 'white' ? 'black' : 'white';
+
+  updateHUD();
+  return true;
+}
+
+function updateHUD() {
+  document.getElementById('currentTurn').textContent = currentTurn === 'white' ? '白方' : '黑方';
+  document.getElementById('currentTurn').className = 'value ' + (currentTurn === 'white' ? 'turn-white' : 'turn-black');
+  document.getElementById('moveCount').textContent = moveCount;
+  document.getElementById('capturedCount').textContent = capturedCount;
+  if (!selectedPieceObj) document.getElementById('selectedPiece').textContent = '—';
+
+  window.__3D_STATE__.currentTurn = currentTurn;
+  window.__3D_STATE__.moveCount = moveCount;
+  window.__3D_STATE__.capturedCount = capturedCount;
+
+  // Update board state
+  const bs = Array.from({length:8}, () => Array(8).fill(""));
+  for (let r = 0; r < 8; r++) {
+    for (let c = 0; c < 8; c++) {
+      if (boardPieces[r][c]) {
+        const p = boardPieces[r][c];
+        bs[r][c] = (p.color === 'white' ? 'w' : 'b') + p.type;
+      }
+    }
+  }
+  window.__3D_STATE__.boardState = bs;
+}
+
+// ─── Click handler ───
+renderer.domElement.addEventListener('click', (event) => {
+  mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+  mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+  raycaster.setFromCamera(mouse, camera);
+
+  // Check highlight squares first
+  if (selectedPieceObj && highlightSquares.length > 0) {
+    const hIntersects = raycaster.intersectObjects(highlightSquares);
+    if (hIntersects.length > 0) {
+      const sq = hIntersects[0].object;
+      movePiece(selectedPieceObj, sq.userData.row, sq.userData.col);
+      return;
+    }
+  }
+
+  // Check pieces
+  const allMeshes = [];
+  chessPieces.forEach(p => {
+    p.mesh.traverse(child => {
+      if (child.isMesh) {
+        child.userData.pieceRef = p;
+        allMeshes.push(child);
+      }
+    });
+  });
+
+  const intersects = raycaster.intersectObjects(allMeshes);
+  if (intersects.length > 0) {
+    const piece = intersects[0].object.userData.pieceRef;
+    if (piece) {
+      if (selectedPieceObj && selectedPieceObj !== piece && piece.color !== currentTurn) {
+        // Try to capture by clicking on enemy piece directly
+        const targetRow = piece.row;
+        const targetCol = piece.col;
+        movePiece(selectedPieceObj, targetRow, targetCol);
+        return;
+      }
+      if (piece.color === currentTurn) {
+        if (selectedPieceObj === piece) {
+          selectPiece(null);
+        } else {
+          selectPiece(piece);
+        }
+      }
+    }
+  } else {
+    // Clicked empty space
+    if (selectedPieceObj) {
+      selectPiece(null);
+    }
+  }
+});
+
+// ─── Load Model ───
+const loader = new GLTFLoader();
+loader.load('assets/ABeautifulGame.glb', (gltf) => {
+  const model = gltf.scene;
+
+  // Compute bounding box
+  const box = new THREE.Box3().setFromObject(model);
+  const center = box.getCenter(new THREE.Vector3());
+  const size = box.getSize(new THREE.Vector3());
+
+  // Center model
+  model.position.sub(center);
+  model.position.y -= box.min.y - center.y; // Place on ground
+
+  scene.add(model);
+
+  // Enable shadows
+  model.traverse(child => {
+    if (child.isMesh) {
+      child.castShadow = true;
+      child.receiveShadow = true;
+    }
+  });
+
+  // Analyze model structure
+  console.log("Model loaded. Analyzing structure...");
+  const topLevelChildren = [];
+  model.traverse(child => {
+    if (child.name) {
+      console.log(`  Name: "${child.name}", type: ${child.type}, pos: ${child.position.x.toFixed(2)}, ${child.position.y.toFixed(2)}, ${child.position.z.toFixed(2)}`);
+    }
+  });
+
+  // Collect all named objects that could be pieces
+  const potentialPieces = [];
+  const boardObj = [];
+
+  model.traverse(child => {
+    const n = child.name.toLowerCase();
+    const isPiece = n.includes('pawn') || n.includes('rook') || n.includes('knight') ||
+                    n.includes('bishop') || n.includes('queen') || n.includes('king') ||
+                    n.includes('horse') || n.includes('castle') || n.includes('tower');
+    if (isPiece) {
+      potentialPieces.push(child);
+    }
+    if (n.includes('board') || n.includes('plane') || n.includes('ground')) {
+      boardObj.push(child);
+    }
+  });
+
+  // If no named pieces found, try to identify by hierarchy
+  if (potentialPieces.length === 0) {
+    // Collect all top-level groups/meshes that aren't the board
+    model.children.forEach(child => {
+      // Check if it's a piece-like object (small, above the board)
+      const childBox = new THREE.Box3().setFromObject(child);
+      const childSize = childBox.getSize(new THREE.Vector3());
+      const childCenter = childBox.getCenter(new THREE.Vector3());
+
+      if (childSize.y > 0.1 && childSize.x < size.x * 0.3) {
+        potentialPieces.push(child);
+      }
+    });
+  }
+
+  console.log(`Found ${potentialPieces.length} potential pieces`);
+
+  // Determine board dimensions from model
+  // The board in ABeautifulGame.glb is typically centered
+  // We need to figure out the square size and origin
+
+  // Get all piece world positions
+  const piecePositions = potentialPieces.map(p => {
+    const worldPos = new THREE.Vector3();
+    p.getWorldPosition(worldPos);
+    return { obj: p, pos: worldPos };
+  });
+
+  if (piecePositions.length > 0) {
+    // Find min/max X and Z of pieces to determine board extent
+    let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
+    piecePositions.forEach(({pos}) => {
+      minX = Math.min(minX, pos.x);
+      maxX = Math.max(maxX, pos.x);
+      minZ = Math.min(minZ, pos.z);
+      maxZ = Math.max(maxZ, pos.z);
+    });
+
+    // Estimate square size: pieces span 7 squares in each direction
+    const spanX = maxX - minX;
+    const spanZ = maxZ - minZ;
+    squareSize = Math.max(spanX, spanZ) / 7;
+
+    if (squareSize < 0.01) squareSize = 1; // fallback
+
+    // Board origin is the corner with minimum X and Z (a1)
+    boardOrigin.set(minX, 0, minZ);
+
+    console.log(`Board: origin=(${boardOrigin.x.toFixed(2)}, ${boardOrigin.z.toFixed(2)}), squareSize=${squareSize.toFixed(3)}`);
+
+    // Map pieces to board positions
+    piecePositions.forEach(({obj, pos}) => {
+      const bp = worldToBoard(pos);
+      if (bp) {
+        const type = detectPieceType(obj.name);
+        const color = detectPieceColor(obj);
+
+        const piece = {
+          mesh: obj,
+          color: color,
+          type: type,
+          row: bp.row,
+          col: bp.col,
+          name: obj.name
+        };
+
+        // Avoid duplicates on same square
+        if (!boardPieces[bp.row][bp.col]) {
+          boardPieces[bp.row][bp.col] = piece;
+          chessPieces.push(piece);
+          console.log(`  Piece: ${color} ${type} at (${bp.row},${bp.col}) name="${obj.name}"`);
+        }
+      }
+    });
+  }
+
+  // If we couldn't find pieces from the model, create a fallback board
+  if (chessPieces.length === 0) {
+    console.log("No pieces detected from model names. Creating fallback mapping...");
+    createFallbackBoard(model, size);
+  }
+
+  // If still very few pieces, try harder
+  if (chessPieces.length < 10) {
+    console.log(`Only ${chessPieces.length} pieces found. Trying deeper analysis...`);
+    tryDeeperAnalysis(model, size);
+  }
+
+  document.getElementById('loading').style.display = 'none';
+  window.__3D_STATE__.modelLoaded = true;
+  updateHUD();
+
+}, (progress) => {
+  const pct = progress.total ? Math.round(progress.loaded / progress.total * 100) : '...';
+  document.getElementById('loading').innerHTML = `<div class="spinner"></div>Loading... ${pct}%`;
+}, (error) => {
+  console.error('Error loading model:', error);
+  document.getElementById('loading').innerHTML = 'Failed to load model.<br>Creating virtual board...';
+  setTimeout(() => {
+    createVirtualBoard();
+    document.getElementById('loading').style.display = 'none';
+  }, 1000);
+});
+
+function tryDeeperAnalysis(model, modelSize) {
+  // Clear existing
+  chessPieces.length = 0;
+  boardPieces = Array.from({length:8}, () => Array(8).fill(null));
+
+  // Collect ALL meshes with their world positions
+  const allObjects = [];
+  model.traverse(child => {
+    if (child.isMesh || child.children.length > 0) {
+      const worldPos = new THREE.Vector3();
+      child.getWorldPosition(worldPos);
+      const childBox = new THREE.Box3().setFromObject(child);
+      const childSize = childBox.getSize(new THREE.Vector3());
+      allObjects.push({ obj: child, pos: worldPos, size: childSize, name: child.name });
+    }
+  });
+
+  // Find the board plane (largest flat object)
+  let boardPlane = null;
+  let maxArea = 0;
+  allObjects.forEach(({obj, size, name}) => {
+    const area = size.x * size.z;
+    if (area > maxArea && size.y < size.x * 0.5) {
+      maxArea = area;
+      boardPlane = { obj, size };
+    }
+  });
+
+  // Use model bounding box to estimate board
+  const mBox = new THREE.Box3().setFromObject(model);
+  const mSize = mBox.getSize(new THREE.Vector3());
+  const mCenter = mBox.getCenter(new THREE.Vector3());
+
+  // Assume board is square, use the larger of x/z
+  const boardExtent = Math.max(mSize.x, mSize.z);
+  squareSize = boardExtent / 8;
+  boardOrigin.set(
+    mCenter.x - 3.5 * squareSize,
+    0,
+    mCenter.z - 3.5 * squareSize
+  );
+
+  // Now find piece-like objects: groups at the top level or one level deep
+  const candidates = [];
+  const visited = new Set();
+
+  function collectCandidates(parent, depth) {
+    parent.children.forEach(child => {
+      if (visited.has(child.uuid)) return;
+      const worldPos = new THREE.Vector3();
+      child.getWorldPosition(worldPos);
+      const cBox = new THREE.Box3().setFromObject(child);
+      const cSize = cBox.getSize(new THREE.Vector3());
+
+      // A piece should be taller than wide and not too big
+      const isPieceLike = cSize.y > squareSize * 0.3 &&
+                          cSize.x < squareSize * 1.5 &&
+                          cSize.z < squareSize * 1.5 &&
+                          cSize.x * cSize.z < boardExtent * boardExtent * 0.1;
+
+      if (isPieceLike && child.name) {
+        visited.add(child.uuid);
+        candidates.push({ obj: child, pos: worldPos, size: cSize });
+      } else if (depth < 2) {
+        collectCandidates(child, depth + 1);
+      }
+    });
+  }
+  collectCandidates(model, 0);
+
+  console.log(`Deep analysis found ${candidates.length} candidates`);
+
+  candidates.forEach(({obj, pos, size}) => {
+    const bp = worldToBoard(pos);
+    if (bp && !boardPieces[bp.row][bp.col]) {
+      const type = detectPieceType(obj.name);
+      const color = detectPieceColor(obj);
+
+      const piece = {
+        mesh: obj,
+        color: color,
+        type: type,
+        row: bp.row,
+        col: bp.col,
+        name: obj.name
+      };
+      boardPieces[bp.row][bp.col] = piece;
+      chessPieces.push(piece);
+    }
+  });
+
+  console.log(`After deep analysis: ${chessPieces.length} pieces mapped`);
+}
+
+function createFallbackBoard(model, modelSize) {
+  // Use model bounds to create board mapping
+  const mBox = new THREE.Box3().setFromObject(model);
+  const mCenter = mBox.getCenter(new THREE.Vector3());
+  const mSize = mBox.getSize(new THREE.Vector3());
+
+  const boardExtent = Math.max(mSize.x, mSize.z);
+  squareSize = boardExtent / 8;
+  boardOrigin.set(
+    mCenter.x - 3.5 * squareSize,
+    0,
+    mCenter.z - 3.5 * squareSize
+  );
+
+  // Try to map any child objects
+  model.children.forEach(child => {
+    const worldPos = new THREE.Vector3();
+    child.getWorldPosition(worldPos);
+    const bp = worldToBoard(worldPos);
+    if (bp && !boardPieces[bp.row][bp.col]) {
+      const type = detectPieceType(child.name);
+      const color = detectPieceColor(child);
+      const piece = {
+        mesh: child,
+        color: color,
+        type: type,
+        row: bp.row,
+        col: bp.col,
+        name: child.name
+      };
+      boardPieces[bp.row][bp.col] = piece;
+      chessPieces.push(piece);
+    }
+  });
+}
+
+function createVirtualBoard() {
+  // Create a simple virtual chess board and pieces
+  squareSize = 1;
+  boardOrigin.set(-3.5, 0, -3.5);
+
+  // Board
+  for (let r = 0; r < 8; r++) {
+    for (let c = 0; c < 8; c++) {
+      const geo = new THREE.BoxGeometry(0.95, 0.1, 0.95);
+      const isLight = (r + c) % 2 === 0;
+      const mat = new THREE.MeshStandardMaterial({
+        color: isLight ? 0xf0d9b5 : 0xb58863,
+        roughness: 0.8
+      });
+      const sq = new THREE.Mesh(geo, mat);
+      sq.position.copy(boardToWorld(r, c, 0));
+      sq.receiveShadow = true;
+      scene.add(sq);
+    }
+  }
+
+  // Piece setup
+  const setup = [
+    ['R','N','B','Q','K','B','N','R'],
+    ['P','P','P','P','P','P','P','P'],
+  ];
+
+  function createPieceMesh(type, color) {
+    let geo;
+    const h = type === 'P' ? 0.5 : type === 'K' ? 1.0 : type === 'Q' ? 0.9 : 0.7;
+    const r = type === 'P' ? 0.2 : type === 'N' ? 0.25 : 0.3;
+    geo = new THREE.CylinderGeometry(r * 0.6, r, h, 16);
+    const mat = new THREE.MeshStandardMaterial({
+      color: color === 'white' ? 0xf5f5dc : 0x2c2c2c,
+      roughness: 0.4,
+      metalness: 0.1
+    });
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.castShadow = true;
+    return mesh;
+  }
+
+  // Place pieces
+  for (let c = 0; c < 8; c++) {
+    // Black back row
+    const bType = setup[0][c];
+    const bMesh = createPieceMesh(bType, 'black');
+    const bPos = boardToWorld(0, c, 0);
+    bPos.y = 0.3;
+    bMesh.position.copy(bPos);
+    bMesh.name = 'black_' + bType + '_' + c;
+    scene.add(bMesh);
+    const bp = { mesh: bMesh, color: 'black', type: bType, row: 0, col: c, name: bMesh.name };
+    boardPieces[0][c] = bp;
+    chessPieces.push(bp);
+
+    // Black pawns
+    const bpMesh = createPieceMesh('P', 'black');
+    const bpPos = boardToWorld(1, c, 0);
+    bpPos.y = 0.25;
+    bpMesh.position.copy(bpPos);
+    bpMesh.name = 'black_P_' + c;
+    scene.add(bpMesh);
+    const bpp = { mesh: bpMesh, color: 'black', type: 'P', row: 1, col: c, name: bpMesh.name };
+    boardPieces[1][c] = bpp;
+    chessPieces.push(bpp);
+
+    // White pawns
+    const wpMesh = createPieceMesh('P', 'white');
+    const wpPos = boardToWorld(6, c, 0);
+    wpPos.y = 0.25;
+    wpMesh.position.copy(wpPos);
+    wpMesh.name = 'white_P_' + c;
+    scene.add(wpMesh);
+    const wpp = { mesh: wpMesh, color: 'white', type: 'P', row: 6, col: c, name: wpMesh.name };
+    boardPieces[6][c] = wpp;
+    chessPieces.push(wpp);
+
+    // White back row
+    const wType = setup[0][c];
+    const wMesh = createPieceMesh(wType, 'white');
+    const wPos = boardToWorld(7, c, 0);
+    wPos.y = 0.3;
+    wMesh.position.copy(wPos);
+    wMesh.name = 'white_' + wType + '_' + c;
+    scene.add(wMesh);
+    const wp = { mesh: wMesh, color: 'white', type: wType, row: 7, col: c, name: wMesh.name };
+    boardPieces[7][c] = wp;
+    chessPieces.push(wp);
+  }
+
+  window.__3D_STATE__.modelLoaded = true;
+  updateHUD();
+}
+
+// ─── Ground plane ───
+const groundGeo = new THREE.PlaneGeometry(50, 50);
+const groundMat = new THREE.MeshStandardMaterial({ color: 0x111122, roughness: 1 });
+const ground = new THREE.Mesh(groundGeo, groundMat);
+ground.rotation.x = -Math.PI / 2;
+ground.position.y = -0.5;
+ground.receiveShadow = true;
+scene.add(ground);
+
+// ─── Animation Loop ───
+function animate(time) {
+  requestAnimationFrame(animate);
+
+  // Update animations
+  for (let i = animations.length - 1; i >= 0; i--) {
+    if (animations[i].update(time)) {
+      animations.splice(i, 1);
+    }
+  }
+
+  // Pulse highlight squares
+  highlightSquares.forEach((sq, idx) => {
+    sq.material.opacity = 0.3 + 0.2 * Math.sin(time * 0.005 + idx);
+  });
+
+  // Pulse selected piece
+  if (selectedPieceObj) {
+    const pulse = 0.3 + 0.3 * Math.sin(time * 0.004);
+    selectedPieceObj.mesh.traverse(child => {
+      if (child.isMesh && child.material) {
+        const mats = Array.isArray(child.material) ? child.material : [child.material];
+        mats.forEach(m => {
+          if (m.emissive) m.emissiveIntensity = pulse;
+        });
+      }
+    });
+  }
+
+  controls.update();
+  renderer.render(scene, camera);
+}
+animate(0);
+
+// ─── Resize ───
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+</script>
+</body>
+</html>

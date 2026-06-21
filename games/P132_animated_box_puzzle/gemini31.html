@@ -1,0 +1,486 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Sliding Puzzle</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #222;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            user-select: none;
+        }
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+        }
+        #hud {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            background: rgba(0, 0, 0, 0.6);
+            color: #fff;
+            padding: 15px 20px;
+            border-radius: 8px;
+            pointer-events: none;
+            font-size: 16px;
+            line-height: 1.5;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+            border: 1px solid rgba(255,255,255,0.1);
+        }
+        #hud span {
+            font-weight: bold;
+            color: #4da6ff;
+        }
+        #shuffleBtn {
+            position: absolute;
+            bottom: 30px;
+            left: 50%;
+            transform: translateX(-50%);
+            padding: 12px 24px;
+            font-size: 18px;
+            font-weight: bold;
+            color: #fff;
+            background: #4da6ff;
+            border: none;
+            border-radius: 25px;
+            cursor: pointer;
+            box-shadow: 0 4px 10px rgba(0,0,0,0.5);
+            transition: background 0.2s, transform 0.1s;
+        }
+        #shuffleBtn:hover {
+            background: #3388dd;
+        }
+        #shuffleBtn:active {
+            transform: translateX(-50%) scale(0.95);
+        }
+    </style>
+    <script type="importmap">
+    { "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+    } }
+    </script>
+</head>
+<body>
+    <div id="hud">
+        Moves: <span id="moves">0</span><br>
+        Solved: <span id="solved">false</span><br>
+        Duck Revealed: <span id="duckRevealed">false</span><br>
+        Time: <span id="elapsed">0</span>s
+    </div>
+    <button id="shuffleBtn">重新打乱</button>
+    <div id="canvas-container"></div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        // --- State ---
+        window.__3D_STATE__ = {
+            modelLoaded: false,
+            moveCount: 0,
+            solved: false,
+            duckRevealed: false,
+            elapsed: 0,
+            emptySlot: { row: 2, col: 2 }
+        };
+
+        let grid = [1, 2, 3, 4, 5, 6, 7, 8, 0];
+        const boxes = {};
+        let emptyIndex = 8;
+        let startTime = Date.now();
+        let isAnimating = false;
+        let duckMesh = null;
+        const mixers = [];
+        const clock = new THREE.Clock();
+        const SPACING = 1.2;
+
+        // --- DOM Elements ---
+        const elMoves = document.getElementById('moves');
+        const elSolved = document.getElementById('solved');
+        const elDuckRevealed = document.getElementById('duckRevealed');
+        const elElapsed = document.getElementById('elapsed');
+        const btnShuffle = document.getElementById('shuffleBtn');
+
+        // --- Scene Setup ---
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x222222);
+
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+        camera.position.set(0, 5, 5);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        renderer.shadowMap.enabled = true;
+        container.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enablePan = false;
+        controls.maxPolarAngle = Math.PI / 2 - 0.1;
+        controls.minDistance = 3;
+        controls.maxDistance = 15;
+
+        // Lights
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+        scene.add(ambientLight);
+        const dirLight = new THREE.DirectionalLight(0xffffff, 1);
+        dirLight.position.set(5, 10, 5);
+        dirLight.castShadow = true;
+        scene.add(dirLight);
+
+        // Base Plane
+        const planeGeo = new THREE.PlaneGeometry(10, 10);
+        const planeMat = new THREE.MeshStandardMaterial({ color: 0x333333, roughness: 0.8 });
+        const plane = new THREE.Mesh(planeGeo, planeMat);
+        plane.rotation.x = -Math.PI / 2;
+        plane.position.y = -0.5;
+        plane.receiveShadow = true;
+        scene.add(plane);
+
+        // --- Simple Tween Engine ---
+        const tweens = [];
+        function tween(obj, targetProps, duration, onComplete) {
+            const startProps = {};
+            for (let k in targetProps) startProps[k] = obj[k];
+            tweens.push({ obj, startProps, targetProps, duration, time: 0, onComplete });
+        }
+        function updateTweens(dt) {
+            for (let i = tweens.length - 1; i >= 0; i--) {
+                const t = tweens[i];
+                t.time += dt;
+                const progress = Math.min(t.time / t.duration, 1);
+                const ease = progress < 0.5 ? 2 * progress * progress : 1 - Math.pow(-2 * progress + 2, 2) / 2;
+                for (let k in t.targetProps) {
+                    t.obj[k] = t.startProps[k] + (t.targetProps[k] - t.startProps[k]) * ease;
+                }
+                if (progress === 1) {
+                    if (t.onComplete) t.onComplete();
+                    tweens.splice(i, 1);
+                }
+            }
+        }
+
+        // --- Utilities ---
+        function getPos(index) {
+            const row = Math.floor(index / 3);
+            const col = index % 3;
+            return new THREE.Vector3((col - 1) * SPACING, 0, (row - 1) * SPACING);
+        }
+
+        function getAdjacent(index) {
+            const row = Math.floor(index / 3);
+            const col = index % 3;
+            const adj = [];
+            if (row > 0) adj.push(index - 3);
+            if (row < 2) adj.push(index + 3);
+            if (col > 0) adj.push(index - 1);
+            if (col < 2) adj.push(index + 1);
+            return adj;
+        }
+
+        function createNumberTexture(num) {
+            const canvas = document.createElement('canvas');
+            canvas.width = 256; canvas.height = 256;
+            const ctx = canvas.getContext('2d');
+            ctx.fillStyle = '#ffffff';
+            ctx.fillRect(0, 0, 256, 256);
+            ctx.fillStyle = '#222222';
+            ctx.fillRect(10, 10, 236, 236);
+            ctx.fillStyle = '#ffffff';
+            ctx.font = 'bold 120px Arial';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(num, 128, 128);
+            return new THREE.CanvasTexture(canvas);
+        }
+
+        // --- Fallback Generators ---
+        function createFallbackBox() {
+            const group = new THREE.Group();
+            const geo = new THREE.BoxGeometry(1, 1, 1);
+            const mat = new THREE.MeshStandardMaterial({ color: 0x888888 });
+            const mesh = new THREE.Mesh(geo, mat);
+            mesh.castShadow = true;
+            mesh.receiveShadow = true;
+            group.add(mesh);
+            return group;
+        }
+
+        function createFallbackDuck() {
+            const group = new THREE.Group();
+            const bodyGeo = new THREE.SphereGeometry(0.3, 16, 16);
+            const bodyMat = new THREE.MeshStandardMaterial({ color: 0xffcc00 });
+            const body = new THREE.Mesh(bodyGeo, bodyMat);
+            body.position.y = 0.3;
+            body.castShadow = true;
+            
+            const beakGeo = new THREE.ConeGeometry(0.1, 0.2, 8);
+            const beakMat = new THREE.MeshStandardMaterial({ color: 0xff6600 });
+            const beak = new THREE.Mesh(beakGeo, beakMat);
+            beak.rotation.x = Math.PI / 2;
+            beak.position.set(0, 0.3, 0.35);
+            
+            group.add(body);
+            group.add(beak);
+            return group;
+        }
+
+        // --- Initialization ---
+        async function init() {
+            const loader = new GLTFLoader();
+            let baseBoxModel, duckModel;
+
+            // Load Box
+            try {
+                const gltf = await loader.loadAsync('assets/BoxAnimated.glb');
+                baseBoxModel = gltf.scene;
+                baseBoxModel.userData.animations = gltf.animations;
+                window.__3D_STATE__.modelLoaded = true;
+            } catch (e) {
+                console.warn("Could not load BoxAnimated.glb, using fallback.");
+                baseBoxModel = createFallbackBox();
+            }
+
+            // Load Duck
+            try {
+                const gltf = await loader.loadAsync('assets/Duck.glb');
+                duckModel = gltf.scene;
+                // Scale duck if it's too big/small depending on the actual GLB
+                duckModel.scale.set(0.5, 0.5, 0.5); 
+            } catch (e) {
+                console.warn("Could not load Duck.glb, using fallback.");
+                duckModel = createFallbackDuck();
+            }
+
+            duckMesh = duckModel;
+            duckMesh.visible = false;
+            scene.add(duckMesh);
+
+            // Create Grid
+            for (let i = 1; i <= 8; i++) {
+                const boxGroup = new THREE.Group();
+                const modelClone = baseBoxModel.clone();
+                boxGroup.add(modelClone);
+
+                // Add Number Plate
+                const numTex = createNumberTexture(i);
+                const numMat = new THREE.MeshBasicMaterial({ map: numTex });
+                const numPlane = new THREE.Mesh(new THREE.PlaneGeometry(0.9, 0.9), numMat);
+                numPlane.rotation.x = -Math.PI / 2;
+                numPlane.position.y = 0.51; // Slightly above the 1x1x1 box
+                boxGroup.add(numPlane);
+
+                // Setup Animation
+                if (baseBoxModel.userData.animations && baseBoxModel.userData.animations.length > 0) {
+                    const mixer = new THREE.AnimationMixer(modelClone);
+                    const action = mixer.clipAction(baseBoxModel.userData.animations[0]);
+                    mixers.push(mixer);
+                    boxGroup.userData.playAnim = (hold = false) => {
+                        action.reset();
+                        action.setLoop(THREE.LoopOnce);
+                        action.clampWhenFinished = true;
+                        action.play();
+                    };
+                } else {
+                    // Fallback animation
+                    boxGroup.userData.playAnim = (hold = false) => {
+                        tween(modelClone.scale, { y: 1.3 }, 0.15, () => {
+                            if (!hold) tween(modelClone.scale, { y: 1 }, 0.15);
+                        });
+                    };
+                }
+
+                boxGroup.userData.id = i;
+                scene.add(boxGroup);
+                boxes[i] = boxGroup;
+            }
+
+            shuffle(true);
+            
+            // Interaction
+            const raycaster = new THREE.Raycaster();
+            const mouse = new THREE.Vector2();
+
+            window.addEventListener('pointerdown', (event) => {
+                if (window.__3D_STATE__.solved || isAnimating) return;
+
+                mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+                mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+                raycaster.setFromCamera(mouse, camera);
+                const intersects = raycaster.intersectObjects(scene.children, true);
+
+                if (intersects.length > 0) {
+                    // Find parent box group
+                    let obj = intersects[0].object;
+                    while (obj && !obj.userData.id) {
+                        obj = obj.parent;
+                    }
+
+                    if (obj && obj.userData.id) {
+                        const boxId = obj.userData.id;
+                        const currentIndex = grid.indexOf(boxId);
+                        const adj = getAdjacent(emptyIndex);
+
+                        if (adj.includes(currentIndex)) {
+                            moveBox(boxId, currentIndex, emptyIndex, true);
+                        }
+                    }
+                }
+            });
+
+            btnShuffle.addEventListener('click', () => shuffle(false));
+            window.addEventListener('resize', onWindowResize);
+            
+            animate();
+        }
+
+        // --- Game Logic ---
+        function moveBox(boxId, fromIndex, toIndex, animateMove) {
+            grid[toIndex] = boxId;
+            grid[fromIndex] = 0;
+            emptyIndex = fromIndex;
+            
+            window.__3D_STATE__.emptySlot = {
+                row: Math.floor(emptyIndex / 3),
+                col: emptyIndex % 3
+            };
+
+            const targetPos = getPos(toIndex);
+            const boxObj = boxes[boxId];
+
+            if (animateMove) {
+                isAnimating = true;
+                window.__3D_STATE__.moveCount++;
+                boxObj.userData.playAnim();
+                
+                tween(boxObj.position, { x: targetPos.x, z: targetPos.z }, 0.3, () => {
+                    isAnimating = false;
+                    checkWin();
+                });
+            } else {
+                boxObj.position.copy(targetPos);
+            }
+        }
+
+        function checkWin() {
+            const winState = [1, 2, 3, 4, 5, 6, 7, 8, 0];
+            let isWin = true;
+            for (let i = 0; i < 9; i++) {
+                if (grid[i] !== winState[i]) {
+                    isWin = false;
+                    break;
+                }
+            }
+
+            if (isWin) {
+                window.__3D_STATE__.solved = true;
+                revealDuck();
+            }
+        }
+
+        function revealDuck() {
+            window.__3D_STATE__.duckRevealed = true;
+            const box5 = boxes[5];
+            
+            // Open box 5 and hold
+            box5.userData.playAnim(true);
+
+            // Position duck inside box 5
+            duckMesh.position.copy(box5.position);
+            duckMesh.position.y = 0;
+            duckMesh.visible = true;
+
+            // Animate duck rising
+            tween(duckMesh.position, { y: 1.5 }, 1.0);
+        }
+
+        function shuffle(initial = false) {
+            window.__3D_STATE__.solved = false;
+            window.__3D_STATE__.duckRevealed = false;
+            window.__3D_STATE__.moveCount = 0;
+            startTime = Date.now();
+            isAnimating = false;
+            
+            if (duckMesh) {
+                duckMesh.visible = false;
+                duckMesh.position.y = 0;
+            }
+
+            // Reset to solved state first
+            grid = [1, 2, 3, 4, 5, 6, 7, 8, 0];
+            emptyIndex = 8;
+
+            // Perform random valid moves
+            const numMoves = Math.floor(Math.random() * 21) + 30; // 30-50 moves
+            let lastMoved = -1;
+
+            for (let i = 0; i < numMoves; i++) {
+                const adj = getAdjacent(emptyIndex);
+                const validAdj = adj.filter(idx => grid[idx] !== lastMoved);
+                const pickIndex = validAdj[Math.floor(Math.random() * validAdj.length)];
+                const boxId = grid[pickIndex];
+                
+                moveBox(boxId, pickIndex, emptyIndex, false);
+                lastMoved = boxId;
+            }
+
+            // Snap all to positions
+            for (let i = 0; i < 9; i++) {
+                if (grid[i] !== 0) {
+                    boxes[grid[i]].position.copy(getPos(i));
+                    // Reset scale/animations if needed
+                    boxes[grid[i]].children[0].scale.set(1,1,1);
+                }
+            }
+            
+            window.__3D_STATE__.emptySlot = {
+                row: Math.floor(emptyIndex / 3),
+                col: emptyIndex % 3
+            };
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        // --- Main Loop ---
+        function animate() {
+            requestAnimationFrame(animate);
+            const dt = clock.getDelta();
+
+            updateTweens(dt);
+            mixers.forEach(m => m.update(dt));
+            controls.update();
+
+            if (window.__3D_STATE__.duckRevealed && duckMesh) {
+                duckMesh.rotation.y += dt * 2;
+            }
+
+            if (!window.__3D_STATE__.solved) {
+                window.__3D_STATE__.elapsed = Math.floor((Date.now() - startTime) / 1000);
+            }
+
+            // Update HUD
+            elMoves.innerText = window.__3D_STATE__.moveCount;
+            elSolved.innerText = window.__3D_STATE__.solved;
+            elDuckRevealed.innerText = window.__3D_STATE__.duckRevealed;
+            elElapsed.innerText = window.__3D_STATE__.elapsed;
+
+            renderer.render(scene, camera);
+        }
+
+        // Start
+        init();
+    </script>
+</body>
+</html>

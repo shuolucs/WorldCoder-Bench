@@ -1,0 +1,488 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3D Kaleidoscope</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { overflow: hidden; background: #000; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+  canvas { display: block; }
+  #hud {
+    position: fixed;
+    top: 0; left: 0; right: 0; bottom: 0;
+    pointer-events: none;
+    z-index: 10;
+  }
+  #hud span {
+    position: absolute;
+    color: #fff;
+    font-size: 18px;
+    text-shadow: 0 0 10px rgba(255,255,255,0.5), 0 0 20px rgba(255,100,200,0.3);
+    padding: 15px 20px;
+  }
+  #score-display { top: 0; left: 0; }
+  #combo-display { top: 0; right: 0; text-align: right; }
+  #segments-display { bottom: 0; left: 0; }
+  #speed-display { bottom: 0; right: 0; text-align: right; }
+  #pause-overlay {
+    position: fixed;
+    top: 0; left: 0; right: 0; bottom: 0;
+    display: none;
+    justify-content: center;
+    align-items: center;
+    z-index: 20;
+    pointer-events: none;
+  }
+  #pause-overlay.active {
+    display: flex;
+  }
+  #pause-overlay span {
+    color: #fff;
+    font-size: 64px;
+    font-weight: bold;
+    text-shadow: 0 0 30px rgba(255,100,200,0.8), 0 0 60px rgba(100,100,255,0.5);
+    letter-spacing: 15px;
+    animation: pulse-text 1.5s ease-in-out infinite;
+  }
+  @keyframes pulse-text {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.6; transform: scale(1.05); }
+  }
+</style>
+</head>
+<body>
+
+<div id="hud">
+  <span id="score-display">Score: 0</span>
+  <span id="combo-display">Combo: 1x</span>
+  <span id="segments-display">Segments: 6</span>
+  <span id="speed-display">Speed: Lv 2</span>
+</div>
+
+<div id="pause-overlay">
+  <span>PAUSED</span>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.163.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.163.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+// --- State ---
+let score = 0;
+let combo = 1;
+let segments = 6;
+let rotationSpeed = 0.5;
+let colorMode = 0;
+let isPaused = false;
+let kaleidoscopeRotation = 0;
+let flamingosLoaded = false;
+let lastClickTime = 0;
+let clickTimestamps = [];
+let pulseRings = [];
+let originalMesh = null;
+
+// --- Scene Setup ---
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+camera.position.set(0, 0, 15);
+camera.lookAt(0, 0, 0);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setClearColor(0x000000);
+document.body.appendChild(renderer.domElement);
+
+// --- Lights ---
+const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+scene.add(ambientLight);
+
+const dirLight1 = new THREE.DirectionalLight(0xffffff, 0.8);
+dirLight1.position.set(5, 10, 5);
+scene.add(dirLight1);
+
+const dirLight2 = new THREE.DirectionalLight(0xff88cc, 0.5);
+dirLight2.position.set(-5, -5, 10);
+scene.add(dirLight2);
+
+// --- Groups ---
+const kaleidoscopeGroup = new THREE.Group();
+scene.add(kaleidoscopeGroup);
+
+const particleGroup = new THREE.Group();
+scene.add(particleGroup);
+
+const pulseRingGroup = new THREE.Group();
+scene.add(pulseRingGroup);
+
+// --- Particles ---
+const particleMaterial = [];
+for (let i = 0; i < 200; i++) {
+  const hue = Math.random();
+  const color = new THREE.Color().setHSL(hue, 0.8, 0.6);
+  const geo = new THREE.SphereGeometry(0.03, 8, 8);
+  const mat = new THREE.MeshBasicMaterial({ color: color });
+  const mesh = new THREE.Mesh(geo, mat);
+  
+  const r = Math.random() * 8;
+  const theta = Math.random() * Math.PI * 2;
+  const phi = Math.acos(2 * Math.random() - 1);
+  mesh.position.set(
+    r * Math.sin(phi) * Math.cos(theta),
+    r * Math.sin(phi) * Math.sin(theta),
+    r * Math.cos(phi)
+  );
+  particleGroup.add(mesh);
+}
+
+// --- Load Flamingo ---
+const loader = new GLTFLoader();
+let flamingoClones = [];
+let originalMaterials = [];
+
+loader.load('https://threejs.org/examples/models/gltf/Flamingo.glb', (gltf) => {
+  let mesh = null;
+  gltf.scene.traverse((child) => {
+    if (child.isMesh && !mesh) {
+      mesh = child;
+    }
+  });
+  
+  if (!mesh) return;
+  
+  originalMesh = mesh;
+  flamingosLoaded = true;
+  
+  // Store original material
+  if (mesh.material) {
+    originalMaterials.push(mesh.material.clone());
+  }
+  
+  buildKaleidoscope();
+}, undefined, (error) => {
+  console.error('Error loading flamingo:', error);
+});
+
+function buildKaleidoscope() {
+  // Clear existing
+  while (kaleidoscopeGroup.children.length > 0) {
+    const child = kaleidoscopeGroup.children[0];
+    kaleidoscopeGroup.remove(child);
+    if (child.geometry) child.geometry.dispose();
+    if (child.material) {
+      if (Array.isArray(child.material)) {
+        child.material.forEach(m => m.dispose());
+      } else {
+        child.material.dispose();
+      }
+    }
+  }
+  flamingoClones = [];
+  
+  if (!originalMesh) return;
+  
+  const N = segments;
+  for (let i = 0; i < N; i++) {
+    const clone = originalMesh.clone();
+    clone.material = originalMesh.material.clone();
+    clone.scale.set(0.02, 0.02, 0.02);
+    
+    const angle = (2 * Math.PI / N) * i;
+    
+    // Create a pivot group for rotation
+    const pivot = new THREE.Group();
+    pivot.rotation.z = angle;
+    pivot.add(clone);
+    
+    // Offset the clone slightly so the kaleidoscope pattern is visible
+    clone.position.set(2, 0, 0);
+    
+    kaleidoscopeGroup.add(pivot);
+    flamingoClones.push({ pivot, mesh: clone, index: i });
+  }
+  
+  applyColorMode();
+}
+
+function applyColorMode() {
+  const N = segments;
+  flamingoClones.forEach(({ mesh, index }) => {
+    if (colorMode === 0) {
+      // Original colors
+      if (originalMesh && originalMesh.material) {
+        mesh.material = originalMesh.material.clone();
+      }
+    } else if (colorMode === 1) {
+      // Rainbow
+      const hue = index / N;
+      const color = new THREE.Color().setHSL(hue, 1.0, 0.5);
+      mesh.material = new THREE.MeshStandardMaterial({
+        color: color,
+        emissive: color,
+        emissiveIntensity: 0.3,
+        metalness: 0.3,
+        roughness: 0.5
+      });
+    } else if (colorMode === 2) {
+      // Monochrome white emissive
+      mesh.material = new THREE.MeshStandardMaterial({
+        color: 0xffffff,
+        emissive: 0xffffff,
+        emissiveIntensity: 0.5,
+        metalness: 0.1,
+        roughness: 0.3
+      });
+    }
+  });
+}
+
+// --- Pulse Rings ---
+function spawnPulseRing() {
+  const geometry = new THREE.TorusGeometry(2, 0.05, 8, 64);
+  const material = new THREE.MeshBasicMaterial({
+    color: new THREE.Color().setHSL(Math.random(), 0.8, 0.6),
+    transparent: true,
+    opacity: 1.0
+  });
+  const ring = new THREE.Mesh(geometry, material);
+  ring.scale.set(0.1, 0.1, 0.1);
+  ring.userData = { age: 0 };
+  pulseRingGroup.add(ring);
+  pulseRings.push(ring);
+}
+
+// --- HUD Update ---
+const scoreDisplay = document.getElementById('score-display');
+const comboDisplay = document.getElementById('combo-display');
+const segmentsDisplay = document.getElementById('segments-display');
+const speedDisplay = document.getElementById('speed-display');
+const pauseOverlay = document.getElementById('pause-overlay');
+
+function updateHUD() {
+  const speedLevel = Math.round(rotationSpeed / 0.25);
+  scoreDisplay.textContent = `Score: ${score}`;
+  comboDisplay.textContent = `Combo: ${combo}x`;
+  segmentsDisplay.textContent = `Segments: ${segments}`;
+  speedDisplay.textContent = `Speed: Lv ${speedLevel}`;
+}
+
+// --- Input Handling ---
+renderer.domElement.addEventListener('click', (e) => {
+  const now = performance.now();
+  lastClickTime = now;
+  
+  // Combo logic
+  clickTimestamps.push(now);
+  // Remove clicks older than 2 seconds
+  clickTimestamps = clickTimestamps.filter(t => now - t <= 2000);
+  
+  if (clickTimestamps.length >= 3) {
+    combo = Math.min(combo + 1, 5);
+    clickTimestamps = [];
+  }
+  
+  // Add score
+  score += 10 * combo;
+  
+  // Spawn pulse ring
+  spawnPulseRing();
+  
+  updateHUD();
+});
+
+// Combo reset check
+let comboCheckInterval = setInterval(() => {
+  const now = performance.now();
+  if (lastClickTime > 0 && now - lastClickTime > 3000) {
+    combo = 1;
+    updateHUD();
+  }
+}, 100);
+
+document.addEventListener('keydown', (e) => {
+  switch (e.code) {
+    case 'ArrowUp':
+      e.preventDefault();
+      rotationSpeed = Math.min(rotationSpeed + 0.25, 3.0);
+      updateHUD();
+      break;
+      
+    case 'ArrowDown':
+      e.preventDefault();
+      rotationSpeed = Math.max(rotationSpeed - 0.25, 0.25);
+      updateHUD();
+      break;
+      
+    case 'ArrowRight':
+      e.preventDefault();
+      if (segments < 16) {
+        segments = Math.min(segments + 2, 16);
+        score += 25;
+        buildKaleidoscope();
+        updateHUD();
+      }
+      break;
+      
+    case 'ArrowLeft':
+      e.preventDefault();
+      if (segments > 2) {
+        segments = Math.max(segments - 2, 2);
+        score += 25;
+        buildKaleidoscope();
+        updateHUD();
+      }
+      break;
+      
+    case 'Space':
+      e.preventDefault();
+      colorMode = (colorMode + 1) % 3;
+      score += 15;
+      applyColorMode();
+      updateHUD();
+      break;
+      
+    case 'KeyR':
+      e.preventDefault();
+      score = 0;
+      combo = 1;
+      segments = 6;
+      rotationSpeed = 0.5;
+      colorMode = 0;
+      isPaused = false;
+      kaleidoscopeRotation = 0;
+      kaleidoscopeGroup.rotation.z = 0;
+      clickTimestamps = [];
+      lastClickTime = 0;
+      pauseOverlay.classList.remove('active');
+      
+      // Remove all pulse rings
+      pulseRings.forEach(ring => {
+        pulseRingGroup.remove(ring);
+        ring.geometry.dispose();
+        ring.material.dispose();
+      });
+      pulseRings = [];
+      
+      buildKaleidoscope();
+      updateHUD();
+      break;
+      
+    case 'KeyP':
+      e.preventDefault();
+      isPaused = !isPaused;
+      if (isPaused) {
+        pauseOverlay.classList.add('active');
+      } else {
+        pauseOverlay.classList.remove('active');
+      }
+      break;
+  }
+});
+
+// --- Window Resize ---
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// --- State ---
+window.__3D_STATE__ = {
+  score: 0,
+  combo: 1,
+  segments: 6,
+  rotationSpeed: 0.5,
+  colorMode: 0,
+  isPaused: false,
+  kaleidoscopeRotation: 0,
+  particleCount: 200,
+  pulseRingCount: 0,
+  speedLevel: 2,
+  flamingosLoaded: false,
+  lastClickTime: 0,
+  cameraZ: 15
+};
+
+// --- Animation Loop ---
+const clock = new THREE.Clock();
+let prevTime = 0;
+
+function animate() {
+  requestAnimationFrame(animate);
+  
+  const elapsed = clock.getElapsedTime();
+  const delta = clock.getDelta();
+  const dt = Math.min(elapsed - prevTime, 0.1);
+  prevTime = elapsed;
+  
+  if (!isPaused) {
+    // Rotate kaleidoscope
+    kaleidoscopeGroup.rotation.z += rotationSpeed * dt;
+    kaleidoscopeRotation = kaleidoscopeGroup.rotation.z;
+    
+    // Oscillate individual clones
+    flamingoClones.forEach(({ mesh, index }) => {
+      const s = 0.02 + 0.005 * Math.sin(elapsed * 2 + index * Math.PI / 3);
+      mesh.scale.set(s, s, s);
+    });
+    
+    // Rotate particles opposite direction
+    particleGroup.rotation.z -= 0.2 * dt;
+    
+    // Update pulse rings
+    for (let i = pulseRings.length - 1; i >= 0; i--) {
+      const ring = pulseRings[i];
+      ring.userData.age += dt;
+      const age = ring.userData.age;
+      
+      const scaleVal = 0.1 + age * 2.0;
+      ring.scale.set(scaleVal, scaleVal, scaleVal);
+      ring.material.opacity = Math.max(0, 1.0 - age * 0.8);
+      ring.rotation.z += dt * 0.5;
+      
+      const currentRadius = 2 * scaleVal;
+      if (currentRadius > 10 || ring.material.opacity < 0.01) {
+        pulseRingGroup.remove(ring);
+        ring.geometry.dispose();
+        ring.material.dispose();
+        pulseRings.splice(i, 1);
+      }
+    }
+  }
+  
+  // Update state
+  const speedLevel = Math.round(rotationSpeed / 0.25);
+  window.__3D_STATE__ = {
+    score: score || 0,
+    combo: combo || 1,
+    segments: segments || 6,
+    rotationSpeed: rotationSpeed || 0.5,
+    colorMode: colorMode || 0,
+    isPaused: isPaused || false,
+    kaleidoscopeRotation: kaleidoscopeRotation || 0,
+    particleCount: 200,
+    pulseRingCount: pulseRings.length || 0,
+    speedLevel: speedLevel || 2,
+    flamingosLoaded: flamingosLoaded || false,
+    lastClickTime: lastClickTime || 0,
+    cameraZ: camera.position.z || 15
+  };
+  
+  renderer.render(scene, camera);
+}
+
+updateHUD();
+animate();
+</script>
+</body>
+</html>

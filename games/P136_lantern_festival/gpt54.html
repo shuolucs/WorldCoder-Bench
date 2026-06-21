@@ -1,0 +1,483 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Three.js 灯笼节场景</title>
+  <style>
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #0a0a2e;
+      font-family: Arial, Helvetica, sans-serif;
+    }
+
+    #app {
+      width: 100%;
+      height: 100%;
+      position: relative;
+    }
+
+    #hud {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      z-index: 10;
+      color: #fff;
+      background: rgba(0, 0, 0, 0.35);
+      padding: 10px 12px;
+      border-radius: 8px;
+      line-height: 1.8;
+      font-size: 14px;
+      user-select: none;
+      min-width: 180px;
+      backdrop-filter: blur(4px);
+    }
+
+    #controls {
+      position: absolute;
+      top: 12px;
+      right: 12px;
+      z-index: 10;
+    }
+
+    #dayNightBtn {
+      border: none;
+      border-radius: 8px;
+      padding: 10px 14px;
+      font-size: 14px;
+      cursor: pointer;
+      color: #fff;
+      background: rgba(30, 30, 30, 0.75);
+      backdrop-filter: blur(4px);
+    }
+
+    #dayNightBtn:hover {
+      background: rgba(60, 60, 60, 0.9);
+    }
+
+    canvas {
+      display: block;
+    }
+  </style>
+
+  <script type="importmap">
+  { "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+  } }
+  </script>
+</head>
+<body>
+  <div id="app">
+    <div id="hud">
+      <div>灯笼总数: <span id="lanternCount">0</span></div>
+      <div>当前时段: <span id="timeOfDay">night</span></div>
+      <div>最后点击的灯笼 ID: <span id="clickedLantern">-1</span></div>
+      <div>灯笼平均高度: <span id="avgHeight">0.0</span></div>
+    </div>
+
+    <div id="controls">
+      <button id="dayNightBtn">昼/夜切换</button>
+    </div>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+    const app = document.getElementById('app');
+    const lanternCountEl = document.getElementById('lanternCount');
+    const timeOfDayEl = document.getElementById('timeOfDay');
+    const clickedLanternEl = document.getElementById('clickedLantern');
+    const avgHeightEl = document.getElementById('avgHeight');
+    const dayNightBtn = document.getElementById('dayNightBtn');
+
+    window.__3D_STATE__ = {
+      modelLoaded: false,
+      lanternCount: 0,
+      timeOfDay: 'night',
+      clickedLanternId: -1,
+      avgHeight: 0,
+      lanternHeights: [],
+      dayNightTransitioning: false
+    };
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0a0a2e);
+
+    const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 200);
+    camera.position.set(0, 10, 28);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    app.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.target.set(0, 8, 0);
+
+    const ground = new THREE.Mesh(
+      new THREE.PlaneGeometry(120, 120),
+      new THREE.MeshStandardMaterial({
+        color: 0x1a1a1a,
+        roughness: 0.95,
+        metalness: 0.05
+      })
+    );
+    ground.rotation.x = -Math.PI / 2;
+    ground.position.y = -0.01;
+    ground.receiveShadow = true;
+    scene.add(ground);
+
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.05);
+    scene.add(ambientLight);
+
+    const directionalLight = new THREE.DirectionalLight(0xffffff, 0);
+    directionalLight.position.set(15, 25, 10);
+    directionalLight.castShadow = true;
+    directionalLight.shadow.mapSize.set(2048, 2048);
+    directionalLight.shadow.camera.left = -40;
+    directionalLight.shadow.camera.right = 40;
+    directionalLight.shadow.camera.top = 40;
+    directionalLight.shadow.camera.bottom = -40;
+    directionalLight.shadow.camera.near = 0.5;
+    directionalLight.shadow.camera.far = 100;
+    scene.add(directionalLight);
+
+    const loader = new GLTFLoader();
+    const raycaster = new THREE.Raycaster();
+    const mouse = new THREE.Vector2();
+    const clock = new THREE.Clock();
+
+    const lanterns = [];
+    const clickableLanternRoots = [];
+    const warmColors = [0xff6600, 0xff3300, 0xffcc00, 0xff9900, 0xff4444];
+
+    let lastClickedLanternId = -1;
+    let isNight = true;
+
+    const transitionState = {
+      active: false,
+      elapsed: 0,
+      duration: 1,
+      from: null,
+      to: null
+    };
+
+    function rand(min, max) {
+      return Math.random() * (max - min) + min;
+    }
+
+    function pickWarmColorDifferent(currentHex = null) {
+      let candidates = warmColors;
+      if (currentHex !== null) {
+        candidates = warmColors.filter(c => c !== currentHex);
+      }
+      return candidates[Math.floor(Math.random() * candidates.length)];
+    }
+
+    function setMaterialTransparency(object, opacity = 1) {
+      object.traverse((child) => {
+        if (child.isMesh) {
+          child.castShadow = true;
+          child.receiveShadow = false;
+
+          if (Array.isArray(child.material)) {
+            child.material = child.material.map((mat) => {
+              const m = mat.clone();
+              m.transparent = true;
+              m.opacity = opacity;
+              m.needsUpdate = true;
+              return m;
+            });
+          } else if (child.material) {
+            child.material = child.material.clone();
+            child.material.transparent = true;
+            child.material.opacity = opacity;
+            child.material.needsUpdate = true;
+          }
+        }
+      });
+    }
+
+    function setLanternOpacity(root, opacity) {
+      root.traverse((child) => {
+        if (child.isMesh && child.material) {
+          if (Array.isArray(child.material)) {
+            child.material.forEach((mat) => {
+              mat.transparent = true;
+              mat.opacity = opacity;
+            });
+          } else {
+            child.material.transparent = true;
+            child.material.opacity = opacity;
+          }
+        }
+      });
+    }
+
+    function createLanternInstance(model, index) {
+      const root = model.clone(true);
+
+      const scale = rand(0.5, 0.8);
+      root.scale.setScalar(scale);
+      root.position.set(rand(-15, 15), rand(0, 15), rand(-15, 15));
+
+      setMaterialTransparency(root, 1);
+
+      const lightColor = pickWarmColorDifferent();
+      const pointLight = new THREE.PointLight(lightColor, 0.8, 5, 2);
+      pointLight.position.set(0, 0, 0);
+      pointLight.castShadow = isNight;
+      pointLight.shadow.mapSize.set(512, 512);
+
+      root.add(pointLight);
+      root.userData.lanternId = index;
+      root.userData.pointLight = pointLight;
+      root.userData.baseScale = scale;
+      root.userData.opacity = 1;
+      root.userData.fadeStartY = 30;
+      root.userData.fadeDuration = 2;
+      root.userData.fadeRange = 0.2 * root.userData.fadeDuration;
+      root.userData.swayAmp = 0.3;
+      root.userData.swayFreqX = rand(0.6, 1.3);
+      root.userData.swayFreqZ = rand(0.6, 1.3);
+      root.userData.swayPhaseX = rand(0, Math.PI * 2);
+      root.userData.swayPhaseZ = rand(0, Math.PI * 2);
+      root.userData.baseX = root.position.x;
+      root.userData.baseZ = root.position.z;
+      root.userData.flickerPhase = rand(0, Math.PI * 2);
+      root.userData.pulseTime = 0;
+      root.userData.pulsing = false;
+      root.userData.colorHex = lightColor;
+
+      scene.add(root);
+      lanterns.push(root);
+      clickableLanternRoots.push(root);
+    }
+
+    function resetLantern(root) {
+      root.position.y = rand(0, 2);
+      root.userData.baseX = rand(-15, 15);
+      root.userData.baseZ = rand(-15, 15);
+      root.position.x = root.userData.baseX;
+      root.position.z = root.userData.baseZ;
+      root.userData.opacity = 1;
+      setLanternOpacity(root, 1);
+    }
+
+    loader.load(
+      'assets/Lantern.glb',
+      (gltf) => {
+        const model = gltf.scene;
+
+        for (let i = 0; i < 20; i++) {
+          createLanternInstance(model, i);
+        }
+
+        window.__3D_STATE__.modelLoaded = true;
+        window.__3D_STATE__.lanternCount = lanterns.length;
+        lanternCountEl.textContent = lanterns.length;
+      },
+      undefined,
+      (error) => {
+        console.error('Lantern.glb 加载失败:', error);
+      }
+    );
+
+    function getCurrentModeValues(nightMode) {
+      if (nightMode) {
+        return {
+          bg: new THREE.Color(0x0a0a2e),
+          ambient: 0.05,
+          directional: 0.0,
+          lanternBaseLight: 0.8
+        };
+      }
+      return {
+        bg: new THREE.Color(0x87CEEB),
+        ambient: 0.6,
+        directional: 1.0,
+        lanternBaseLight: 0.3
+      };
+    }
+
+    function startDayNightTransition() {
+      transitionState.active = true;
+      transitionState.elapsed = 0;
+      transitionState.from = getCurrentModeValues(isNight);
+      isNight = !isNight;
+      transitionState.to = getCurrentModeValues(isNight);
+
+      window.__3D_STATE__.dayNightTransitioning = true;
+      window.__3D_STATE__.timeOfDay = isNight ? 'night' : 'day';
+      timeOfDayEl.textContent = window.__3D_STATE__.timeOfDay;
+    }
+
+    dayNightBtn.addEventListener('click', () => {
+      startDayNightTransition();
+    });
+
+    function updateTransition(delta) {
+      if (!transitionState.active) return;
+
+      transitionState.elapsed += delta;
+      const t = Math.min(transitionState.elapsed / transitionState.duration, 1);
+      const eased = t * t * (3 - 2 * t);
+
+      scene.background = transitionState.from.bg.clone().lerp(transitionState.to.bg, eased);
+      ambientLight.intensity = THREE.MathUtils.lerp(
+        transitionState.from.ambient,
+        transitionState.to.ambient,
+        eased
+      );
+      directionalLight.intensity = THREE.MathUtils.lerp(
+        transitionState.from.directional,
+        transitionState.to.directional,
+        eased
+      );
+
+      const baseLightIntensity = THREE.MathUtils.lerp(
+        transitionState.from.lanternBaseLight,
+        transitionState.to.lanternBaseLight,
+        eased
+      );
+
+      for (const lantern of lanterns) {
+        lantern.userData.currentBaseLightIntensity = baseLightIntensity;
+        lantern.userData.pointLight.castShadow = isNight || transitionState.to.directional < 0.5;
+      }
+
+      if (t >= 1) {
+        transitionState.active = false;
+        window.__3D_STATE__.dayNightTransitioning = false;
+      }
+    }
+
+    function onPointerDown(event) {
+      const rect = renderer.domElement.getBoundingClientRect();
+      mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+      mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+
+      raycaster.setFromCamera(mouse, camera);
+
+      const meshTargets = [];
+      for (const root of clickableLanternRoots) {
+        root.traverse((child) => {
+          if (child.isMesh) meshTargets.push(child);
+        });
+      }
+
+      const intersects = raycaster.intersectObjects(meshTargets, true);
+      if (intersects.length === 0) return;
+
+      let target = intersects[0].object;
+      while (target && !Object.prototype.hasOwnProperty.call(target.userData, 'lanternId')) {
+        target = target.parent;
+      }
+      if (!target) return;
+
+      const currentHex = target.userData.colorHex;
+      const newHex = pickWarmColorDifferent(currentHex);
+      target.userData.colorHex = newHex;
+      target.userData.pointLight.color.setHex(newHex);
+
+      target.userData.pulsing = true;
+      target.userData.pulseTime = 0;
+
+      lastClickedLanternId = target.userData.lanternId;
+      window.__3D_STATE__.clickedLanternId = lastClickedLanternId;
+      clickedLanternEl.textContent = lastClickedLanternId;
+    }
+
+    renderer.domElement.addEventListener('pointerdown', onPointerDown);
+
+    function updateLanterns(delta, elapsedTime) {
+      const riseSpeed = 0.2;
+      let sumHeight = 0;
+      const heights = [];
+
+      for (const lantern of lanterns) {
+        lantern.position.y += riseSpeed * delta;
+
+        const swayX = Math.sin(elapsedTime * lantern.userData.swayFreqX + lantern.userData.swayPhaseX) * lantern.userData.swayAmp;
+        const swayZ = Math.cos(elapsedTime * lantern.userData.swayFreqZ + lantern.userData.swayPhaseZ) * lantern.userData.swayAmp;
+        lantern.position.x = lantern.userData.baseX + swayX;
+        lantern.position.z = lantern.userData.baseZ + swayZ;
+
+        if (lantern.position.y >= lantern.userData.fadeStartY) {
+          lantern.userData.opacity -= delta / lantern.userData.fadeDuration;
+          lantern.userData.opacity = Math.max(0, lantern.userData.opacity);
+          setLanternOpacity(lantern, lantern.userData.opacity);
+
+          if (lantern.userData.opacity <= 0) {
+            resetLantern(lantern);
+          }
+        }
+
+        const baseLight = lantern.userData.currentBaseLightIntensity ?? (isNight ? 0.8 : 0.3);
+        const flicker = Math.sin(elapsedTime * 4 + lantern.userData.flickerPhase) * 0.2;
+        lantern.userData.pointLight.intensity = Math.max(0, baseLight + flicker);
+
+        if (lantern.userData.pulsing) {
+          lantern.userData.pulseTime += delta * 4;
+          const pulseProgress = lantern.userData.pulseTime;
+          const pulseScale = lantern.userData.baseScale * (1 + Math.sin(Math.min(pulseProgress, Math.PI)) * 0.2);
+          lantern.scale.setScalar(pulseScale);
+
+          if (pulseProgress >= Math.PI) {
+            lantern.userData.pulsing = false;
+            lantern.scale.setScalar(lantern.userData.baseScale);
+          }
+        } else {
+          lantern.scale.setScalar(lantern.userData.baseScale);
+        }
+
+        sumHeight += lantern.position.y;
+        heights.push(Number(lantern.position.y.toFixed(3)));
+      }
+
+      const avgHeight = lanterns.length ? sumHeight / lanterns.length : 0;
+
+      window.__3D_STATE__.lanternCount = lanterns.length;
+      window.__3D_STATE__.timeOfDay = isNight ? 'night' : 'day';
+      window.__3D_STATE__.clickedLanternId = lastClickedLanternId;
+      window.__3D_STATE__.avgHeight = Number(avgHeight.toFixed(1));
+      window.__3D_STATE__.lanternHeights = heights;
+
+      lanternCountEl.textContent = lanterns.length;
+      timeOfDayEl.textContent = window.__3D_STATE__.timeOfDay;
+      clickedLanternEl.textContent = lastClickedLanternId;
+      avgHeightEl.textContent = avgHeight.toFixed(1);
+    }
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      const delta = Math.min(clock.getDelta(), 0.033);
+      const elapsedTime = clock.elapsedTime;
+
+      updateTransition(delta);
+      updateLanterns(delta, elapsedTime);
+
+      controls.update();
+      renderer.render(scene, camera);
+    }
+
+    animate();
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+  </script>
+</body>
+</html>

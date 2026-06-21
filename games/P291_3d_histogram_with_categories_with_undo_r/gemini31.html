@@ -1,0 +1,525 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Histogram Visualization</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            font-family: sans-serif;
+            background-color: #111;
+        }
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+        }
+        #ui-layer {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+            display: flex;
+            flex-direction: column;
+            padding: 20px;
+            box-sizing: border-box;
+        }
+        .toolbar {
+            pointer-events: auto;
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+            margin-bottom: 10px;
+        }
+        button {
+            padding: 8px 16px;
+            border-radius: 4px;
+            background-color: #4A90D9;
+            color: white;
+            border: none;
+            cursor: pointer;
+            font-weight: bold;
+            transition: background-color 0.2s;
+        }
+        button:hover {
+            background-color: #357ABD;
+        }
+        button:disabled {
+            background-color: #555;
+            color: #888;
+            cursor: not-allowed;
+        }
+        #info-panel {
+            pointer-events: auto;
+            background: rgba(0, 0, 0, 0.7);
+            color: white;
+            padding: 10px 15px;
+            border-radius: 4px;
+            display: inline-block;
+            align-self: flex-start;
+            font-size: 14px;
+        }
+        #edit-panel {
+            pointer-events: auto;
+            position: absolute;
+            bottom: 40px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: rgba(0, 0, 0, 0.8);
+            padding: 15px;
+            border-radius: 8px;
+            display: none;
+            gap: 10px;
+            align-items: center;
+            color: white;
+        }
+        #value-input {
+            width: 60px;
+            padding: 5px;
+            border-radius: 4px;
+            border: 1px solid #ccc;
+        }
+    </style>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="canvas-container"></div>
+    <div id="ui-layer">
+        <div class="toolbar">
+            <button id="btn-add">Add Category</button>
+            <button id="btn-remove">Remove Last</button>
+            <button id="btn-undo">Undo</button>
+            <button id="btn-redo">Redo</button>
+            <button id="btn-randomize">Randomize</button>
+            <button id="btn-sort-asc">Sort Asc</button>
+            <button id="btn-sort-desc">Sort Desc</button>
+        </div>
+        <div id="info-panel"></div>
+        <div id="edit-panel">
+            <label for="value-input">Value (1-10):</label>
+            <input type="number" id="value-input" min="1" max="10">
+            <button id="btn-set-value">Set Value</button>
+        </div>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+        // --- State Management ---
+        const MAX_HISTORY = 20;
+        let history = [];
+        let historyIndex = -1;
+        
+        let currentState = {
+            categories: ['Alpha', 'Beta', 'Gamma', 'Delta', 'Epsilon'],
+            values: [4, 7, 3, 9, 5]
+        };
+        
+        let selectedBarIndex = -1;
+        let dragonLoaded = false;
+        let sortOrder = 'none';
+        let lastAction = 'init';
+
+        window.__3D_STATE__ = {};
+
+        function updateGlobalState() {
+            const sum = currentState.values.reduce((a, b) => a + b, 0);
+            const avg = currentState.values.length ? (sum / currentState.values.length) : 0;
+
+            window.__3D_STATE__ = {
+                categories: [...currentState.categories],
+                values: [...currentState.values],
+                barCount: currentState.values.length,
+                selectedBarIndex: selectedBarIndex,
+                historyIndex: historyIndex,
+                historyLength: history.length,
+                canUndo: historyIndex > 0,
+                canRedo: historyIndex < history.length - 1,
+                sumValues: sum,
+                avgValue: Number(avg.toFixed(2)),
+                dragonLoaded: dragonLoaded,
+                sortOrder: sortOrder,
+                lastAction: lastAction
+            };
+
+            // Update UI
+            document.getElementById('btn-undo').disabled = !window.__3D_STATE__.canUndo;
+            document.getElementById('btn-redo').disabled = !window.__3D_STATE__.canRedo;
+            document.getElementById('info-panel').innerHTML = `
+                Categories: ${window.__3D_STATE__.barCount} | 
+                Sum: ${window.__3D_STATE__.sumValues} | 
+                Avg: ${window.__3D_STATE__.avgValue} | 
+                History Stack: ${window.__3D_STATE__.historyLength}
+            `;
+
+            const editPanel = document.getElementById('edit-panel');
+            if (selectedBarIndex !== -1 && selectedBarIndex < currentState.values.length) {
+                editPanel.style.display = 'flex';
+                document.getElementById('value-input').value = currentState.values[selectedBarIndex];
+            } else {
+                editPanel.style.display = 'none';
+            }
+        }
+
+        function pushState(newState, action) {
+            history = history.slice(0, historyIndex + 1);
+            history.push(JSON.parse(JSON.stringify(newState)));
+            if (history.length > MAX_HISTORY) {
+                history.shift();
+            } else {
+                historyIndex++;
+            }
+            currentState = JSON.parse(JSON.stringify(newState));
+            lastAction = action;
+            
+            if (selectedBarIndex >= currentState.values.length) {
+                selectedBarIndex = -1;
+            }
+            
+            updateGlobalState();
+            syncSceneWithState();
+        }
+
+        function undo() {
+            if (historyIndex > 0) {
+                historyIndex--;
+                currentState = JSON.parse(JSON.stringify(history[historyIndex]));
+                lastAction = 'undo';
+                if (selectedBarIndex >= currentState.values.length) selectedBarIndex = -1;
+                updateGlobalState();
+                syncSceneWithState();
+            }
+        }
+
+        function redo() {
+            if (historyIndex < history.length - 1) {
+                historyIndex++;
+                currentState = JSON.parse(JSON.stringify(history[historyIndex]));
+                lastAction = 'redo';
+                if (selectedBarIndex >= currentState.values.length) selectedBarIndex = -1;
+                updateGlobalState();
+                syncSceneWithState();
+            }
+        }
+
+        // --- Three.js Setup ---
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x111111);
+
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+        camera.position.set(8, 6, 10);
+        camera.lookAt(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        container.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+        dirLight.position.set(5, 10, 5);
+        scene.add(dirLight);
+
+        const groundGeo = new THREE.PlaneGeometry(20, 20);
+        const groundMat = new THREE.MeshStandardMaterial({ color: 0x333333 });
+        const ground = new THREE.Mesh(groundGeo, groundMat);
+        ground.rotation.x = -Math.PI / 2;
+        scene.add(ground);
+
+        // Pedestal
+        const pedestalGeo = new THREE.CylinderGeometry(1, 1, 0.3, 32);
+        const pedestalMat = new THREE.MeshStandardMaterial({ color: 0x666666 });
+        const pedestal = new THREE.Mesh(pedestalGeo, pedestalMat);
+        pedestal.position.set(6, 0.15, -3);
+        scene.add(pedestal);
+
+        // Dragon Model
+        let dragonModel = null;
+        const loader = new GLTFLoader();
+        loader.load(
+            'https://cdn.jsdelivr.net/gh/KhronosGroup/glTF-Sample-Models/2.0/DragonAttenuation/glTF-Binary/DragonAttenuation.glb',
+            (gltf) => {
+                dragonModel = gltf.scene;
+                
+                const box = new THREE.Box3().setFromObject(dragonModel);
+                const size = box.getSize(new THREE.Vector3());
+                const maxDim = Math.max(size.x, size.y, size.z);
+                const scale = 2 / maxDim;
+                dragonModel.scale.set(scale, scale, scale);
+                
+                const center = box.getCenter(new THREE.Vector3());
+                dragonModel.position.set(6, 0.3 - (box.min.y * scale), -3);
+                
+                scene.add(dragonModel);
+                dragonLoaded = true;
+                updateGlobalState();
+            }
+        );
+
+        // --- Histogram Logic ---
+        const barGroup = new THREE.Group();
+        scene.add(barGroup);
+        
+        const barColors = [0xFF6B6B, 0x4ECDC4, 0x45B7D1, 0x96CEB4, 0xFFEAA7];
+        const barMeshes = [];
+        
+        // Geometry with origin at bottom
+        const boxGeo = new THREE.BoxGeometry(0.8, 1, 0.8);
+        boxGeo.translate(0, 0.5, 0);
+
+        function createTextSprite(text, fontSize = 48, color = 'white') {
+            const canvas = document.createElement('canvas');
+            const context = canvas.getContext('2d');
+            context.font = `Bold ${fontSize}px Arial`;
+            const metrics = context.measureText(text);
+            canvas.width = Math.max(128, metrics.width + 20);
+            canvas.height = fontSize + 20;
+            
+            context.clearRect(0, 0, canvas.width, canvas.height);
+            context.font = `Bold ${fontSize}px Arial`;
+            context.fillStyle = color;
+            context.textAlign = 'center';
+            context.textBaseline = 'middle';
+            context.fillText(text, canvas.width / 2, canvas.height / 2);
+            
+            const texture = new THREE.CanvasTexture(canvas);
+            texture.minFilter = THREE.LinearFilter;
+            const material = new THREE.SpriteMaterial({ map: texture, depthTest: false });
+            const sprite = new THREE.Sprite(material);
+            sprite.scale.set(canvas.width / 50, canvas.height / 50, 1);
+            return sprite;
+        }
+
+        function syncSceneWithState() {
+            const count = currentState.values.length;
+            const spacing = 1.5;
+            const totalWidth = (count - 1) * spacing;
+            const startX = -totalWidth / 2;
+
+            // Remove excess bars
+            while (barMeshes.length > count) {
+                const obj = barMeshes.pop();
+                barGroup.remove(obj.mesh);
+                barGroup.remove(obj.catLabel);
+                barGroup.remove(obj.valLabel);
+                obj.mesh.material.dispose();
+                obj.catLabel.material.map.dispose();
+                obj.catLabel.material.dispose();
+                obj.valLabel.material.map.dispose();
+                obj.valLabel.material.dispose();
+            }
+
+            // Add missing bars
+            while (barMeshes.length < count) {
+                const mat = new THREE.MeshStandardMaterial();
+                const mesh = new THREE.Mesh(boxGeo, mat);
+                const catLabel = new THREE.Sprite();
+                const valLabel = new THREE.Sprite();
+                
+                barGroup.add(mesh);
+                barGroup.add(catLabel);
+                barGroup.add(valLabel);
+                
+                barMeshes.push({ mesh, catLabel, valLabel, targetHeight: 0 });
+            }
+
+            // Update all bars
+            for (let i = 0; i < count; i++) {
+                const obj = barMeshes[i];
+                const val = currentState.values[i];
+                const cat = currentState.categories[i];
+                const targetX = startX + i * spacing;
+                
+                obj.targetHeight = val * 0.5;
+                obj.targetX = targetX;
+                
+                // Initial setup if new
+                if (obj.mesh.scale.y === 1 && obj.targetHeight !== 0.5) {
+                    obj.mesh.scale.y = obj.targetHeight;
+                    obj.mesh.position.x = targetX;
+                }
+
+                obj.mesh.material.color.setHex(barColors[i % barColors.length]);
+                obj.mesh.userData.index = i;
+
+                // Update selection highlight
+                if (i === selectedBarIndex) {
+                    obj.mesh.material.emissive.setHex(0xFFFF00);
+                    obj.mesh.material.emissiveIntensity = 0.5;
+                } else {
+                    obj.mesh.material.emissive.setHex(0x000000);
+                }
+
+                // Update Labels
+                if (obj.catLabel.material.map) obj.catLabel.material.map.dispose();
+                if (obj.catLabel.material) obj.catLabel.material.dispose();
+                
+                if (obj.valLabel.material.map) obj.valLabel.material.map.dispose();
+                if (obj.valLabel.material) obj.valLabel.material.dispose();
+
+                const newCatSprite = createTextSprite(cat, 32, '#aaaaaa');
+                obj.catLabel.material = newCatSprite.material;
+                obj.catLabel.scale.copy(newCatSprite.scale);
+                
+                const newValSprite = createTextSprite(val.toString(), 40, '#ffffff');
+                obj.valLabel.material = newValSprite.material;
+                obj.valLabel.scale.copy(newValSprite.scale);
+            }
+        }
+
+        // --- Interaction ---
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+
+        window.addEventListener('pointerdown', (event) => {
+            if (event.target.tagName === 'BUTTON' || event.target.tagName === 'INPUT') return;
+
+            mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+            raycaster.setFromCamera(mouse, camera);
+            const intersects = raycaster.intersectObjects(barMeshes.map(b => b.mesh));
+
+            if (intersects.length > 0) {
+                selectedBarIndex = intersects[0].object.userData.index;
+            } else {
+                selectedBarIndex = -1;
+            }
+            
+            updateGlobalState();
+            syncSceneWithState();
+        });
+
+        // --- UI Event Listeners ---
+        document.getElementById('btn-add').addEventListener('click', () => {
+            const newCat = `Cat_${currentState.categories.length + 1}`;
+            const newVal = Math.floor(Math.random() * 10) + 1;
+            pushState({
+                categories: [...currentState.categories, newCat],
+                values: [...currentState.values, newVal]
+            }, 'add');
+        });
+
+        document.getElementById('btn-remove').addEventListener('click', () => {
+            if (currentState.values.length > 0) {
+                const newCat = [...currentState.categories];
+                const newVal = [...currentState.values];
+                newCat.pop();
+                newVal.pop();
+                pushState({ categories: newCat, values: newVal }, 'remove');
+            }
+        });
+
+        document.getElementById('btn-undo').addEventListener('click', undo);
+        document.getElementById('btn-redo').addEventListener('click', redo);
+
+        document.getElementById('btn-randomize').addEventListener('click', () => {
+            const newVal = currentState.values.map(() => Math.floor(Math.random() * 10) + 1);
+            pushState({ categories: [...currentState.categories], values: newVal }, 'randomize');
+        });
+
+        function sortBars(asc) {
+            let combined = currentState.categories.map((c, i) => ({ c, v: currentState.values[i] }));
+            combined.sort((a, b) => asc ? a.v - b.v : b.v - a.v);
+            sortOrder = asc ? 'asc' : 'desc';
+            pushState({
+                categories: combined.map(x => x.c),
+                values: combined.map(x => x.v)
+            }, asc ? 'sort_asc' : 'sort_desc');
+        }
+
+        document.getElementById('btn-sort-asc').addEventListener('click', () => sortBars(true));
+        document.getElementById('btn-sort-desc').addEventListener('click', () => sortBars(false));
+
+        document.getElementById('btn-set-value').addEventListener('click', () => {
+            if (selectedBarIndex !== -1) {
+                let val = parseInt(document.getElementById('value-input').value);
+                if (isNaN(val)) return;
+                val = Math.max(1, Math.min(10, val));
+                const newVal = [...currentState.values];
+                newVal[selectedBarIndex] = val;
+                pushState({ categories: [...currentState.categories], values: newVal }, 'set_value');
+            }
+        });
+
+        // --- Keyboard ---
+        window.addEventListener('keydown', (e) => {
+            if (e.ctrlKey && e.key === 'z') {
+                e.preventDefault();
+                undo();
+            } else if (e.ctrlKey && e.key === 'y') {
+                e.preventDefault();
+                redo();
+            } else if (e.key === 'Delete' && selectedBarIndex !== -1) {
+                const newCat = [...currentState.categories];
+                const newVal = [...currentState.values];
+                newCat.splice(selectedBarIndex, 1);
+                newVal.splice(selectedBarIndex, 1);
+                const oldIndex = selectedBarIndex;
+                selectedBarIndex = -1;
+                pushState({ categories: newCat, values: newVal }, 'delete');
+            }
+        });
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // --- Initialization ---
+        pushState(currentState, 'init');
+
+        // --- Animation Loop ---
+        const clock = new THREE.Clock();
+
+        function animate() {
+            requestAnimationFrame(animate);
+            const delta = clock.getDelta();
+
+            controls.update();
+
+            if (dragonModel) {
+                dragonModel.rotation.y += 0.5 * delta;
+            }
+
+            // Animate bars (lerp over roughly 500ms)
+            const lerpFactor = 1 - Math.exp(-delta * 10);
+            
+            barMeshes.forEach(obj => {
+                // Lerp Height
+                obj.mesh.scale.y += (obj.targetHeight - obj.mesh.scale.y) * lerpFactor;
+                // Lerp Position X
+                obj.mesh.position.x += (obj.targetX - obj.mesh.position.x) * lerpFactor;
+                
+                // Update Label Positions
+                obj.catLabel.position.set(obj.mesh.position.x, 0.2, 0.8);
+                obj.valLabel.position.set(obj.mesh.position.x, obj.mesh.scale.y + 0.4, 0);
+            });
+
+            renderer.render(scene, camera);
+        }
+
+        animate();
+    </script>
+</body>
+</html>

@@ -1,0 +1,569 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3D Gyroscope Precession Simulation</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { overflow: hidden; background: #000; font-family: 'Courier New', monospace; }
+  canvas { display: block; }
+
+  #debugOverlay {
+    position: absolute;
+    top: 10px;
+    left: 10px;
+    background: rgba(0, 0, 0, 0.75);
+    color: #0f0;
+    padding: 15px 20px;
+    border-radius: 8px;
+    font-size: 13px;
+    line-height: 1.8;
+    z-index: 100;
+    border: 1px solid rgba(0, 255, 0, 0.3);
+    min-width: 320px;
+  }
+
+  #debugOverlay .title {
+    color: #0ff;
+    font-size: 15px;
+    font-weight: bold;
+    margin-bottom: 8px;
+    border-bottom: 1px solid rgba(0, 255, 255, 0.3);
+    padding-bottom: 5px;
+  }
+
+  #debugOverlay .label {
+    color: #aaa;
+  }
+
+  #debugOverlay span.value {
+    color: #0f0;
+    font-weight: bold;
+  }
+
+  #toggleGravityBtn {
+    position: absolute;
+    bottom: 20px;
+    left: 50%;
+    transform: translateX(-50%);
+    padding: 12px 30px;
+    font-size: 16px;
+    font-family: 'Courier New', monospace;
+    background: rgba(0, 0, 0, 0.7);
+    color: #0ff;
+    border: 2px solid #0ff;
+    border-radius: 8px;
+    cursor: pointer;
+    z-index: 100;
+    transition: all 0.3s;
+  }
+
+  #toggleGravityBtn:hover {
+    background: rgba(0, 255, 255, 0.2);
+  }
+
+  #controls-help {
+    position: absolute;
+    bottom: 70px;
+    left: 50%;
+    transform: translateX(-50%);
+    color: rgba(255, 255, 255, 0.5);
+    font-size: 12px;
+    z-index: 100;
+    text-align: center;
+    font-family: 'Courier New', monospace;
+  }
+</style>
+</head>
+<body>
+
+<div id="debugOverlay">
+  <div class="title">🌀 Gyroscope Debug Panel</div>
+  <div><span class="label">Spin Speed (ω_s):</span> <span class="value" id="dbgSpinSpeed">50</span> <span class="label">rad/s</span></div>
+  <div><span class="label">Mass:</span> <span class="value" id="dbgMass">2.0</span> <span class="label">kg</span></div>
+  <div><span class="label">Precession Rate (ω_p):</span> <span class="value" id="dbgPrecessionRate">0.0000</span> <span class="label">rad/s</span></div>
+  <div><span class="label">Precession Angle:</span> <span class="value" id="dbgPrecessionAngle">0.00</span> <span class="label">°</span></div>
+  <div><span class="label">Nutation Angle:</span> <span class="value" id="dbgNutation">0.0000</span> <span class="label">rad</span></div>
+  <div><span class="label">Gravity:</span> <span class="value" id="dbgGravity">9.81</span> <span class="label">m/s²</span></div>
+  <div><span class="label">Rotational KE:</span> <span class="value" id="dbgEnergy">625.00</span> <span class="label">J</span></div>
+  <div><span class="label">Paused:</span> <span class="value" id="dbgPaused">false</span></div>
+  <div><span class="label">Sim Time:</span> <span class="value" id="dbgSimTime">0.00</span> <span class="label">s</span></div>
+</div>
+
+<button id="toggleGravityBtn">Toggle Gravity</button>
+
+<div id="controls-help">
+  ↑/↓: Spin Speed | ←/→: Mass | Space: Pause | D: Debug | R: Reset
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+// Constants
+const I_FLYWHEEL = 0.5; // moment of inertia kg·m²
+const D_PIVOT = 2.0; // distance from pivot to center of mass
+
+// Default parameters
+const DEFAULTS = {
+  spinSpeed: 50,
+  mass: 2.0,
+  gravity: 9.81,
+  paused: false,
+  debugVisible: true
+};
+
+// Compute precession rate
+function computePrecessionRate(mass, gravity, d, I, omegaS) {
+  if (omegaS === 0 || I === 0) return 0;
+  return (mass * gravity * d) / (I * omegaS);
+}
+
+// Initialize state
+const initialPrecessionRate = computePrecessionRate(DEFAULTS.mass, DEFAULTS.gravity, D_PIVOT, I_FLYWHEEL, DEFAULTS.spinSpeed);
+
+window.__3D_STATE__ = {
+  spinSpeed: DEFAULTS.spinSpeed,
+  mass: DEFAULTS.mass,
+  gravity: DEFAULTS.gravity,
+  precessionRate: initialPrecessionRate,
+  precessionAngle: 0,
+  nutationAngle: 0,
+  paused: DEFAULTS.paused,
+  debugVisible: DEFAULTS.debugVisible,
+  simTime: 0,
+  energy: 0.5 * I_FLYWHEEL * DEFAULTS.spinSpeed * DEFAULTS.spinSpeed,
+  robotLoaded: false,
+  discRotation: 0,
+  frameCount: 0
+};
+
+const state = window.__3D_STATE__;
+
+// Scene setup
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x1a1a2e);
+scene.fog = new THREE.Fog(0x1a1a2e, 20, 60);
+
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+camera.position.set(0, 5, 10);
+camera.lookAt(0, 0, 0);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.2;
+document.body.appendChild(renderer.domElement);
+
+// Controls
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.05;
+controls.target.set(0, 2, 0);
+controls.update();
+
+// Lights
+const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+scene.add(ambientLight);
+
+const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+dirLight.position.set(5, 10, 5);
+dirLight.castShadow = true;
+dirLight.shadow.mapSize.width = 2048;
+dirLight.shadow.mapSize.height = 2048;
+dirLight.shadow.camera.near = 0.5;
+dirLight.shadow.camera.far = 50;
+dirLight.shadow.camera.left = -10;
+dirLight.shadow.camera.right = 10;
+dirLight.shadow.camera.top = 10;
+dirLight.shadow.camera.bottom = -10;
+scene.add(dirLight);
+
+// Additional fill light
+const fillLight = new THREE.DirectionalLight(0x4488ff, 0.3);
+fillLight.position.set(-5, 5, -5);
+scene.add(fillLight);
+
+// Ground plane
+const groundGeom = new THREE.PlaneGeometry(50, 50);
+const groundMat = new THREE.MeshStandardMaterial({
+  color: 0x444444,
+  roughness: 0.8,
+  metalness: 0.2
+});
+const ground = new THREE.Mesh(groundGeom, groundMat);
+ground.rotation.x = -Math.PI / 2;
+ground.position.y = 0;
+ground.receiveShadow = true;
+scene.add(ground);
+
+// Grid helper
+const gridHelper = new THREE.GridHelper(50, 50, 0x555555, 0x333333);
+gridHelper.position.y = 0.01;
+scene.add(gridHelper);
+
+// ============ GYROSCOPE ASSEMBLY ============
+
+// Pivot group - this rotates around Y for precession
+const pivotGroup = new THREE.Group();
+pivotGroup.position.set(0, 3, 0); // at top of pillar
+scene.add(pivotGroup);
+
+// Arm group - child of pivot, handles nutation tilt
+const armGroup = new THREE.Group();
+pivotGroup.add(armGroup);
+
+// 1. Vertical support pillar
+const pillarGeom = new THREE.CylinderGeometry(0.05, 0.05, 3, 16);
+const pillarMat = new THREE.MeshStandardMaterial({ color: 0x888888, roughness: 0.4, metalness: 0.6 });
+const pillar = new THREE.Mesh(pillarGeom, pillarMat);
+pillar.position.set(0, 1.5, 0);
+pillar.castShadow = true;
+scene.add(pillar);
+
+// Pillar base
+const baseGeom = new THREE.CylinderGeometry(0.4, 0.5, 0.1, 32);
+const baseMat = new THREE.MeshStandardMaterial({ color: 0x666666, roughness: 0.3, metalness: 0.7 });
+const base = new THREE.Mesh(baseGeom, baseMat);
+base.position.set(0, 0.05, 0);
+base.castShadow = true;
+scene.add(base);
+
+// 2. Pivot point (red sphere)
+const pivotSphereGeom = new THREE.SphereGeometry(0.1, 32, 32);
+const pivotSphereMat = new THREE.MeshStandardMaterial({ color: 0xff0000, roughness: 0.3, metalness: 0.5, emissive: 0x330000 });
+const pivotSphere = new THREE.Mesh(pivotSphereGeom, pivotSphereMat);
+pivotSphere.castShadow = true;
+pivotGroup.add(pivotSphere);
+
+// 3. Gyroscope arm (horizontal cylinder extending from pivot)
+const armGeom = new THREE.CylinderGeometry(0.05, 0.05, 4, 16);
+const armMat = new THREE.MeshStandardMaterial({ color: 0x2266cc, roughness: 0.2, metalness: 0.8 });
+const arm = new THREE.Mesh(armGeom, armMat);
+arm.rotation.z = Math.PI / 2; // make horizontal
+arm.position.set(2, 0, 0); // center at 2 units from pivot (extends 0 to 4)
+arm.castShadow = true;
+armGroup.add(arm);
+
+// 4. Spinning disc (flywheel) at end of arm
+const discGroup = new THREE.Group();
+discGroup.position.set(4, 0, 0); // at end of arm
+armGroup.add(discGroup);
+
+// Main disc (torus)
+const torusGeom = new THREE.TorusGeometry(0.8, 0.12, 16, 48);
+const torusMat = new THREE.MeshStandardMaterial({
+  color: 0xffaa00,
+  roughness: 0.2,
+  metalness: 0.9,
+  emissive: 0x221100
+});
+const torus = new THREE.Mesh(torusGeom, torusMat);
+torus.castShadow = true;
+discGroup.add(torus);
+
+// Inner disc fill
+const innerDiscGeom = new THREE.CylinderGeometry(0.68, 0.68, 0.08, 48);
+const innerDiscMat = new THREE.MeshStandardMaterial({
+  color: 0xddaa00,
+  roughness: 0.3,
+  metalness: 0.8
+});
+const innerDisc = new THREE.Mesh(innerDiscGeom, innerDiscMat);
+innerDisc.rotation.x = Math.PI / 2;
+innerDisc.castShadow = true;
+discGroup.add(innerDisc);
+
+// Disc hub
+const hubGeom = new THREE.CylinderGeometry(0.15, 0.15, 0.2, 16);
+const hubMat = new THREE.MeshStandardMaterial({ color: 0xcccccc, roughness: 0.3, metalness: 0.7 });
+const hub = new THREE.Mesh(hubGeom, hubMat);
+hub.rotation.x = Math.PI / 2;
+discGroup.add(hub);
+
+// Spokes
+for (let i = 0; i < 6; i++) {
+  const angle = (i / 6) * Math.PI * 2;
+  const spokeGeom = new THREE.CylinderGeometry(0.02, 0.02, 0.65, 8);
+  const spokeMat = new THREE.MeshStandardMaterial({ color: 0xaaaaaa, roughness: 0.4, metalness: 0.6 });
+  const spoke = new THREE.Mesh(spokeGeom, spokeMat);
+  spoke.position.set(Math.cos(angle) * 0.35, Math.sin(angle) * 0.35, 0);
+  spoke.rotation.z = angle;
+  spoke.rotation.x = Math.PI / 2;
+  discGroup.add(spoke);
+}
+
+// 5. Load robot.glb
+let robotModel = null;
+const loader = new GLTFLoader();
+
+loader.load(
+  'robot.glb',
+  (gltf) => {
+    robotModel = gltf.scene;
+    robotModel.scale.set(0.5, 0.5, 0.5);
+    robotModel.position.set(0, 0.9, 0); // on top of disc
+    robotModel.castShadow = true;
+    robotModel.traverse((child) => {
+      if (child.isMesh) {
+        child.castShadow = true;
+        child.receiveShadow = true;
+      }
+    });
+    discGroup.add(robotModel);
+    state.robotLoaded = true;
+    console.log('Robot model loaded successfully');
+  },
+  (progress) => {
+    console.log('Loading robot:', (progress.loaded / (progress.total || 1) * 100).toFixed(1) + '%');
+  },
+  (error) => {
+    console.warn('Could not load robot.glb, creating placeholder:', error.message);
+    // Create a placeholder robot
+    const placeholderGroup = new THREE.Group();
+
+    // Body
+    const bodyGeom = new THREE.BoxGeometry(0.3, 0.4, 0.2);
+    const bodyMat = new THREE.MeshStandardMaterial({ color: 0x4488ff, roughness: 0.3, metalness: 0.7 });
+    const body = new THREE.Mesh(bodyGeom, bodyMat);
+    body.position.y = 0.4;
+    placeholderGroup.add(body);
+
+    // Head
+    const headGeom = new THREE.SphereGeometry(0.15, 16, 16);
+    const headMat = new THREE.MeshStandardMaterial({ color: 0x66aaff, roughness: 0.3, metalness: 0.5 });
+    const head = new THREE.Mesh(headGeom, headMat);
+    head.position.y = 0.75;
+    placeholderGroup.add(head);
+
+    // Eyes
+    const eyeGeom = new THREE.SphereGeometry(0.04, 8, 8);
+    const eyeMat = new THREE.MeshStandardMaterial({ color: 0xff0000, emissive: 0xff0000, emissiveIntensity: 0.5 });
+    const eyeL = new THREE.Mesh(eyeGeom, eyeMat);
+    eyeL.position.set(-0.06, 0.78, 0.12);
+    placeholderGroup.add(eyeL);
+    const eyeR = new THREE.Mesh(eyeGeom, eyeMat);
+    eyeR.position.set(0.06, 0.78, 0.12);
+    placeholderGroup.add(eyeR);
+
+    // Arms
+    const armGeo = new THREE.CylinderGeometry(0.04, 0.04, 0.35, 8);
+    const armMaterial = new THREE.MeshStandardMaterial({ color: 0x3377dd, roughness: 0.4, metalness: 0.6 });
+    const leftArm = new THREE.Mesh(armGeo, armMaterial);
+    leftArm.position.set(-0.25, 0.35, 0);
+    leftArm.rotation.z = 0.3;
+    placeholderGroup.add(leftArm);
+    const rightArm = new THREE.Mesh(armGeo, armMaterial);
+    rightArm.position.set(0.25, 0.35, 0);
+    rightArm.rotation.z = -0.3;
+    placeholderGroup.add(rightArm);
+
+    // Legs
+    const legGeo = new THREE.CylinderGeometry(0.05, 0.05, 0.3, 8);
+    const legMat = new THREE.MeshStandardMaterial({ color: 0x3366cc, roughness: 0.4, metalness: 0.6 });
+    const leftLeg = new THREE.Mesh(legGeo, legMat);
+    leftLeg.position.set(-0.1, 0.05, 0);
+    placeholderGroup.add(leftLeg);
+    const rightLeg = new THREE.Mesh(legGeo, legMat);
+    rightLeg.position.set(0.1, 0.05, 0);
+    placeholderGroup.add(rightLeg);
+
+    placeholderGroup.scale.set(0.5, 0.5, 0.5);
+    placeholderGroup.position.set(0, 0.9, 0);
+
+    placeholderGroup.traverse((child) => {
+      if (child.isMesh) {
+        child.castShadow = true;
+      }
+    });
+
+    discGroup.add(placeholderGroup);
+    robotModel = placeholderGroup;
+    state.robotLoaded = true;
+  }
+);
+
+// Trail effect for precession visualization
+const trailGeom = new THREE.BufferGeometry();
+const trailPositions = new Float32Array(300 * 3);
+trailGeom.setAttribute('position', new THREE.BufferAttribute(trailPositions, 3));
+const trailMat = new THREE.LineBasicMaterial({ color: 0x00ff88, transparent: true, opacity: 0.4 });
+const trail = new THREE.Line(trailGeom, trailMat);
+scene.add(trail);
+let trailIndex = 0;
+
+// DOM references
+const dbgSpinSpeed = document.getElementById('dbgSpinSpeed');
+const dbgMass = document.getElementById('dbgMass');
+const dbgPrecessionRate = document.getElementById('dbgPrecessionRate');
+const dbgPrecessionAngle = document.getElementById('dbgPrecessionAngle');
+const dbgNutation = document.getElementById('dbgNutation');
+const dbgGravity = document.getElementById('dbgGravity');
+const dbgEnergy = document.getElementById('dbgEnergy');
+const dbgPaused = document.getElementById('dbgPaused');
+const dbgSimTime = document.getElementById('dbgSimTime');
+const debugOverlay = document.getElementById('debugOverlay');
+
+// Update debug overlay
+function updateDebugOverlay() {
+  dbgSpinSpeed.textContent = state.spinSpeed;
+  dbgMass.textContent = state.mass.toFixed(1);
+  dbgPrecessionRate.textContent = state.precessionRate.toFixed(4);
+  dbgPrecessionAngle.textContent = ((state.precessionAngle * 180 / Math.PI) % 360).toFixed(2);
+  dbgNutation.textContent = state.nutationAngle.toFixed(4);
+  dbgGravity.textContent = state.gravity.toFixed(2);
+  dbgEnergy.textContent = state.energy.toFixed(2);
+  dbgPaused.textContent = state.paused ? 'true' : 'false';
+  dbgSimTime.textContent = state.simTime.toFixed(2);
+}
+
+// Reset function
+function resetSimulation() {
+  state.spinSpeed = DEFAULTS.spinSpeed;
+  state.mass = DEFAULTS.mass;
+  state.gravity = DEFAULTS.gravity;
+  state.precessionAngle = 0;
+  state.nutationAngle = 0;
+  state.paused = DEFAULTS.paused;
+  state.simTime = 0;
+  state.discRotation = 0;
+  state.precessionRate = computePrecessionRate(state.mass, state.gravity, D_PIVOT, I_FLYWHEEL, state.spinSpeed);
+  state.energy = 0.5 * I_FLYWHEEL * state.spinSpeed * state.spinSpeed;
+
+  // Reset trail
+  trailIndex = 0;
+  const positions = trail.geometry.attributes.position.array;
+  for (let i = 0; i < positions.length; i++) positions[i] = 0;
+  trail.geometry.attributes.position.needsUpdate = true;
+  trail.geometry.setDrawRange(0, 0);
+}
+
+// Keyboard events
+document.addEventListener('keydown', (e) => {
+  switch (e.code) {
+    case 'ArrowUp':
+      e.preventDefault();
+      state.spinSpeed = Math.min(200, state.spinSpeed + 10);
+      break;
+    case 'ArrowDown':
+      e.preventDefault();
+      state.spinSpeed = Math.max(10, state.spinSpeed - 10);
+      break;
+    case 'ArrowLeft':
+      e.preventDefault();
+      state.mass = Math.max(0.5, parseFloat((state.mass - 0.5).toFixed(1)));
+      break;
+    case 'ArrowRight':
+      e.preventDefault();
+      state.mass = Math.min(5.0, parseFloat((state.mass + 0.5).toFixed(1)));
+      break;
+    case 'Space':
+      e.preventDefault();
+      state.paused = !state.paused;
+      break;
+    case 'KeyD':
+      state.debugVisible = !state.debugVisible;
+      debugOverlay.style.display = state.debugVisible ? 'block' : 'none';
+      break;
+    case 'KeyR':
+      resetSimulation();
+      break;
+  }
+});
+
+// Toggle gravity button
+document.getElementById('toggleGravityBtn').addEventListener('click', () => {
+  state.gravity = state.gravity > 0 ? 0 : 9.81;
+});
+
+// Window resize
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// Animation
+const clock = new THREE.Clock();
+let lastTime = 0;
+
+function animate() {
+  requestAnimationFrame(animate);
+
+  const delta = clock.getDelta();
+  const clampedDelta = Math.min(delta, 0.05); // clamp to avoid huge jumps
+
+  state.frameCount++;
+
+  if (!state.paused) {
+    // Update physics
+    state.precessionRate = computePrecessionRate(state.mass, state.gravity, D_PIVOT, I_FLYWHEEL, state.spinSpeed);
+    state.energy = 0.5 * I_FLYWHEEL * state.spinSpeed * state.spinSpeed;
+
+    state.simTime += clampedDelta;
+
+    // Precession
+    state.precessionAngle += state.precessionRate * clampedDelta;
+
+    // Disc spin
+    state.discRotation += state.spinSpeed * clampedDelta;
+
+    // Nutation: small sinusoidal oscillation, amplitude 0.05 rad, frequency 2 Hz
+    state.nutationAngle = 0.05 * Math.sin(2 * Math.PI * 2 * state.simTime);
+
+    // Apply precession rotation to pivot group (around Y axis)
+    pivotGroup.rotation.y = state.precessionAngle;
+
+    // Apply nutation tilt to arm group
+    armGroup.rotation.z = state.nutationAngle;
+
+    // Spin the disc around its local axis (Z axis in disc local space, since torus lies in XY)
+    // The torus is oriented in XY plane by default, so spinning around Z
+    discGroup.rotation.z = state.discRotation;
+
+    // Counter-rotate the robot so it stays upright-ish visually
+    if (robotModel) {
+      robotModel.rotation.z = -state.discRotation;
+    }
+
+    // Update trail
+    const worldPos = new THREE.Vector3();
+    discGroup.getWorldPosition(worldPos);
+    const positions = trail.geometry.attributes.position.array;
+    const idx = (trailIndex % 300) * 3;
+    positions[idx] = worldPos.x;
+    positions[idx + 1] = worldPos.y;
+    positions[idx + 2] = worldPos.z;
+    trailIndex++;
+    trail.geometry.attributes.position.needsUpdate = true;
+    trail.geometry.setDrawRange(0, Math.min(trailIndex, 300));
+  }
+
+  // Update debug overlay
+  updateDebugOverlay();
+
+  // Update controls
+  controls.update();
+
+  // Render
+  renderer.render(scene, camera);
+}
+
+animate();
+</script>
+</body>
+</html>

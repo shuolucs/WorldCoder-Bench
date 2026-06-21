@@ -1,0 +1,570 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Product Exploded View</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #f0f0f0;
+            font-family: sans-serif;
+        }
+        #webgl-container {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+        }
+        #ui-panel {
+            position: absolute;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: rgba(255, 255, 255, 0.9);
+            padding: 15px 25px;
+            border-radius: 8px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            z-index: 10;
+            min-width: 300px;
+        }
+        .control-group {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 10px;
+        }
+        .control-group label {
+            font-size: 14px;
+            font-weight: bold;
+            color: #333;
+            width: 120px;
+        }
+        .control-group input[type="range"] {
+            flex-grow: 1;
+        }
+        .button-group {
+            display: flex;
+            justify-content: center;
+            gap: 10px;
+            margin-top: 5px;
+        }
+        button {
+            padding: 8px 12px;
+            border: none;
+            border-radius: 4px;
+            background: #007bff;
+            color: white;
+            cursor: pointer;
+            font-size: 12px;
+            font-weight: bold;
+            transition: background 0.2s;
+        }
+        button:hover {
+            background: #0056b3;
+        }
+        #hud {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            background: rgba(0, 0, 0, 0.7);
+            color: white;
+            padding: 12px;
+            border-radius: 6px;
+            font-family: monospace;
+            font-size: 14px;
+            z-index: 10;
+            pointer-events: none;
+            line-height: 1.5;
+        }
+        .part-label {
+            background: rgba(0, 0, 0, 0.8);
+            color: white;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+            pointer-events: none;
+            white-space: nowrap;
+            margin-top: -10px;
+        }
+        #loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            font-size: 24px;
+            font-weight: bold;
+            color: #333;
+            z-index: 20;
+            pointer-events: none;
+        }
+    </style>
+    <script type="importmap">
+    { "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+    } }
+    </script>
+</head>
+<body>
+    <div id="webgl-container"></div>
+    <div id="loading">Loading Model...</div>
+    
+    <div id="hud">
+        <div>Parts: <span id="hud-parts">0</span></div>
+        <div>Explode: <span id="hud-explode">0.00</span></div>
+        <div>Selected: <span id="hud-selected">0</span></div>
+        <div>Hovered: <span id="hud-hovered">none</span></div>
+        <div>Opacity: <span id="hud-opacity">1.00</span></div>
+    </div>
+
+    <div id="ui-panel">
+        <div class="control-group">
+            <label for="slider-explode">Explode Distance</label>
+            <input type="range" id="slider-explode" min="0" max="3" step="0.01" value="0">
+        </div>
+        <div class="control-group">
+            <label for="slider-opacity">Part Opacity</label>
+            <input type="range" id="slider-opacity" min="0.1" max="1" step="0.05" value="1">
+        </div>
+        <div class="button-group">
+            <button id="btn-reset">Reset</button>
+            <button id="btn-explode-full">Explode Full</button>
+            <button id="btn-assemble">Assemble</button>
+        </div>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+        import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer.js';
+
+        // --- Global State ---
+        window.__3D_STATE__ = {
+            frameCount: 0,
+            partCount: 0,
+            explodeDistance: 0,
+            selectedCount: 0,
+            hoveredPart: -1,
+            opacity: 1,
+            partsPositions: [],
+            explodeValid: false,
+            isPaused: false,
+            isAnimating: false
+        };
+
+        // --- Scene Setup ---
+        const container = document.getElementById('webgl-container');
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0xf0f0f0);
+
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+        camera.position.set(3, 2, 5);
+        camera.lookAt(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        container.appendChild(renderer.domElement);
+
+        const labelRenderer = new CSS2DRenderer();
+        labelRenderer.setSize(window.innerWidth, window.innerHeight);
+        labelRenderer.domElement.style.position = 'absolute';
+        labelRenderer.domElement.style.top = '0px';
+        labelRenderer.domElement.style.pointerEvents = 'none';
+        document.body.appendChild(labelRenderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.05;
+        // Save initial state for reset
+        controls.saveState();
+
+        // --- Lights ---
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
+        scene.add(ambientLight);
+
+        const dirLight1 = new THREE.DirectionalLight(0xffffff, 1.2);
+        dirLight1.position.set(5, 8, 5);
+        dirLight1.castShadow = true;
+        dirLight1.shadow.mapSize.width = 2048;
+        dirLight1.shadow.mapSize.height = 2048;
+        scene.add(dirLight1);
+
+        const dirLight2 = new THREE.DirectionalLight(0xffffff, 0.6);
+        dirLight2.position.set(-3, 5, -5);
+        scene.add(dirLight2);
+
+        // --- Ground Plane ---
+        const groundGeo = new THREE.CircleGeometry(3, 64);
+        const groundMat = new THREE.MeshStandardMaterial({ 
+            color: 0xdddddd, 
+            transparent: true, 
+            opacity: 0.8,
+            roughness: 0.8
+        });
+        const ground = new THREE.Mesh(groundGeo, groundMat);
+        ground.rotation.x = -Math.PI / 2;
+        ground.position.y = -1;
+        ground.receiveShadow = true;
+        scene.add(ground);
+
+        // --- Variables ---
+        const parts = [];
+        let modelGroup = new THREE.Group();
+        scene.add(modelGroup);
+
+        let currentExplodeDistance = 0;
+        let targetExplodeDistance = 0;
+        let targetOpacity = 1;
+        let hoveredPartIndex = -1;
+        
+        // Animation state
+        let animStartTime = 0;
+        let animStartVal = 0;
+        let animEndVal = 0;
+        const animDuration = 1000;
+
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2(-100, -100); // Init offscreen
+
+        // --- UI Elements ---
+        const sliderExplode = document.getElementById('slider-explode');
+        const sliderOpacity = document.getElementById('slider-opacity');
+        const hudParts = document.getElementById('hud-parts');
+        const hudExplode = document.getElementById('hud-explode');
+        const hudSelected = document.getElementById('hud-selected');
+        const hudHovered = document.getElementById('hud-hovered');
+        const hudOpacity = document.getElementById('hud-opacity');
+        const loadingEl = document.getElementById('loading');
+
+        // --- Fallback Model Generator ---
+        function createFallbackModel() {
+            const group = new THREE.Group();
+            const mat = new THREE.MeshStandardMaterial({ color: 0x888888, roughness: 0.4, metalness: 0.6 });
+            
+            const addPart = (geo, pos, name) => {
+                const mesh = new THREE.Mesh(geo, mat.clone());
+                mesh.position.copy(pos);
+                mesh.name = name;
+                group.add(mesh);
+            };
+
+            addPart(new THREE.BoxGeometry(2, 1.2, 0.8), new THREE.Vector3(0,0,0), "Body");
+            
+            const lens1 = new THREE.CylinderGeometry(0.5, 0.5, 0.4, 32);
+            lens1.rotateX(Math.PI/2);
+            addPart(lens1, new THREE.Vector3(0, 0, 0.6), "Lens_Base");
+            
+            const lens2 = new THREE.CylinderGeometry(0.4, 0.4, 0.3, 32);
+            lens2.rotateX(Math.PI/2);
+            addPart(lens2, new THREE.Vector3(0, 0, 0.95), "Lens_Front");
+            
+            addPart(new THREE.BoxGeometry(0.4, 0.3, 0.4), new THREE.Vector3(0, 0.75, 0), "Viewfinder");
+            addPart(new THREE.CylinderGeometry(0.15, 0.15, 0.1, 16), new THREE.Vector3(0.6, 0.65, 0), "Dial_Left");
+            addPart(new THREE.CylinderGeometry(0.12, 0.12, 0.1, 16), new THREE.Vector3(-0.6, 0.65, 0), "Dial_Right");
+            addPart(new THREE.BoxGeometry(0.3, 0.5, 0.2), new THREE.Vector3(-0.8, 0.85, 0), "Flash");
+
+            return group;
+        }
+
+        // --- Process Loaded Model ---
+        function processModel(model) {
+            // Center and scale
+            const box = new THREE.Box3().setFromObject(model);
+            const center = box.getCenter(new THREE.Vector3());
+            const size = box.getSize(new THREE.Vector3());
+            const maxDim = Math.max(size.x, size.y, size.z);
+            const scale = 2.0 / maxDim;
+
+            model.position.sub(center);
+            
+            // Wrap in group to apply scale without affecting local positions of children directly
+            const wrapper = new THREE.Group();
+            wrapper.add(model);
+            wrapper.scale.setScalar(scale);
+            modelGroup.add(wrapper);
+
+            // Update matrices to compute correct world/local centers
+            modelGroup.updateMatrixWorld(true);
+
+            let index = 0;
+            model.traverse((child) => {
+                if (child.isMesh) {
+                    child.castShadow = true;
+                    child.receiveShadow = true;
+
+                    // Ensure unique material for independent highlighting/opacity
+                    if (Array.isArray(child.material)) {
+                        child.material = child.material.map(m => m.clone());
+                        child.material.forEach(m => m.transparent = true);
+                    } else {
+                        child.material = child.material.clone();
+                        child.material.transparent = true;
+                    }
+
+                    // Compute explode direction based on bounding box center in model space
+                    const partBox = new THREE.Box3().setFromObject(child);
+                    const partCenterWorld = partBox.getCenter(new THREE.Vector3());
+                    // Convert to model's local space (which is centered at origin)
+                    const partCenterLocal = model.worldToLocal(partCenterWorld.clone());
+
+                    const explodeDir = partCenterLocal.clone().normalize();
+                    const distFromCenter = partCenterLocal.length();
+
+                    // Handle missing emissive properties gracefully
+                    const mat = Array.isArray(child.material) ? child.material[0] : child.material;
+                    const origEmissive = mat.emissive ? mat.emissive.clone() : new THREE.Color(0x000000);
+                    const origEmissiveInt = mat.emissiveIntensity !== undefined ? mat.emissiveIntensity : 0;
+
+                    // Create CSS2D Label
+                    const div = document.createElement('div');
+                    div.className = 'part-label';
+                    const partName = child.name || `Part_${index}`;
+                    div.textContent = `Part ${index}: ${partName}`;
+                    const label = new CSS2DObject(div);
+                    
+                    // Position label at the center of the part
+                    // We need to attach it to the child, so position is relative to child origin
+                    const childOriginWorld = new THREE.Vector3();
+                    child.getWorldPosition(childOriginWorld);
+                    const offset = partCenterWorld.clone().sub(childOriginWorld);
+                    // Convert offset to child's local space
+                    const offsetLocal = offset.applyQuaternion(child.getWorldQuaternion(new THREE.Quaternion()).invert());
+                    // Scale offset by inverse of child's world scale to get local coordinates
+                    const childScale = new THREE.Vector3();
+                    child.getWorldScale(childScale);
+                    offsetLocal.divide(childScale);
+
+                    label.position.copy(offsetLocal);
+                    child.add(label);
+                    label.visible = false;
+
+                    parts.push({
+                        index: index,
+                        mesh: child,
+                        name: partName,
+                        originalPos: child.position.clone(),
+                        originalQuat: child.quaternion.clone(),
+                        explodeDir: explodeDir,
+                        distFromCenter: distFromCenter,
+                        partCenterLocal: partCenterLocal, // Store for displacement calc
+                        originalEmissive: origEmissive,
+                        originalEmissiveInt: origEmissiveInt,
+                        isSelected: false,
+                        label: label
+                    });
+                    index++;
+                }
+            });
+
+            window.__3D_STATE__.partCount = parts.length;
+            hudParts.textContent = parts.length;
+            loadingEl.style.display = 'none';
+        }
+
+        // --- Load Model ---
+        const loader = new GLTFLoader();
+        loader.load(
+            './AntiqueCamera.glb',
+            (gltf) => {
+                processModel(gltf.scene);
+            },
+            undefined,
+            (error) => {
+                console.warn("Failed to load AntiqueCamera.glb, using fallback model.", error);
+                const fallback = createFallbackModel();
+                processModel(fallback);
+            }
+        );
+
+        // --- Event Listeners ---
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            labelRenderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        window.addEventListener('pointermove', (e) => {
+            mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+        });
+
+        window.addEventListener('click', () => {
+            if (hoveredPartIndex !== -1) {
+                const part = parts[hoveredPartIndex];
+                part.isSelected = !part.isSelected;
+            }
+        });
+
+        window.addEventListener('keydown', (e) => {
+            if (e.key === 'p' || e.key === 'P') {
+                window.__3D_STATE__.isPaused = !window.__3D_STATE__.isPaused;
+            }
+            if (e.key === 'r' || e.key === 'R') {
+                controls.reset();
+            }
+        });
+
+        // UI Controls
+        sliderExplode.addEventListener('input', (e) => {
+            targetExplodeDistance = parseFloat(e.target.value);
+            window.__3D_STATE__.isAnimating = false; // Cancel auto animation
+        });
+
+        sliderOpacity.addEventListener('input', (e) => {
+            targetOpacity = parseFloat(e.target.value);
+        });
+
+        document.getElementById('btn-reset').addEventListener('click', () => {
+            targetExplodeDistance = 0;
+            sliderExplode.value = 0;
+            targetOpacity = 1;
+            sliderOpacity.value = 1;
+            parts.forEach(p => p.isSelected = false);
+            window.__3D_STATE__.isAnimating = false;
+        });
+
+        function startExplodeAnimation(target) {
+            animStartVal = currentExplodeDistance;
+            animEndVal = target;
+            animStartTime = performance.now();
+            window.__3D_STATE__.isAnimating = true;
+        }
+
+        document.getElementById('btn-explode-full').addEventListener('click', () => {
+            startExplodeAnimation(2.0);
+        });
+
+        document.getElementById('btn-assemble').addEventListener('click', () => {
+            startExplodeAnimation(0.0);
+        });
+
+        // --- Animation & Render Loop ---
+        function animate(time) {
+            requestAnimationFrame(animate);
+
+            if (!window.__3D_STATE__.isPaused) {
+                controls.update();
+
+                // Handle Auto Animation
+                if (window.__3D_STATE__.isAnimating) {
+                    let progress = (time - animStartTime) / animDuration;
+                    if (progress >= 1) {
+                        progress = 1;
+                        window.__3D_STATE__.isAnimating = false;
+                    }
+                    // Ease in out cubic
+                    const ease = progress < 0.5 ? 4 * progress * progress * progress : 1 - Math.pow(-2 * progress + 2, 3) / 2;
+                    targetExplodeDistance = animStartVal + (animEndVal - animStartVal) * ease;
+                    sliderExplode.value = targetExplodeDistance;
+                }
+
+                // Lerp explode distance
+                currentExplodeDistance = THREE.MathUtils.lerp(currentExplodeDistance, targetExplodeDistance, 0.15);
+
+                // Update Parts Position & Rotation
+                parts.forEach(part => {
+                    // Displacement: move along vector from center to part
+                    // newPos = originalPos + partCenterLocal * d
+                    const displacement = part.partCenterLocal.clone().multiplyScalar(currentExplodeDistance);
+                    part.mesh.position.copy(part.originalPos).add(displacement);
+
+                    // Rotation: rotate around explode direction
+                    const axis = part.explodeDir;
+                    const angle = currentExplodeDistance * 0.1;
+                    const q = new THREE.Quaternion().setFromAxisAngle(axis, angle);
+                    part.mesh.quaternion.copy(q).multiply(part.originalQuat);
+                });
+
+                // Raycasting
+                raycaster.setFromCamera(mouse, camera);
+                const meshes = parts.map(p => p.mesh);
+                const intersects = raycaster.intersectObjects(meshes, false);
+                
+                let newHovered = -1;
+                if (intersects.length > 0) {
+                    const hit = intersects[0].object;
+                    const part = parts.find(p => p.mesh === hit);
+                    if (part) newHovered = part.index;
+                }
+                hoveredPartIndex = newHovered;
+
+                // Update Materials and Labels
+                let selectedCount = 0;
+                parts.forEach(part => {
+                    const isHovered = (part.index === hoveredPartIndex);
+                    const isSelected = part.isSelected;
+                    
+                    if (isSelected) selectedCount++;
+
+                    const mats = Array.isArray(part.mesh.material) ? part.mesh.material : [part.mesh.material];
+                    
+                    mats.forEach(mat => {
+                        if (!mat.emissive) return;
+                        
+                        if (isSelected) {
+                            mat.emissive.setHex(0xff8800);
+                            mat.emissiveIntensity = 0.4;
+                            mat.opacity = 1.0;
+                        } else if (isHovered) {
+                            mat.emissive.setHex(0x4444ff);
+                            mat.emissiveIntensity = 0.3;
+                            mat.opacity = targetOpacity;
+                        } else {
+                            mat.emissive.copy(part.originalEmissive);
+                            mat.emissiveIntensity = part.originalEmissiveInt;
+                            mat.opacity = targetOpacity;
+                        }
+                    });
+
+                    part.label.visible = isSelected || isHovered;
+                });
+
+                // Update HUD
+                hudExplode.textContent = currentExplodeDistance.toFixed(2);
+                hudSelected.textContent = selectedCount;
+                hudOpacity.textContent = targetOpacity.toFixed(2);
+                if (hoveredPartIndex !== -1) {
+                    hudHovered.textContent = `[${hoveredPartIndex}] ${parts[hoveredPartIndex].name}`;
+                } else {
+                    hudHovered.textContent = 'none';
+                }
+
+                // Update State Object
+                window.__3D_STATE__.frameCount++;
+                window.__3D_STATE__.explodeDistance = currentExplodeDistance;
+                window.__3D_STATE__.selectedCount = selectedCount;
+                window.__3D_STATE__.hoveredPart = hoveredPartIndex;
+                window.__3D_STATE__.opacity = targetOpacity;
+                
+                const positions = [];
+                let allValid = parts.length > 0;
+                for(let i=0; i<parts.length; i++) {
+                    const pos = parts[i].mesh.position;
+                    positions.push({ x: pos.x, y: pos.y, z: pos.z });
+                    if (!isFinite(pos.x) || !isFinite(pos.y) || !isFinite(pos.z)) {
+                        allValid = false;
+                    }
+                }
+                window.__3D_STATE__.partsPositions = positions;
+                window.__3D_STATE__.explodeValid = allValid;
+            }
+
+            renderer.render(scene, camera);
+            labelRenderer.render(scene, camera);
+        }
+
+        animate(performance.now());
+    </script>
+</body>
+</html>

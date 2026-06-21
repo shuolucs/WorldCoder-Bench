@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Three.js Spiral Galaxy</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #000;
+            color: #fff;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            user-select: none;
+        }
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+        }
+        #ui-panel {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            background: rgba(10, 15, 25, 0.85);
+            padding: 20px;
+            border-radius: 12px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.5);
+            backdrop-filter: blur(5px);
+            width: 280px;
+        }
+        .control-group {
+            margin-bottom: 15px;
+        }
+        .control-group:last-child {
+            margin-bottom: 0;
+        }
+        label {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 8px;
+            font-size: 14px;
+            color: #aaa;
+        }
+        span.val {
+            color: #fff;
+            font-weight: bold;
+        }
+        input[type=range] {
+            width: 100%;
+            cursor: pointer;
+            accent-color: #4488ff;
+        }
+    </style>
+    <script type="importmap">
+    { "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+    } }
+    </script>
+</head>
+<body>
+    <div id="canvas-container"></div>
+    
+    <div id="ui-panel">
+        <div class="control-group">
+            <label>旋臂数量 (Arm Count) <span id="armCountVal" class="val">4</span></label>
+            <input type="range" id="armCount" min="2" max="6" step="1" value="4">
+        </div>
+        <div class="control-group">
+            <label>离散度 (Spread) <span id="spreadVal" class="val">1.0</span></label>
+            <input type="range" id="spread" min="0.1" max="2.0" step="0.1" value="1.0">
+        </div>
+        <div class="control-group">
+            <label>旋转速度 (Rot Speed) <span id="rotSpeedVal" class="val">0.002</span></label>
+            <input type="range" id="rotSpeed" min="0" max="0.01" step="0.0005" value="0.002">
+        </div>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        // --- Configuration & State ---
+        const config = {
+            starCount: 50000,
+            armCount: 4,
+            spread: 1.0,
+            rotSpeed: 0.002,
+            galaxyRadius: 25,
+            centerDensity: 0.25, // 25% particles in bulge
+            a: 0.5, // Logarithmic spiral parameter a
+            b: 0.2  // Logarithmic spiral parameter b
+        };
+
+        window.__3D_STATE__ = {
+            starCount: config.starCount,
+            armCount: config.armCount,
+            spread: config.spread,
+            rotSpeed: config.rotSpeed,
+            galaxyRadius: config.galaxyRadius,
+            centerDensity: config.centerDensity,
+            simTime: 0
+        };
+
+        // --- Scene Setup ---
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        scene.fog = new THREE.FogExp2(0x000000, 0.015);
+
+        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.set(0, 20, 35);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        container.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.05;
+        controls.maxDistance = 100;
+
+        // --- Galaxy Generation ---
+        let galaxyGeometry = null;
+        let galaxyMaterial = null;
+        let galaxyPoints = null;
+
+        const vertexShader = `
+            attribute float size;
+            varying vec3 vColor;
+            void main() {
+                vColor = color;
+                vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+                // Size attenuation
+                gl_PointSize = size * (300.0 / -mvPosition.z);
+                gl_Position = projectionMatrix * mvPosition;
+            }
+        `;
+
+        const fragmentShader = `
+            varying vec3 vColor;
+            void main() {
+                // Circular particle with soft edge
+                vec2 xy = gl_PointCoord.xy - vec2(0.5);
+                float ll = length(xy);
+                if (ll > 0.5) discard;
+                
+                // Gaussian-like falloff for glow
+                float alpha = exp(-ll * ll * 20.0);
+                gl_FragColor = vec4(vColor, alpha);
+            }
+        `;
+
+        function generateGalaxy() {
+            if (galaxyPoints !== null) {
+                galaxyGeometry.dispose();
+                galaxyMaterial.dispose();
+                scene.remove(galaxyPoints);
+            }
+
+            galaxyGeometry = new THREE.BufferGeometry();
+            const positions = new Float32Array(config.starCount * 3);
+            const colors = new Float32Array(config.starCount * 3);
+            const sizes = new Float32Array(config.starCount);
+
+            const colorCore = new THREE.Color(0xffd1a3); // Warm white/yellow
+            const colorMid = new THREE.Color(0x4488ff);  // Blue
+            const colorEdge = new THREE.Color(0x8a2be2); // Purple
+
+            const maxTheta = (1 / config.b) * Math.log(config.galaxyRadius / config.a);
+            const bulgeCount = Math.floor(config.starCount * config.centerDensity);
+            const armCount = config.starCount - bulgeCount;
+
+            for (let i = 0; i < config.starCount; i++) {
+                let x, y, z, r, colorRatio;
+
+                if (i < bulgeCount) {
+                    // Central Bulge
+                    r = Math.pow(Math.random(), 2) * (config.galaxyRadius * 0.15);
+                    const theta = Math.random() * Math.PI * 2;
+                    const phi = Math.acos((Math.random() * 2) - 1);
+                    
+                    x = r * Math.sin(phi) * Math.cos(theta);
+                    y = r * Math.sin(phi) * Math.sin(theta) * 0.7; // Flattened sphere
+                    z = r * Math.cos(phi);
+                    
+                    colorRatio = r / (config.galaxyRadius * 0.2);
+                } else {
+                    // Spiral Arms (Logarithmic Spiral r = a * exp(b * theta))
+                    const t = Math.pow(Math.random(), 1.5); // Bias towards center
+                    const theta = t * maxTheta;
+                    r = config.a * Math.exp(config.b * theta);
+
+                    const armIndex = i % config.armCount;
+                    const armOffset = (armIndex / config.armCount) * Math.PI * 2;
+                    const finalTheta = theta + armOffset;
+
+                    // Base position on spiral
+                    x = r * Math.cos(finalTheta);
+                    z = r * Math.sin(finalTheta);
+                    y = 0;
+
+                    // Scatter
+                    const scatterAmount = config.spread * (r / config.galaxyRadius * 3.0 + 0.5);
+                    
+                    // Random point in unit sphere for scatter
+                    let rx, ry, rz, rs;
+                    do {
+                        rx = Math.random() * 2 - 1;
+                        ry = Math.random() * 2 - 1;
+                        rz = Math.random() * 2 - 1;
+                        rs = rx*rx + ry*ry + rz*rz;
+                    } while(rs > 1);
+
+                    x += rx * scatterAmount;
+                    y += ry * scatterAmount * 0.25; // Arms are flat
+                    z += rz * scatterAmount;
+
+                    colorRatio = r / config.galaxyRadius;
+                }
+
+                positions[i * 3] = x;
+                positions[i * 3 + 1] = y;
+                positions[i * 3 + 2] = z;
+
+                // Color interpolation based on distance from center
+                const mixedColor = new THREE.Color();
+                if (colorRatio < 0.3) {
+                    mixedColor.lerpColors(colorCore, colorMid, colorRatio / 0.3);
+                } else {
+                    mixedColor.lerpColors(colorMid, colorEdge, (colorRatio - 0.3) / 0.7);
+                }
+
+                // Add slight random color variation
+                mixedColor.r = THREE.MathUtils.clamp(mixedColor.r + (Math.random() - 0.5) * 0.2, 0, 1);
+                mixedColor.g = THREE.MathUtils.clamp(mixedColor.g + (Math.random() - 0.5) * 0.2, 0, 1);
+                mixedColor.b = THREE.MathUtils.clamp(mixedColor.b + (Math.random() - 0.5) * 0.2, 0, 1);
+
+                colors[i * 3] = mixedColor.r;
+                colors[i * 3 + 1] = mixedColor.g;
+                colors[i * 3 + 2] = mixedColor.b;
+
+                // Random size, larger in center
+                const baseSize = Math.random() * 1.5 + 0.5;
+                sizes[i] = baseSize * (1.0 + Math.max(0, 1.0 - colorRatio) * 2.0);
+            }
+
+            galaxyGeometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+            galaxyGeometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+            galaxyGeometry.setAttribute('size', new THREE.BufferAttribute(sizes, 1));
+
+            galaxyMaterial = new THREE.ShaderMaterial({
+                vertexShader,
+                fragmentShader,
+                transparent: true,
+                depthWrite: false,
+                blending: THREE.AdditiveBlending,
+                vertexColors: true
+            });
+
+            galaxyPoints = new THREE.Points(galaxyGeometry, galaxyMaterial);
+            scene.add(galaxyPoints);
+        }
+
+        generateGalaxy();
+
+        // --- UI Interactions ---
+        const elArmCount = document.getElementById('armCount');
+        const elSpread = document.getElementById('spread');
+        const elRotSpeed = document.getElementById('rotSpeed');
+        
+        const valArmCount = document.getElementById('armCountVal');
+        const valSpread = document.getElementById('spreadVal');
+        const valRotSpeed = document.getElementById('rotSpeedVal');
+
+        elArmCount.addEventListener('input', (e) => {
+            const val = parseInt(e.target.value);
+            valArmCount.textContent = val;
+            config.armCount = val;
+            window.__3D_STATE__.armCount = val;
+            generateGalaxy();
+        });
+
+        elSpread.addEventListener('input', (e) => {
+            const val = parseFloat(e.target.value);
+            valSpread.textContent = val.toFixed(1);
+            config.spread = val;
+            window.__3D_STATE__.spread = val;
+            generateGalaxy();
+        });
+
+        elRotSpeed.addEventListener('input', (e) => {
+            const val = parseFloat(e.target.value);
+            valRotSpeed.textContent = val.toFixed(4);
+            config.rotSpeed = val;
+            window.__3D_STATE__.rotSpeed = val;
+        });
+
+        // --- Resize Handler ---
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // --- Animation Loop ---
+        const clock = new THREE.Clock();
+
+        function animate() {
+            requestAnimationFrame(animate);
+            
+            const dt = clock.getDelta();
+            window.__3D_STATE__.simTime += dt;
+
+            if (galaxyPoints) {
+                galaxyPoints.rotation.y -= config.rotSpeed; // Rotate clockwise
+            }
+
+            controls.update();
+            renderer.render(scene, camera);
+        }
+
+        animate();
+    </script>
+</body>
+</html>

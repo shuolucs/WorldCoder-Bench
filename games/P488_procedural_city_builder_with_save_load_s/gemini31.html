@@ -1,0 +1,443 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Procedural City Builder</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            font-family: sans-serif;
+            user-select: none;
+        }
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+        }
+        #hud {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(0, 0, 0, 0.7);
+            color: white;
+            padding: 15px;
+            border-radius: 8px;
+            pointer-events: none;
+            min-width: 150px;
+        }
+        #hud div {
+            margin-bottom: 5px;
+        }
+        #toolbar {
+            position: absolute;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            gap: 10px;
+            background: rgba(0, 0, 0, 0.5);
+            padding: 10px;
+            border-radius: 8px;
+            pointer-events: auto;
+        }
+        button {
+            padding: 8px 16px;
+            cursor: pointer;
+            border: none;
+            border-radius: 4px;
+            font-weight: bold;
+            background: #eee;
+            transition: background 0.2s;
+        }
+        button:hover {
+            background: #ccc;
+        }
+        button.active {
+            background: #4CAF50;
+            color: white;
+        }
+        button.danger {
+            background: #f44336;
+            color: white;
+        }
+        button.danger.active {
+            background: #d32f2f;
+        }
+    </style>
+    <!-- Import maps polyfill -->
+    <script async src="https://unpkg.com/es-module-shims@1.8.0/dist/es-module-shims.js"></script>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="hud">
+        <div>Gold: <span id="hud-gold">1000</span></div>
+        <div>Buildings: <span id="hud-buildings">0</span></div>
+        <div>Income/tick: <span id="hud-income">0</span></div>
+        <div>Selected: <span id="hud-selected">House</span></div>
+    </div>
+
+    <div id="toolbar">
+        <button id="btn-house" class="active">House (100g)</button>
+        <button id="btn-tower">Tower (250g)</button>
+        <button id="btn-factory">Factory (400g)</button>
+        <button id="btn-demolish" class="danger">Demolish: OFF</button>
+        <button id="btn-save">Save</button>
+        <button id="btn-load">Load</button>
+        <button id="btn-clear">Clear</button>
+    </div>
+
+    <div id="canvas-container"></div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+        // --- State Management ---
+        window.__3D_STATE__ = {
+            buildingCount: 0,
+            gold: 1000,
+            selectedType: 'house',
+            demolishMode: false,
+            foxPositionX: 0,
+            foxPositionZ: 0,
+            foxLoaded: false,
+            buildings: [],
+            savedStateExists: !!localStorage.getItem('cityState'),
+            totalIncome: 0,
+            lastPlacedType: null,
+            incomeRate: 0
+        };
+
+        const state = window.__3D_STATE__;
+
+        const BUILDING_DEFS = {
+            house: { color: 0xCC8844, w: 1.5, h: 2, d: 1.5, cost: 100, income: 10, name: 'House' },
+            tower: { color: 0x6688CC, w: 1, h: 5, d: 1, cost: 250, income: 25, name: 'Tower' },
+            factory: { color: 0x888888, w: 1.8, h: 3, d: 1.8, cost: 400, income: 50, name: 'Factory' }
+        };
+
+        let nextBuildingId = 1;
+        const buildingsMap = new Map(); // key: "x,z", value: mesh
+        const buildingMeshes = []; // For raycasting
+
+        // --- Scene Setup ---
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x87CEEB);
+
+        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.set(15, 20, 15);
+        camera.lookAt(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.shadowMap.enabled = true;
+        container.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.maxPolarAngle = Math.PI / 2 - 0.05; // Don't go below ground
+
+        // Lights
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+        dirLight.position.set(10, 20, 10);
+        dirLight.castShadow = true;
+        dirLight.shadow.camera.left = -15;
+        dirLight.shadow.camera.right = 15;
+        dirLight.shadow.camera.top = 15;
+        dirLight.shadow.camera.bottom = -15;
+        scene.add(dirLight);
+
+        // Grid & Ground
+        const gridSize = 20;
+        const divisions = 10;
+        
+        const groundGeo = new THREE.PlaneGeometry(gridSize, gridSize);
+        const groundMat = new THREE.MeshStandardMaterial({ color: 0x4a7c4f });
+        const groundPlane = new THREE.Mesh(groundGeo, groundMat);
+        groundPlane.rotation.x = -Math.PI / 2;
+        groundPlane.receiveShadow = true;
+        scene.add(groundPlane);
+
+        const gridHelper = new THREE.GridHelper(gridSize, divisions, 0x000000, 0x000000);
+        gridHelper.position.y = 0.01;
+        gridHelper.material.opacity = 0.2;
+        gridHelper.material.transparent = true;
+        scene.add(gridHelper);
+
+        // --- Fox Mascot ---
+        let fox, mixer;
+        let foxDirection = 1;
+        const clock = new THREE.Clock();
+
+        const loader = new GLTFLoader();
+        loader.load('https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Models/master/2.0/Fox/glTF-Binary/Fox.glb', (gltf) => {
+            fox = gltf.scene;
+            fox.scale.set(0.02, 0.02, 0.02);
+            fox.position.set(0, 0, 0);
+            
+            fox.traverse((child) => {
+                if (child.isMesh) {
+                    child.castShadow = true;
+                    child.receiveShadow = true;
+                }
+            });
+
+            mixer = new THREE.AnimationMixer(fox);
+            const action = mixer.clipAction(gltf.animations[0]);
+            action.play();
+
+            fox.rotation.y = Math.PI / 2; // Face positive X initially
+            scene.add(fox);
+            state.foxLoaded = true;
+        });
+
+        // --- UI & Interaction ---
+        const hudGold = document.getElementById('hud-gold');
+        const hudBuildings = document.getElementById('hud-buildings');
+        const hudIncome = document.getElementById('hud-income');
+        const hudSelected = document.getElementById('hud-selected');
+
+        const btnHouse = document.getElementById('btn-house');
+        const btnTower = document.getElementById('btn-tower');
+        const btnFactory = document.getElementById('btn-factory');
+        const btnDemolish = document.getElementById('btn-demolish');
+
+        function updateHUD() {
+            hudGold.textContent = state.gold;
+            hudBuildings.textContent = state.buildingCount;
+            
+            let rate = 0;
+            buildingsMap.forEach(b => rate += BUILDING_DEFS[b.userData.type].income);
+            state.incomeRate = rate;
+            hudIncome.textContent = rate;
+            
+            hudSelected.textContent = state.demolishMode ? 'Demolish' : BUILDING_DEFS[state.selectedType].name;
+
+            // Sync state array
+            state.buildings = Array.from(buildingsMap.values()).map(mesh => ({
+                id: mesh.userData.buildingId,
+                type: mesh.userData.type,
+                gridX: mesh.userData.gridX,
+                gridZ: mesh.userData.gridZ,
+                cost: BUILDING_DEFS[mesh.userData.type].cost
+            }));
+        }
+
+        function selectType(type, btn) {
+            state.selectedType = type;
+            state.demolishMode = false;
+            btnDemolish.textContent = 'Demolish: OFF';
+            btnDemolish.classList.remove('active');
+            
+            [btnHouse, btnTower, btnFactory].forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            updateHUD();
+        }
+
+        btnHouse.addEventListener('click', () => selectType('house', btnHouse));
+        btnTower.addEventListener('click', () => selectType('tower', btnTower));
+        btnFactory.addEventListener('click', () => selectType('factory', btnFactory));
+
+        btnDemolish.addEventListener('click', () => {
+            state.demolishMode = !state.demolishMode;
+            btnDemolish.textContent = state.demolishMode ? 'Demolish: ON' : 'Demolish: OFF';
+            if (state.demolishMode) {
+                btnDemolish.classList.add('active');
+                [btnHouse, btnTower, btnFactory].forEach(b => b.classList.remove('active'));
+            } else {
+                btnDemolish.classList.remove('active');
+                document.getElementById(`btn-${state.selectedType}`).classList.add('active');
+            }
+            updateHUD();
+        });
+
+        // Placement Logic
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+
+        renderer.domElement.addEventListener('pointerdown', (event) => {
+            if (event.button !== 0) return; // Only left click
+
+            mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+            raycaster.setFromCamera(mouse, camera);
+
+            if (state.demolishMode) {
+                const intersects = raycaster.intersectObjects(buildingMeshes);
+                if (intersects.length > 0) {
+                    const mesh = intersects[0].object;
+                    const def = BUILDING_DEFS[mesh.userData.type];
+                    state.gold += Math.floor(def.cost * 0.5);
+                    
+                    scene.remove(mesh);
+                    buildingMeshes.splice(buildingMeshes.indexOf(mesh), 1);
+                    buildingsMap.delete(`${mesh.userData.gridX},${mesh.userData.gridZ}`);
+                    state.buildingCount--;
+                    updateHUD();
+                }
+            } else {
+                const intersects = raycaster.intersectObject(groundPlane);
+                if (intersects.length > 0) {
+                    const point = intersects[0].point;
+                    
+                    // Snap to 2x2 grid. Grid goes from -10 to 10. Centers are at odd numbers.
+                    const gridX = Math.floor(point.x / 2) * 2 + 1;
+                    const gridZ = Math.floor(point.z / 2) * 2 + 1;
+
+                    // Bounds check
+                    if (gridX < -9 || gridX > 9 || gridZ < -9 || gridZ > 9) return;
+
+                    const key = `${gridX},${gridZ}`;
+                    if (buildingsMap.has(key)) return; // Occupied
+
+                    const def = BUILDING_DEFS[state.selectedType];
+                    if (state.gold >= def.cost) {
+                        state.gold -= def.cost;
+                        createBuilding(state.selectedType, gridX, gridZ, nextBuildingId++);
+                        state.lastPlacedType = state.selectedType;
+                        updateHUD();
+                    }
+                }
+            }
+        });
+
+        function createBuilding(type, x, z, id) {
+            const def = BUILDING_DEFS[type];
+            const geo = new THREE.BoxGeometry(def.w, def.h, def.d);
+            const mat = new THREE.MeshStandardMaterial({ color: def.color });
+            const mesh = new THREE.Mesh(geo, mat);
+            
+            mesh.position.set(x, def.h / 2, z);
+            mesh.castShadow = true;
+            mesh.receiveShadow = true;
+            
+            mesh.userData = { buildingId: id, type: type, gridX: x, gridZ: z };
+            
+            scene.add(mesh);
+            buildingMeshes.push(mesh);
+            buildingsMap.set(`${x},${z}`, mesh);
+            state.buildingCount++;
+        }
+
+        // --- Economy Loop ---
+        setInterval(() => {
+            if (state.incomeRate > 0) {
+                state.gold += state.incomeRate;
+                state.totalIncome += state.incomeRate;
+                updateHUD();
+            }
+        }, 5000);
+
+        // --- Save / Load / Clear ---
+        document.getElementById('btn-save').addEventListener('click', () => {
+            const data = {
+                gold: state.gold,
+                nextId: nextBuildingId,
+                foxX: fox ? fox.position.x : 0,
+                foxZ: fox ? fox.position.z : 0,
+                foxDir: foxDirection,
+                buildings: state.buildings
+            };
+            localStorage.setItem('cityState', JSON.stringify(data));
+            state.savedStateExists = true;
+        });
+
+        document.getElementById('btn-load').addEventListener('click', () => {
+            const str = localStorage.getItem('cityState');
+            if (!str) return;
+            
+            clearCity();
+            
+            const data = JSON.parse(str);
+            state.gold = data.gold;
+            nextBuildingId = data.nextId || 1;
+            
+            if (fox) {
+                fox.position.set(data.foxX, 0, data.foxZ);
+                foxDirection = data.foxDir || 1;
+                fox.rotation.y = foxDirection === 1 ? Math.PI / 2 : -Math.PI / 2;
+            }
+
+            data.buildings.forEach(b => {
+                createBuilding(b.type, b.gridX, b.gridZ, b.id);
+            });
+            
+            updateHUD();
+        });
+
+        document.getElementById('btn-clear').addEventListener('click', () => {
+            clearCity();
+            state.gold = 1000;
+            nextBuildingId = 1;
+            if (fox) {
+                fox.position.set(0, 0, 0);
+                foxDirection = 1;
+                fox.rotation.y = Math.PI / 2;
+            }
+            updateHUD();
+        });
+
+        function clearCity() {
+            buildingMeshes.forEach(mesh => scene.remove(mesh));
+            buildingMeshes.length = 0;
+            buildingsMap.clear();
+            state.buildingCount = 0;
+        }
+
+        // --- Resize Handler ---
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // --- Animation Loop ---
+        function animate() {
+            requestAnimationFrame(animate);
+            
+            const delta = clock.getDelta();
+            
+            if (fox && mixer) {
+                mixer.update(delta);
+                
+                // Patrol logic
+                fox.position.x += foxDirection * 2 * delta;
+                
+                if (fox.position.x > 8) {
+                    fox.position.x = 8;
+                    foxDirection = -1;
+                    fox.rotation.y = -Math.PI / 2;
+                } else if (fox.position.x < -8) {
+                    fox.position.x = -8;
+                    foxDirection = 1;
+                    fox.rotation.y = Math.PI / 2;
+                }
+
+                state.foxPositionX = Number(fox.position.x.toFixed(2));
+                state.foxPositionZ = Number(fox.position.z.toFixed(2));
+            }
+
+            controls.update();
+            renderer.render(scene, camera);
+        }
+
+        updateHUD();
+        animate();
+    </script>
+</body>
+</html>

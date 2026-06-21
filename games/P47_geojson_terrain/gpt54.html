@@ -1,0 +1,657 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Three.js 程序噪声地形 + GeoJSON 区域叠加</title>
+  <style>
+    html, body {
+      margin: 0;
+      height: 100%;
+      overflow: hidden;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #0f172a;
+      color: #e5e7eb;
+    }
+
+    #app {
+      position: relative;
+      width: 100%;
+      height: 100%;
+    }
+
+    canvas {
+      display: block;
+    }
+
+    .panel {
+      position: absolute;
+      z-index: 10;
+      background: rgba(15, 23, 42, 0.82);
+      backdrop-filter: blur(8px);
+      border: 1px solid rgba(148, 163, 184, 0.25);
+      border-radius: 12px;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.35);
+      padding: 12px 14px;
+      line-height: 1.5;
+    }
+
+    #controlsPanel {
+      top: 14px;
+      left: 14px;
+      min-width: 220px;
+    }
+
+    #regionStats {
+      top: 14px;
+      right: 14px;
+      width: 280px;
+      min-height: 120px;
+      white-space: pre-line;
+    }
+
+    .panel h3 {
+      margin: 0 0 8px 0;
+      font-size: 15px;
+      color: #f8fafc;
+    }
+
+    .row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin: 8px 0;
+    }
+
+    label {
+      cursor: pointer;
+      user-select: none;
+    }
+
+    .hint {
+      margin-top: 8px;
+      font-size: 12px;
+      color: #cbd5e1;
+      opacity: 0.9;
+    }
+
+    .legend {
+      margin-top: 8px;
+      height: 10px;
+      border-radius: 999px;
+      background: linear-gradient(90deg,
+        #1e3a8a 0%,
+        #3b82f6 15%,
+        #22c55e 40%,
+        #84cc16 58%,
+        #ca8a04 78%,
+        #e5e7eb 100%);
+      border: 1px solid rgba(255,255,255,0.15);
+    }
+  </style>
+
+  <script type="importmap">
+  { "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+  } }
+  </script>
+</head>
+<body>
+  <div id="app">
+    <div id="controlsPanel" class="panel">
+      <h3>图层控制</h3>
+      <div class="row">
+        <input id="terrainToggle" type="checkbox" checked />
+        <label for="terrainToggle">显示地形 Mesh</label>
+      </div>
+      <div class="row">
+        <input id="regionToggle" type="checkbox" checked />
+        <label for="regionToggle">显示区域叠加层</label>
+      </div>
+      <div class="hint">
+        鼠标左键旋转，右键平移，滚轮缩放。<br />
+        点击彩色区域查看统计信息。
+      </div>
+      <div class="legend" title="海拔颜色：低 → 高"></div>
+    </div>
+
+    <div id="regionStats" class="panel">
+      <h3>区域统计</h3>
+      尚未选择区域
+    </div>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+    const app = document.getElementById('app');
+    const regionStats = document.getElementById('regionStats');
+    const terrainToggle = document.getElementById('terrainToggle');
+    const regionToggle = document.getElementById('regionToggle');
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0xbfd7ea);
+    scene.fog = new THREE.Fog(0xbfd7ea, 140, 260);
+
+    const camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 0.1, 1000);
+    camera.position.set(0, 70, 95);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.shadowMap.enabled = true;
+    app.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.set(0, 0, 0);
+    controls.enableDamping = true;
+    controls.minDistance = 25;
+    controls.maxDistance = 220;
+    controls.maxPolarAngle = Math.PI * 0.48;
+
+    scene.add(new THREE.AmbientLight(0xffffff, 1.15));
+
+    const dirLight = new THREE.DirectionalLight(0xffffff, 1.35);
+    dirLight.position.set(40, 70, 25);
+    dirLight.castShadow = true;
+    dirLight.shadow.mapSize.set(2048, 2048);
+    scene.add(dirLight);
+
+    const fillLight = new THREE.DirectionalLight(0x9fd3ff, 0.55);
+    fillLight.position.set(-60, 35, -30);
+    scene.add(fillLight);
+
+    const terrainGroup = new THREE.Group();
+    const regionGroup = new THREE.Group();
+    scene.add(terrainGroup);
+    scene.add(regionGroup);
+
+    const TERRAIN_SIZE = 100;
+    const TERRAIN_SEGMENTS = 127; // 128x128 顶点
+    const GRID_SIZE = 128;
+    const HALF = TERRAIN_SIZE / 2;
+
+    // ---------------------------
+    // Simplex-like value noise / fBm
+    // ---------------------------
+    function fract(x) {
+      return x - Math.floor(x);
+    }
+
+    function hash2(x, y) {
+      return fract(Math.sin(x * 127.1 + y * 311.7) * 43758.5453123);
+    }
+
+    function smoothstep(t) {
+      return t * t * (3 - 2 * t);
+    }
+
+    function valueNoise2D(x, y) {
+      const x0 = Math.floor(x);
+      const y0 = Math.floor(y);
+      const x1 = x0 + 1;
+      const y1 = y0 + 1;
+
+      const sx = smoothstep(x - x0);
+      const sy = smoothstep(y - y0);
+
+      const n00 = hash2(x0, y0);
+      const n10 = hash2(x1, y0);
+      const n01 = hash2(x0, y1);
+      const n11 = hash2(x1, y1);
+
+      const ix0 = THREE.MathUtils.lerp(n00, n10, sx);
+      const ix1 = THREE.MathUtils.lerp(n01, n11, sx);
+      return THREE.MathUtils.lerp(ix0, ix1, sy) * 2 - 1;
+    }
+
+    function fbm(x, y, octaves = 5) {
+      let value = 0;
+      let amplitude = 0.5;
+      let frequency = 1.0;
+      let sumAmplitude = 0;
+
+      for (let i = 0; i < octaves; i++) {
+        value += valueNoise2D(x * frequency, y * frequency) * amplitude;
+        sumAmplitude += amplitude;
+        amplitude *= 0.5;
+        frequency *= 2.0;
+      }
+      return value / sumAmplitude;
+    }
+
+    // ---------------------------
+    // 高度图与地形
+    // ---------------------------
+    const heights = new Float32Array(GRID_SIZE * GRID_SIZE);
+    let minElevation = Infinity;
+    let maxElevation = -Infinity;
+
+    function gridIndex(ix, iz) {
+      return iz * GRID_SIZE + ix;
+    }
+
+    function generateHeight(ix, iz) {
+      const nx = ix / (GRID_SIZE - 1);
+      const nz = iz / (GRID_SIZE - 1);
+
+      const x = nx * 5.2;
+      const z = nz * 5.2;
+
+      const base = fbm(x, z, 6);
+      const detail = fbm(x * 2.3 + 11.7, z * 2.3 - 5.1, 4) * 0.35;
+
+      const dx = nx - 0.5;
+      const dz = nz - 0.5;
+      const radial = Math.sqrt(dx * dx + dz * dz);
+      const islandMask = THREE.MathUtils.clamp(1.15 - radial * 1.85, 0, 1);
+
+      let h = (base * 0.85 + detail) * 20;
+      h *= islandMask;
+      h -= 4.0;
+
+      return h;
+    }
+
+    for (let iz = 0; iz < GRID_SIZE; iz++) {
+      for (let ix = 0; ix < GRID_SIZE; ix++) {
+        const h = generateHeight(ix, iz);
+        heights[gridIndex(ix, iz)] = h;
+        minElevation = Math.min(minElevation, h);
+        maxElevation = Math.max(maxElevation, h);
+      }
+    }
+
+    function getHeightAtWorld(x, z) {
+      const u = THREE.MathUtils.clamp((x + HALF) / TERRAIN_SIZE, 0, 1);
+      const v = THREE.MathUtils.clamp((z + HALF) / TERRAIN_SIZE, 0, 1);
+
+      const gx = u * (GRID_SIZE - 1);
+      const gz = v * (GRID_SIZE - 1);
+
+      const x0 = Math.floor(gx);
+      const z0 = Math.floor(gz);
+      const x1 = Math.min(x0 + 1, GRID_SIZE - 1);
+      const z1 = Math.min(z0 + 1, GRID_SIZE - 1);
+
+      const tx = gx - x0;
+      const tz = gz - z0;
+
+      const h00 = heights[gridIndex(x0, z0)];
+      const h10 = heights[gridIndex(x1, z0)];
+      const h01 = heights[gridIndex(x0, z1)];
+      const h11 = heights[gridIndex(x1, z1)];
+
+      const hx0 = THREE.MathUtils.lerp(h00, h10, tx);
+      const hx1 = THREE.MathUtils.lerp(h01, h11, tx);
+      return THREE.MathUtils.lerp(hx0, hx1, tz);
+    }
+
+    function getTerrainColor(h) {
+      const t = (h - minElevation) / (maxElevation - minElevation);
+
+      const colorStops = [
+        { t: 0.00, c: new THREE.Color(0x1e3a8a) }, // 深蓝
+        { t: 0.15, c: new THREE.Color(0x3b82f6) }, // 海岸蓝
+        { t: 0.32, c: new THREE.Color(0x22c55e) }, // 低地绿
+        { t: 0.55, c: new THREE.Color(0x84cc16) }, // 高地绿黄
+        { t: 0.76, c: new THREE.Color(0xca8a04) }, // 岩土
+        { t: 1.00, c: new THREE.Color(0xe5e7eb) }  // 雪顶
+      ];
+
+      for (let i = 0; i < colorStops.length - 1; i++) {
+        const a = colorStops[i];
+        const b = colorStops[i + 1];
+        if (t >= a.t && t <= b.t) {
+          const lt = (t - a.t) / (b.t - a.t);
+          return a.c.clone().lerp(b.c, lt);
+        }
+      }
+      return colorStops[colorStops.length - 1].c.clone();
+    }
+
+    const terrainGeometry = new THREE.PlaneGeometry(
+      TERRAIN_SIZE,
+      TERRAIN_SIZE,
+      TERRAIN_SEGMENTS,
+      TERRAIN_SEGMENTS
+    );
+    terrainGeometry.rotateX(-Math.PI / 2);
+
+    const pos = terrainGeometry.attributes.position;
+    const colors = new Float32Array(pos.count * 3);
+
+    for (let i = 0; i < pos.count; i++) {
+      const x = pos.getX(i);
+      const z = pos.getZ(i);
+      const h = getHeightAtWorld(x, z);
+      pos.setY(i, h);
+
+      const c = getTerrainColor(h);
+      colors[i * 3 + 0] = c.r;
+      colors[i * 3 + 1] = c.g;
+      colors[i * 3 + 2] = c.b;
+    }
+
+    terrainGeometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+    terrainGeometry.computeVertexNormals();
+
+    const terrainMaterial = new THREE.MeshStandardMaterial({
+      vertexColors: true,
+      roughness: 0.96,
+      metalness: 0.02,
+      side: THREE.DoubleSide
+    });
+
+    const terrainMesh = new THREE.Mesh(terrainGeometry, terrainMaterial);
+    terrainMesh.castShadow = false;
+    terrainMesh.receiveShadow = true;
+    terrainGroup.add(terrainMesh);
+
+    const gridHelper = new THREE.GridHelper(TERRAIN_SIZE, 10, 0x64748b, 0x94a3b8);
+    gridHelper.position.y = minElevation - 0.15;
+    gridHelper.material.opacity = 0.28;
+    gridHelper.material.transparent = true;
+    terrainGroup.add(gridHelper);
+
+    // ---------------------------
+    // 硬编码 GeoJSON：恰好 5 个 Polygon
+    // 坐标范围使用 [0,100] 映射到地形 [-50,50]
+    // ---------------------------
+    const geojson = {
+      type: "FeatureCollection",
+      features: [
+        {
+          type: "Feature",
+          properties: { id: 1, name: "Northwest Reach", color: "#ef4444" },
+          geometry: {
+            type: "Polygon",
+            coordinates: [[
+              [8, 68], [24, 90], [42, 86], [38, 66], [20, 58], [8, 68]
+            ]]
+          }
+        },
+        {
+          type: "Feature",
+          properties: { id: 2, name: "Northern Basin", color: "#f59e0b" },
+          geometry: {
+            type: "Polygon",
+            coordinates: [[
+              [44, 82], [66, 88], [80, 76], [72, 60], [50, 62], [44, 82]
+            ]]
+          }
+        },
+        {
+          type: "Feature",
+          properties: { id: 3, name: "Central Heights", color: "#10b981" },
+          geometry: {
+            type: "Polygon",
+            coordinates: [[
+              [28, 58], [44, 64], [58, 54], [54, 38], [36, 34], [24, 46], [28, 58]
+            ]]
+          }
+        },
+        {
+          type: "Feature",
+          properties: { id: 4, name: "Western Plains", color: "#3b82f6" },
+          geometry: {
+            type: "Polygon",
+            coordinates: [[
+              [10, 42], [24, 52], [30, 34], [24, 16], [8, 20], [10, 42]
+            ]]
+          }
+        },
+        {
+          type: "Feature",
+          properties: { id: 5, name: "Southeast March", color: "#a855f7" },
+          geometry: {
+            type: "Polygon",
+            coordinates: [[
+              [58, 44], [76, 50], [90, 34], [84, 14], [62, 10], [54, 24], [58, 44]
+            ]]
+          }
+        }
+      ]
+    };
+
+    function mapGeoToWorld(coord) {
+      const x = (coord[0] / 100) * TERRAIN_SIZE - HALF;
+      const z = (coord[1] / 100) * TERRAIN_SIZE - HALF;
+      return new THREE.Vector3(x, 0, z);
+    }
+
+    function polygonArea2D(points) {
+      let sum = 0;
+      for (let i = 0; i < points.length; i++) {
+        const a = points[i];
+        const b = points[(i + 1) % points.length];
+        sum += a.x * b.z - b.x * a.z;
+      }
+      return Math.abs(sum) * 0.5;
+    }
+
+    function pointInPolygonXZ(x, z, points) {
+      let inside = false;
+      for (let i = 0, j = points.length - 1; i < points.length; j = i++) {
+        const xi = points[i].x, zi = points[i].z;
+        const xj = points[j].x, zj = points[j].z;
+
+        const intersect = ((zi > z) !== (zj > z)) &&
+          (x < ((xj - xi) * (z - zi)) / ((zj - zi) || 1e-9) + xi);
+        if (intersect) inside = !inside;
+      }
+      return inside;
+    }
+
+    function computeRegionStats(worldRing) {
+      const area = polygonArea2D(worldRing);
+
+      let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
+      for (const p of worldRing) {
+        minX = Math.min(minX, p.x);
+        maxX = Math.max(maxX, p.x);
+        minZ = Math.min(minZ, p.z);
+        maxZ = Math.max(maxZ, p.z);
+      }
+
+      const sampleStep = 2.0;
+      let elevSum = 0;
+      let count = 0;
+
+      for (let z = minZ; z <= maxZ; z += sampleStep) {
+        for (let x = minX; x <= maxX; x += sampleStep) {
+          if (pointInPolygonXZ(x, z, worldRing)) {
+            elevSum += getHeightAtWorld(x, z);
+            count++;
+          }
+        }
+      }
+
+      const avgElevation = count > 0 ? elevSum / count : 0;
+      return { area, avgElevation, sampleCount: count };
+    }
+
+    const raycaster = new THREE.Raycaster();
+    const mouse = new THREE.Vector2();
+    const regionMeshes = [];
+    let selectedRegionMesh = null;
+
+    function setSelectedRegion(regionMesh) {
+      if (selectedRegionMesh && selectedRegionMesh.userData.baseMaterial) {
+        selectedRegionMesh.material = selectedRegionMesh.userData.baseMaterial;
+      }
+
+      selectedRegionMesh = regionMesh || null;
+
+      if (!regionMesh) {
+        regionStats.innerHTML = `<h3>区域统计</h3>尚未选择区域`;
+        window.__3D_STATE__.selectedRegion = null;
+        return;
+      }
+
+      const baseMat = regionMesh.userData.baseMaterial;
+      const highlightMat = baseMat.clone();
+      highlightMat.color = baseMat.color.clone().lerp(new THREE.Color(0xffffff), 0.35);
+      highlightMat.opacity = 0.9;
+      regionMesh.material = highlightMat;
+
+      const { feature, stats } = regionMesh.userData;
+      regionStats.innerHTML = `
+        <h3>区域统计</h3>
+        名称：${feature.properties.name}
+        ID：${feature.properties.id}
+        近似面积：${stats.area.toFixed(2)} 平方单位
+        平均海拔：${stats.avgElevation.toFixed(2)}
+        采样点数：${stats.sampleCount}
+      `.trim();
+
+      window.__3D_STATE__.selectedRegion = feature.properties.id;
+    }
+
+    function createRegionMesh(feature) {
+      const ring = feature.geometry.coordinates[0];
+      const worldRing = ring.slice(0, -1).map(mapGeoToWorld);
+
+      const shape = new THREE.Shape();
+      worldRing.forEach((p, idx) => {
+        if (idx === 0) shape.moveTo(p.x, p.z);
+        else shape.lineTo(p.x, p.z);
+      });
+
+      const geom2D = new THREE.ShapeGeometry(shape, 24);
+      const posAttr = geom2D.attributes.position;
+
+      for (let i = 0; i < posAttr.count; i++) {
+        const x = posAttr.getX(i);
+        const z = posAttr.getY(i);
+        const y = getHeightAtWorld(x, z) + 0.35;
+        posAttr.setXYZ(i, x, y, z);
+      }
+
+      geom2D.computeVertexNormals();
+
+      const color = new THREE.Color(feature.properties.color);
+      const mat = new THREE.MeshStandardMaterial({
+        color,
+        transparent: true,
+        opacity: 0.58,
+        roughness: 0.7,
+        metalness: 0.0,
+        side: THREE.DoubleSide,
+        depthWrite: false
+      });
+
+      const mesh = new THREE.Mesh(geom2D, mat);
+      mesh.userData.baseMaterial = mat;
+      mesh.userData.feature = feature;
+      mesh.userData.stats = computeRegionStats(worldRing);
+
+      // 边界线
+      const edgePoints = [];
+      for (const p of worldRing) {
+        edgePoints.push(new THREE.Vector3(p.x, getHeightAtWorld(p.x, p.z) + 0.6, p.z));
+      }
+      edgePoints.push(edgePoints[0].clone());
+
+      const lineGeom = new THREE.BufferGeometry().setFromPoints(edgePoints);
+      const lineMat = new THREE.LineBasicMaterial({
+        color: color.clone().lerp(new THREE.Color(0xffffff), 0.35),
+        transparent: true,
+        opacity: 0.95
+      });
+      const line = new THREE.Line(lineGeom, lineMat);
+      mesh.add(line);
+
+      return mesh;
+    }
+
+    geojson.features.forEach(feature => {
+      const mesh = createRegionMesh(feature);
+      regionMeshes.push(mesh);
+      regionGroup.add(mesh);
+    });
+
+    // ---------------------------
+    // 交互
+    // ---------------------------
+    renderer.domElement.addEventListener('pointerdown', (event) => {
+      const rect = renderer.domElement.getBoundingClientRect();
+      mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+      mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+
+      raycaster.setFromCamera(mouse, camera);
+      const hits = raycaster.intersectObjects(regionMeshes, false);
+
+      if (hits.length > 0) {
+        setSelectedRegion(hits[0].object);
+      } else {
+        setSelectedRegion(null);
+      }
+    });
+
+    terrainToggle.addEventListener('change', () => {
+      terrainGroup.visible = terrainToggle.checked;
+      window.__3D_STATE__.layerVisibility.terrain = terrainGroup.visible;
+    });
+
+    regionToggle.addEventListener('change', () => {
+      regionGroup.visible = regionToggle.checked;
+      window.__3D_STATE__.layerVisibility.regions = regionGroup.visible;
+    });
+
+    // ---------------------------
+    // 状态暴露（必须）
+    // ---------------------------
+    window.__3D_STATE__ = {
+      terrainVertices: terrainGeometry.attributes.position.count,
+      regionCount: geojson.features.length,
+      selectedRegion: null,
+      maxElevation: maxElevation,
+      minElevation: minElevation,
+      layerVisibility: {
+        terrain: terrainGroup.visible,
+        regions: regionGroup.visible
+      }
+    };
+
+    // 初始统计面板补充整体信息
+    regionStats.innerHTML = `
+      <h3>区域统计</h3>
+      尚未选择区域
+
+      地形顶点：${window.__3D_STATE__.terrainVertices}
+      区域数量：${window.__3D_STATE__.regionCount}
+      海拔范围：${minElevation.toFixed(2)} ~ ${maxElevation.toFixed(2)}
+    `.trim();
+
+    // 场景辅助底座
+    const baseGeo = new THREE.CylinderGeometry(78, 78, 4, 64);
+    const baseMat = new THREE.MeshStandardMaterial({
+      color: 0x334155,
+      roughness: 0.95,
+      metalness: 0.05
+    });
+    const baseMesh = new THREE.Mesh(baseGeo, baseMat);
+    baseMesh.position.y = minElevation - 2.2;
+    baseMesh.receiveShadow = true;
+    scene.add(baseMesh);
+
+    // 动画
+    function animate() {
+      requestAnimationFrame(animate);
+      controls.update();
+      renderer.render(scene, camera);
+    }
+    animate();
+
+    // 自适应
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+  </script>
+</body>
+</html>

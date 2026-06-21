@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Fox Obstacle Course</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #87ceeb;
+            font-family: monospace;
+        }
+        #hud {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(0, 0, 0, 0.6);
+            color: white;
+            padding: 15px;
+            border-radius: 8px;
+            pointer-events: none;
+            user-select: none;
+            font-size: 16px;
+            line-height: 1.5;
+        }
+        .hud-item { margin-bottom: 5px; }
+        .value { color: #00ff00; font-weight: bold; }
+        .warning { color: #ff4444; font-weight: bold; }
+    </style>
+    <script type="importmap">
+    { "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+    } }
+    </script>
+    <script type="module">
+        import * as THREE from 'three';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+        // --- Global State ---
+        window.__3D_STATE__ = {
+            modelLoaded: false,
+            timer: 0,
+            obstaclesCleared: 0,
+            collisions: 0,
+            speed: 0,
+            foxPosition: { x: 0, y: 0, z: 0 },
+            isJumping: false,
+            gameStarted: false,
+            gameFinished: false
+        };
+
+        // --- DOM Elements ---
+        const elTimer = document.getElementById('timer');
+        const elCleared = document.getElementById('obstaclesCleared');
+        const elCollisions = document.getElementById('collisionCount');
+        const elSpeed = document.getElementById('speed');
+        const elLoadStatus = document.getElementById('loadStatus');
+
+        // --- Scene Setup ---
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x87ceeb);
+        scene.fog = new THREE.Fog(0x87ceeb, 20, 100);
+
+        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 200);
+        
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.shadowMap.enabled = true;
+        document.body.appendChild(renderer.domElement);
+
+        // --- Lighting ---
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 1.5);
+        dirLight.position.set(-10, 20, 10);
+        dirLight.castShadow = true;
+        dirLight.shadow.camera.top = 20;
+        dirLight.shadow.camera.bottom = -100;
+        dirLight.shadow.camera.left = -20;
+        dirLight.shadow.camera.right = 20;
+        scene.add(dirLight);
+
+        // --- Environment ---
+        const groundGeo = new THREE.PlaneGeometry(20, 150);
+        const groundMat = new THREE.MeshStandardMaterial({ color: 0x4a7c59 });
+        const ground = new THREE.Mesh(groundGeo, groundMat);
+        ground.rotation.x = -Math.PI / 2;
+        ground.position.z = -50;
+        ground.receiveShadow = true;
+        scene.add(ground);
+
+        // Decorations (Trees)
+        const treeGeo = new THREE.ConeGeometry(0.5, 2, 8);
+        const treeMat = new THREE.MeshStandardMaterial({ color: 0x2d4c1e });
+        for (let i = 0; i < 20; i++) {
+            const tree = new THREE.Mesh(treeGeo, treeMat);
+            tree.position.set(Math.random() > 0.5 ? 4 : -4, 1, -Math.random() * 120);
+            tree.castShadow = true;
+            scene.add(tree);
+        }
+
+        // --- Obstacles ---
+        const obstacles = [];
+        const obstacleSpacing = 10;
+        const startZ = -10;
+
+        const hurdleGeo = new THREE.BoxGeometry(3, 0.5, 0.2);
+        const hurdleMat = new THREE.MeshStandardMaterial({ color: 0xffffff });
+        
+        const tunnelPillarGeo = new THREE.BoxGeometry(0.5, 1.2, 0.5);
+        const tunnelTopGeo = new THREE.BoxGeometry(3, 0.2, 0.5);
+        const tunnelMat = new THREE.MeshStandardMaterial({ color: 0x1e90ff });
+
+        for (let i = 0; i < 10; i++) {
+            const zPos = startZ - i * obstacleSpacing;
+            const isHurdle = i % 2 === 0; // 0,2,4,6,8 are hurdles (1st, 3rd, 5th...)
+            
+            let obsGroup = new THREE.Group();
+            obsGroup.position.set(0, 0, zPos);
+            
+            let collisionBox = new THREE.Box3();
+            let meshesToFlash = [];
+
+            if (isHurdle) {
+                // Hurdle
+                const mesh = new THREE.Mesh(hurdleGeo, hurdleMat.clone());
+                mesh.position.y = 0.25;
+                mesh.castShadow = true;
+                obsGroup.add(mesh);
+                meshesToFlash.push(mesh);
+                
+                // Red stripes
+                const stripeGeo = new THREE.BoxGeometry(0.4, 0.51, 0.21);
+                const stripeMat = new THREE.MeshStandardMaterial({ color: 0xff0000 });
+                for(let j=-1; j<=1; j+=0.5) {
+                    if(Math.abs(j) === 0.5) continue;
+                    const stripe = new THREE.Mesh(stripeGeo, stripeMat.clone());
+                    stripe.position.set(j, 0.25, 0);
+                    obsGroup.add(stripe);
+                    meshesToFlash.push(stripe);
+                }
+                
+                collisionBox.setFromCenterAndSize(new THREE.Vector3(0, 0.25, zPos), new THREE.Vector3(3, 0.5, 0.2));
+            } else {
+                // Tunnel
+                const leftPillar = new THREE.Mesh(tunnelPillarGeo, tunnelMat.clone());
+                leftPillar.position.set(-1.25, 0.6, 0);
+                leftPillar.castShadow = true;
+                
+                const rightPillar = new THREE.Mesh(tunnelPillarGeo, tunnelMat.clone());
+                rightPillar.position.set(1.25, 0.6, 0);
+                rightPillar.castShadow = true;
+                
+                const topBeam = new THREE.Mesh(tunnelTopGeo, tunnelMat.clone());
+                topBeam.position.set(0, 1.3, 0); // Height forces crouch
+                topBeam.castShadow = true;
+                
+                obsGroup.add(leftPillar, rightPillar, topBeam);
+                meshesToFlash.push(leftPillar, rightPillar, topBeam);
+                
+                // Collision box only for the top beam to force crouching
+                collisionBox.setFromCenterAndSize(new THREE.Vector3(0, 1.3, zPos), new THREE.Vector3(3, 0.2, 0.5));
+            }
+
+            scene.add(obsGroup);
+            obstacles.push({
+                z: zPos,
+                isHurdle: isHurdle,
+                box: collisionBox,
+                passed: false,
+                meshes: meshesToFlash,
+                flashTimer: 0,
+                originalColors: meshesToFlash.map(m => m.material.color.getHex())
+            });
+        }
+
+        // --- Fox Model ---
+        let fox, mixer, actions = {};
+        let currentAction = null;
+        const foxScale = 0.015;
+
+        const loader = new GLTFLoader();
+        loader.load('assets/Fox.glb', (gltf) => {
+            fox = gltf.scene;
+            fox.scale.set(foxScale, foxScale, foxScale);
+            fox.rotation.y = Math.PI; // Face -Z
+            
+            fox.traverse((child) => {
+                if (child.isMesh) {
+                    child.castShadow = true;
+                }
+            });
+            
+            scene.add(fox);
+
+            mixer = new THREE.AnimationMixer(fox);
+            actions.survey = mixer.clipAction(gltf.animations.find(a => a.name === 'Survey'));
+            actions.run = mixer.clipAction(gltf.animations.find(a => a.name === 'Run'));
+            
+            if(actions.survey) {
+                actions.survey.play();
+                currentAction = actions.survey;
+            }
+
+            window.__3D_STATE__.modelLoaded = true;
+            elLoadStatus.textContent = "Ready";
+            elLoadStatus.className = "value";
+        }, undefined, (error) => {
+            console.error('Error loading model:', error);
+            elLoadStatus.textContent = "Error";
+            elLoadStatus.className = "warning";
+        });
+
+        // --- Controls & Logic ---
+        const keys = { w: false, s: false, space: false, up: false, down: false };
+        
+        window.addEventListener('keydown', (e) => {
+            if (e.code === 'KeyW' || e.code === 'ArrowUp') keys.w = true;
+            if (e.code === 'KeyS' || e.code === 'ArrowDown') keys.s = true;
+            if (e.code === 'Space') keys.space = true;
+        });
+
+        window.addEventListener('keyup', (e) => {
+            if (e.code === 'KeyW' || e.code === 'ArrowUp') keys.w = false;
+            if (e.code === 'KeyS' || e.code === 'ArrowDown') keys.s = false;
+            if (e.code === 'Space') keys.space = false;
+        });
+
+        const clock = new THREE.Clock();
+        let actualTime = 0;
+        let penaltyTime = 0;
+        
+        // Movement params
+        const moveSpeed = 8;
+        let jumpTimer = 0;
+        const jumpDuration = 0.6;
+        const jumpHeight = 1.5;
+        let isCrouching = false;
+        let collisionCooldown = 0;
+
+        function fadeToAction(name, duration) {
+            if (!actions[name] || currentAction === actions[name]) return;
+            const previousAction = currentAction;
+            currentAction = actions[name];
+            if (previousAction) previousAction.fadeOut(duration);
+            currentAction.reset().setEffectiveTimeScale(1).setEffectiveWeight(1).fadeIn(duration).play();
+        }
+
+        function formatTime(seconds) {
+            const m = Math.floor(seconds / 60);
+            const s = Math.floor(seconds % 60);
+            const ms = Math.floor((seconds % 1) * 100);
+            return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}.${ms.toString().padStart(2, '0')}`;
+        }
+
+        // --- Game Loop ---
+        function animate() {
+            requestAnimationFrame(animate);
+            const delta = clock.getDelta();
+
+            if (mixer) mixer.update(delta);
+
+            if (fox && window.__3D_STATE__.modelLoaded && !window.__3D_STATE__.gameFinished) {
+                let isMoving = false;
+                let currentSpeed = 0;
+
+                // Start game on first move
+                if (!window.__3D_STATE__.gameStarted && (keys.w || keys.s)) {
+                    window.__3D_STATE__.gameStarted = true;
+                }
+
+                // Movement
+                if (keys.w) {
+                    fox.position.z -= moveSpeed * delta;
+                    isMoving = true;
+                    currentSpeed = moveSpeed;
+                } else if (keys.s) {
+                    fox.position.z += moveSpeed * delta;
+                    isMoving = true;
+                    currentSpeed = -moveSpeed;
+                }
+
+                // Jump
+                if (keys.space && !window.__3D_STATE__.isJumping && !isCrouching) {
+                    window.__3D_STATE__.isJumping = true;
+                    jumpTimer = 0;
+                }
+
+                if (window.__3D_STATE__.isJumping) {
+                    jumpTimer += delta;
+                    if (jumpTimer >= jumpDuration) {
+                        window.__3D_STATE__.isJumping = false;
+                        fox.position.y = 0;
+                    } else {
+                        // Parabola
+                        const t = jumpTimer / jumpDuration;
+                        fox.position.y = 4 * jumpHeight * t * (1 - t);
+                    }
+                }
+
+                // Auto-Crouch
+                let nearTunnel = false;
+                for (let obs of obstacles) {
+                    if (!obs.isHurdle && fox.position.z < obs.z + 2 && fox.position.z > obs.z - 2) {
+                        nearTunnel = true;
+                        break;
+                    }
+                }
+
+                if (nearTunnel && !window.__3D_STATE__.isJumping) {
+                    isCrouching = true;
+                    fox.scale.y = THREE.MathUtils.lerp(fox.scale.y, foxScale * 0.5, 10 * delta);
+                } else {
+                    isCrouching = false;
+                    fox.scale.y = THREE.MathUtils.lerp(fox.scale.y, foxScale, 10 * delta);
+                }
+
+                // Animations
+                if (isMoving && !window.__3D_STATE__.isJumping) {
+                    fadeToAction('run', 0.2);
+                } else if (!isMoving && !window.__3D_STATE__.isJumping) {
+                    fadeToAction('survey', 0.2);
+                }
+
+                // Camera Follow
+                camera.position.x = THREE.MathUtils.lerp(camera.position.x, fox.position.x, 5 * delta);
+                camera.position.y = THREE.MathUtils.lerp(camera.position.y, fox.position.y + 2.5, 5 * delta);
+                camera.position.z = THREE.MathUtils.lerp(camera.position.z, fox.position.z + 4, 5 * delta);
+                camera.lookAt(fox.position.x, fox.position.y + 1, fox.position.z - 2);
+
+                // Collision Detection
+                if (collisionCooldown > 0) collisionCooldown -= delta;
+
+                // Logical Fox AABB
+                const foxHeight = isCrouching ? 0.5 : 1.0;
+                const foxBox = new THREE.Box3().setFromCenterAndSize(
+                    new THREE.Vector3(fox.position.x, fox.position.y + foxHeight / 2, fox.position.z),
+                    new THREE.Vector3(0.4, foxHeight, 0.8)
+                );
+
+                for (let obs of obstacles) {
+                    // Flash effect update
+                    if (obs.flashTimer > 0) {
+                        obs.flashTimer -= delta;
+                        if (obs.flashTimer <= 0) {
+                            obs.meshes.forEach((m, idx) => m.material.color.setHex(obs.originalColors[idx]));
+                        }
+                    }
+
+                    // Check collision
+                    if (collisionCooldown <= 0 && foxBox.intersectsBox(obs.box)) {
+                        window.__3D_STATE__.collisions++;
+                        penaltyTime += 2;
+                        collisionCooldown = 0.5; // 0.5s cooldown
+                        
+                        // Flash red
+                        obs.flashTimer = 0.5;
+                        obs.meshes.forEach(m => m.material.color.setHex(0xff0000));
+                    }
+
+                    // Check passed
+                    if (!obs.passed && fox.position.z < obs.z) {
+                        obs.passed = true;
+                        window.__3D_STATE__.obstaclesCleared++;
+                        
+                        if (window.__3D_STATE__.obstaclesCleared >= 10) {
+                            window.__3D_STATE__.gameFinished = true;
+                            fadeToAction('survey', 0.5);
+                        }
+                    }
+                }
+
+                // Update State
+                if (window.__3D_STATE__.gameStarted && !window.__3D_STATE__.gameFinished) {
+                    actualTime += delta;
+                }
+                
+                window.__3D_STATE__.timer = actualTime + penaltyTime;
+                window.__3D_STATE__.speed = currentSpeed;
+                window.__3D_STATE__.foxPosition.x = fox.position.x;
+                window.__3D_STATE__.foxPosition.y = fox.position.y;
+                window.__3D_STATE__.foxPosition.z = fox.position.z;
+
+                // Update HUD
+                elTimer.textContent = formatTime(window.__3D_STATE__.timer);
+                elCleared.textContent = `${window.__3D_STATE__.obstaclesCleared} / 10`;
+                elCollisions.textContent = window.__3D_STATE__.collisions;
+                if(window.__3D_STATE__.collisions > 0) elCollisions.className = "warning";
+                elSpeed.textContent = Math.abs(currentSpeed).toFixed(1);
+            }
+
+            renderer.render(scene, camera);
+        }
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        animate();
+    </script>
+</head>
+<body>
+    <div id="hud">
+        <div class="hud-item">Status: <span id="loadStatus" class="warning">Loading...</span></div>
+        <div class="hud-item">Time: <span id="timer" class="value">00:00.00</span></div>
+        <div class="hud-item">Cleared: <span id="obstaclesCleared" class="value">0 / 10</span></div>
+        <div class="hud-item">Collisions: <span id="collisionCount" class="value">0</span> (+2s penalty)</div>
+        <div class="hud-item">Speed: <span id="speed" class="value">0.0</span></div>
+        <div style="margin-top: 10px; font-size: 12px; color: #ccc;">
+            [W/Up] Forward | [S/Down] Backward | [Space] Jump<br>
+            Auto-crouch at blue tunnels.
+        </div>
+    </div>
+</body>
+</html>

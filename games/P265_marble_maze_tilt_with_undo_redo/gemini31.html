@@ -1,0 +1,413 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Marble Maze</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #1a1a2e;
+            font-family: monospace;
+            color: #ffffff;
+        }
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+        }
+        #hud {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 15px;
+            border-radius: 8px;
+            pointer-events: none;
+            user-select: none;
+            min-width: 250px;
+        }
+        .hud-line {
+            margin: 5px 0;
+        }
+        #controls {
+            position: absolute;
+            bottom: 20px;
+            left: 10px;
+            display: flex;
+            gap: 10px;
+        }
+        button {
+            background: #e94560;
+            color: white;
+            border: none;
+            padding: 10px 15px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-family: monospace;
+            font-weight: bold;
+            pointer-events: auto;
+        }
+        button:hover {
+            background: #ff5c77;
+        }
+        button:disabled {
+            background: #555;
+            cursor: not-allowed;
+            color: #888;
+        }
+    </style>
+    <!-- Import maps polyfill -->
+    <script async src="https://unpkg.com/es-module-shims@1.8.0/dist/es-module-shims.js"></script>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="hud">
+        <div class="hud-line" id="hud-tilt">Tilt X: 0.000 | Tilt Z: 0.000</div>
+        <div class="hud-line" id="hud-pos">Marble Pos: (0.00, 2.00, 0.00)</div>
+        <div class="hud-line" id="hud-speed">Speed: 0.00</div>
+        <div class="hud-line" id="hud-falls">Falls: 0</div>
+        <div class="hud-line" id="hud-snaps">Snapshots: 0 | Index: -1</div>
+        <div class="hud-line" id="hud-undo">Undo (U): No | Redo (R): No</div>
+    </div>
+    
+    <div id="controls">
+        <button id="btn-undo" disabled>Undo (U)</button>
+        <button id="btn-redo" disabled>Redo (R)</button>
+        <button id="btn-reset">Reset</button>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+        // --- Scene Setup ---
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color('#1a1a2e');
+
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.set(0, 15, 15);
+        camera.lookAt(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        document.body.appendChild(renderer.domElement);
+
+        // Lights
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+        dirLight.position.set(5, 10, 5);
+        dirLight.castShadow = true;
+        dirLight.shadow.camera.left = -15;
+        dirLight.shadow.camera.right = 15;
+        dirLight.shadow.camera.top = 15;
+        dirLight.shadow.camera.bottom = -15;
+        dirLight.shadow.mapSize.width = 2048;
+        dirLight.shadow.mapSize.height = 2048;
+        scene.add(dirLight);
+
+        // Controls
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enabled = false; // Disabled by default
+
+        // --- Game Objects ---
+        let collisionWorldModel = null;
+        let modelLoaded = false;
+
+        // Load GLTF
+        const loader = new GLTFLoader();
+        loader.load(
+            'collision-world.glb',
+            (gltf) => {
+                collisionWorldModel = gltf.scene;
+                
+                // Center model
+                const box = new THREE.Box3().setFromObject(collisionWorldModel);
+                const center = box.getCenter(new THREE.Vector3());
+                collisionWorldModel.position.sub(center);
+
+                // Scale to roughly 20x20
+                const size = box.getSize(new THREE.Vector3());
+                const maxDim = Math.max(size.x, size.z);
+                if (maxDim > 0) {
+                    const scale = 20 / maxDim;
+                    collisionWorldModel.scale.setScalar(scale);
+                }
+
+                // Enable shadows
+                collisionWorldModel.traverse((child) => {
+                    if (child.isMesh) {
+                        child.receiveShadow = true;
+                        child.castShadow = true;
+                    }
+                });
+
+                // Create a wrapper group to apply tilt easily without messing up centering
+                const wrapper = new THREE.Group();
+                wrapper.add(collisionWorldModel);
+                scene.add(wrapper);
+                collisionWorldModel = wrapper; // Reassign to wrapper for tilting
+                
+                modelLoaded = true;
+            },
+            undefined,
+            (error) => {
+                console.error('Error loading collision-world.glb. Ensure the file exists.', error);
+                // Fallback visual so the game isn't completely empty if file is missing
+                const geo = new THREE.BoxGeometry(20, 1, 20);
+                const mat = new THREE.MeshStandardMaterial({ color: 0x444455 });
+                const mesh = new THREE.Mesh(geo, mat);
+                mesh.position.y = -0.5;
+                mesh.receiveShadow = true;
+                collisionWorldModel = new THREE.Group();
+                collisionWorldModel.add(mesh);
+                scene.add(collisionWorldModel);
+                modelLoaded = true;
+            }
+        );
+
+        // Marble
+        const marbleRadius = 0.4;
+        const marbleGeo = new THREE.SphereGeometry(marbleRadius, 32, 32);
+        const marbleMat = new THREE.MeshStandardMaterial({
+            color: 0xe94560,
+            metalness: 0.8,
+            roughness: 0.2
+        });
+        const marble = new THREE.Mesh(marbleGeo, marbleMat);
+        marble.position.set(0, 2, 0);
+        marble.castShadow = true;
+        scene.add(marble);
+
+        // --- Physics & State Variables ---
+        const velocity = new THREE.Vector3(0, 0, 0);
+        let tiltX = 0;
+        let tiltZ = 0;
+        let fallCount = 0;
+        let timeElapsed = 0;
+
+        const keys = {
+            ArrowUp: false,
+            ArrowDown: false,
+            ArrowLeft: false,
+            ArrowRight: false
+        };
+
+        // --- Undo/Redo System ---
+        let snapshots = [];
+        let undoIndex = -1;
+        let timeSinceLastSnapshot = 0;
+        const MAX_SNAPSHOTS = 60;
+
+        function saveSnapshot() {
+            // If we are not at the end of the timeline, discard future
+            if (undoIndex < snapshots.length - 1) {
+                snapshots = snapshots.slice(0, undoIndex + 1);
+            }
+
+            const snap = {
+                pos: marble.position.clone(),
+                vel: velocity.clone(),
+                tiltX: tiltX,
+                tiltZ: tiltZ
+            };
+
+            snapshots.push(snap);
+            if (snapshots.length > MAX_SNAPSHOTS) {
+                snapshots.shift();
+            } else {
+                undoIndex++;
+            }
+        }
+
+        function applySnapshot(index) {
+            if (index >= 0 && index < snapshots.length) {
+                const snap = snapshots[index];
+                marble.position.copy(snap.pos);
+                velocity.copy(snap.vel);
+                tiltX = snap.tiltX;
+                tiltZ = snap.tiltZ;
+                if (collisionWorldModel) {
+                    collisionWorldModel.rotation.x = tiltX;
+                    collisionWorldModel.rotation.z = tiltZ;
+                }
+            }
+        }
+
+        function undo() {
+            if (undoIndex > 0) {
+                undoIndex--;
+                applySnapshot(undoIndex);
+            }
+        }
+
+        function redo() {
+            if (undoIndex < snapshots.length - 1) {
+                undoIndex++;
+                applySnapshot(undoIndex);
+            }
+        }
+
+        function resetGame() {
+            marble.position.set(0, 2, 0);
+            velocity.set(0, 0, 0);
+            tiltX = 0;
+            tiltZ = 0;
+            if (collisionWorldModel) {
+                collisionWorldModel.rotation.set(0, 0, 0);
+            }
+            snapshots = [];
+            undoIndex = -1;
+            timeSinceLastSnapshot = 0;
+            saveSnapshot(); // Initial state
+        }
+
+        // Initial snapshot
+        saveSnapshot();
+
+        // --- Input Handling ---
+        window.addEventListener('keydown', (e) => {
+            if (keys.hasOwnProperty(e.code)) {
+                keys[e.code] = true;
+            }
+            if (e.key.toLowerCase() === 'u') undo();
+            if (e.key.toLowerCase() === 'r') redo();
+        });
+
+        window.addEventListener('keyup', (e) => {
+            if (keys.hasOwnProperty(e.code)) {
+                keys[e.code] = false;
+            }
+        });
+
+        // UI Buttons
+        document.getElementById('btn-undo').addEventListener('click', undo);
+        document.getElementById('btn-redo').addEventListener('click', redo);
+        document.getElementById('btn-reset').addEventListener('click', () => {
+            resetGame();
+            fallCount = 0;
+        });
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // --- Main Loop ---
+        const clock = new THREE.Clock();
+
+        // Expose state
+        window.__3D_STATE__ = {};
+
+        function updateHUD(speed, canUndo, canRedo) {
+            document.getElementById('hud-tilt').innerText = `Tilt X: ${tiltX.toFixed(3)} | Tilt Z: ${tiltZ.toFixed(3)}`;
+            document.getElementById('hud-pos').innerText = `Marble Pos: (${marble.position.x.toFixed(2)}, ${marble.position.y.toFixed(2)}, ${marble.position.z.toFixed(2)})`;
+            document.getElementById('hud-speed').innerText = `Speed: ${speed.toFixed(2)}`;
+            document.getElementById('hud-falls').innerText = `Falls: ${fallCount}`;
+            document.getElementById('hud-snaps').innerText = `Snapshots: ${snapshots.length} | Index: ${undoIndex}`;
+            document.getElementById('hud-undo').innerText = `Undo (U): ${canUndo ? 'Yes' : 'No'} | Redo (R): ${canRedo ? 'Yes' : 'No'}`;
+
+            document.getElementById('btn-undo').disabled = !canUndo;
+            document.getElementById('btn-redo').disabled = !canRedo;
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            let dt = clock.getDelta();
+            if (dt > 1/30) dt = 1/30; // Cap dt
+
+            timeElapsed += dt;
+
+            // Handle Tilt Input
+            if (keys.ArrowUp) tiltX -= 0.005;
+            if (keys.ArrowDown) tiltX += 0.005;
+            if (keys.ArrowLeft) tiltZ -= 0.005;
+            if (keys.ArrowRight) tiltZ += 0.005;
+
+            // Clamp tilt
+            tiltX = Math.max(-0.15, Math.min(0.15, tiltX));
+            tiltZ = Math.max(-0.15, Math.min(0.15, tiltZ));
+
+            if (collisionWorldModel) {
+                collisionWorldModel.rotation.x = tiltX;
+                collisionWorldModel.rotation.z = tiltZ;
+            }
+
+            // Physics
+            velocity.y -= 9.8 * dt; // Gravity
+            
+            // Acceleration from tilt
+            velocity.z += Math.sin(tiltX) * 8.0 * dt;
+            velocity.x -= Math.sin(tiltZ) * 8.0 * dt;
+
+            // Friction (applied per frame as requested)
+            velocity.x *= 0.98;
+            velocity.z *= 0.98;
+
+            // Move marble
+            marble.position.addScaledVector(velocity, dt);
+
+            // Simple Collision
+            if (marble.position.y < marbleRadius) {
+                marble.position.y = marbleRadius;
+                velocity.y = 0;
+            }
+
+            // Fall detection
+            if (marble.position.y < -10) {
+                marble.position.set(0, 2, 0);
+                velocity.set(0, 0, 0);
+                fallCount++;
+            }
+
+            // Auto Snapshot
+            timeSinceLastSnapshot += dt;
+            if (timeSinceLastSnapshot >= 1.0) {
+                saveSnapshot();
+                timeSinceLastSnapshot = 0;
+            }
+
+            // Update State & UI
+            const speed = velocity.length();
+            const canUndo = undoIndex > 0;
+            const canRedo = undoIndex < snapshots.length - 1;
+
+            updateHUD(speed, canUndo, canRedo);
+
+            window.__3D_STATE__ = {
+                marblePos: { x: marble.position.x, y: marble.position.y, z: marble.position.z },
+                marbleVel: { x: velocity.x, y: velocity.y, z: velocity.z },
+                speed: speed,
+                tiltX: tiltX,
+                tiltZ: tiltZ,
+                fallCount: fallCount,
+                snapshotCount: snapshots.length,
+                undoIndex: undoIndex,
+                canUndo: canUndo,
+                canRedo: canRedo,
+                modelLoaded: modelLoaded,
+                timeElapsed: timeElapsed
+            };
+
+            renderer.render(scene, camera);
+        }
+
+        animate();
+    </script>
+</body>
+</html>

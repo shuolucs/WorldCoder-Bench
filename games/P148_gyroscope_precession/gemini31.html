@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Gyroscope Precession Simulator</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #1a1a2e;
+            font-family: monospace;
+            user-select: none;
+        }
+        #hud {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(0, 0, 0, 0.7);
+            color: white;
+            padding: 15px;
+            border-radius: 5px;
+            font-size: 14px;
+            pointer-events: none;
+            line-height: 1.5;
+        }
+        #instructions {
+            position: absolute;
+            bottom: 15px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: rgba(0, 0, 0, 0.7);
+            color: white;
+            padding: 10px 20px;
+            border-radius: 5px;
+            font-size: 14px;
+            pointer-events: none;
+            text-align: center;
+            white-space: nowrap;
+        }
+    </style>
+</head>
+<body>
+    <div id="hud">
+        <div>Spin Speed: <span id="hud-spin">30.0</span> rad/s</div>
+        <div>Precession Rate: <span id="hud-prec-rate">0.000</span> rad/s</div>
+        <div>Tilt Angle: <span id="hud-tilt">25.0</span>°</div>
+        <div>Precession Angle: <span id="hud-prec-angle">0.0</span>°</div>
+        <div>Status: <span id="hud-status">Spinning</span></div>
+    </div>
+    <div id="instructions">
+        Space: Pause/Resume | Up/Down: Spin Speed | R: Reset | T: Cycle Tilt | Click Rotor: Toggle Trail
+    </div>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        // --- State Management ---
+        const tiltPresets = [15, 25, 35, 45];
+        const state = {
+            spinSpeed: 30,
+            precessionRate: 0,
+            tiltAngle: 25,
+            precessionAngle: 0,
+            isPaused: false,
+            isToppled: false,
+            trailVisible: false,
+            elapsedTime: 0,
+            tiltPresetIndex: 1,
+            rotorRotation: 0,
+            nutationOffset: 0
+        };
+        window.__3D_STATE__ = state;
+
+        let precessionAngleRad = 0;
+        let toppleTimer = 0;
+        let initialToppleTilt = 0;
+
+        // --- Scene Setup ---
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x1a1a2e);
+
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+        camera.position.set(4, 3, 4);
+        camera.lookAt(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        document.body.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.target.set(0, 0, 0);
+
+        // --- Lights ---
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+        dirLight.position.set(5, 10, 5);
+        scene.add(dirLight);
+
+        // --- Ground ---
+        const groundGeo = new THREE.PlaneGeometry(20, 20);
+        const groundMat = new THREE.MeshStandardMaterial({ color: 0x888888 });
+        const ground = new THREE.Mesh(groundGeo, groundMat);
+        ground.rotation.x = -Math.PI / 2;
+        scene.add(ground);
+
+        const gridHelper = new THREE.GridHelper(20, 20, 0x444444, 0x444444);
+        gridHelper.position.y = 0.01;
+        scene.add(gridHelper);
+
+        // --- Gyroscope Construction ---
+        // Pedestal
+        const pedestalGeo = new THREE.CylinderGeometry(0.15, 0.15, 0.2, 32);
+        const pedestalMat = new THREE.MeshStandardMaterial({ color: 0x333333 });
+        const pedestal = new THREE.Mesh(pedestalGeo, pedestalMat);
+        pedestal.position.y = 0.1;
+        scene.add(pedestal);
+
+        // Hierarchy: Pivot -> Precession -> Tilt -> Center -> (Rotor, Axle, Ring)
+        const pivotGroup = new THREE.Group();
+        pivotGroup.position.y = 0.2; // Top of pedestal
+        scene.add(pivotGroup);
+
+        const precessionGroup = new THREE.Group();
+        pivotGroup.add(precessionGroup);
+
+        const tiltGroup = new THREE.Group();
+        precessionGroup.add(tiltGroup);
+
+        const centerGroup = new THREE.Group();
+        centerGroup.position.y = 1.25; // Half axle length, so bottom is at pivot
+        tiltGroup.add(centerGroup);
+
+        // Rotor
+        const rotorGeo = new THREE.CylinderGeometry(1.0, 1.0, 0.1, 32);
+        const rotorMat = new THREE.MeshStandardMaterial({ color: 0xFFD700, metalness: 0.6, roughness: 0.3 });
+        const rotor = new THREE.Mesh(rotorGeo, rotorMat);
+        centerGroup.add(rotor);
+
+        // Axle
+        const axleGeo = new THREE.CylinderGeometry(0.05, 0.05, 2.5, 8);
+        const axleMat = new THREE.MeshStandardMaterial({ color: 0xC0C0C0, metalness: 0.8, roughness: 0.2 });
+        const axle = new THREE.Mesh(axleGeo, axleMat);
+        centerGroup.add(axle);
+
+        // Support Ring
+        const ringGeo = new THREE.TorusGeometry(1.1, 0.04, 8, 32);
+        const ringMat = new THREE.MeshStandardMaterial({ color: 0x4488FF, metalness: 0.3, roughness: 0.5 });
+        const ring = new THREE.Mesh(ringGeo, ringMat);
+        ring.rotation.x = Math.PI / 2;
+        centerGroup.add(ring);
+
+        // --- Trail ---
+        const trailPoints = [];
+        for (let i = 0; i <= 64; i++) {
+            const theta = (i / 64) * Math.PI * 2;
+            trailPoints.push(new THREE.Vector3(Math.cos(theta), 0, Math.sin(theta)));
+        }
+        const trailGeo = new THREE.BufferGeometry().setFromPoints(trailPoints);
+        const trailMat = new THREE.LineDashedMaterial({ color: 0xffffff, dashSize: 0.1, gapSize: 0.1 });
+        const trail = new THREE.Line(trailGeo, trailMat);
+        trail.computeLineDistances();
+        trail.position.y = 0.21; // Slightly above pedestal
+        trail.visible = false;
+        scene.add(trail);
+
+        // --- Interaction ---
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+
+        window.addEventListener('click', (event) => {
+            mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+            raycaster.setFromCamera(mouse, camera);
+            const intersects = raycaster.intersectObject(rotor);
+            if (intersects.length > 0) {
+                state.trailVisible = !state.trailVisible;
+            }
+        });
+
+        function resetSimulation() {
+            state.spinSpeed = 30;
+            state.tiltPresetIndex = 1;
+            state.tiltAngle = tiltPresets[state.tiltPresetIndex];
+            precessionAngleRad = 0;
+            state.precessionAngle = 0;
+            state.isPaused = false;
+            state.isToppled = false;
+            state.elapsedTime = 0;
+            state.rotorRotation = 0;
+            state.nutationOffset = 0;
+            toppleTimer = 0;
+        }
+
+        window.addEventListener('keydown', (event) => {
+            switch (event.code) {
+                case 'Space':
+                    state.isPaused = !state.isPaused;
+                    break;
+                case 'ArrowUp':
+                    state.spinSpeed = Math.min(60, state.spinSpeed + 5);
+                    if (state.isToppled) {
+                        state.isToppled = false;
+                        state.tiltAngle = tiltPresets[state.tiltPresetIndex];
+                    }
+                    break;
+                case 'ArrowDown':
+                    state.spinSpeed = Math.max(0, state.spinSpeed - 5);
+                    break;
+                case 'KeyR':
+                    resetSimulation();
+                    break;
+                case 'KeyT':
+                    state.tiltPresetIndex = (state.tiltPresetIndex + 1) % 4;
+                    state.tiltAngle = tiltPresets[state.tiltPresetIndex];
+                    precessionAngleRad = 0;
+                    state.precessionAngle = 0;
+                    break;
+            }
+        });
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // --- HUD Elements ---
+        const elSpin = document.getElementById('hud-spin');
+        const elPrecRate = document.getElementById('hud-prec-rate');
+        const elTilt = document.getElementById('hud-tilt');
+        const elPrecAngle = document.getElementById('hud-prec-angle');
+        const elStatus = document.getElementById('hud-status');
+
+        // --- Animation Loop ---
+        const clock = new THREE.Clock();
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const deltaTime = clock.getDelta();
+
+            if (!state.isPaused) {
+                state.elapsedTime += deltaTime;
+
+                if (!state.isToppled) {
+                    // Spin decay
+                    state.spinSpeed -= 0.5 * deltaTime;
+                    
+                    if (state.spinSpeed <= 0) {
+                        state.spinSpeed = 0;
+                        state.isToppled = true;
+                        toppleTimer = 0;
+                        initialToppleTilt = state.tiltAngle;
+                        state.precessionRate = 0;
+                    } else {
+                        // Precession calculation
+                        // m = 2.0, g = 9.81, d = 0.625, I = 0.5 * 2.0 * 1.0^2 = 1.0
+                        const m = 2.0;
+                        const g = 9.81;
+                        const d = 0.625;
+                        const I = 1.0;
+                        
+                        const omega_p = (m * g * d) / (I * state.spinSpeed);
+                        state.precessionRate = omega_p;
+                        
+                        precessionAngleRad += omega_p * deltaTime;
+                        state.precessionAngle = precessionAngleRad * (180 / Math.PI);
+
+                        // Nutation
+                        state.nutationOffset = 2 * Math.sin(2 * Math.PI * 3 * state.elapsedTime);
+                    }
+                } else {
+                    // Toppling animation
+                    toppleTimer += deltaTime;
+                    const progress = Math.min(1.0, toppleTimer / 2.0);
+                    state.tiltAngle = initialToppleTilt + (90 - initialToppleTilt) * progress;
+                    state.nutationOffset = 0;
+                    state.precessionRate = 0;
+                }
+
+                // Rotor rotation
+                state.rotorRotation += state.spinSpeed * deltaTime;
+            }
+
+            // Apply Transforms
+            precessionGroup.rotation.y = precessionAngleRad;
+            // Negative Z rotation to tilt towards +X
+            tiltGroup.rotation.z = -THREE.MathUtils.degToRad(state.tiltAngle + state.nutationOffset);
+            rotor.rotation.y = state.rotorRotation;
+            axle.rotation.y = state.rotorRotation;
+
+            // Update Trail
+            if (state.trailVisible) {
+                trail.visible = true;
+                const currentTiltRad = THREE.MathUtils.degToRad(state.tiltAngle + state.nutationOffset);
+                const radius = 1.25 * Math.sin(currentTiltRad);
+                trail.scale.set(radius, 1, radius);
+            } else {
+                trail.visible = false;
+            }
+
+            // Update HUD
+            elSpin.innerText = state.spinSpeed.toFixed(1);
+            elPrecRate.innerText = state.precessionRate.toFixed(3);
+            elTilt.innerText = (state.tiltAngle + state.nutationOffset).toFixed(1);
+            elPrecAngle.innerText = state.precessionAngle.toFixed(1);
+            
+            if (state.isPaused) {
+                elStatus.innerText = 'Paused';
+                elStatus.style.color = '#ffaa00';
+            } else if (state.isToppled) {
+                elStatus.innerText = 'Toppled';
+                elStatus.style.color = '#ff4444';
+            } else {
+                elStatus.innerText = 'Spinning';
+                elStatus.style.color = '#44ff44';
+            }
+
+            controls.update();
+            renderer.render(scene, camera);
+        }
+
+        animate();
+    </script>
+</body>
+</html>

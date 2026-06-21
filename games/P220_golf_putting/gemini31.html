@@ -1,0 +1,569 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Golf Putting Game</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #87CEEB;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            user-select: none;
+        }
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+        }
+        #hud {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+        }
+        .stat-box {
+            position: absolute;
+            background: rgba(0, 0, 0, 0.6);
+            color: white;
+            padding: 10px 20px;
+            border-radius: 8px;
+            font-size: 24px;
+            font-weight: bold;
+            border: 2px solid rgba(255, 255, 255, 0.3);
+        }
+        #strokeCount {
+            top: 20px;
+            left: 20px;
+        }
+        #scoreDisplay {
+            top: 20px;
+            right: 20px;
+        }
+        #power-container {
+            position: absolute;
+            bottom: 40px;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 200px;
+            height: 20px;
+            background: rgba(0, 0, 0, 0.5);
+            border: 3px solid white;
+            border-radius: 10px;
+            overflow: hidden;
+            display: none;
+        }
+        #powerBar {
+            width: 0%;
+            height: 100%;
+            background-color: #00ff00;
+            transition: background-color 0.1s;
+        }
+        #messageDisplay {
+            position: absolute;
+            top: 40%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background: rgba(0, 0, 0, 0.8);
+            color: #FFD700;
+            padding: 20px 40px;
+            border-radius: 15px;
+            font-size: 48px;
+            font-weight: bold;
+            text-align: center;
+            border: 4px solid #FFD700;
+            text-shadow: 2px 2px 4px #000;
+            display: none;
+            animation: popIn 0.5s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+        }
+        #controls-help {
+            position: absolute;
+            bottom: 20px;
+            left: 20px;
+            background: rgba(0, 0, 0, 0.5);
+            color: white;
+            padding: 10px;
+            border-radius: 5px;
+            font-size: 14px;
+        }
+        @keyframes popIn {
+            0% { transform: translate(-50%, -50%) scale(0.5); opacity: 0; }
+            100% { transform: translate(-50%, -50%) scale(1); opacity: 1; }
+        }
+    </style>
+    <!-- Import maps polyfill -->
+    <script async src="https://unpkg.com/es-module-shims@1.8.0/dist/es-module-shims.js"></script>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://cdn.jsdelivr.net/npm/three@0.163.0/build/three.module.js",
+                "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.163.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="canvas-container"></div>
+    <div id="hud">
+        <div id="strokeCount" class="stat-box">Strokes: 0</div>
+        <div id="scoreDisplay" class="stat-box">Score: 0</div>
+        <div id="power-container">
+            <div id="powerBar"></div>
+        </div>
+        <div id="messageDisplay"></div>
+        <div id="controls-help">
+            Left/Right: Aim<br>
+            Hold Space: Power<br>
+            R: Reset Ball<br>
+            N: New Game
+        </div>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+        // --- State Management ---
+        window.__3D_STATE__ = {
+            ballPosition: { x: 0, y: 0.15, z: 8 },
+            ballVelocity: { x: 0, z: 0 },
+            ballSpeed: 0,
+            ballStopped: true,
+            ballSunk: false,
+            aimAngle: 0,
+            power: 0,
+            isCharging: false,
+            strokeCount: 0,
+            score: 0,
+            modelLoaded: false,
+            wallBounceCount: 0,
+            modelBounceCount: 0,
+            gameState: 'aiming' // 'aiming', 'charging', 'rolling', 'sunk'
+        };
+
+        const state = window.__3D_STATE__;
+
+        // --- Constants ---
+        const TEE_POS = new THREE.Vector3(0, 0.15, 8);
+        const HOLE_POS = new THREE.Vector3(2, 0.01, -10);
+        const BALL_RADIUS = 0.15;
+        const HOLE_RADIUS = 0.4;
+        const FRICTION = 0.985;
+        const MAX_POWER_VELOCITY = 12.0;
+        const CHARGE_RATE = 0.5; // per second
+        const BOUNDS = { x: 5, z: 15 };
+
+        // --- Scene Setup ---
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x87CEEB);
+
+        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.set(0, 12, 15);
+        camera.lookAt(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        container.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.maxPolarAngle = Math.PI / 2 - 0.05; // Don't go below ground
+
+        // --- Lights ---
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 1.5);
+        dirLight.position.set(5, 10, 5);
+        dirLight.castShadow = true;
+        dirLight.shadow.camera.top = 20;
+        dirLight.shadow.camera.bottom = -20;
+        dirLight.shadow.camera.left = -20;
+        dirLight.shadow.camera.right = 20;
+        dirLight.shadow.mapSize.width = 2048;
+        dirLight.shadow.mapSize.height = 2048;
+        scene.add(dirLight);
+
+        // --- Environment ---
+        // Green
+        const greenGeo = new THREE.BoxGeometry(10, 0.1, 30);
+        const greenMat = new THREE.MeshStandardMaterial({ color: 0x2d8a4e, roughness: 0.8 });
+        const green = new THREE.Mesh(greenGeo, greenMat);
+        green.position.y = -0.05;
+        green.receiveShadow = true;
+        scene.add(green);
+
+        // Walls
+        const wallMat = new THREE.MeshStandardMaterial({ color: 0x1a522f });
+        const wallThickness = 0.2;
+        const wallHeight = 0.3;
+
+        const wallN = new THREE.Mesh(new THREE.BoxGeometry(10 + wallThickness*2, wallHeight, wallThickness), wallMat);
+        wallN.position.set(0, wallHeight/2, -15 - wallThickness/2);
+        wallN.castShadow = true; wallN.receiveShadow = true;
+        scene.add(wallN);
+
+        const wallS = new THREE.Mesh(new THREE.BoxGeometry(10 + wallThickness*2, wallHeight, wallThickness), wallMat);
+        wallS.position.set(0, wallHeight/2, 15 + wallThickness/2);
+        wallS.castShadow = true; wallS.receiveShadow = true;
+        scene.add(wallS);
+
+        const wallE = new THREE.Mesh(new THREE.BoxGeometry(wallThickness, wallHeight, 30), wallMat);
+        wallE.position.set(5 + wallThickness/2, wallHeight/2, 0);
+        wallE.castShadow = true; wallE.receiveShadow = true;
+        scene.add(wallE);
+
+        const wallW = new THREE.Mesh(new THREE.BoxGeometry(wallThickness, wallHeight, 30), wallMat);
+        wallW.position.set(-5 - wallThickness/2, wallHeight/2, 0);
+        wallW.castShadow = true; wallW.receiveShadow = true;
+        scene.add(wallW);
+
+        // Hole
+        const holeGeo = new THREE.CircleGeometry(HOLE_RADIUS, 32);
+        const holeMat = new THREE.MeshBasicMaterial({ color: 0x111111 });
+        const hole = new THREE.Mesh(holeGeo, holeMat);
+        hole.rotation.x = -Math.PI / 2;
+        hole.position.copy(HOLE_POS);
+        scene.add(hole);
+
+        // Flag Pole
+        const poleGeo = new THREE.CylinderGeometry(0.03, 0.03, 1.5);
+        const poleMat = new THREE.MeshStandardMaterial({ color: 0xdddddd });
+        const pole = new THREE.Mesh(poleGeo, poleMat);
+        pole.position.set(HOLE_POS.x, 0.75, HOLE_POS.z);
+        pole.castShadow = true;
+        scene.add(pole);
+
+        // Flag
+        const flagShape = new THREE.Shape();
+        flagShape.moveTo(0, 0);
+        flagShape.lineTo(0.6, 0.2);
+        flagShape.lineTo(0, 0.4);
+        flagShape.lineTo(0, 0);
+        const flagGeo = new THREE.ShapeGeometry(flagShape);
+        const flagMat = new THREE.MeshStandardMaterial({ color: 0xff0000, side: THREE.DoubleSide });
+        const flag = new THREE.Mesh(flagGeo, flagMat);
+        flag.position.set(HOLE_POS.x, 1.0, HOLE_POS.z);
+        flag.castShadow = true;
+        scene.add(flag);
+
+        // Ball
+        const ballGeo = new THREE.SphereGeometry(BALL_RADIUS, 32, 32);
+        const ballMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.2 });
+        const ball = new THREE.Mesh(ballGeo, ballMat);
+        ball.position.copy(TEE_POS);
+        ball.castShadow = true;
+        scene.add(ball);
+
+        // Aim Line
+        const aimMat = new THREE.LineBasicMaterial({ color: 0xffffff, linewidth: 2 });
+        const aimGeo = new THREE.BufferGeometry();
+        const aimLine = new THREE.Line(aimGeo, aimMat);
+        scene.add(aimLine);
+
+        // --- Model Loading ---
+        let modelBoundingBox = new THREE.Box3();
+        const loader = new GLTFLoader();
+        loader.load(
+            'https://cdn.jsdelivr.net/gh/mrdoob/three.js@master/examples/models/gltf/ABeautifulGame/ABeautifulGame.glb',
+            function (gltf) {
+                const model = gltf.scene;
+                model.scale.set(0.5, 0.5, 0.5);
+                model.position.set(0, 0, -5);
+                
+                model.traverse((child) => {
+                    if (child.isMesh) {
+                        child.castShadow = true;
+                        child.receiveShadow = true;
+                    }
+                });
+
+                scene.add(model);
+                
+                // Compute bounding box for collision
+                modelBoundingBox.setFromObject(model);
+                state.modelLoaded = true;
+            },
+            undefined,
+            function (error) {
+                console.error('Error loading model:', error);
+            }
+        );
+
+        // --- Input Handling ---
+        const keys = { ArrowLeft: false, ArrowRight: false, Space: false };
+
+        window.addEventListener('keydown', (e) => {
+            if (e.code === 'ArrowLeft') keys.ArrowLeft = true;
+            if (e.code === 'ArrowRight') keys.ArrowRight = true;
+            if (e.code === 'Space' && state.gameState === 'aiming') {
+                keys.Space = true;
+                state.isCharging = true;
+                state.gameState = 'charging';
+                document.getElementById('power-container').style.display = 'block';
+            }
+            if (e.code === 'KeyR') resetBall();
+            if (e.code === 'KeyN') resetGame();
+        });
+
+        window.addEventListener('keyup', (e) => {
+            if (e.code === 'ArrowLeft') keys.ArrowLeft = false;
+            if (e.code === 'ArrowRight') keys.ArrowRight = false;
+            if (e.code === 'Space' && state.isCharging) {
+                keys.Space = false;
+                shootBall();
+            }
+        });
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // --- Game Logic ---
+        function resetBall() {
+            ball.position.copy(TEE_POS);
+            state.ballVelocity.x = 0;
+            state.ballVelocity.z = 0;
+            state.ballSpeed = 0;
+            state.ballStopped = true;
+            state.ballSunk = false;
+            state.gameState = 'aiming';
+            state.strokeCount++;
+            state.wallBounceCount = 0;
+            state.modelBounceCount = 0;
+            updateHUD();
+            hideMessage();
+        }
+
+        function resetGame() {
+            ball.position.copy(TEE_POS);
+            state.ballVelocity.x = 0;
+            state.ballVelocity.z = 0;
+            state.ballSpeed = 0;
+            state.ballStopped = true;
+            state.ballSunk = false;
+            state.gameState = 'aiming';
+            state.strokeCount = 0;
+            state.score = 0;
+            state.wallBounceCount = 0;
+            state.modelBounceCount = 0;
+            updateHUD();
+            hideMessage();
+        }
+
+        function shootBall() {
+            state.isCharging = false;
+            document.getElementById('power-container').style.display = 'none';
+            
+            const velMag = state.power * MAX_POWER_VELOCITY;
+            state.ballVelocity.x = Math.sin(state.aimAngle) * velMag;
+            state.ballVelocity.z = -Math.cos(state.aimAngle) * velMag;
+            
+            state.power = 0;
+            state.ballStopped = false;
+            state.gameState = 'rolling';
+            state.strokeCount++;
+            state.wallBounceCount = 0;
+            state.modelBounceCount = 0;
+            updateHUD();
+        }
+
+        function updateHUD() {
+            document.getElementById('strokeCount').innerText = `Strokes: ${state.strokeCount}`;
+            document.getElementById('scoreDisplay').innerText = `Score: ${state.score}`;
+        }
+
+        function showMessage(msg) {
+            const el = document.getElementById('messageDisplay');
+            el.innerText = msg;
+            el.style.display = 'block';
+        }
+
+        function hideMessage() {
+            document.getElementById('messageDisplay').style.display = 'none';
+        }
+
+        function handlePhysics() {
+            if (state.ballStopped || state.ballSunk) return;
+
+            // Apply velocity
+            ball.position.x += state.ballVelocity.x * (1/60); // Assuming ~60fps for manual physics
+            ball.position.z += state.ballVelocity.z * (1/60);
+
+            // Apply friction
+            state.ballVelocity.x *= FRICTION;
+            state.ballVelocity.z *= FRICTION;
+
+            // Calculate speed
+            state.ballSpeed = Math.sqrt(state.ballVelocity.x**2 + state.ballVelocity.z**2);
+
+            // Wall Collisions
+            const maxX = BOUNDS.x - BALL_RADIUS;
+            const maxZ = BOUNDS.z - BALL_RADIUS;
+
+            if (ball.position.x > maxX) {
+                ball.position.x = maxX;
+                state.ballVelocity.x *= -0.7;
+                state.wallBounceCount++;
+            } else if (ball.position.x < -maxX) {
+                ball.position.x = -maxX;
+                state.ballVelocity.x *= -0.7;
+                state.wallBounceCount++;
+            }
+
+            if (ball.position.z > maxZ) {
+                ball.position.z = maxZ;
+                state.ballVelocity.z *= -0.7;
+                state.wallBounceCount++;
+            } else if (ball.position.z < -maxZ) {
+                ball.position.z = -maxZ;
+                state.ballVelocity.z *= -0.7;
+                state.wallBounceCount++;
+            }
+
+            // Model Collision (AABB vs Sphere)
+            if (state.modelLoaded) {
+                const closestX = Math.max(modelBoundingBox.min.x, Math.min(ball.position.x, modelBoundingBox.max.x));
+                const closestY = Math.max(modelBoundingBox.min.y, Math.min(ball.position.y, modelBoundingBox.max.y));
+                const closestZ = Math.max(modelBoundingBox.min.z, Math.min(ball.position.z, modelBoundingBox.max.z));
+
+                const dx = ball.position.x - closestX;
+                const dy = ball.position.y - closestY;
+                const dz = ball.position.z - closestZ;
+
+                const distanceSq = dx*dx + dy*dy + dz*dz;
+
+                if (distanceSq < BALL_RADIUS * BALL_RADIUS) {
+                    const distance = Math.sqrt(distanceSq);
+                    let nx = dx / distance;
+                    let nz = dz / distance;
+
+                    if (distance === 0) {
+                        nx = -Math.sign(state.ballVelocity.x) || 1;
+                        nz = -Math.sign(state.ballVelocity.z) || 0;
+                    }
+
+                    // Normalize 2D normal
+                    const nLen = Math.sqrt(nx*nx + nz*nz);
+                    if (nLen > 0) {
+                        nx /= nLen; nz /= nLen;
+                    } else {
+                        nx = 1; nz = 0;
+                    }
+
+                    // Reflect velocity
+                    const dot = state.ballVelocity.x * nx + state.ballVelocity.z * nz;
+                    state.ballVelocity.x = (state.ballVelocity.x - 2 * dot * nx) * 0.5;
+                    state.ballVelocity.z = (state.ballVelocity.z - 2 * dot * nz) * 0.5;
+
+                    // Push out
+                    ball.position.x = closestX + nx * BALL_RADIUS;
+                    ball.position.z = closestZ + nz * BALL_RADIUS;
+
+                    state.modelBounceCount++;
+                }
+            }
+
+            // Hole Logic
+            const distToHole = Math.sqrt((ball.position.x - HOLE_POS.x)**2 + (ball.position.z - HOLE_POS.z)**2);
+            if (distToHole < 0.5 && state.ballSpeed < 3.0) {
+                state.ballSunk = true;
+                state.gameState = 'sunk';
+                ball.position.x = HOLE_POS.x;
+                ball.position.z = HOLE_POS.z;
+                ball.position.y = -0.1;
+                state.ballVelocity.x = 0;
+                state.ballVelocity.z = 0;
+                state.ballSpeed = 0;
+                state.score++;
+                updateHUD();
+
+                if (state.strokeCount === 1) {
+                    showMessage("HOLE IN ONE!");
+                } else if (state.strokeCount <= 3) {
+                    showMessage("Nice Putt!");
+                } else {
+                    showMessage(`Ball Sunk in ${state.strokeCount} strokes!`);
+                }
+            }
+
+            // Stop Logic
+            if (!state.ballSunk && state.ballSpeed < 0.005) {
+                state.ballVelocity.x = 0;
+                state.ballVelocity.z = 0;
+                state.ballSpeed = 0;
+                state.ballStopped = true;
+                state.gameState = 'aiming';
+            }
+        }
+
+        const clock = new THREE.Clock();
+
+        function animate() {
+            requestAnimationFrame(animate);
+            const delta = clock.getDelta();
+
+            // Handle Aiming
+            if (state.gameState === 'aiming') {
+                if (keys.ArrowLeft) state.aimAngle += 0.03;
+                if (keys.ArrowRight) state.aimAngle -= 0.03;
+
+                const pts = [
+                    new THREE.Vector3(ball.position.x, 0.16, ball.position.z),
+                    new THREE.Vector3(
+                        ball.position.x + Math.sin(state.aimAngle) * 3,
+                        0.16,
+                        ball.position.z - Math.cos(state.aimAngle) * 3
+                    )
+                ];
+                aimLine.geometry.setFromPoints(pts);
+                aimLine.visible = true;
+            } else {
+                aimLine.visible = false;
+            }
+
+            // Handle Charging
+            if (state.gameState === 'charging') {
+                state.power += delta * CHARGE_RATE;
+                if (state.power > 1) state.power = 1;
+
+                const powerBar = document.getElementById('powerBar');
+                powerBar.style.width = `${state.power * 100}%`;
+                
+                let r, g, b;
+                if (state.power < 0.5) {
+                    r = Math.floor(state.power * 2 * 255);
+                    g = 255;
+                    b = 0;
+                } else {
+                    r = 255;
+                    g = Math.floor((1 - state.power) * 2 * 255);
+                    b = 0;
+                }
+                powerBar.style.backgroundColor = `rgb(${r},${g},${b})`;
+            }
+
+            handlePhysics();
+
+            // Update State Object
+            state.ballPosition.x = ball.position.x;
+            state.ballPosition.y = ball.position.y;
+            state.ballPosition.z = ball.position.z;
+
+            controls.update();
+            renderer.render(scene, camera);
+        }
+
+        animate();
+    </script>
+</body>
+</html>

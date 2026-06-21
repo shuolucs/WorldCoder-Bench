@@ -1,0 +1,690 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Three.js SPH Fluid + Rigid Body Two-way Coupling</title>
+  <style>
+    html, body {
+      margin: 0;
+      overflow: hidden;
+      background: #0b1020;
+      color: #eaf2ff;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    #app {
+      width: 100vw;
+      height: 100vh;
+      display: block;
+    }
+    #hud {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      padding: 12px 14px;
+      background: rgba(10, 18, 32, 0.72);
+      border: 1px solid rgba(180, 210, 255, 0.2);
+      border-radius: 10px;
+      backdrop-filter: blur(6px);
+      line-height: 1.7;
+      font-size: 14px;
+      min-width: 220px;
+      user-select: none;
+    }
+    #hud b {
+      color: #9fd3ff;
+    }
+    #resetBtn {
+      margin-top: 8px;
+      width: 100%;
+      border: none;
+      border-radius: 8px;
+      padding: 8px 10px;
+      background: #2b6cb0;
+      color: white;
+      cursor: pointer;
+      font-size: 14px;
+    }
+    #resetBtn:hover {
+      background: #3b82d6;
+    }
+    .note {
+      margin-top: 8px;
+      color: #9fb6d9;
+      font-size: 12px;
+      line-height: 1.4;
+    }
+  </style>
+
+  <script type="importmap">
+  { "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+  } }
+  </script>
+</head>
+<body>
+  <canvas id="app"></canvas>
+
+  <div id="hud">
+    <div>模拟时间: <b id="simTime">0.000</b> s</div>
+    <div>粒子数: <b id="particleCount">200</b></div>
+    <div>Heavy 盒子 y: <b id="heavyY">0.000</b></div>
+    <div>Light 盒子 y: <b id="lightY">0.000</b></div>
+    <button id="resetBtn">重置</button>
+    <div class="note">SPH(200粒子) + 3刚体盒子双向耦合，3子步/帧</div>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+    // =========================
+    // Basic Scene Setup
+    // =========================
+    const canvas = document.getElementById('app');
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0b1020);
+
+    const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.01, 100);
+    camera.position.set(6.2, 4.6, 7.2);
+
+    const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.set(2, 1.2, 2);
+    controls.enableDamping = true;
+
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.65);
+    scene.add(ambientLight);
+
+    const dirLight = new THREE.DirectionalLight(0xffffff, 1.25);
+    dirLight.position.set(5, 8, 4);
+    scene.add(dirLight);
+
+    // =========================
+    // Constants
+    // =========================
+    const TANK_MIN = new THREE.Vector3(0, 0, 0);
+    const TANK_MAX = new THREE.Vector3(4, 3, 4);
+    const TANK_SIZE = new THREE.Vector3(4, 3, 4);
+
+    const N = 200;
+    const PARTICLE_MASS = 0.05;
+    const H = 0.5;
+    const H2 = H * H;
+    const REST_DENS = 1000.0;
+    const TAIT_K = 15.0;
+    const VISC = 0.15;
+    const DT = 0.002;
+    const SUBSTEPS = 3;
+    const G = new THREE.Vector3(0, -9.81, 0);
+    const PARTICLE_BOUNCE = 0.3;
+    const RIGID_BOUNCE = 0.2;
+    const K_REPEL = 500.0;
+    const PARTICLE_RADIUS = 0.06;
+    const BOX_SIZE = 0.4;
+    const BOX_HALF = BOX_SIZE * 0.5;
+    const BOX_VOLUME = BOX_SIZE * BOX_SIZE * BOX_SIZE;
+    const BOX_PROBE_RADIUS = H;
+
+    const POLY6_COEFF = 315.0 / (64.0 * Math.PI * Math.pow(H, 9));
+    const SPIKY_GRAD_COEFF = -45.0 / (Math.PI * Math.pow(H, 6));
+    const VISC_LAPL_COEFF = 45.0 / (Math.PI * Math.pow(H, 6));
+
+    // =========================
+    // HUD
+    // =========================
+    const simTimeEl = document.getElementById('simTime');
+    const particleCountEl = document.getElementById('particleCount');
+    const heavyYEl = document.getElementById('heavyY');
+    const lightYEl = document.getElementById('lightY');
+    const resetBtn = document.getElementById('resetBtn');
+
+    // =========================
+    // Tank Rendering
+    // =========================
+    const tankGroup = new THREE.Group();
+    scene.add(tankGroup);
+
+    const bottomGeom = new THREE.PlaneGeometry(TANK_SIZE.x, TANK_SIZE.z);
+    const bottomMat = new THREE.MeshPhongMaterial({
+      color: 0x345d7e,
+      transparent: true,
+      opacity: 0.35,
+      side: THREE.DoubleSide
+    });
+    const bottom = new THREE.Mesh(bottomGeom, bottomMat);
+    bottom.rotation.x = -Math.PI / 2;
+    bottom.position.set(2, 0, 2);
+    tankGroup.add(bottom);
+
+    const edgesGeom = new THREE.EdgesGeometry(new THREE.BoxGeometry(TANK_SIZE.x, TANK_SIZE.y, TANK_SIZE.z));
+    const edgesMat = new THREE.LineBasicMaterial({ color: 0x9dd6ff, transparent: true, opacity: 0.8 });
+    const tankWire = new THREE.LineSegments(edgesGeom, edgesMat);
+    tankWire.position.set(2, 1.5, 2);
+    tankGroup.add(tankWire);
+
+    // =========================
+    // Fluid Particles
+    // =========================
+    const sphereGeom = new THREE.SphereGeometry(PARTICLE_RADIUS, 14, 14);
+    const particleMat = new THREE.MeshPhongMaterial({
+      color: 0x4aa3ff,
+      transparent: true,
+      opacity: 0.95
+    });
+    const particlesMesh = new THREE.InstancedMesh(sphereGeom, particleMat, N);
+    particlesMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    particlesMesh.castShadow = false;
+    particlesMesh.receiveShadow = false;
+    scene.add(particlesMesh);
+
+    if (particlesMesh.instanceColor === null) {
+      particlesMesh.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(N * 3), 3);
+    }
+
+    const tempMatrix = new THREE.Matrix4();
+    const tempColor = new THREE.Color();
+
+    // =========================
+    // Rigid Bodies
+    // =========================
+    const rigidBodies = [];
+    const boxGeom = new THREE.BoxGeometry(BOX_SIZE, BOX_SIZE, BOX_SIZE);
+
+    function createRigidBody(name, density, color, position) {
+      const mass = density * BOX_VOLUME;
+      const mat = new THREE.MeshPhongMaterial({
+        color,
+        transparent: true,
+        opacity: 0.85
+      });
+      const mesh = new THREE.Mesh(boxGeom, mat);
+      mesh.position.copy(position);
+      scene.add(mesh);
+
+      const body = {
+        name,
+        density,
+        mass,
+        volume: BOX_VOLUME,
+        pos: position.clone(),
+        vel: new THREE.Vector3(),
+        force: new THREE.Vector3(),
+        submergedRatio: 0,
+        mesh
+      };
+      rigidBodies.push(body);
+      return body;
+    }
+
+    createRigidBody('heavy', 2000, 0xD32F2F, new THREE.Vector3(1, 2.5, 1));
+    createRigidBody('neutral', 1000, 0x388E3C, new THREE.Vector3(2, 2.5, 1));
+    createRigidBody('light', 500, 0xFBC02D, new THREE.Vector3(3, 2.5, 1));
+
+    // =========================
+    // Simulation Data
+    // =========================
+    const positions = new Array(N);
+    const velocities = new Array(N);
+    const forces = new Array(N);
+    const densities = new Float32Array(N);
+    const pressures = new Float32Array(N);
+
+    function createVecArray() {
+      const arr = new Array(N);
+      for (let i = 0; i < N; i++) arr[i] = new THREE.Vector3();
+      return arr;
+    }
+
+    const pressureForces = createVecArray();
+    const viscosityForces = createVecArray();
+
+    let simTime = 0;
+
+    function resetSimulation() {
+      // Initial fluid distribution:
+      // x,y,z in [0,2], uniform grid, 200 particles
+      // Use 5x5x8 = 200
+      let idx = 0;
+      const nx = 5, ny = 5, nz = 8;
+      const pad = 0.18;
+      const sx = (2.0 - 2 * pad) / (nx - 1);
+      const sy = (2.0 - 2 * pad) / (ny - 1);
+      const sz = (2.0 - 2 * pad) / (nz - 1);
+
+      for (let iy = 0; iy < ny; iy++) {
+        for (let iz = 0; iz < nz; iz++) {
+          for (let ix = 0; ix < nx; ix++) {
+            if (idx >= N) break;
+            const x = pad + ix * sx;
+            const y = pad + iy * sy;
+            const z = pad + iz * sz;
+
+            if (!positions[idx]) positions[idx] = new THREE.Vector3();
+            if (!velocities[idx]) velocities[idx] = new THREE.Vector3();
+            if (!forces[idx]) forces[idx] = new THREE.Vector3();
+
+            positions[idx].set(x, y, z);
+            velocities[idx].set(0, 0, 0);
+            forces[idx].set(0, 0, 0);
+            densities[idx] = REST_DENS;
+            pressures[idx] = 0;
+            idx++;
+          }
+        }
+      }
+
+      rigidBodies[0].pos.set(1, 2.5, 1);
+      rigidBodies[1].pos.set(2, 2.5, 1);
+      rigidBodies[2].pos.set(3, 2.5, 1);
+      for (const rb of rigidBodies) {
+        rb.vel.set(0, 0, 0);
+        rb.force.set(0, 0, 0);
+        rb.submergedRatio = 0;
+        rb.mesh.position.copy(rb.pos);
+      }
+
+      simTime = 0;
+      updateParticleVisuals();
+      updateHUD();
+      updateExposedState(0);
+    }
+
+    resetBtn.addEventListener('click', resetSimulation);
+
+    // =========================
+    // SPH Kernels
+    // =========================
+    function poly6Kernel(r2) {
+      if (r2 >= H2) return 0;
+      const term = H2 - r2;
+      return POLY6_COEFF * term * term * term;
+    }
+
+    function spikyGrad(rVec, out) {
+      const r = rVec.length();
+      if (r <= 1e-8 || r >= H) {
+        out.set(0, 0, 0);
+        return out;
+      }
+      const coeff = SPIKY_GRAD_COEFF * Math.pow(H - r, 2) / r;
+      out.copy(rVec).multiplyScalar(coeff);
+      return out;
+    }
+
+    function viscLaplacian(r) {
+      if (r >= H) return 0;
+      return VISC_LAPL_COEFF * (H - r);
+    }
+
+    // =========================
+    // Helpers
+    // =========================
+    const tmpA = new THREE.Vector3();
+    const tmpB = new THREE.Vector3();
+    const tmpC = new THREE.Vector3();
+    const tmpD = new THREE.Vector3();
+    const clampVec = new THREE.Vector3();
+
+    function particleWallCollision(i) {
+      const p = positions[i];
+      const v = velocities[i];
+      const r = PARTICLE_RADIUS;
+
+      if (p.x < TANK_MIN.x + r) {
+        p.x = TANK_MIN.x + r;
+        if (v.x < 0) v.x *= -PARTICLE_BOUNCE;
+      }
+      if (p.x > TANK_MAX.x - r) {
+        p.x = TANK_MAX.x - r;
+        if (v.x > 0) v.x *= -PARTICLE_BOUNCE;
+      }
+      if (p.y < TANK_MIN.y + r) {
+        p.y = TANK_MIN.y + r;
+        if (v.y < 0) v.y *= -PARTICLE_BOUNCE;
+      }
+      if (p.y > TANK_MAX.y - r) {
+        p.y = TANK_MAX.y - r;
+        if (v.y > 0) v.y *= -PARTICLE_BOUNCE;
+      }
+      if (p.z < TANK_MIN.z + r) {
+        p.z = TANK_MIN.z + r;
+        if (v.z < 0) v.z *= -PARTICLE_BOUNCE;
+      }
+      if (p.z > TANK_MAX.z - r) {
+        p.z = TANK_MAX.z - r;
+        if (v.z > 0) v.z *= -PARTICLE_BOUNCE;
+      }
+    }
+
+    function rigidWallCollision(rb) {
+      if (rb.pos.x < TANK_MIN.x + BOX_HALF) {
+        rb.pos.x = TANK_MIN.x + BOX_HALF;
+        if (rb.vel.x < 0) rb.vel.x *= -RIGID_BOUNCE;
+      }
+      if (rb.pos.x > TANK_MAX.x - BOX_HALF) {
+        rb.pos.x = TANK_MAX.x - BOX_HALF;
+        if (rb.vel.x > 0) rb.vel.x *= -RIGID_BOUNCE;
+      }
+      if (rb.pos.y < TANK_MIN.y + BOX_HALF) {
+        rb.pos.y = TANK_MIN.y + BOX_HALF;
+        if (rb.vel.y < 0) rb.vel.y *= -RIGID_BOUNCE;
+      }
+      if (rb.pos.y > TANK_MAX.y - BOX_HALF) {
+        rb.pos.y = TANK_MAX.y - BOX_HALF;
+        if (rb.vel.y > 0) rb.vel.y *= -RIGID_BOUNCE;
+      }
+      if (rb.pos.z < TANK_MIN.z + BOX_HALF) {
+        rb.pos.z = TANK_MIN.z + BOX_HALF;
+        if (rb.vel.z < 0) rb.vel.z *= -RIGID_BOUNCE;
+      }
+      if (rb.pos.z > TANK_MAX.z - BOX_HALF) {
+        rb.pos.z = TANK_MAX.z - BOX_HALF;
+        if (rb.vel.z > 0) rb.vel.z *= -RIGID_BOUNCE;
+      }
+    }
+
+    function estimateFluidSurfaceYAround(x, z, radius = 0.9) {
+      let sumY = 0;
+      let count = 0;
+      for (let i = 0; i < N; i++) {
+        const dx = positions[i].x - x;
+        const dz = positions[i].z - z;
+        if (dx * dx + dz * dz <= radius * radius) {
+          sumY += positions[i].y;
+          count++;
+        }
+      }
+      if (count === 0) return 0.0;
+      return sumY / count + 0.35;
+    }
+
+    function computeSubmergedRatio(rb) {
+      const fluidSurfaceY = estimateFluidSurfaceYAround(rb.pos.x, rb.pos.z);
+      const top = rb.pos.y + BOX_HALF;
+      const bottom = rb.pos.y - BOX_HALF;
+
+      let ratio;
+      if (fluidSurfaceY <= bottom) ratio = 0;
+      else if (fluidSurfaceY >= top) ratio = 1;
+      else ratio = (fluidSurfaceY - bottom) / BOX_SIZE;
+
+      // neighborhood correction using nearby particles within h
+      let nearby = 0;
+      for (let i = 0; i < N; i++) {
+        if (positions[i].distanceToSquared(rb.pos) < BOX_PROBE_RADIUS * BOX_PROBE_RADIUS) nearby++;
+      }
+      const localFactor = THREE.MathUtils.clamp(nearby / 12, 0, 1);
+      ratio *= 0.5 + 0.5 * localFactor;
+
+      rb.submergedRatio = THREE.MathUtils.clamp(ratio, 0, 1);
+    }
+
+    function particleBoxRepulsion(i, rb) {
+      const p = positions[i];
+      clampVec.copy(p).sub(rb.pos).clamp(
+        new THREE.Vector3(-BOX_HALF, -BOX_HALF, -BOX_HALF),
+        new THREE.Vector3( BOX_HALF,  BOX_HALF,  BOX_HALF)
+      ).add(rb.pos);
+
+      tmpA.copy(p).sub(clampVec);
+      const dist = tmpA.length();
+
+      const threshold = 0.15;
+      if (dist < threshold) {
+        let normal;
+        if (dist > 1e-8) {
+          normal = tmpA.normalize();
+        } else {
+          // fallback normal from nearest face direction
+          const local = tmpB.copy(p).sub(rb.pos);
+          const ax = BOX_HALF - Math.abs(local.x);
+          const ay = BOX_HALF - Math.abs(local.y);
+          const az = BOX_HALF - Math.abs(local.z);
+          if (ax <= ay && ax <= az) normal = new THREE.Vector3(Math.sign(local.x) || 1, 0, 0);
+          else if (ay <= ax && ay <= az) normal = new THREE.Vector3(0, Math.sign(local.y) || 1, 0);
+          else normal = new THREE.Vector3(0, 0, Math.sign(local.z) || 1);
+        }
+
+        const overlap = threshold - dist;
+        const repel = tmpC.copy(normal).multiplyScalar(K_REPEL * overlap);
+        forces[i].add(repel);
+        rb.force.addScaledVector(repel, -1); // two-way coupling
+      }
+    }
+
+    // =========================
+    // Physics Step
+    // =========================
+    const grad = new THREE.Vector3();
+
+    function physicsSubstep() {
+      // 1) density
+      for (let i = 0; i < N; i++) {
+        let rho = 0;
+        const pi = positions[i];
+        for (let j = 0; j < N; j++) {
+          const r2 = pi.distanceToSquared(positions[j]);
+          rho += PARTICLE_MASS * poly6Kernel(r2);
+        }
+        densities[i] = Math.max(rho, REST_DENS * 0.15);
+      }
+
+      // 2) pressure
+      for (let i = 0; i < N; i++) {
+        pressures[i] = TAIT_K * (Math.pow(densities[i] / REST_DENS, 7.0) - 1.0);
+      }
+
+      // 3) clear forces
+      for (let i = 0; i < N; i++) {
+        pressureForces[i].set(0, 0, 0);
+        viscosityForces[i].set(0, 0, 0);
+        forces[i].copy(G).multiplyScalar(PARTICLE_MASS); // gravity
+      }
+
+      for (const rb of rigidBodies) {
+        rb.force.copy(G).multiplyScalar(rb.mass); // gravity
+      }
+
+      // 4) SPH pair forces
+      for (let i = 0; i < N; i++) {
+        const pi = positions[i];
+        const vi = velocities[i];
+
+        for (let j = 0; j < N; j++) {
+          if (i === j) continue;
+
+          const pj = positions[j];
+          tmpA.copy(pi).sub(pj);
+          const r = tmpA.length();
+          if (r <= 1e-8 || r >= H) continue;
+
+          spikyGrad(tmpA, grad);
+
+          // pressure force
+          const pressCoeff = -PARTICLE_MASS * (pressures[i] + pressures[j]) / (2.0 * densities[j]);
+          pressureForces[i].addScaledVector(grad, pressCoeff);
+
+          // viscosity force
+          const lap = viscLaplacian(r);
+          tmpB.copy(velocities[j]).sub(vi).multiplyScalar(VISC * PARTICLE_MASS * lap / densities[j]);
+          viscosityForces[i].add(tmpB);
+        }
+      }
+
+      // 5) fluid -> rigid pressure transfer and rigid -> fluid repulsion
+      for (let b = 0; b < rigidBodies.length; b++) {
+        const rb = rigidBodies[b];
+
+        computeSubmergedRatio(rb);
+
+        const buoyancyMag = REST_DENS * rb.volume * rb.submergedRatio * 9.81;
+        rb.force.add(new THREE.Vector3(0, buoyancyMag, 0));
+
+        for (let i = 0; i < N; i++) {
+          // Rigid -> fluid repulsion
+          particleBoxRepulsion(i, rb);
+
+          // Fluid -> rigid pressure from nearby particles
+          tmpA.copy(positions[i]).sub(rb.pos);
+          const dist = tmpA.length();
+          if (dist < H && dist > 1e-8) {
+            const influence = (H - dist) / H;
+            const pressureMag = Math.max(pressures[i], 0) * 0.0008 * influence;
+            tmpB.copy(tmpA).normalize();
+            const fOnRigid = tmpB.multiplyScalar(pressureMag);
+            rb.force.add(fOnRigid);
+            forces[i].addScaledVector(fOnRigid, -1.0);
+          }
+        }
+      }
+
+      // 6) apply particle forces and integrate
+      for (let i = 0; i < N; i++) {
+        forces[i].add(pressureForces[i]).add(viscosityForces[i]);
+
+        const invRho = 1.0 / Math.max(densities[i], 1e-6);
+        velocities[i].addScaledVector(forces[i], DT * invRho);
+        positions[i].addScaledVector(velocities[i], DT);
+
+        particleWallCollision(i);
+      }
+
+      // 7) integrate rigid bodies
+      for (const rb of rigidBodies) {
+        rb.vel.addScaledVector(rb.force, DT / rb.mass);
+        rb.pos.addScaledVector(rb.vel, DT);
+        rigidWallCollision(rb);
+        rb.mesh.position.copy(rb.pos);
+      }
+
+      simTime += DT;
+    }
+
+    // =========================
+    // Rendering Updates
+    // =========================
+    function updateParticleVisuals() {
+      let maxSpeed = 0;
+      for (let i = 0; i < N; i++) {
+        const s = velocities[i].length();
+        if (s > maxSpeed) maxSpeed = s;
+      }
+      maxSpeed = Math.max(maxSpeed, 0.5);
+
+      for (let i = 0; i < N; i++) {
+        tempMatrix.makeTranslation(positions[i].x, positions[i].y, positions[i].z);
+        particlesMesh.setMatrixAt(i, tempMatrix);
+
+        const speed = velocities[i].length();
+        const t = THREE.MathUtils.clamp(speed / maxSpeed, 0, 1);
+        tempColor.setRGB(
+          0.12 + 0.25 * t,
+          0.30 + 0.45 * t,
+          0.75 + 0.20 * t
+        );
+        particlesMesh.setColorAt(i, tempColor);
+      }
+
+      particlesMesh.instanceMatrix.needsUpdate = true;
+      if (particlesMesh.instanceColor) particlesMesh.instanceColor.needsUpdate = true;
+    }
+
+    function computeTotalEnergy() {
+      let kinetic = 0;
+      let potential = 0;
+      let elastic = 0;
+
+      for (let i = 0; i < N; i++) {
+        kinetic += 0.5 * PARTICLE_MASS * velocities[i].lengthSq();
+        potential += PARTICLE_MASS * 9.81 * positions[i].y;
+      }
+
+      for (const rb of rigidBodies) {
+        kinetic += 0.5 * rb.mass * rb.vel.lengthSq();
+        potential += rb.mass * 9.81 * rb.pos.y;
+      }
+
+      // Simple elastic proxy from box-particle penetration region
+      for (const rb of rigidBodies) {
+        for (let i = 0; i < N; i++) {
+          clampVec.copy(positions[i]).sub(rb.pos).clamp(
+            new THREE.Vector3(-BOX_HALF, -BOX_HALF, -BOX_HALF),
+            new THREE.Vector3( BOX_HALF,  BOX_HALF,  BOX_HALF)
+          ).add(rb.pos);
+
+          const d = positions[i].distanceTo(clampVec);
+          if (d < 0.15) {
+            const overlap = 0.15 - d;
+            elastic += 0.5 * K_REPEL * overlap * overlap;
+          }
+        }
+      }
+
+      return kinetic + potential + elastic;
+    }
+
+    function updateHUD() {
+      simTimeEl.textContent = simTime.toFixed(3);
+      particleCountEl.textContent = String(N);
+      const heavy = rigidBodies.find(b => b.name === 'heavy');
+      const light = rigidBodies.find(b => b.name === 'light');
+      heavyYEl.textContent = heavy.pos.y.toFixed(3);
+      lightYEl.textContent = light.pos.y.toFixed(3);
+    }
+
+    function updateExposedState(totalEnergy) {
+      window.__3D_STATE__ = {
+        particleCount: N,
+        rigidBodies: rigidBodies.map(rb => ({
+          name: rb.name,
+          x: rb.pos.x,
+          y: rb.pos.y,
+          z: rb.pos.z,
+          density: rb.density,
+          submergedRatio: rb.submergedRatio
+        })),
+        simTime,
+        totalEnergy
+      };
+    }
+
+    // =========================
+    // Animation Loop
+    // =========================
+    function animate() {
+      requestAnimationFrame(animate);
+
+      for (let s = 0; s < SUBSTEPS; s++) {
+        physicsSubstep();
+      }
+
+      updateParticleVisuals();
+      updateHUD();
+      const totalEnergy = computeTotalEnergy();
+      updateExposedState(totalEnergy);
+
+      controls.update();
+      renderer.render(scene, camera);
+    }
+
+    // =========================
+    // Resize
+    // =========================
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    // init
+    resetSimulation();
+    animate();
+  </script>
+</body>
+</html>

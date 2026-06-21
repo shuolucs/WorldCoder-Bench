@@ -1,0 +1,667 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>3D Avalanche Simulation</title>
+  <style>
+    html, body {
+      margin: 0;
+      overflow: hidden;
+      background: #0b1220;
+      font-family: Arial, sans-serif;
+    }
+
+    #hud {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      color: #ffffff;
+      background: rgba(0,0,0,0.35);
+      padding: 10px 12px;
+      border-radius: 8px;
+      line-height: 1.5;
+      font-size: 14px;
+      z-index: 10;
+      min-width: 250px;
+    }
+
+    #controls {
+      position: absolute;
+      top: 12px;
+      right: 12px;
+      z-index: 10;
+      display: flex;
+      gap: 10px;
+    }
+
+    button {
+      padding: 10px 14px;
+      border: none;
+      border-radius: 8px;
+      background: #e8eefc;
+      color: #111;
+      font-weight: bold;
+      cursor: pointer;
+    }
+
+    button:hover {
+      background: #ffffff;
+    }
+
+    #hint {
+      position: absolute;
+      bottom: 12px;
+      left: 12px;
+      color: #dfe7ff;
+      background: rgba(0,0,0,0.3);
+      padding: 8px 10px;
+      border-radius: 8px;
+      font-size: 13px;
+      z-index: 10;
+    }
+  </style>
+</head>
+<body>
+  <div id="hud"></div>
+
+  <div id="controls">
+    <button id="startBtn">Start Avalanche</button>
+    <button id="resetBtn">Reset</button>
+  </div>
+
+  <div id="hint">Keys: P = Pause/Resume, U = Undo, R = Redo</div>
+
+  <script type="module">
+    import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
+    import { GLTFLoader } from 'https://unpkg.com/three@0.160.0/examples/jsm/loaders/GLTFLoader.js';
+
+    let scene, camera, renderer, clock;
+    let terrain;
+    let horseGroup = new THREE.Group();
+    let horseBox = new THREE.Box3();
+    let horseLoaded = false;
+
+    const PARTICLE_COUNT = 200;
+    const GRAVITY = -15;
+    const particles = [];
+    const particleGroup = new THREE.Group();
+
+    let simulationStarted = false;
+    let paused = false;
+    let simulationTime = 0;
+    let snapshotTimer = 0;
+    let particlesStopped = 0;
+
+    const history = [];
+    let snapshotIndex = -1;
+    let undoCount = 0;
+    let redoCount = 0;
+
+    const hud = document.getElementById('hud');
+    const startBtn = document.getElementById('startBtn');
+    const resetBtn = document.getElementById('resetBtn');
+
+    const horsePosition = { x: 5, y: 0, z: 10 };
+    const horseCollider = {
+      width: 4,
+      height: 6,
+      depth: 4
+    };
+
+    window.__3D_STATE__ = {
+      simulationStarted: false,
+      simulationTime: 0,
+      activeParticles: 0,
+      totalParticles: PARTICLE_COUNT,
+      paused: false,
+      snapshotIndex: -1,
+      totalSnapshots: 0,
+      horseLoaded: false,
+      horsePosition: { ...horsePosition },
+      particlesStopped: 0,
+      undoCount: 0,
+      redoCount: 0,
+      canUndo: false,
+      canRedo: false
+    };
+
+    init();
+    animate();
+
+    function init() {
+      scene = new THREE.Scene();
+      scene.background = new THREE.Color(0xbfd3e6);
+      scene.fog = new THREE.Fog(0xbfd3e6, 80, 160);
+
+      camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 500);
+      camera.position.set(0, 40, 60);
+      camera.lookAt(0, 0, 0);
+
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+      renderer.shadowMap.enabled = true;
+      renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+      document.body.appendChild(renderer.domElement);
+
+      clock = new THREE.Clock();
+
+      const ambient = new THREE.AmbientLight(0xffffff, 0.4);
+      scene.add(ambient);
+
+      const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+      dirLight.position.set(10, 50, 10);
+      dirLight.castShadow = true;
+      dirLight.shadow.mapSize.set(2048, 2048);
+      dirLight.shadow.camera.near = 0.1;
+      dirLight.shadow.camera.far = 200;
+      dirLight.shadow.camera.left = -80;
+      dirLight.shadow.camera.right = 80;
+      dirLight.shadow.camera.top = 80;
+      dirLight.shadow.camera.bottom = -80;
+      scene.add(dirLight);
+
+      createTerrain();
+      createParticles();
+      loadHorse();
+
+      scene.add(particleGroup);
+
+      startBtn.addEventListener('click', startAvalanche);
+      resetBtn.addEventListener('click', resetSimulation);
+      window.addEventListener('resize', onResize);
+      window.addEventListener('keydown', onKeyDown);
+
+      updateHUD();
+      updateState();
+    }
+
+    function createTerrain() {
+      const geometry = new THREE.PlaneGeometry(100, 100, 64, 64);
+      geometry.rotateX(-Math.PI / 2);
+
+      const pos = geometry.attributes.position;
+      const colorArray = [];
+
+      for (let i = 0; i < pos.count; i++) {
+        const x = pos.getX(i);
+        const z = pos.getZ(i);
+
+        // Base slope: z=-50 => y=0, z=50 => y=30
+        let y = ((z + 50) / 100) * 30;
+
+        // Add mountain variation
+        y += Math.sin(x * 0.15) * 1.5 + Math.cos(z * 0.12) * 1.2;
+        y += Math.sin((x + z) * 0.08) * 0.8;
+
+        if (y < 0) y = 0;
+        pos.setY(i, y);
+
+        const shade = 0.78 + (y / 35) * 0.18;
+        colorArray.push(shade, shade, shade + 0.03 > 1 ? 1 : shade + 0.03);
+      }
+
+      geometry.setAttribute('color', new THREE.Float32BufferAttribute(colorArray, 3));
+      geometry.computeVertexNormals();
+
+      const material = new THREE.MeshStandardMaterial({
+        vertexColors: true,
+        roughness: 0.95,
+        metalness: 0.02
+      });
+
+      terrain = new THREE.Mesh(geometry, material);
+      terrain.receiveShadow = true;
+      scene.add(terrain);
+    }
+
+    function getTerrainHeight(x, z) {
+      let y = ((z + 50) / 100) * 30;
+      y += Math.sin(x * 0.15) * 1.5 + Math.cos(z * 0.12) * 1.2;
+      y += Math.sin((x + z) * 0.08) * 0.8;
+      return Math.max(0, y);
+    }
+
+    function createParticles() {
+      const geometry = new THREE.SphereGeometry(0.3, 10, 10);
+      const material = new THREE.MeshStandardMaterial({
+        color: 0xffffff,
+        roughness: 0.9,
+        metalness: 0.0
+      });
+
+      for (let i = 0; i < PARTICLE_COUNT; i++) {
+        const mesh = new THREE.Mesh(geometry, material);
+        mesh.castShadow = true;
+        mesh.visible = false;
+
+        const p = {
+          mesh,
+          position: new THREE.Vector3(),
+          velocity: new THREE.Vector3(),
+          active: false,
+          stopped: false
+        };
+
+        particles.push(p);
+        particleGroup.add(mesh);
+      }
+
+      initializeParticles();
+    }
+
+    function initializeParticles() {
+      particlesStopped = 0;
+
+      for (let i = 0; i < particles.length; i++) {
+        const p = particles[i];
+
+        const px = (Math.random() - 0.5) * 4;
+        const pz = 45 + (Math.random() - 0.5) * 4;
+        const ground = getTerrainHeight(px, pz);
+
+        p.position.set(px, ground + 0.5 + Math.random() * 1.2, pz);
+        p.velocity.set(
+          (Math.random() - 0.5) * 1.0,
+          0,
+          -(2 + Math.random() * 2)
+        );
+        p.active = false;
+        p.stopped = false;
+
+        p.mesh.position.copy(p.position);
+        p.mesh.visible = false;
+      }
+    }
+
+    function loadHorse() {
+      const loader = new GLTFLoader();
+
+      loader.load(
+        '._horse.glb',
+        (gltf) => {
+          horseGroup.clear();
+
+          const model = gltf.scene;
+          model.scale.set(3, 3, 3);
+
+          const groundY = getTerrainHeight(horsePosition.x, horsePosition.z);
+          model.position.set(horsePosition.x, groundY, horsePosition.z);
+
+          model.traverse((child) => {
+            if (child.isMesh) {
+              child.castShadow = true;
+              child.receiveShadow = true;
+              if (child.material) {
+                child.material = child.material.clone();
+                child.material.color = new THREE.Color(0xdfe6ee);
+                child.material.roughness = 1.0;
+                child.material.metalness = 0.0;
+              }
+            }
+          });
+
+          horseGroup.add(model);
+          scene.add(horseGroup);
+
+          horseLoaded = true;
+          updateHorseBox();
+          updateState();
+          updateHUD();
+        },
+        undefined,
+        () => {
+          // Fallback decorative frozen horse statue placeholder
+          const fallbackMat = new THREE.MeshStandardMaterial({
+            color: 0xdfe6ee,
+            roughness: 1,
+            metalness: 0
+          });
+
+          const body = new THREE.Mesh(new THREE.BoxGeometry(2.8, 2.0, 1.2), fallbackMat);
+          const neck = new THREE.Mesh(new THREE.BoxGeometry(0.7, 1.5, 0.7), fallbackMat);
+          const head = new THREE.Mesh(new THREE.BoxGeometry(1.0, 0.7, 0.7), fallbackMat);
+          const legGeo = new THREE.BoxGeometry(0.35, 1.8, 0.35);
+
+          const leg1 = new THREE.Mesh(legGeo, fallbackMat);
+          const leg2 = new THREE.Mesh(legGeo, fallbackMat);
+          const leg3 = new THREE.Mesh(legGeo, fallbackMat);
+          const leg4 = new THREE.Mesh(legGeo, fallbackMat);
+
+          body.position.set(0, 2.5, 0);
+          neck.position.set(1.1, 3.2, 0);
+          neck.rotation.z = -0.4;
+          head.position.set(1.8, 3.7, 0);
+
+          leg1.position.set(-0.9, 1.0, -0.35);
+          leg2.position.set(-0.2, 1.0, 0.35);
+          leg3.position.set(0.7, 1.0, -0.35);
+          leg4.position.set(1.2, 1.0, 0.35);
+
+          horseGroup.add(body, neck, head, leg1, leg2, leg3, leg4);
+          horseGroup.scale.set(1.5, 1.5, 1.5);
+
+          const groundY = getTerrainHeight(horsePosition.x, horsePosition.z);
+          horseGroup.position.set(horsePosition.x, groundY, horsePosition.z);
+
+          horseGroup.traverse((child) => {
+            if (child.isMesh) {
+              child.castShadow = true;
+              child.receiveShadow = true;
+            }
+          });
+
+          scene.add(horseGroup);
+          horseLoaded = true;
+          updateHorseBox();
+          updateState();
+          updateHUD();
+        }
+      );
+    }
+
+    function updateHorseBox() {
+      if (!horseGroup) return;
+
+      horseBox.setFromCenterAndSize(
+        new THREE.Vector3(
+          horseGroup.position.x,
+          horseGroup.position.y + horseCollider.height * 0.5,
+          horseGroup.position.z
+        ),
+        new THREE.Vector3(horseCollider.width, horseCollider.height, horseCollider.depth)
+      );
+    }
+
+    function startAvalanche() {
+      if (!simulationStarted) {
+        simulationStarted = true;
+        paused = false;
+
+        particles.forEach((p) => {
+          p.active = true;
+          p.stopped = false;
+          p.mesh.visible = true;
+        });
+
+        if (history.length === 0) {
+          saveSnapshot();
+        }
+      } else {
+        paused = false;
+      }
+
+      updateState();
+      updateHUD();
+    }
+
+    function resetSimulation() {
+      simulationStarted = false;
+      paused = false;
+      simulationTime = 0;
+      snapshotTimer = 0;
+      particlesStopped = 0;
+
+      history.length = 0;
+      snapshotIndex = -1;
+      undoCount = 0;
+      redoCount = 0;
+
+      initializeParticles();
+
+      updateState();
+      updateHUD();
+    }
+
+    function saveSnapshot() {
+      if (snapshotIndex < history.length - 1) {
+        history.splice(snapshotIndex + 1);
+      }
+
+      const snapshot = {
+        simulationTime,
+        particlesStopped,
+        particles: particles.map((p) => ({
+          position: { x: p.position.x, y: p.position.y, z: p.position.z },
+          velocity: { x: p.velocity.x, y: p.velocity.y, z: p.velocity.z },
+          active: p.active,
+          stopped: p.stopped,
+          visible: p.mesh.visible
+        }))
+      };
+
+      history.push(snapshot);
+
+      if (history.length > 30) {
+        history.shift();
+      }
+
+      snapshotIndex = history.length - 1;
+      updateState();
+      updateHUD();
+    }
+
+    function restoreSnapshot(index) {
+      const snap = history[index];
+      if (!snap) return;
+
+      simulationTime = snap.simulationTime;
+      particlesStopped = snap.particlesStopped;
+
+      for (let i = 0; i < particles.length; i++) {
+        const p = particles[i];
+        const sp = snap.particles[i];
+
+        p.position.set(sp.position.x, sp.position.y, sp.position.z);
+        p.velocity.set(sp.velocity.x, sp.velocity.y, sp.velocity.z);
+        p.active = sp.active;
+        p.stopped = sp.stopped;
+        p.mesh.visible = sp.visible;
+        p.mesh.position.copy(p.position);
+      }
+
+      updateState();
+      updateHUD();
+    }
+
+    function undo() {
+      if (snapshotIndex > 0) {
+        snapshotIndex--;
+        undoCount++;
+        restoreSnapshot(snapshotIndex);
+      } else {
+        updateState();
+        updateHUD();
+      }
+    }
+
+    function redo() {
+      if (snapshotIndex < history.length - 1) {
+        snapshotIndex++;
+        redoCount++;
+        restoreSnapshot(snapshotIndex);
+      } else {
+        updateState();
+        updateHUD();
+      }
+    }
+
+    function onKeyDown(e) {
+      const key = e.key.toLowerCase();
+
+      if (key === 'p') {
+        if (simulationStarted) {
+          paused = !paused;
+          updateState();
+          updateHUD();
+        }
+      } else if (key === 'u') {
+        undo();
+      } else if (key === 'r') {
+        redo();
+      }
+    }
+
+    function updateParticles(dt) {
+      if (!simulationStarted || paused) return;
+
+      simulationTime += dt;
+      snapshotTimer += dt;
+      updateHorseBox();
+
+      for (let i = 0; i < particles.length; i++) {
+        const p = particles[i];
+        if (!p.active || p.stopped) continue;
+
+        // Gravity
+        p.velocity.y += GRAVITY * dt;
+
+        // Downhill drive in -z direction
+        p.velocity.z += -6.5 * dt;
+
+        // Slight x drift
+        p.velocity.x += (Math.random() - 0.5) * 1.2 * dt;
+
+        // Damping
+        p.velocity.x *= 0.995;
+        p.velocity.z *= 0.998;
+
+        // Integrate
+        p.position.x += p.velocity.x * dt;
+        p.position.y += p.velocity.y * dt;
+        p.position.z += p.velocity.z * dt;
+
+        const terrainY = getTerrainHeight(p.position.x, p.position.z) + 0.3;
+
+        // Follow terrain / surface collision
+        if (p.position.y <= terrainY) {
+          p.position.y = terrainY;
+
+          // Convert downhill slope influence into motion
+          p.velocity.y = Math.max(0, -p.velocity.y * 0.15);
+          p.velocity.z -= 1.2 * dt;
+          p.velocity.x += (Math.random() - 0.5) * 0.2;
+        }
+
+        // Horse box collision
+        if (
+          p.position.x > horseBox.min.x &&
+          p.position.x < horseBox.max.x &&
+          p.position.y > horseBox.min.y &&
+          p.position.y < horseBox.max.y &&
+          p.position.z > horseBox.min.z &&
+          p.position.z < horseBox.max.z
+        ) {
+          const dxMin = Math.abs(p.position.x - horseBox.min.x);
+          const dxMax = Math.abs(horseBox.max.x - p.position.x);
+          const dzMin = Math.abs(p.position.z - horseBox.min.z);
+          const dzMax = Math.abs(horseBox.max.z - p.position.z);
+
+          const minDist = Math.min(dxMin, dxMax, dzMin, dzMax);
+
+          if (minDist === dxMin) {
+            p.position.x = horseBox.min.x - 0.35;
+            p.velocity.x = -Math.abs(p.velocity.x) * 0.7;
+          } else if (minDist === dxMax) {
+            p.position.x = horseBox.max.x + 0.35;
+            p.velocity.x = Math.abs(p.velocity.x) * 0.7;
+          } else if (minDist === dzMin) {
+            p.position.z = horseBox.min.z - 0.35;
+            p.velocity.z = -Math.abs(p.velocity.z) * 0.4;
+          } else {
+            p.position.z = horseBox.max.z + 0.35;
+            p.velocity.z = Math.abs(p.velocity.z) * 0.4;
+          }
+
+          p.velocity.x += (Math.random() - 0.5) * 2.0;
+        }
+
+        // Stop conditions
+        if (p.position.z < -40 || p.position.y < 0.3) {
+          if (!p.stopped) {
+            p.stopped = true;
+            p.active = false;
+            particlesStopped++;
+          }
+        }
+
+        // Low-speed stop near bottom
+        if (
+          p.position.z < -35 &&
+          Math.abs(p.velocity.x) < 0.3 &&
+          Math.abs(p.velocity.z) < 0.5
+        ) {
+          if (!p.stopped) {
+            p.stopped = true;
+            p.active = false;
+            particlesStopped++;
+          }
+        }
+
+        p.mesh.position.copy(p.position);
+      }
+
+      if (snapshotTimer >= 1) {
+        snapshotTimer = 0;
+        saveSnapshot();
+      }
+    }
+
+    function getActiveParticleCount() {
+      let count = 0;
+      for (const p of particles) {
+        if (p.active && !p.stopped) count++;
+      }
+      return count;
+    }
+
+    function updateState() {
+      window.__3D_STATE__.simulationStarted = simulationStarted;
+      window.__3D_STATE__.simulationTime = simulationTime;
+      window.__3D_STATE__.activeParticles = getActiveParticleCount();
+      window.__3D_STATE__.totalParticles = PARTICLE_COUNT;
+      window.__3D_STATE__.paused = paused;
+      window.__3D_STATE__.snapshotIndex = snapshotIndex;
+      window.__3D_STATE__.totalSnapshots = history.length;
+      window.__3D_STATE__.horseLoaded = horseLoaded;
+      window.__3D_STATE__.horsePosition = { ...horsePosition };
+      window.__3D_STATE__.particlesStopped = particlesStopped;
+      window.__3D_STATE__.undoCount = undoCount;
+      window.__3D_STATE__.redoCount = redoCount;
+      window.__3D_STATE__.canUndo = snapshotIndex > 0;
+      window.__3D_STATE__.canRedo = snapshotIndex >= 0 && snapshotIndex < history.length - 1;
+    }
+
+    function updateHUD() {
+      updateState();
+      hud.innerHTML = `
+        <div><strong>Simulation Time:</strong> ${simulationTime.toFixed(2)} s</div>
+        <div><strong>Active Particles:</strong> ${window.__3D_STATE__.activeParticles} / ${PARTICLE_COUNT}</div>
+        <div><strong>Stopped Particles:</strong> ${particlesStopped}</div>
+        <div><strong>Snapshots:</strong> ${snapshotIndex} / ${history.length - 1}</div>
+        <div><strong>Paused:</strong> ${paused ? 'Yes' : 'No'}</div>
+        <div><strong>Horse Loaded:</strong> ${horseLoaded ? 'Yes' : 'No'}</div>
+      `;
+    }
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      let dt = clock.getDelta();
+      dt = Math.min(dt, 0.033);
+
+      updateParticles(dt);
+      updateHUD();
+
+      renderer.render(scene, camera);
+    }
+
+    function onResize() {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    }
+  </script>
+</body>
+</html>

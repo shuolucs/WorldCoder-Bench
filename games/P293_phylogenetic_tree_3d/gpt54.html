@@ -1,0 +1,643 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>3D Phylogenetic Tree</title>
+  <style>
+    html, body {
+      margin: 0;
+      overflow: hidden;
+      background: #0a0a1a;
+      font-family: Arial, sans-serif;
+      color: #fff;
+    }
+
+    #ui {
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+    }
+
+    .panel {
+      position: absolute;
+      background: rgba(10, 10, 26, 0.8);
+      border: 1px solid #334;
+      border-radius: 8px;
+      padding: 10px 12px;
+      font-size: 14px;
+      line-height: 1.4;
+      min-width: 220px;
+      box-shadow: 0 0 12px rgba(0,0,0,0.3);
+      pointer-events: auto;
+    }
+
+    #statsPanel {
+      top: 12px;
+      left: 12px;
+    }
+
+    #infoPanel {
+      top: 12px;
+      right: 12px;
+    }
+
+    #controlsPanel {
+      position: absolute;
+      left: 50%;
+      bottom: 16px;
+      transform: translateX(-50%);
+      background: rgba(10, 10, 26, 0.8);
+      border: 1px solid #334;
+      border-radius: 10px;
+      padding: 12px 16px;
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      pointer-events: auto;
+    }
+
+    button, input[type="range"] {
+      pointer-events: auto;
+    }
+
+    button {
+      background: #1c1c3a;
+      color: #fff;
+      border: 1px solid #445;
+      padding: 8px 12px;
+      border-radius: 6px;
+      cursor: pointer;
+    }
+
+    button:hover {
+      background: #2a2a55;
+    }
+
+    label {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: #ddd;
+      font-size: 14px;
+    }
+
+    .hint {
+      font-size: 12px;
+      color: #aaa;
+      margin-top: 6px;
+    }
+  </style>
+</head>
+<body>
+  <div id="ui">
+    <div id="statsPanel" class="panel"></div>
+    <div id="infoPanel" class="panel"></div>
+
+    <div id="controlsPanel">
+      <label>
+        Depth Filter
+        <input id="depthSlider" type="range" min="0" max="3" step="1" value="3" />
+      </label>
+      <button id="rotateBtn">Auto Rotate: OFF</button>
+      <button id="colorModeBtn">Color Mode: depth</button>
+    </div>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js';
+    import { OrbitControls } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js';
+    import { GLTFLoader } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/GLTFLoader.js';
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color('#0a0a1a');
+
+    const camera = new THREE.PerspectiveCamera(
+      60,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      1000
+    );
+    camera.position.set(0, 5, 15);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    document.body.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.set(0, 4, 0);
+    controls.update();
+
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
+    scene.add(ambientLight);
+
+    const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
+    directionalLight.position.set(5, 10, 5);
+    scene.add(directionalLight);
+
+    const grid = new THREE.GridHelper(20, 20, new THREE.Color('#222244'), new THREE.Color('#222244'));
+    grid.position.y = -0.01;
+    grid.material.opacity = 0.35;
+    grid.material.transparent = true;
+    scene.add(grid);
+
+    const treeGroup = new THREE.Group();
+    scene.add(treeGroup);
+
+    const DEPTH_COLORS = {
+      0: '#ff4444',
+      1: '#ff8844',
+      2: '#44aa88',
+      3: '#4488ff'
+    };
+    const UNIFORM_COLOR = '#aa44ff';
+
+    const nodes = {};
+    const branches = [];
+    const nodeMeshes = [];
+    let selectedNode = null;
+    let autoRotate = false;
+    let rotationAngle = 0;
+    let colorMode = 'depth';
+    let treeState = 'expanded';
+    let collapseAnim = null;
+    let robotInstance = null;
+    let robotLoaded = false;
+    let highlightedPath = [];
+
+    const depthSlider = document.getElementById('depthSlider');
+    const rotateBtn = document.getElementById('rotateBtn');
+    const colorModeBtn = document.getElementById('colorModeBtn');
+    const infoPanel = document.getElementById('infoPanel');
+    const statsPanel = document.getElementById('statsPanel');
+
+    const raycaster = new THREE.Raycaster();
+    const mouse = new THREE.Vector2();
+    const clock = new THREE.Clock();
+
+    function createNode(id, depth, parentId, position) {
+      const geometry = new THREE.SphereGeometry(0.3, 24, 24);
+      const material = new THREE.MeshStandardMaterial({
+        color: new THREE.Color(DEPTH_COLORS[depth]),
+        emissive: new THREE.Color('#000000'),
+        emissiveIntensity: 0.8
+      });
+      const mesh = new THREE.Mesh(geometry, material);
+      mesh.position.copy(position);
+      treeGroup.add(mesh);
+
+      const node = {
+        id,
+        depth,
+        parentId,
+        children: [],
+        mesh,
+        originalPosition: position.clone()
+      };
+
+      nodes[id] = node;
+      nodeMeshes.push(mesh);
+      mesh.userData.nodeId = id;
+      return node;
+    }
+
+    function connectNodes(parentNode, childNode) {
+      const branch = {
+        parentId: parentNode.id,
+        childId: childNode.id,
+        line: null,
+        highlighted: false
+      };
+
+      const material = new THREE.LineBasicMaterial({
+        color: new THREE.Color('#ffffff'),
+        transparent: true,
+        opacity: 0.6
+      });
+
+      const points = [parentNode.mesh.position.clone(), childNode.mesh.position.clone()];
+      const geometry = new THREE.BufferGeometry().setFromPoints(points);
+      const line = new THREE.Line(geometry, material);
+      treeGroup.add(line);
+
+      branch.line = line;
+      branches.push(branch);
+      parentNode.children.push(childNode.id);
+    }
+
+    function updateBranchGeometry(branch) {
+      const parent = nodes[branch.parentId].mesh.position;
+      const child = nodes[branch.childId].mesh.position;
+      branch.line.geometry.dispose();
+      branch.line.geometry = new THREE.BufferGeometry().setFromPoints([
+        parent.clone(),
+        child.clone()
+      ]);
+    }
+
+    function radialPositions(count, radius, y, angleOffset = 0) {
+      const arr = [];
+      for (let i = 0; i < count; i++) {
+        const angle = angleOffset + (i / count) * Math.PI * 2;
+        arr.push(new THREE.Vector3(
+          Math.cos(angle) * radius,
+          y,
+          Math.sin(angle) * radius
+        ));
+      }
+      return arr;
+    }
+
+    function buildTree() {
+      const depth0 = [new THREE.Vector3(0, 0, 0)];
+      const depth1 = radialPositions(2, 2.2, 3, Math.PI / 2);
+      const depth2 = radialPositions(4, 4.5, 6, Math.PI / 4);
+      const depth3 = radialPositions(8, 7.2, 9, Math.PI / 8);
+
+      createNode('root', 0, null, depth0[0]);
+
+      createNode('n1a', 1, 'root', depth1[0]);
+      createNode('n1b', 1, 'root', depth1[1]);
+
+      createNode('n2a', 2, 'n1a', depth2[0]);
+      createNode('n2b', 2, 'n1a', depth2[1]);
+      createNode('n2c', 2, 'n1b', depth2[2]);
+      createNode('n2d', 2, 'n1b', depth2[3]);
+
+      createNode('n3a', 3, 'n2a', depth3[0]);
+      createNode('n3b', 3, 'n2a', depth3[1]);
+      createNode('n3c', 3, 'n2b', depth3[2]);
+      createNode('n3d', 3, 'n2b', depth3[3]);
+      createNode('n3e', 3, 'n2c', depth3[4]);
+      createNode('n3f', 3, 'n2c', depth3[5]);
+      createNode('n3g', 3, 'n2d', depth3[6]);
+      createNode('n3h', 3, 'n2d', depth3[7]);
+
+      connectNodes(nodes.root, nodes.n1a);
+      connectNodes(nodes.root, nodes.n1b);
+
+      connectNodes(nodes.n1a, nodes.n2a);
+      connectNodes(nodes.n1a, nodes.n2b);
+      connectNodes(nodes.n1b, nodes.n2c);
+      connectNodes(nodes.n1b, nodes.n2d);
+
+      connectNodes(nodes.n2a, nodes.n3a);
+      connectNodes(nodes.n2a, nodes.n3b);
+      connectNodes(nodes.n2b, nodes.n3c);
+      connectNodes(nodes.n2b, nodes.n3d);
+      connectNodes(nodes.n2c, nodes.n3e);
+      connectNodes(nodes.n2c, nodes.n3f);
+      connectNodes(nodes.n2d, nodes.n3g);
+      connectNodes(nodes.n2d, nodes.n3h);
+    }
+
+    buildTree();
+
+    function setNodeColor(node) {
+      const color = colorMode === 'depth'
+        ? DEPTH_COLORS[node.depth]
+        : UNIFORM_COLOR;
+      node.mesh.material.color.set(color);
+    }
+
+    function applyNodeColors() {
+      Object.values(nodes).forEach(node => setNodeColor(node));
+      if (selectedNode && nodes[selectedNode]) {
+        nodes[selectedNode].mesh.material.emissive.set('#ffff00');
+      }
+    }
+
+    function clearSelectionHighlight() {
+      Object.values(nodes).forEach(node => {
+        node.mesh.material.emissive.set('#000000');
+      });
+    }
+
+    function resetBranchStyles() {
+      branches.forEach(branch => {
+        branch.highlighted = false;
+        branch.line.material.color.set('#ffffff');
+        branch.line.material.opacity = 0.6;
+      });
+    }
+
+    function getPathToRoot(nodeId) {
+      const path = [];
+      let current = nodes[nodeId];
+      while (current) {
+        path.unshift(current.id);
+        current = current.parentId ? nodes[current.parentId] : null;
+      }
+      return path;
+    }
+
+    function highlightPathForLeaf(nodeId) {
+      highlightedPath = [];
+      resetBranchStyles();
+      if (!nodeId || !nodes[nodeId]) return;
+
+      const node = nodes[nodeId];
+      if (node.children.length > 0) return;
+
+      const path = getPathToRoot(nodeId);
+      highlightedPath = path.slice();
+
+      for (let i = 0; i < path.length - 1; i++) {
+        const a = path[i];
+        const b = path[i + 1];
+        const branch = branches.find(br => br.parentId === a && br.childId === b);
+        if (branch) {
+          branch.highlighted = true;
+          branch.line.material.color.set('#00ff88');
+          branch.line.material.opacity = 1.0;
+        }
+      }
+    }
+
+    function updateInfoPanel() {
+      if (!selectedNode || !nodes[selectedNode]) {
+        infoPanel.innerHTML = `
+          <strong>Selected Node</strong><br>
+          ID: none<br>
+          Depth: -1<br>
+          Children: 0<br>
+          Leaf: false
+        `;
+        return;
+      }
+
+      const node = nodes[selectedNode];
+      infoPanel.innerHTML = `
+        <strong>Selected Node</strong><br>
+        ID: ${node.id}<br>
+        Depth: ${node.depth}<br>
+        Children: ${node.children.length}<br>
+        Leaf: ${node.children.length === 0}
+      `;
+    }
+
+    function countVisibleNodes() {
+      return Object.values(nodes).filter(n => n.mesh.visible).length;
+    }
+
+    function updateStatsPanel() {
+      statsPanel.innerHTML = `
+        <strong>Tree Stats</strong><br>
+        Visible Nodes: ${countVisibleNodes()} / 15<br>
+        Depth Filter: ${depthSlider.value}<br>
+        Rotation: ${autoRotate ? 'ON' : 'OFF'}<br>
+        Tree State: ${treeState}<br>
+        Color Mode: ${colorMode}<br>
+        <div class="hint">
+          Keys: Space = expand/collapse, T = top view, F = front view
+        </div>
+      `;
+    }
+
+    function updateVisibility() {
+      const maxDepth = parseInt(depthSlider.value, 10);
+
+      Object.values(nodes).forEach(node => {
+        node.mesh.visible = node.depth <= maxDepth;
+      });
+
+      branches.forEach(branch => {
+        const parentVisible = nodes[branch.parentId].mesh.visible;
+        const childVisible = nodes[branch.childId].mesh.visible;
+        branch.line.visible = parentVisible && childVisible;
+      });
+    }
+
+    function selectNode(nodeId) {
+      clearSelectionHighlight();
+      selectedNode = nodeId;
+      if (selectedNode && nodes[selectedNode]) {
+        nodes[selectedNode].mesh.material.emissive.set('#ffff00');
+      }
+      highlightPathForLeaf(selectedNode);
+      updateInfoPanel();
+    }
+
+    function animateTreeCollapse(expand) {
+      const duration = 1.0;
+      const startTime = clock.getElapsedTime();
+
+      collapseAnim = {
+        startTime,
+        duration,
+        expand,
+        startY: {}
+      };
+
+      Object.values(nodes).forEach(node => {
+        collapseAnim.startY[node.id] = node.mesh.position.y;
+      });
+
+      treeState = 'animating';
+    }
+
+    function updateCollapseAnimation(now) {
+      if (!collapseAnim) return;
+
+      const t = Math.min((now - collapseAnim.startTime) / collapseAnim.duration, 1);
+      const eased = t < 0.5
+        ? 4 * t * t * t
+        : 1 - Math.pow(-2 * t + 2, 3) / 2;
+
+      Object.values(nodes).forEach(node => {
+        const startY = collapseAnim.startY[node.id];
+        const targetY = collapseAnim.expand ? node.originalPosition.y : 0;
+        node.mesh.position.y = THREE.MathUtils.lerp(startY, targetY, eased);
+      });
+
+      branches.forEach(updateBranchGeometry);
+
+      if (robotInstance) {
+        const leafPos = nodes['n3d'].mesh.position;
+        robotInstance.position.set(leafPos.x, leafPos.y + 0.45, leafPos.z);
+      }
+
+      if (t >= 1) {
+        treeState = collapseAnim.expand ? 'expanded' : 'collapsed';
+        collapseAnim = null;
+      }
+    }
+
+    rotateBtn.addEventListener('click', () => {
+      autoRotate = !autoRotate;
+      rotateBtn.textContent = `Auto Rotate: ${autoRotate ? 'ON' : 'OFF'}`;
+    });
+
+    colorModeBtn.addEventListener('click', () => {
+      colorMode = colorMode === 'depth' ? 'uniform' : 'depth';
+      colorModeBtn.textContent = `Color Mode: ${colorMode}`;
+      applyNodeColors();
+    });
+
+    depthSlider.addEventListener('input', () => {
+      updateVisibility();
+    });
+
+    window.addEventListener('keydown', (e) => {
+      if (e.code === 'Space') {
+        e.preventDefault();
+        if (treeState === 'animating') return;
+        animateTreeCollapse(treeState !== 'collapsed');
+      }
+
+      if (e.key === 't' || e.key === 'T') {
+        camera.position.set(0, 20, 0.001);
+        camera.lookAt(0, 0, 0);
+        controls.target.set(0, 0, 0);
+        controls.update();
+      }
+
+      if (e.key === 'f' || e.key === 'F') {
+        camera.position.set(0, 5, 15);
+        camera.lookAt(0, 0, 0);
+        controls.target.set(0, 4, 0);
+        controls.update();
+      }
+    });
+
+    renderer.domElement.addEventListener('click', (event) => {
+      const rect = renderer.domElement.getBoundingClientRect();
+      mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+      mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+
+      raycaster.setFromCamera(mouse, camera);
+      const visibleMeshes = nodeMeshes.filter(m => m.visible);
+      const intersects = raycaster.intersectObjects(visibleMeshes, false);
+
+      if (intersects.length > 0) {
+        const nodeId = intersects[0].object.userData.nodeId;
+        selectNode(nodeId);
+      }
+    });
+
+    const loader = new GLTFLoader();
+    loader.load(
+      'robot.glb',
+      (gltf) => {
+        robotInstance = gltf.scene;
+        robotInstance.scale.setScalar(0.3);
+
+        const leafPos = nodes['n3d'].mesh.position;
+        robotInstance.position.set(leafPos.x, leafPos.y + 0.45, leafPos.z);
+
+        treeGroup.add(robotInstance);
+        robotLoaded = true;
+      },
+      undefined,
+      () => {
+        const fallback = new THREE.Group();
+
+        const body = new THREE.Mesh(
+          new THREE.BoxGeometry(0.5, 0.7, 0.3),
+          new THREE.MeshStandardMaterial({ color: '#bbbbcc' })
+        );
+        const head = new THREE.Mesh(
+          new THREE.BoxGeometry(0.35, 0.35, 0.35),
+          new THREE.MeshStandardMaterial({ color: '#ddddff' })
+        );
+        head.position.y = 0.6;
+
+        fallback.add(body);
+        fallback.add(head);
+        fallback.scale.setScalar(0.3);
+
+        const leafPos = nodes['n3d'].mesh.position;
+        fallback.position.set(leafPos.x, leafPos.y + 0.45, leafPos.z);
+
+        robotInstance = fallback;
+        treeGroup.add(robotInstance);
+        robotLoaded = true;
+      }
+    );
+
+    window.__3D_STATE__ = {
+      totalNodes: 15,
+      visibleNodes: 15,
+      selectedNode: null,
+      selectedDepth: -1,
+      depthFilter: 3,
+      autoRotate: false,
+      rotationAngle: 0,
+      treeState: 'expanded',
+      colorMode: 'depth',
+      robotLoaded: false,
+      robotRotation: 0,
+      cameraY: 5.0,
+      highlightedPath: [],
+      nodePositions: {}
+    };
+
+    function updateState() {
+      const nodePositions = {};
+      Object.values(nodes).forEach(node => {
+        nodePositions[node.id] = {
+          x: Number(node.mesh.position.x.toFixed(2)),
+          y: Number(node.mesh.position.y.toFixed(2)),
+          z: Number(node.mesh.position.z.toFixed(2))
+        };
+      });
+
+      window.__3D_STATE__ = {
+        totalNodes: 15,
+        visibleNodes: countVisibleNodes(),
+        selectedNode: selectedNode,
+        selectedDepth: selectedNode ? nodes[selectedNode].depth : -1,
+        depthFilter: parseInt(depthSlider.value, 10),
+        autoRotate: autoRotate,
+        rotationAngle: rotationAngle,
+        treeState: treeState,
+        colorMode: colorMode,
+        robotLoaded: robotLoaded,
+        robotRotation: robotInstance ? robotInstance.rotation.y : 0,
+        cameraY: Number(camera.position.y.toFixed(1)),
+        highlightedPath: highlightedPath.slice(),
+        nodePositions
+      };
+    }
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      const dt = clock.getDelta();
+      const now = clock.getElapsedTime();
+
+      if (autoRotate) {
+        treeGroup.rotation.y += 0.3 * dt;
+        rotationAngle += 0.3 * dt;
+      }
+
+      if (robotInstance) {
+        robotInstance.rotation.y += 0.5 * dt;
+      }
+
+      updateCollapseAnimation(now);
+      updateVisibility();
+      updateStatsPanel();
+      updateInfoPanel();
+      updateState();
+
+      controls.update();
+      renderer.render(scene, camera);
+    }
+
+    applyNodeColors();
+    updateVisibility();
+    updateInfoPanel();
+    updateStatsPanel();
+    animate();
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+  </script>
+</body>
+</html>

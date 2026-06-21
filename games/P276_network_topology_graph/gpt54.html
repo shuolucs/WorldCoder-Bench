@@ -1,0 +1,663 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>3D Network Topology Graph</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      background: #0a0a1a;
+      font-family: Arial, sans-serif;
+    }
+
+    canvas {
+      display: block;
+    }
+
+    #hud {
+      position: absolute;
+      top: 16px;
+      left: 16px;
+      color: #d8e6ff;
+      background: rgba(10, 16, 32, 0.75);
+      border: 1px solid rgba(120, 160, 255, 0.25);
+      padding: 12px 14px;
+      border-radius: 10px;
+      font-size: 14px;
+      line-height: 1.5;
+      min-width: 220px;
+      backdrop-filter: blur(4px);
+      z-index: 10;
+    }
+
+    #resetBtn {
+      position: absolute;
+      top: 16px;
+      right: 16px;
+      z-index: 10;
+      padding: 10px 14px;
+      border: none;
+      border-radius: 10px;
+      background: #1f6fff;
+      color: white;
+      font-size: 14px;
+      cursor: pointer;
+      box-shadow: 0 4px 18px rgba(0,0,0,0.35);
+    }
+
+    #resetBtn:hover {
+      background: #3b82ff;
+    }
+
+    #info {
+      position: absolute;
+      bottom: 12px;
+      left: 50%;
+      transform: translateX(-50%);
+      color: #9fb7ff;
+      background: rgba(10, 16, 32, 0.65);
+      border: 1px solid rgba(120, 160, 255, 0.2);
+      padding: 8px 12px;
+      border-radius: 8px;
+      font-size: 13px;
+      z-index: 10;
+      pointer-events: none;
+    }
+  </style>
+</head>
+<body>
+  <div id="hud"></div>
+  <button id="resetBtn">Reset View</button>
+  <div id="info">Hover nodes • Click to select • P = Ping • T = Toggle topology • L = Toggle labels</div>
+
+  <script type="module">
+    import * as THREE from "https://unpkg.com/three@0.160.0/build/three.module.js";
+    import { OrbitControls } from "https://unpkg.com/three@0.160.0/examples/jsm/controls/OrbitControls.js";
+    import { GLTFLoader } from "https://unpkg.com/three@0.160.0/examples/jsm/loaders/GLTFLoader.js";
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0a0a1a);
+
+    const camera = new THREE.PerspectiveCamera(
+      60,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      1000
+    );
+    camera.position.set(0, 8, 15);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    document.body.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.target.set(0, 0, 0);
+
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+    scene.add(ambientLight);
+
+    const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
+    directionalLight.position.set(5, 10, 5);
+    scene.add(directionalLight);
+
+    window.__3D_STATE__ = {
+      nodeCount: 9,
+      edgeCount: 8,
+      selectedNode: -1,
+      hoveredNode: -1,
+      topology: "star",
+      labelsVisible: true,
+      pingActive: false,
+      cameraDistance: camera.position.length(),
+      hubModelLoaded: false
+    };
+
+    const hud = document.getElementById("hud");
+    const resetBtn = document.getElementById("resetBtn");
+
+    const raycaster = new THREE.Raycaster();
+    const mouse = new THREE.Vector2();
+
+    const nodePalette = [
+      0x00ff88, 0xff4488, 0x4488ff, 0xffaa00,
+      0xaa44ff, 0x44ffaa, 0xff8844, 0x88aaff
+    ];
+
+    const nodes = [];
+    const labels = [];
+    const outerNodeObjects = [];
+    const edgeGroup = new THREE.Group();
+    const pingGroup = new THREE.Group();
+    scene.add(edgeGroup);
+    scene.add(pingGroup);
+
+    const hubPosition = new THREE.Vector3(0, 0, 0);
+    const initialCameraPosition = new THREE.Vector3(0, 8, 15);
+    const initialTarget = new THREE.Vector3(0, 0, 0);
+
+    let hubObject = null;
+    let hoverIndex = -1;
+    let selectedIndex = -1;
+    let pingAnimations = [];
+
+    function createTextSprite(text) {
+      const canvas = document.createElement("canvas");
+      canvas.width = 256;
+      canvas.height = 128;
+      const ctx = canvas.getContext("2d");
+
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.font = "bold 34px Arial";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+
+      ctx.fillStyle = "rgba(10, 10, 26, 0.75)";
+      roundRect(ctx, 28, 30, 200, 68, 18);
+      ctx.fill();
+
+      ctx.strokeStyle = "rgba(120, 180, 255, 0.7)";
+      ctx.lineWidth = 3;
+      roundRect(ctx, 28, 30, 200, 68, 18);
+      ctx.stroke();
+
+      ctx.fillStyle = "#eaf2ff";
+      ctx.fillText(text, canvas.width / 2, canvas.height / 2);
+
+      const texture = new THREE.CanvasTexture(canvas);
+      texture.needsUpdate = true;
+
+      const material = new THREE.SpriteMaterial({
+        map: texture,
+        transparent: true,
+        depthWrite: false
+      });
+
+      const sprite = new THREE.Sprite(material);
+      sprite.scale.set(2.2, 1.1, 1);
+      return sprite;
+    }
+
+    function roundRect(ctx, x, y, w, h, r) {
+      ctx.beginPath();
+      ctx.moveTo(x + r, y);
+      ctx.lineTo(x + w - r, y);
+      ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+      ctx.lineTo(x + w, y + h - r);
+      ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+      ctx.lineTo(x + r, y + h);
+      ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+      ctx.lineTo(x, y + r);
+      ctx.quadraticCurveTo(x, y, x + r, y);
+      ctx.closePath();
+    }
+
+    function createOuterNodes() {
+      const radius = 6;
+      const sphereGeo = new THREE.SphereGeometry(0.4, 32, 32);
+
+      for (let i = 0; i < 8; i++) {
+        const angle = (i / 8) * Math.PI * 2;
+        const x = Math.cos(angle) * radius;
+        const z = Math.sin(angle) * radius;
+
+        const material = new THREE.MeshStandardMaterial({
+          color: nodePalette[i],
+          emissive: 0x000000,
+          roughness: 0.35,
+          metalness: 0.2
+        });
+
+        const sphere = new THREE.Mesh(sphereGeo, material);
+        sphere.position.set(x, 0, z);
+        sphere.userData = {
+          nodeIndex: i + 1,
+          nodeName: `Node ${i + 1}`,
+          baseScale: 1,
+          isHub: false
+        };
+
+        scene.add(sphere);
+        nodes[i + 1] = sphere;
+        outerNodeObjects.push(sphere);
+
+        const label = createTextSprite(`Node ${i + 1}`);
+        label.position.set(x, 1.1, z);
+        scene.add(label);
+        labels[i + 1] = label;
+      }
+    }
+
+    function createHubFallback() {
+      const geo = new THREE.CylinderGeometry(0.6, 0.6, 1.2, 32);
+      const mat = new THREE.MeshStandardMaterial({
+        color: 0x88ccff,
+        emissive: 0x111133,
+        roughness: 0.4,
+        metalness: 0.4
+      });
+      const fallback = new THREE.Mesh(geo, mat);
+      fallback.position.copy(hubPosition);
+      fallback.userData = {
+        nodeIndex: 0,
+        nodeName: "Hub",
+        baseScale: 1,
+        isHub: true
+      };
+      scene.add(fallback);
+      nodes[0] = fallback;
+      hubObject = fallback;
+    }
+
+    function loadHubModel() {
+      const loader = new GLTFLoader();
+      loader.load(
+        "coffeemat.glb",
+        (gltf) => {
+          const model = gltf.scene;
+          model.scale.set(0.5, 0.5, 0.5);
+          model.position.copy(hubPosition);
+          model.userData = {
+            nodeIndex: 0,
+            nodeName: "Hub",
+            baseScale: 1,
+            isHub: true
+          };
+
+          model.traverse((child) => {
+            if (child.isMesh) {
+              child.castShadow = false;
+              child.receiveShadow = false;
+              if (child.material) {
+                child.material = child.material.clone();
+                if (child.material.emissive) child.material.emissive.setHex(0x000000);
+              }
+              child.userData = model.userData;
+            }
+          });
+
+          if (hubObject) scene.remove(hubObject);
+          hubObject = model;
+          nodes[0] = model;
+          scene.add(model);
+          window.__3D_STATE__.hubModelLoaded = true;
+        },
+        undefined,
+        () => {
+          window.__3D_STATE__.hubModelLoaded = false;
+        }
+      );
+    }
+
+    function createHubLabel() {
+      const label = createTextSprite("Hub");
+      label.position.set(0, 1.6, 0);
+      scene.add(label);
+      labels[0] = label;
+    }
+
+    function getNodePosition(index) {
+      if (!nodes[index]) return new THREE.Vector3();
+      const pos = new THREE.Vector3();
+      nodes[index].getWorldPosition(pos);
+      return pos;
+    }
+
+    function getTopologyEdges(topology) {
+      const edges = [];
+
+      for (let i = 1; i <= 8; i++) edges.push([0, i]);
+
+      if (topology === "star") {
+        return edges;
+      }
+
+      if (topology === "ring") {
+        for (let i = 1; i <= 8; i++) {
+          const next = i === 8 ? 1 : i + 1;
+          edges.push([i, next]);
+        }
+        return edges;
+      }
+
+      if (topology === "mesh") {
+        for (let i = 1; i <= 8; i++) {
+          for (let j = i + 1; j <= 8; j++) {
+            edges.push([i, j]);
+          }
+        }
+        return edges;
+      }
+
+      return edges;
+    }
+
+    function clearEdges() {
+      while (edgeGroup.children.length) {
+        const child = edgeGroup.children.pop();
+        child.geometry.dispose();
+        child.material.dispose();
+      }
+    }
+
+    function buildEdges() {
+      clearEdges();
+
+      const edgePairs = getTopologyEdges(window.__3D_STATE__.topology);
+      edgePairs.forEach(([a, b]) => {
+        const p1 = getNodePosition(a);
+        const p2 = getNodePosition(b);
+        const geometry = new THREE.BufferGeometry().setFromPoints([p1, p2]);
+        const material = new THREE.LineBasicMaterial({ color: 0x334466 });
+        const line = new THREE.Line(geometry, material);
+        line.userData = { a, b };
+        edgeGroup.add(line);
+      });
+
+      window.__3D_STATE__.edgeCount = edgePairs.length;
+      updateSelectionVisuals();
+      updateHUD();
+    }
+
+    function setLabelsVisible(visible) {
+      labels.forEach((label) => {
+        if (label) label.visible = visible;
+      });
+      window.__3D_STATE__.labelsVisible = visible;
+      updateHUD();
+    }
+
+    function setHoveredNode(index) {
+      if (hoverIndex === index) return;
+
+      if (hoverIndex !== -1 && nodes[hoverIndex]) {
+        applyNodeVisualState(hoverIndex);
+      }
+
+      hoverIndex = index;
+      window.__3D_STATE__.hoveredNode = index;
+
+      if (hoverIndex !== -1 && nodes[hoverIndex]) {
+        applyNodeVisualState(hoverIndex);
+      }
+    }
+
+    function setSelectedNode(index) {
+      selectedIndex = index;
+      window.__3D_STATE__.selectedNode = index;
+      updateSelectionVisuals();
+      updateHUD();
+    }
+
+    function applyEmissiveToObject(object, color) {
+      object.traverse((child) => {
+        if (child.isMesh && child.material && child.material.emissive) {
+          child.material.emissive.setHex(color);
+        }
+      });
+      if (object.isMesh && object.material && object.material.emissive) {
+        object.material.emissive.setHex(color);
+      }
+    }
+
+    function applyScaleToNode(index, scaleFactor) {
+      const node = nodes[index];
+      if (!node) return;
+      if (index === 0) {
+        node.scale.set(0.5 * scaleFactor, 0.5 * scaleFactor, 0.5 * scaleFactor);
+      } else {
+        node.scale.setScalar(scaleFactor);
+      }
+    }
+
+    function applyNodeVisualState(index) {
+      const node = nodes[index];
+      if (!node) return;
+
+      const isSelected = selectedIndex === index;
+      const isHovered = hoverIndex === index;
+
+      let scale = 1;
+      let emissive = 0x000000;
+
+      if (isHovered) {
+        scale = 1.5;
+        emissive = 0x224466;
+      }
+
+      if (isSelected) {
+        emissive = 0xffffff;
+      }
+
+      applyScaleToNode(index, scale);
+      applyEmissiveToObject(node, emissive);
+    }
+
+    function updateSelectionVisuals() {
+      for (let i = 0; i < nodes.length; i++) {
+        if (nodes[i]) applyNodeVisualState(i);
+      }
+
+      edgeGroup.children.forEach((line) => {
+        const { a, b } = line.userData;
+        const connected = selectedIndex !== -1 && (a === selectedIndex || b === selectedIndex);
+        line.material.color.setHex(connected ? 0x00ff00 : 0x334466);
+      });
+    }
+
+    function getNodeName(index) {
+      if (index === -1) return "None";
+      return index === 0 ? "Hub" : `Node ${index}`;
+    }
+
+    function updateHUD() {
+      hud.innerHTML = `
+        <div><strong>Topology:</strong> ${window.__3D_STATE__.topology}</div>
+        <div><strong>Selected:</strong> ${getNodeName(window.__3D_STATE__.selectedNode)}</div>
+        <div><strong>Total Nodes:</strong> 9</div>
+        <div><strong>Total Edges:</strong> ${window.__3D_STATE__.edgeCount}</div>
+      `;
+    }
+
+    function getConnectedNeighbors(index) {
+      const neighbors = [];
+      edgeGroup.children.forEach((line) => {
+        const { a, b } = line.userData;
+        if (a === index) neighbors.push(b);
+        else if (b === index) neighbors.push(a);
+      });
+      return neighbors;
+    }
+
+    function startPingAnimation() {
+      if (selectedIndex === -1 || window.__3D_STATE__.pingActive) return;
+
+      const neighbors = getConnectedNeighbors(selectedIndex);
+      if (!neighbors.length) return;
+
+      while (pingGroup.children.length) {
+        const child = pingGroup.children.pop();
+        child.geometry.dispose();
+        child.material.dispose();
+      }
+
+      pingAnimations = [];
+      const start = getNodePosition(selectedIndex);
+
+      neighbors.forEach((neighborIndex) => {
+        const end = getNodePosition(neighborIndex);
+        const orb = new THREE.Mesh(
+          new THREE.SphereGeometry(0.13, 16, 16),
+          new THREE.MeshStandardMaterial({
+            color: 0xaaffcc,
+            emissive: 0x66ffcc,
+            emissiveIntensity: 1.6,
+            transparent: true,
+            opacity: 0.95
+          })
+        );
+        orb.position.copy(start);
+        pingGroup.add(orb);
+
+        pingAnimations.push({
+          mesh: orb,
+          start: start.clone(),
+          end: end.clone(),
+          t: 0
+        });
+      });
+
+      window.__3D_STATE__.pingActive = true;
+    }
+
+    function updatePingAnimations(delta) {
+      if (!window.__3D_STATE__.pingActive) return;
+
+      let activeCount = 0;
+      pingAnimations.forEach((anim) => {
+        if (anim.t >= 1) return;
+        anim.t += delta * 0.8;
+        const t = Math.min(anim.t, 1);
+        anim.mesh.position.lerpVectors(anim.start, anim.end, t);
+        anim.mesh.scale.setScalar(1 + Math.sin(t * Math.PI) * 0.6);
+        if (t < 1) activeCount++;
+      });
+
+      if (activeCount === 0) {
+        pingAnimations.forEach((anim) => {
+          if (anim.mesh) {
+            pingGroup.remove(anim.mesh);
+            anim.mesh.geometry.dispose();
+            anim.mesh.material.dispose();
+          }
+        });
+        pingAnimations = [];
+        window.__3D_STATE__.pingActive = false;
+      }
+    }
+
+    function performRaycast(event) {
+      mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+      mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+      raycaster.setFromCamera(mouse, camera);
+
+      const intersectTargets = [];
+      nodes.forEach((node) => {
+        if (!node) return;
+        node.traverse?.((child) => {
+          if (child.isMesh) intersectTargets.push(child);
+        });
+        if (node.isMesh) intersectTargets.push(node);
+      });
+
+      const intersects = raycaster.intersectObjects(intersectTargets, true);
+      if (intersects.length > 0) {
+        const rootIndex = intersects[0].object.userData.nodeIndex;
+        setHoveredNode(rootIndex ?? -1);
+      } else {
+        setHoveredNode(-1);
+      }
+    }
+
+    function handleClick(event) {
+      mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+      mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+      raycaster.setFromCamera(mouse, camera);
+
+      const intersectTargets = [];
+      nodes.forEach((node) => {
+        if (!node) return;
+        node.traverse?.((child) => {
+          if (child.isMesh) intersectTargets.push(child);
+        });
+        if (node.isMesh) intersectTargets.push(node);
+      });
+
+      const intersects = raycaster.intersectObjects(intersectTargets, true);
+      if (intersects.length > 0) {
+        const idx = intersects[0].object.userData.nodeIndex;
+        setSelectedNode(idx ?? -1);
+      } else {
+        setSelectedNode(-1);
+      }
+    }
+
+    function cycleTopology() {
+      const order = ["star", "mesh", "ring"];
+      const current = order.indexOf(window.__3D_STATE__.topology);
+      const next = order[(current + 1) % order.length];
+      window.__3D_STATE__.topology = next;
+      buildEdges();
+    }
+
+    function resetView() {
+      camera.position.copy(initialCameraPosition);
+      controls.target.copy(initialTarget);
+      controls.update();
+      setSelectedNode(-1);
+      setHoveredNode(-1);
+    }
+
+    createOuterNodes();
+    createHubFallback();
+    createHubLabel();
+    loadHubModel();
+    buildEdges();
+    setLabelsVisible(true);
+    updateHUD();
+
+    window.addEventListener("mousemove", performRaycast);
+    window.addEventListener("click", handleClick);
+
+    window.addEventListener("keydown", (event) => {
+      const key = event.key.toLowerCase();
+
+      if (key === "p") {
+        startPingAnimation();
+      } else if (key === "t") {
+        cycleTopology();
+      } else if (key === "l") {
+        setLabelsVisible(!window.__3D_STATE__.labelsVisible);
+      }
+    });
+
+    resetBtn.addEventListener("click", resetView);
+
+    window.addEventListener("resize", () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    const clock = new THREE.Clock();
+
+    function animate() {
+      requestAnimationFrame(animate);
+      const delta = clock.getDelta();
+
+      controls.update();
+      updatePingAnimations(delta);
+
+      if (labels[0]) labels[0].position.set(0, 1.6, 0);
+      for (let i = 1; i <= 8; i++) {
+        if (nodes[i] && labels[i]) {
+          labels[i].position.set(nodes[i].position.x, nodes[i].position.y + 1.1, nodes[i].position.z);
+        }
+      }
+
+      window.__3D_STATE__.cameraDistance = camera.position.distanceTo(new THREE.Vector3(0, 0, 0));
+
+      renderer.render(scene, camera);
+    }
+
+    animate();
+  </script>
+</body>
+</html>

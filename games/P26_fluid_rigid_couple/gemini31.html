@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SPH Fluid & Rigid Body Coupling</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #111; color: #fff; font-family: monospace; }
+        #hud { position: absolute; top: 10px; left: 10px; background: rgba(0,0,0,0.7); padding: 15px; border-radius: 8px; pointer-events: none; }
+        #hud div { margin-bottom: 5px; }
+        button { pointer-events: auto; margin-top: 10px; padding: 5px 10px; background: #444; color: #fff; border: 1px solid #666; cursor: pointer; border-radius: 4px; }
+        button:hover { background: #666; }
+    </style>
+    <script type="importmap">
+    { "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+    } }
+    </script>
+</head>
+<body>
+    <div id="hud">
+        <div>Sim Time: <span id="simTime">0.000</span> s</div>
+        <div>Particles: <span id="particleCount">200</span></div>
+        <div>Heavy Y: <span id="heavyY">0.000</span></div>
+        <div>Light Y: <span id="lightY">0.000</span></div>
+        <button id="resetBtn">Reset Simulation</button>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        // --- Configuration ---
+        const N = 200;
+        const mass = 0.05;
+        const h = 0.5;
+        const h2 = h * h;
+        const k_press = 15.0;
+        const rho0 = 1000.0;
+        const mu = 0.15;
+        const g = -9.81;
+        const dt = 0.002;
+        const substeps = 3;
+        const k_repel = 500.0;
+
+        // Math Constants
+        const poly6_factor = 315.0 / (64.0 * Math.PI * Math.pow(h, 9));
+        const spiky_factor = -45.0 / (Math.PI * Math.pow(h, 6));
+        const visc_factor = 45.0 / (Math.PI * Math.pow(h, 6));
+
+        // --- State ---
+        let simTime = 0;
+        const pos = new Float32Array(N * 3);
+        const vel = new Float32Array(N * 3);
+        const force = new Float32Array(N * 3);
+        const rho = new Float32Array(N);
+        const press = new Float32Array(N);
+
+        class RigidBody {
+            constructor(name, density, colorHex, initX, initY, initZ) {
+                this.name = name;
+                this.density = density;
+                this.volume = 0.4 * 0.4 * 0.4;
+                this.mass = this.density * this.volume;
+                this.initPos = new THREE.Vector3(initX, initY, initZ);
+                this.pos = this.initPos.clone();
+                this.vel = new THREE.Vector3();
+                this.force = new THREE.Vector3();
+                this.submergedRatio = 0;
+                
+                const geo = new THREE.BoxGeometry(0.4, 0.4, 0.4);
+                const mat = new THREE.MeshLambertMaterial({ color: colorHex, transparent: true, opacity: 0.85 });
+                this.mesh = new THREE.Mesh(geo, mat);
+                this.mesh.position.copy(this.pos);
+            }
+            reset() {
+                this.pos.copy(this.initPos);
+                this.vel.set(0, 0, 0);
+                this.force.set(0, 0, 0);
+                this.submergedRatio = 0;
+                this.mesh.position.copy(this.pos);
+            }
+        }
+
+        const bodies = [
+            new RigidBody('heavy', 2000, 0xD32F2F, 1, 2.5, 1),
+            new RigidBody('neutral', 1000, 0x388E3C, 2, 2.5, 1),
+            new RigidBody('light', 500, 0xFBC02D, 3, 2.5, 1)
+        ];
+
+        // --- Three.js Setup ---
+        const scene = new THREE.Scene();
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+        camera.position.set(2, 4, 9);
+        
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        document.body.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.target.set(2, 1.5, 2);
+        controls.update();
+
+        const ambientLight = new THREE.AmbientLight(0x404040, 2);
+        scene.add(ambientLight);
+        const dirLight = new THREE.DirectionalLight(0xffffff, 1.5);
+        dirLight.position.set(5, 10, 5);
+        scene.add(dirLight);
+
+        // Tank
+        const tankGeo = new THREE.BoxGeometry(4, 3, 4);
+        const tankEdges = new THREE.EdgesGeometry(tankGeo);
+        const tankLines = new THREE.LineSegments(tankEdges, new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.2 }));
+        tankLines.position.set(2, 1.5, 2);
+        scene.add(tankLines);
+
+        const bottomGeo = new THREE.PlaneGeometry(4, 4);
+        bottomGeo.rotateX(-Math.PI / 2);
+        const bottomMat = new THREE.MeshLambertMaterial({ color: 0x333333, transparent: true, opacity: 0.6, side: THREE.DoubleSide });
+        const bottomMesh = new THREE.Mesh(bottomGeo, bottomMat);
+        bottomMesh.position.set(2, 0, 2);
+        scene.add(bottomMesh);
+
+        // Particles
+        const particleGeo = new THREE.SphereGeometry(0.06, 8, 8);
+        const particleMat = new THREE.MeshPhongMaterial({ color: 0xffffff });
+        const instancedMesh = new THREE.InstancedMesh(particleGeo, particleMat, N);
+        instancedMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+        scene.add(instancedMesh);
+
+        bodies.forEach(b => scene.add(b.mesh));
+
+        // --- Initialization ---
+        function initParticles() {
+            let idx = 0;
+            const spacing = 0.25;
+            for (let x = 0.2; x <= 1.8 && idx < N; x += spacing) {
+                for (let y = 0.2; y <= 1.8 && idx < N; y += spacing) {
+                    for (let z = 0.2; z <= 1.8 && idx < N; z += spacing) {
+                        pos[idx * 3] = x;
+                        pos[idx * 3 + 1] = y;
+                        pos[idx * 3 + 2] = z;
+                        vel[idx * 3] = 0;
+                        vel[idx * 3 + 1] = 0;
+                        vel[idx * 3 + 2] = 0;
+                        idx++;
+                    }
+                }
+            }
+            // Fill remaining if any
+            while (idx < N) {
+                pos[idx * 3] = Math.random() * 1.8 + 0.1;
+                pos[idx * 3 + 1] = Math.random() * 1.8 + 0.1;
+                pos[idx * 3 + 2] = Math.random() * 1.8 + 0.1;
+                vel[idx * 3] = vel[idx * 3 + 1] = vel[idx * 3 + 2] = 0;
+                idx++;
+            }
+        }
+
+        function resetSim() {
+            simTime = 0;
+            initParticles();
+            bodies.forEach(b => b.reset());
+        }
+
+        // --- Physics Helpers ---
+        function getAABBDistNormal(px, py, pz, bx, by, bz, hx, hy, hz) {
+            let dx = px - bx, dy = py - by, dz = pz - bz;
+            let qx = Math.max(-hx, Math.min(dx, hx));
+            let qy = Math.max(-hy, Math.min(dy, hy));
+            let qz = Math.max(-hz, Math.min(dz, hz));
+            let distSq = (dx - qx) ** 2 + (dy - qy) ** 2 + (dz - qz) ** 2;
+            
+            if (distSq > 0.000001) {
+                let dist = Math.sqrt(distSq);
+                return { dist: dist, nx: (dx - qx) / dist, ny: (dy - qy) / dist, nz: (dz - qz) / dist };
+            } else {
+                let pdx = hx - dx, ndx = dx - (-hx);
+                let pdy = hy - dy, ndy = dy - (-hy);
+                let pdz = hz - dz, ndz = dz - (-hz);
+                let minD = Math.min(pdx, ndx, pdy, ndy, pdz, ndz);
+                if (minD === pdx) return { dist: -minD, nx: 1, ny: 0, nz: 0 };
+                if (minD === ndx) return { dist: -minD, nx: -1, ny: 0, nz: 0 };
+                if (minD === pdy) return { dist: -minD, nx: 0, ny: 1, nz: 0 };
+                if (minD === ndy) return { dist: -minD, nx: 0, ny: -1, nz: 0 };
+                if (minD === pdz) return { dist: -minD, nx: 0, ny: 0, nz: 1 };
+                return { dist: -minD, nx: 0, ny: 0, nz: -1 };
+            }
+        }
+
+        // --- Physics Step ---
+        function step() {
+            // 1. Density & Pressure
+            for (let i = 0; i < N; i++) {
+                let density = 0;
+                for (let j = 0; j < N; j++) {
+                    let dx = pos[i*3] - pos[j*3];
+                    let dy = pos[i*3+1] - pos[j*3+1];
+                    let dz = pos[i*3+2] - pos[j*3+2];
+                    let r2 = dx*dx + dy*dy + dz*dz;
+                    if (r2 < h2) {
+                        density += mass * poly6_factor * Math.pow(h2 - r2, 3);
+                    }
+                }
+                rho[i] = density;
+                press[i] = Math.max(0, k_press * (Math.pow(density / rho0, 7) - 1.0));
+            }
+
+            // 2. SPH Forces
+            for (let i = 0; i < N; i++) {
+                let fx = 0, fy = 0, fz = 0;
+                for (let j = 0; j < N; j++) {
+                    if (i === j) continue;
+                    let dx = pos[i*3] - pos[j*3];
+                    let dy = pos[i*3+1] - pos[j*3+1];
+                    let dz = pos[i*3+2] - pos[j*3+2];
+                    let r2 = dx*dx + dy*dy + dz*dz;
+                    
+                    if (r2 > 0 && r2 < h2) {
+                        let r = Math.sqrt(r2);
+                        // Pressure
+                        let pTerm = -mass * (press[i] + press[j]) / (2.0 * rho[j]) * spiky_factor * Math.pow(h - r, 2);
+                        fx += pTerm * (dx / r);
+                        fy += pTerm * (dy / r);
+                        fz += pTerm * (dz / r);
+                        
+                        // Viscosity
+                        let vTerm = mu * mass * visc_factor * (h - r) / rho[j];
+                        fx += vTerm * (vel[j*3] - vel[i*3]);
+                        fy += vTerm * (vel[j*3+1] - vel[i*3+1]);
+                        fz += vTerm * (vel[j*3+2] - vel[i*3+2]);
+                    }
+                }
+                force[i*3] = fx;
+                force[i*3+1] = fy;
+                force[i*3+2] = fz;
+            }
+
+            // 3. Rigid Body Forces & Coupling
+            for (let b of bodies) {
+                b.force.set(0, g * b.mass, 0); // Gravity
+
+                // Buoyancy
+                let fluidYSum = 0, fluidCount = 0;
+                for (let i = 0; i < N; i++) {
+                    let dx = pos[i*3] - b.pos.x;
+                    let dy = pos[i*3+1] - b.pos.y;
+                    let dz = pos[i*3+2] - b.pos.z;
+                    if (dx*dx + dy*dy + dz*dz < h2) {
+                        fluidYSum += pos[i*3+1];
+                        fluidCount++;
+                    }
+                }
+                
+                if (fluidCount > 0) {
+                    let fluidY = fluidYSum / fluidCount;
+                    b.submergedRatio = Math.max(0, Math.min(1, (fluidY - (b.pos.y - 0.2)) / 0.4));
+                } else {
+                    b.submergedRatio = 0;
+                }
+                b.force.y += rho0 * b.volume * b.submergedRatio * Math.abs(g);
+
+                // Repulsion (Coupling)
+                for (let i = 0; i < N; i++) {
+                    let res = getAABBDistNormal(pos[i*3], pos[i*3+1], pos[i*3+2], b.pos.x, b.pos.y, b.pos.z, 0.2, 0.2, 0.2);
+                    if (res.dist < 0.15) {
+                        let overlap = 0.15 - res.dist;
+                        let fMag = k_repel * overlap;
+                        let fx = fMag * res.nx, fy = fMag * res.ny, fz = fMag * res.nz;
+                        
+                        force[i*3] += fx;
+                        force[i*3+1] += fy;
+                        force[i*3+2] += fz;
+                        
+                        b.force.x -= fx;
+                        b.force.y -= fy;
+                        b.force.z -= fz;
+                    }
+                }
+            }
+
+            // 4. Integration & Collision (Particles)
+            for (let i = 0; i < N; i++) {
+                vel[i*3] += (force[i*3] / mass) * dt;
+                vel[i*3+1] += (force[i*3+1] / mass + g) * dt;
+                vel[i*3+2] += (force[i*3+2] / mass) * dt;
+                
+                pos[i*3] += vel[i*3] * dt;
+                pos[i*3+1] += vel[i*3+1] * dt;
+                pos[i*3+2] += vel[i*3+2] * dt;
+
+                // Tank Bounds
+                if (pos[i*3] < 0.06) { pos[i*3] = 0.06; vel[i*3] *= -0.3; }
+                if (pos[i*3] > 3.94) { pos[i*3] = 3.94; vel[i*3] *= -0.3; }
+                if (pos[i*3+1] < 0.06) { pos[i*3+1] = 0.06; vel[i*3+1] *= -0.3; }
+                if (pos[i*3+1] > 2.94) { pos[i*3+1] = 2.94; vel[i*3+1] *= -0.3; }
+                if (pos[i*3+2] < 0.06) { pos[i*3+2] = 0.06; vel[i*3+2] *= -0.3; }
+                if (pos[i*3+2] > 3.94) { pos[i*3+2] = 3.94; vel[i*3+2] *= -0.3; }
+            }
+
+            // 5. Integration & Collision (Rigid Bodies)
+            for (let b of bodies) {
+                b.vel.addScaledVector(b.force, dt / b.mass);
+                b.pos.addScaledVector(b.vel, dt);
+
+                // Tank Bounds
+                if (b.pos.x - 0.2 < 0) { b.pos.x = 0.2; b.vel.x *= -0.2; }
+                if (b.pos.x + 0.2 > 4) { b.pos.x = 3.8; b.vel.x *= -0.2; }
+                if (b.pos.y - 0.2 < 0) { b.pos.y = 0.2; b.vel.y *= -0.2; }
+                if (b.pos.y + 0.2 > 3) { b.pos.y = 2.8; b.vel.y *= -0.2; }
+                if (b.pos.z - 0.2 < 0) { b.pos.z = 0.2; b.vel.z *= -0.2; }
+                if (b.pos.z + 0.2 > 4) { b.pos.z = 3.8; b.vel.z *= -0.2; }
+                
+                b.mesh.position.copy(b.pos);
+            }
+            
+            simTime += dt;
+        }
+
+        // --- Main Loop ---
+        const dummy = new THREE.Object3D();
+        const colorObj = new THREE.Color();
+        const colorSlow = new THREE.Color(0x00008B);
+        const colorFast = new THREE.Color(0xADD8E6);
+
+        const domSimTime = document.getElementById('simTime');
+        const domHeavyY = document.getElementById('heavyY');
+        const domLightY = document.getElementById('lightY');
+        document.getElementById('resetBtn').addEventListener('click', resetSim);
+
+        resetSim();
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            for (let s = 0; s < substeps; s++) {
+                step();
+            }
+
+            // Update InstancedMesh
+            let totalKinetic = 0;
+            let totalPotential = 0;
+
+            for (let i = 0; i < N; i++) {
+                dummy.position.set(pos[i*3], pos[i*3+1], pos[i*3+2]);
+                dummy.updateMatrix();
+                instancedMesh.setMatrixAt(i, dummy.matrix);
+
+                let speedSq = vel[i*3]**2 + vel[i*3+1]**2 + vel[i*3+2]**2;
+                let speed = Math.sqrt(speedSq);
+                let t = Math.min(speed / 5.0, 1.0);
+                colorObj.lerpColors(colorSlow, colorFast, t);
+                instancedMesh.setColorAt(i, colorObj);
+
+                totalKinetic += 0.5 * mass * speedSq;
+                totalPotential += mass * Math.abs(g) * pos[i*3+1];
+            }
+            instancedMesh.instanceMatrix.needsUpdate = true;
+            instancedMesh.instanceColor.needsUpdate = true;
+
+            // Energy & State
+            let rbState = [];
+            for (let b of bodies) {
+                totalKinetic += 0.5 * b.mass * b.vel.lengthSq();
+                totalPotential += b.mass * Math.abs(g) * b.pos.y;
+                rbState.push({
+                    name: b.name,
+                    x: b.pos.x, y: b.pos.y, z: b.pos.z,
+                    density: b.density,
+                    submergedRatio: b.submergedRatio
+                });
+            }
+
+            // Update HUD
+            domSimTime.innerText = simTime.toFixed(3);
+            domHeavyY.innerText = bodies[0].pos.y.toFixed(3);
+            domLightY.innerText = bodies[2].pos.y.toFixed(3);
+
+            // Expose State
+            window.__3D_STATE__ = {
+                particleCount: N,
+                rigidBodies: rbState,
+                simTime: simTime,
+                totalEnergy: totalKinetic + totalPotential
+            };
+
+            controls.update();
+            renderer.render(scene, camera);
+        }
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        animate();
+    </script>
+</body>
+</html>

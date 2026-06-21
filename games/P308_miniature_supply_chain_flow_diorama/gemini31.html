@@ -1,0 +1,497 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Supply Chain Diorama</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #1a1a1a;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            user-select: none;
+        }
+        canvas {
+            display: block;
+        }
+        #ui-container {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+        }
+        .panel {
+            background: rgba(20, 20, 20, 0.85);
+            color: white;
+            padding: 15px;
+            border-radius: 8px;
+            border: 1px solid #444;
+            pointer-events: auto;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+        }
+        #hud-stats {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            font-size: 16px;
+            font-weight: bold;
+            letter-spacing: 1px;
+        }
+        #controls {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+        button {
+            background: #333;
+            color: white;
+            border: 1px solid #555;
+            padding: 8px 16px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-weight: bold;
+            transition: background 0.2s;
+        }
+        button:hover {
+            background: #444;
+        }
+        button:active {
+            background: #222;
+        }
+        #info-panel {
+            position: absolute;
+            bottom: 20px;
+            right: 20px;
+            min-width: 200px;
+            display: none;
+        }
+        #info-title {
+            margin: 0 0 10px 0;
+            font-size: 18px;
+            border-bottom: 1px solid #555;
+            padding-bottom: 5px;
+        }
+        .info-stat {
+            margin: 5px 0;
+            font-size: 14px;
+            color: #ccc;
+        }
+        #instructions {
+            position: absolute;
+            bottom: 20px;
+            left: 20px;
+            color: rgba(255,255,255,0.6);
+            font-size: 12px;
+            pointer-events: none;
+        }
+    </style>
+</head>
+<body>
+    <div id="ui-container">
+        <div id="hud-stats" class="panel">
+            Spawned: 0 | In-Transit: 0 | Delivered: 0
+        </div>
+        
+        <div id="controls">
+            <button id="btn-play">Play</button>
+            <button id="btn-speed">Speed: 1x</button>
+            <button id="btn-heatmap">Heatmap: OFF</button>
+        </div>
+
+        <div id="info-panel" class="panel">
+            <h3 id="info-title">Building Name</h3>
+            <div id="info-content"></div>
+        </div>
+
+        <div id="instructions">
+            Click buildings for info | Keys: 1, 2, 3 (Cameras) | R (Reset)
+        </div>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
+
+        // --- State Management ---
+        window.__3D_STATE__ = {
+            running: false,
+            speedMultiplier: 1,
+            totalSpawned: 0,
+            totalInTransit: 0,
+            totalDelivered: 0,
+            selectedBuilding: null,
+            cameraPreset: 1,
+            heatmapEnabled: false,
+            warehouseThroughput: [0, 0],
+            parcelCount: 0,
+            elapsedTime: 0
+        };
+        const state = window.__3D_STATE__;
+
+        // --- Scene Setup ---
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x1a1a1a);
+
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.set(0, 12, 18);
+        camera.lookAt(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        document.body.appendChild(renderer.domElement);
+
+        // --- Lighting ---
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+        dirLight.position.set(10, 15, 10);
+        dirLight.castShadow = true;
+        dirLight.shadow.mapSize.width = 2048;
+        dirLight.shadow.mapSize.height = 2048;
+        dirLight.shadow.camera.left = -20;
+        dirLight.shadow.camera.right = 20;
+        dirLight.shadow.camera.top = 15;
+        dirLight.shadow.camera.bottom = -15;
+        dirLight.shadow.camera.near = 0.5;
+        dirLight.shadow.camera.far = 50;
+        scene.add(dirLight);
+
+        // --- Materials ---
+        const matTable = new THREE.MeshStandardMaterial({ color: 0x8B6914, roughness: 0.8 });
+        const matPath = new THREE.MeshStandardMaterial({ color: 0x888888, roughness: 0.9 });
+        const matParcel = new THREE.MeshStandardMaterial({ color: 0x2266CC, roughness: 0.4, metalness: 0.2 });
+
+        // --- Environment ---
+        const tableGeom = new THREE.BoxGeometry(30, 0.5, 20);
+        const table = new THREE.Mesh(tableGeom, matTable);
+        table.position.set(0, -0.25, 0);
+        table.receiveShadow = true;
+        scene.add(table);
+
+        // --- Buildings ---
+        const buildings = [];
+        const factories = [];
+        const warehouses = [];
+        const stores = [];
+
+        function createBuilding(type, name, color, w, h, d, x, y, z) {
+            const geom = new THREE.BoxGeometry(w, h, d);
+            const mat = new THREE.MeshStandardMaterial({ color: color, roughness: 0.7 });
+            const mesh = new THREE.Mesh(geom, mat);
+            mesh.position.set(x, y, z);
+            mesh.castShadow = true;
+            mesh.receiveShadow = true;
+            
+            mesh.userData = {
+                type: type,
+                name: name,
+                baseColor: color,
+                stats: { processed: 0, current: 0 }
+            };
+            
+            scene.add(mesh);
+            buildings.push(mesh);
+            return mesh;
+        }
+
+        // Factories
+        factories.push(createBuilding('Factory', 'Factory North', 0xff0000, 1.5, 1.5, 1.5, -10, 0.75, -5));
+        factories.push(createBuilding('Factory', 'Factory South', 0xff0000, 1.5, 1.5, 1.5, -10, 0.75, 5));
+        
+        // Add chimneys
+        factories.forEach(f => {
+            const cylGeom = new THREE.CylinderGeometry(0.2, 0.2, 0.8);
+            const cylMat = new THREE.MeshStandardMaterial({ color: 0x555555 });
+            const chimney = new THREE.Mesh(cylGeom, cylMat);
+            chimney.position.set(0.4, 1.15, -0.4);
+            chimney.castShadow = true;
+            f.add(chimney);
+        });
+
+        // Warehouses
+        warehouses.push(createBuilding('Warehouse', 'Warehouse Alpha', 0xffff00, 2, 1.2, 1.5, 0, 0.6, -4));
+        warehouses.push(createBuilding('Warehouse', 'Warehouse Beta', 0xffff00, 2, 1.2, 1.5, 0, 0.6, 4));
+
+        // Retail Stores
+        stores.push(createBuilding('Store', 'Store 1', 0x00ff00, 1, 1, 1, 10, 0.5, -6));
+        stores.push(createBuilding('Store', 'Store 2', 0x00ff00, 1, 1, 1, 10, 0.5, 0));
+        stores.push(createBuilding('Store', 'Store 3', 0x00ff00, 1, 1, 1, 10, 0.5, 6));
+
+        // --- Paths ---
+        function createPath(nodeA, nodeB) {
+            const start = new THREE.Vector3(nodeA.position.x, 0.025, nodeA.position.z);
+            const end = new THREE.Vector3(nodeB.position.x, 0.025, nodeB.position.z);
+            const distance = start.distanceTo(end);
+            
+            const pathGeom = new THREE.BoxGeometry(0.2, 0.05, distance);
+            const pathMesh = new THREE.Mesh(pathGeom, matPath);
+            
+            pathMesh.position.copy(start).lerp(end, 0.5);
+            pathMesh.lookAt(end);
+            pathMesh.receiveShadow = true;
+            scene.add(pathMesh);
+        }
+
+        factories.forEach(f => warehouses.forEach(w => createPath(f, w)));
+        warehouses.forEach(w => stores.forEach(s => createPath(w, s)));
+
+        // --- Parcels ---
+        let parcels = [];
+        let lastSpawnTime = 0;
+        const parcelGeom = new THREE.BoxGeometry(0.4, 0.4, 0.4);
+
+        function spawnParcel(factory) {
+            const mesh = new THREE.Mesh(parcelGeom, matParcel);
+            mesh.castShadow = true;
+            mesh.receiveShadow = true;
+            mesh.position.set(factory.position.x, 0.2, factory.position.z);
+            scene.add(mesh);
+
+            const targetWarehouse = warehouses[Math.floor(Math.random() * warehouses.length)];
+
+            parcels.push({
+                mesh: mesh,
+                phase: 0, // 0: F->W, 1: Wait at W, 2: W->S
+                startNode: factory,
+                targetNode: targetWarehouse,
+                progress: 0,
+                waitTimer: 0
+            });
+
+            state.totalSpawned++;
+            state.totalInTransit++;
+            factory.userData.stats.processed++;
+            updateHUD();
+        }
+
+        // --- Interaction & UI ---
+        const btnPlay = document.getElementById('btn-play');
+        const btnSpeed = document.getElementById('btn-speed');
+        const btnHeatmap = document.getElementById('btn-heatmap');
+        const hudStats = document.getElementById('hud-stats');
+        const infoPanel = document.getElementById('info-panel');
+        const infoTitle = document.getElementById('info-title');
+        const infoContent = document.getElementById('info-content');
+
+        btnPlay.addEventListener('click', () => {
+            state.running = !state.running;
+            btnPlay.textContent = state.running ? 'Pause' : 'Play';
+        });
+
+        btnSpeed.addEventListener('click', () => {
+            state.speedMultiplier = state.speedMultiplier >= 3 ? 1 : state.speedMultiplier + 1;
+            btnSpeed.textContent = `Speed: ${state.speedMultiplier}x`;
+        });
+
+        btnHeatmap.addEventListener('click', () => {
+            state.heatmapEnabled = !state.heatmapEnabled;
+            btnHeatmap.textContent = `Heatmap: ${state.heatmapEnabled ? 'ON' : 'OFF'}`;
+            updateHeatmap();
+        });
+
+        function updateHUD() {
+            hudStats.textContent = `Spawned: ${state.totalSpawned} | In-Transit: ${state.totalInTransit} | Delivered: ${state.totalDelivered}`;
+            state.parcelCount = parcels.length;
+        }
+
+        function updateHeatmap() {
+            if (!state.heatmapEnabled) {
+                warehouses.forEach(w => w.material.color.setHex(w.userData.baseColor));
+                return;
+            }
+            const maxExpected = 20; // Scale for color mapping
+            warehouses.forEach((w, i) => {
+                const throughput = w.userData.stats.processed;
+                state.warehouseThroughput[i] = throughput;
+                const ratio = Math.min(throughput / maxExpected, 1.0);
+                const color = new THREE.Color(0xffff00).lerp(new THREE.Color(0xff0000), ratio);
+                w.material.color.copy(color);
+            });
+        }
+
+        // Raycasting
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+        let selectedMesh = null;
+
+        window.addEventListener('pointerdown', (event) => {
+            if (event.target.tagName === 'BUTTON') return;
+
+            mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+            raycaster.setFromCamera(mouse, camera);
+            const intersects = raycaster.intersectObjects(buildings, true);
+
+            if (selectedMesh) {
+                selectedMesh.material.emissive.setHex(0x000000);
+            }
+
+            if (intersects.length > 0) {
+                let object = intersects[0].object;
+                // If clicked on chimney, get parent factory
+                if (object.parent && object.parent.userData.type) {
+                    object = object.parent;
+                }
+
+                selectedMesh = object;
+                selectedMesh.material.emissive.setHex(0x444444);
+                state.selectedBuilding = selectedMesh.userData.name;
+                updateInfoPanel();
+                infoPanel.style.display = 'block';
+            } else {
+                selectedMesh = null;
+                state.selectedBuilding = null;
+                infoPanel.style.display = 'none';
+            }
+        });
+
+        function updateInfoPanel() {
+            if (!selectedMesh) return;
+            const data = selectedMesh.userData;
+            infoTitle.textContent = data.name;
+            
+            let html = `<div class="info-stat">Type: ${data.type}</div>`;
+            if (data.type === 'Factory') {
+                html += `<div class="info-stat">Parcels Produced: ${data.stats.processed}</div>`;
+            } else if (data.type === 'Warehouse') {
+                html += `<div class="info-stat">Parcels Processed: ${data.stats.processed}</div>`;
+                html += `<div class="info-stat">Currently Storing: ${data.stats.current}</div>`;
+            } else if (data.type === 'Store') {
+                html += `<div class="info-stat">Parcels Received: ${data.stats.processed}</div>`;
+            }
+            infoContent.innerHTML = html;
+        }
+
+        // Keyboard Controls
+        window.addEventListener('keydown', (event) => {
+            const key = event.key.toLowerCase();
+            if (key === 'r') {
+                resetSimulation();
+            } else if (key === '1') {
+                camera.position.set(0, 12, 18);
+                camera.lookAt(0, 0, 0);
+                state.cameraPreset = 1;
+            } else if (key === '2') {
+                camera.position.set(0, 20, 0.1);
+                camera.lookAt(0, 0, 0);
+                state.cameraPreset = 2;
+            } else if (key === '3') {
+                camera.position.set(25, 5, 0);
+                camera.lookAt(0, 0, 0);
+                state.cameraPreset = 3;
+            }
+        });
+
+        function resetSimulation() {
+            state.running = false;
+            btnPlay.textContent = 'Play';
+            state.totalSpawned = 0;
+            state.totalInTransit = 0;
+            state.totalDelivered = 0;
+            state.elapsedTime = 0;
+            lastSpawnTime = 0;
+            
+            parcels.forEach(p => scene.remove(p.mesh));
+            parcels = [];
+            
+            buildings.forEach(b => {
+                b.userData.stats.processed = 0;
+                b.userData.stats.current = 0;
+            });
+            
+            updateHeatmap();
+            updateHUD();
+            if (selectedMesh) updateInfoPanel();
+        }
+
+        // Window Resize
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // --- Animation Loop ---
+        const clock = new THREE.Clock();
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const delta = clock.getDelta();
+
+            if (state.running) {
+                const simDelta = delta * state.speedMultiplier;
+                state.elapsedTime += simDelta;
+
+                // Spawning
+                if (state.elapsedTime - lastSpawnTime >= 2.0) {
+                    factories.forEach(f => spawnParcel(f));
+                    lastSpawnTime = state.elapsedTime;
+                }
+
+                // Parcel Movement
+                for (let i = parcels.length - 1; i >= 0; i--) {
+                    const p = parcels[i];
+                    
+                    if (p.phase === 0 || p.phase === 2) {
+                        const startPos = new THREE.Vector3(p.startNode.position.x, 0.2, p.startNode.position.z);
+                        const endPos = new THREE.Vector3(p.targetNode.position.x, 0.2, p.targetNode.position.z);
+                        const distance = startPos.distanceTo(endPos);
+                        
+                        // Speed is 3 units/sec
+                        p.progress += (3 * simDelta) / distance;
+
+                        if (p.progress >= 1) {
+                            p.mesh.position.copy(endPos);
+                            
+                            if (p.phase === 0) {
+                                // Reached Warehouse
+                                p.phase = 1;
+                                p.waitTimer = 1.0; // 1 second wait (simulated time)
+                                p.targetNode.userData.stats.processed++;
+                                p.targetNode.userData.stats.current++;
+                                if (state.heatmapEnabled) updateHeatmap();
+                            } else {
+                                // Reached Store
+                                scene.remove(p.mesh);
+                                parcels.splice(i, 1);
+                                state.totalInTransit--;
+                                state.totalDelivered++;
+                                p.targetNode.userData.stats.processed++;
+                                updateHUD();
+                            }
+                        } else {
+                            p.mesh.position.lerpVectors(startPos, endPos, p.progress);
+                        }
+                    } else if (p.phase === 1) {
+                        // Waiting at Warehouse
+                        p.waitTimer -= simDelta;
+                        if (p.waitTimer <= 0) {
+                            p.phase = 2;
+                            p.startNode.userData.stats.current--;
+                            p.startNode = p.targetNode;
+                            p.targetNode = stores[Math.floor(Math.random() * stores.length)];
+                            p.progress = 0;
+                        }
+                    }
+                }
+                
+                if (selectedMesh) updateInfoPanel();
+            }
+
+            renderer.render(scene, camera);
+        }
+
+        animate();
+    </script>
+</body>
+</html>

@@ -1,0 +1,395 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Boid Flocking Simulation</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #87CEEB;
+            font-family: monospace;
+        }
+        canvas {
+            display: block;
+            width: 100vw;
+            height: 100vh;
+        }
+        #hud {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(0, 0, 0, 0.7);
+            color: white;
+            padding: 15px;
+            border-radius: 8px;
+            pointer-events: auto;
+            z-index: 100;
+            user-select: none;
+        }
+        #hud div {
+            margin-bottom: 8px;
+        }
+        #hud label {
+            display: inline-block;
+            width: 140px;
+        }
+        input[type=range] {
+            vertical-align: middle;
+        }
+    </style>
+    <script type="importmap">
+    { "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+    } }
+    </script>
+</head>
+<body>
+    <div id="hud">
+        <div>Flock Center: <span id="flockCenter">0.0, 0.0, 0.0</span></div>
+        <div>Avg Speed: <span id="avgSpeed">0.00</span></div>
+        <hr style="border-color: #444;">
+        <div>
+            <label>Separation: <span id="sepVal">1.0</span></label>
+            <input type="range" id="sepWeight" min="0" max="2" step="0.1" value="1">
+        </div>
+        <div>
+            <label>Alignment: <span id="alignVal">1.0</span></label>
+            <input type="range" id="alignWeight" min="0" max="2" step="0.1" value="1">
+        </div>
+        <div>
+            <label>Cohesion: <span id="cohVal">1.0</span></label>
+            <input type="range" id="cohWeight" min="0" max="2" step="0.1" value="1">
+        </div>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import * as SkeletonUtils from 'three/addons/utils/SkeletonUtils.js';
+
+        // Initialize State
+        window.__3D_STATE__ = {
+            modelLoaded: false,
+            boidCount: 15,
+            flockCenter: { x: 0, y: 0, z: 0 },
+            avgSpeed: 0,
+            separationWeight: 1,
+            alignmentWeight: 1,
+            cohesionWeight: 1
+        };
+
+        // Scene Setup
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x87CEEB);
+        scene.fog = new THREE.FogExp2(0x87CEEB, 0.005);
+
+        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.set(0, 30, 60);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        document.body.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.target.set(0, 12.5, 0);
+
+        // Lights
+        const hemiLight = new THREE.HemisphereLight(0xffffff, 0x444444, 1);
+        hemiLight.position.set(0, 50, 0);
+        scene.add(hemiLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 1);
+        dirLight.position.set(20, 50, 20);
+        scene.add(dirLight);
+
+        // Boundary Visualization
+        const boxGeo = new THREE.BoxGeometry(60, 25, 60);
+        const edges = new THREE.EdgesGeometry(boxGeo);
+        const line = new THREE.LineSegments(edges, new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.2 }));
+        line.position.set(0, 12.5, 0);
+        scene.add(line);
+
+        // Predator
+        const predGeo = new THREE.SphereGeometry(0.5, 16, 16);
+        const predMat = new THREE.MeshBasicMaterial({ color: 0xff0000 });
+        const predator = new THREE.Mesh(predGeo, predMat);
+        scene.add(predator);
+
+        // Mouse Tracking for Predator
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+        const plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -10); // Plane at y=10
+        const targetPos = new THREE.Vector3(0, 10, 0);
+
+        window.addEventListener('mousemove', (e) => {
+            mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+        });
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // Boid Class
+        class Boid {
+            constructor(mesh, mixer) {
+                this.mesh = mesh;
+                this.mixer = mixer;
+                this.velocity = new THREE.Vector3(
+                    (Math.random() - 0.5) * 2,
+                    (Math.random() - 0.5) * 2,
+                    (Math.random() - 0.5) * 2
+                ).normalize().multiplyScalar(Math.random() * 2 + 3);
+                this.acceleration = new THREE.Vector3();
+                this.maxSpeed = 10;
+                this.maxForce = 0.2;
+            }
+
+            applyForce(force) {
+                this.acceleration.add(force);
+            }
+
+            seek(target) {
+                const desired = new THREE.Vector3().subVectors(target, this.mesh.position);
+                desired.normalize().multiplyScalar(this.maxSpeed);
+                const steer = new THREE.Vector3().subVectors(desired, this.velocity);
+                steer.clampLength(0, this.maxForce);
+                return steer;
+            }
+
+            separate(boids) {
+                const steer = new THREE.Vector3();
+                let count = 0;
+                for (let other of boids) {
+                    if (other === this) continue;
+                    const d = this.mesh.position.distanceTo(other.mesh.position);
+                    if (d > 0 && d < 3) {
+                        const diff = new THREE.Vector3().subVectors(this.mesh.position, other.mesh.position);
+                        diff.normalize().divideScalar(d);
+                        steer.add(diff);
+                        count++;
+                    }
+                }
+                if (count > 0) {
+                    steer.divideScalar(count);
+                }
+                if (steer.lengthSq() > 0) {
+                    steer.normalize().multiplyScalar(this.maxSpeed);
+                    steer.sub(this.velocity).clampLength(0, this.maxForce);
+                }
+                return steer;
+            }
+
+            align(boids) {
+                const sum = new THREE.Vector3();
+                let count = 0;
+                for (let other of boids) {
+                    if (other === this) continue;
+                    const d = this.mesh.position.distanceTo(other.mesh.position);
+                    if (d > 0 && d < 10) {
+                        sum.add(other.velocity);
+                        count++;
+                    }
+                }
+                if (count > 0) {
+                    sum.divideScalar(count);
+                    sum.normalize().multiplyScalar(this.maxSpeed);
+                    const steer = new THREE.Vector3().subVectors(sum, this.velocity);
+                    steer.clampLength(0, this.maxForce);
+                    return steer;
+                }
+                return new THREE.Vector3();
+            }
+
+            cohere(boids) {
+                const sum = new THREE.Vector3();
+                let count = 0;
+                for (let other of boids) {
+                    if (other === this) continue;
+                    const d = this.mesh.position.distanceTo(other.mesh.position);
+                    if (d > 0 && d < 10) {
+                        sum.add(other.mesh.position);
+                        count++;
+                    }
+                }
+                if (count > 0) {
+                    sum.divideScalar(count);
+                    return this.seek(sum);
+                }
+                return new THREE.Vector3();
+            }
+
+            flee(target) {
+                const d = this.mesh.position.distanceTo(target);
+                if (d < 5) {
+                    const desired = new THREE.Vector3().subVectors(this.mesh.position, target);
+                    desired.normalize().multiplyScalar(this.maxSpeed * 1.5);
+                    const steer = new THREE.Vector3().subVectors(desired, this.velocity);
+                    steer.clampLength(0, this.maxForce * 2);
+                    return steer;
+                }
+                return new THREE.Vector3();
+            }
+
+            checkBorders() {
+                const pos = this.mesh.position;
+                let force = new THREE.Vector3();
+                if (pos.x < -30 || pos.x > 30 || pos.y < 0 || pos.y > 25 || pos.z < -30 || pos.z > 30) {
+                    const center = new THREE.Vector3(0, 12.5, 0);
+                    const desired = new THREE.Vector3().subVectors(center, pos).normalize().multiplyScalar(this.maxSpeed);
+                    force = new THREE.Vector3().subVectors(desired, this.velocity).clampLength(0, this.maxForce * 1.5);
+                }
+                return force;
+            }
+
+            flock(boids, sepW, aliW, cohW, predPos) {
+                const sep = this.separate(boids).multiplyScalar(sepW);
+                const ali = this.align(boids).multiplyScalar(aliW);
+                const coh = this.cohere(boids).multiplyScalar(cohW);
+                const flee = this.flee(predPos).multiplyScalar(3.0);
+                const bound = this.checkBorders();
+
+                this.applyForce(sep);
+                this.applyForce(ali);
+                this.applyForce(coh);
+                this.applyForce(flee);
+                this.applyForce(bound);
+            }
+
+            update(delta) {
+                this.velocity.add(this.acceleration);
+                this.velocity.clampLength(0, this.maxSpeed);
+                this.mesh.position.addScaledVector(this.velocity, delta);
+                this.acceleration.set(0, 0, 0);
+
+                if (this.velocity.lengthSq() > 0.001) {
+                    const target = this.mesh.position.clone().add(this.velocity);
+                    this.mesh.lookAt(target);
+                }
+
+                if (this.mixer) {
+                    // Adjust animation speed based on velocity
+                    this.mixer.timeScale = this.velocity.length() / 5;
+                    this.mixer.update(delta);
+                }
+            }
+        }
+
+        // Load Model and Initialize Boids
+        const boids = [];
+        const loader = new GLTFLoader();
+        
+        loader.load('assets/flamingo.glb', (gltf) => {
+            const originalScene = gltf.scene;
+            const animations = gltf.animations;
+            
+            // Scale adjustment for typical three.js flamingo model
+            originalScene.scale.set(0.02, 0.02, 0.02);
+
+            for (let i = 0; i < 15; i++) {
+                const clone = SkeletonUtils.clone(originalScene);
+                
+                // Random position between (-20,5,-20) and (20,15,20)
+                clone.position.set(
+                    Math.random() * 40 - 20,
+                    Math.random() * 10 + 5,
+                    Math.random() * 40 - 20
+                );
+                
+                scene.add(clone);
+
+                let mixer = null;
+                if (animations && animations.length > 0) {
+                    mixer = new THREE.AnimationMixer(clone);
+                    const action = mixer.clipAction(animations[0]);
+                    // Randomize start time to desynchronize wing flaps
+                    action.startAt(Math.random() * 2).play();
+                }
+
+                boids.push(new Boid(clone, mixer));
+            }
+            window.__3D_STATE__.modelLoaded = true;
+        }, undefined, (error) => {
+            console.error('Error loading model:', error);
+        });
+
+        // UI Elements
+        const elFlockCenter = document.getElementById('flockCenter');
+        const elAvgSpeed = document.getElementById('avgSpeed');
+        const elSepWeight = document.getElementById('sepWeight');
+        const elAlignWeight = document.getElementById('alignWeight');
+        const elCohWeight = document.getElementById('cohWeight');
+        const elSepVal = document.getElementById('sepVal');
+        const elAlignVal = document.getElementById('alignVal');
+        const elCohVal = document.getElementById('cohVal');
+
+        // Animation Loop
+        const clock = new THREE.Clock();
+
+        function animate() {
+            requestAnimationFrame(animate);
+            const delta = Math.min(clock.getDelta(), 0.1); // Cap delta to prevent huge jumps
+
+            // Update Predator Position
+            raycaster.setFromCamera(mouse, camera);
+            raycaster.ray.intersectPlane(plane, targetPos);
+            if (targetPos) {
+                predator.position.lerp(targetPos, 0.1);
+            }
+
+            // Get Weights
+            const sepW = parseFloat(elSepWeight.value);
+            const aliW = parseFloat(elAlignWeight.value);
+            const cohW = parseFloat(elCohWeight.value);
+
+            elSepVal.innerText = sepW.toFixed(1);
+            elAlignVal.innerText = aliW.toFixed(1);
+            elCohVal.innerText = cohW.toFixed(1);
+
+            let center = new THREE.Vector3();
+            let totalSpeed = 0;
+
+            // Calculate Flocking Forces
+            for (let boid of boids) {
+                boid.flock(boids, sepW, aliW, cohW, predator.position);
+            }
+
+            // Apply Updates
+            for (let boid of boids) {
+                boid.update(delta);
+                center.add(boid.mesh.position);
+                totalSpeed += boid.velocity.length();
+            }
+
+            // Update HUD and State
+            if (boids.length > 0) {
+                center.divideScalar(boids.length);
+                const avgSpeed = totalSpeed / boids.length;
+
+                elFlockCenter.innerText = `${center.x.toFixed(1)}, ${center.y.toFixed(1)}, ${center.z.toFixed(1)}`;
+                elAvgSpeed.innerText = avgSpeed.toFixed(2);
+
+                window.__3D_STATE__.flockCenter = { x: center.x, y: center.y, z: center.z };
+                window.__3D_STATE__.avgSpeed = avgSpeed;
+            }
+
+            window.__3D_STATE__.separationWeight = sepW;
+            window.__3D_STATE__.alignmentWeight = aliW;
+            window.__3D_STATE__.cohesionWeight = cohW;
+
+            controls.update();
+            renderer.render(scene, camera);
+        }
+
+        animate();
+    </script>
+</body>
+</html>

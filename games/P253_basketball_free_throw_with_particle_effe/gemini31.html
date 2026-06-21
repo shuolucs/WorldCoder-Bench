@@ -1,0 +1,565 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Basketball Free Throw</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #87CEEB;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            user-select: none;
+        }
+        #gameCanvas {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+        }
+        #ui {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+            color: white;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.8);
+        }
+        #scoreDisplay {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            font-size: 32px;
+            font-weight: bold;
+            color: #FFD700;
+        }
+        #shotsDisplay {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            font-size: 24px;
+        }
+        #statusText {
+            position: absolute;
+            top: 30%;
+            width: 100%;
+            text-align: center;
+            font-size: 36px;
+            font-weight: bold;
+            transition: transform 0.2s;
+        }
+        #controls {
+            position: absolute;
+            bottom: 40px;
+            left: 50%;
+            transform: translateX(-50%);
+            text-align: center;
+            background: rgba(0, 0, 0, 0.5);
+            padding: 20px;
+            border-radius: 15px;
+            border: 2px solid rgba(255,255,255,0.2);
+        }
+        #powerBar {
+            width: 300px;
+            height: 25px;
+            background: #333;
+            border: 2px solid #fff;
+            border-radius: 12px;
+            overflow: hidden;
+            margin-bottom: 15px;
+        }
+        #powerFill {
+            width: 0%;
+            height: 100%;
+            background: linear-gradient(90deg, #ff0000, #ffff00, #00ff00);
+            transition: width 0.05s linear;
+        }
+        #angleDisplay, #aimDisplay {
+            font-size: 20px;
+            margin: 5px 0;
+        }
+        .highlight { color: #00ff00; }
+    </style>
+</head>
+<body>
+    <div id="ui">
+        <div id="scoreDisplay">Score: 0</div>
+        <div id="shotsDisplay">Shots: 0</div>
+        <div id="statusText">Hold SPACE to charge</div>
+        <div id="controls">
+            <div id="powerBar"><div id="powerFill"></div></div>
+            <div id="angleDisplay">Angle: 45°</div>
+            <div id="aimDisplay">Aim: 0.0</div>
+        </div>
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/GLTFLoader.js"></script>
+
+    <script>
+        // --- STATE MANAGEMENT ---
+        window.__3D_STATE__ = {
+            phase: 'idle', // 'idle', 'charging', 'aiming', 'flying', 'scored', 'missed'
+            power: 0,
+            angle: 45,
+            aimX: 0,
+            score: 0,
+            shots: 0,
+            ballPosition: { x: 0, y: 3, z: 10 },
+            ballVelocity: { x: 0, y: 0, z: 0 },
+            isCharging: false,
+            particleCount: 0,
+            fishLoaded: false,
+            fishCelebrating: false,
+            ballSpeed: 0,
+            lastShotResult: 'none'
+        };
+
+        const state = window.__3D_STATE__;
+        const START_POS = new THREE.Vector3(0, 3, 10);
+        const HOOP_POS = new THREE.Vector3(0, 8, -8);
+        const GRAVITY = -9.81;
+        const TIMESTEP = 1 / 60;
+
+        let hasScoredThisShot = false;
+        let fishAnimTime = 0;
+        let prevBallY = START_POS.y;
+
+        // --- DOM ELEMENTS ---
+        const uiScore = document.getElementById('scoreDisplay');
+        const uiShots = document.getElementById('shotsDisplay');
+        const uiStatus = document.getElementById('statusText');
+        const uiPowerFill = document.getElementById('powerFill');
+        const uiAngle = document.getElementById('angleDisplay');
+        const uiAim = document.getElementById('aimDisplay');
+
+        // --- SCENE SETUP ---
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x87CEEB);
+        scene.fog = new THREE.Fog(0x87CEEB, 10, 50);
+
+        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+        camera.position.set(0, 5, 15);
+        camera.lookAt(0, 4, -8);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        document.body.appendChild(renderer.domElement);
+
+        // --- LIGHTS ---
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+        dirLight.position.set(10, 20, 10);
+        dirLight.castShadow = true;
+        dirLight.shadow.camera.left = -15;
+        dirLight.shadow.camera.right = 15;
+        dirLight.shadow.camera.top = 15;
+        dirLight.shadow.camera.bottom = -15;
+        dirLight.shadow.mapSize.width = 1024;
+        dirLight.shadow.mapSize.height = 1024;
+        scene.add(dirLight);
+
+        // --- OBJECTS ---
+        // Floor
+        const floorGeo = new THREE.PlaneGeometry(50, 50);
+        const floorMat = new THREE.MeshStandardMaterial({ color: 0x556B2F, roughness: 0.8 });
+        const floor = new THREE.Mesh(floorGeo, floorMat);
+        floor.rotation.x = -Math.PI / 2;
+        floor.receiveShadow = true;
+        scene.add(floor);
+
+        // Hoop Ring
+        const ringGeo = new THREE.TorusGeometry(0.6, 0.08, 16, 32);
+        const ringMat = new THREE.MeshStandardMaterial({ color: 0xff4500, roughness: 0.4 });
+        const ring = new THREE.Mesh(ringGeo, ringMat);
+        ring.position.copy(HOOP_POS);
+        ring.rotation.x = Math.PI / 2;
+        ring.castShadow = true;
+        scene.add(ring);
+
+        // Backboard
+        const boardGeo = new THREE.BoxGeometry(2.5, 2, 0.1);
+        const boardMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.5 });
+        const board = new THREE.Mesh(boardGeo, boardMat);
+        board.position.set(0, 9, -8.5);
+        board.castShadow = true;
+        board.receiveShadow = true;
+        scene.add(board);
+
+        // Backboard lines (simple red square)
+        const lineGeo = new THREE.BoxGeometry(1.2, 1, 0.11);
+        const lineMat = new THREE.MeshBasicMaterial({ color: 0xff0000, wireframe: true });
+        const lines = new THREE.Mesh(lineGeo, lineMat);
+        lines.position.set(0, 8.5, -8.5);
+        scene.add(lines);
+
+        // Pole
+        const poleGeo = new THREE.CylinderGeometry(0.1, 0.1, 9, 16);
+        const poleMat = new THREE.MeshStandardMaterial({ color: 0x888888, metalness: 0.5 });
+        const pole = new THREE.Mesh(poleGeo, poleMat);
+        pole.position.set(0, 4.5, -8.5);
+        pole.castShadow = true;
+        scene.add(pole);
+
+        // Ball
+        const createBallTexture = () => {
+            const canvas = document.createElement('canvas');
+            canvas.width = 256; canvas.height = 256;
+            const ctx = canvas.getContext('2d');
+            ctx.fillStyle = '#ff6600';
+            ctx.fillRect(0, 0, 256, 256);
+            ctx.strokeStyle = '#222';
+            ctx.lineWidth = 4;
+            ctx.beginPath(); ctx.moveTo(128, 0); ctx.lineTo(128, 256); ctx.stroke();
+            ctx.beginPath(); ctx.moveTo(0, 128); ctx.lineTo(256, 128); ctx.stroke();
+            return new THREE.CanvasTexture(canvas);
+        };
+        const ballGeo = new THREE.SphereGeometry(0.35, 32, 32);
+        const ballMat = new THREE.MeshStandardMaterial({ 
+            map: createBallTexture(), 
+            roughness: 0.7,
+            color: 0xff8800
+        });
+        const ball = new THREE.Mesh(ballGeo, ballMat);
+        ball.position.copy(START_POS);
+        ball.castShadow = true;
+        scene.add(ball);
+
+        // --- MODEL LOADING ---
+        window.__fishModel = null;
+        const loader = new THREE.GLTFLoader();
+        loader.load('BarramundiFish.glb', (gltf) => {
+            const fish = gltf.scene;
+            fish.scale.set(2, 2, 2);
+            fish.position.set(4, 10.5, -8.5);
+            
+            fish.traverse((child) => {
+                if (child.isMesh) {
+                    child.castShadow = true;
+                    child.receiveShadow = true;
+                }
+            });
+            
+            scene.add(fish);
+            window.__fishModel = fish;
+            state.fishLoaded = true;
+        }, undefined, (error) => {
+            console.warn('Could not load fish model:', error);
+        });
+
+        // --- PARTICLE SYSTEM ---
+        const MAX_PARTICLES = 300;
+        const partGeo = new THREE.BufferGeometry();
+        const partPos = new Float32Array(MAX_PARTICLES * 3);
+        const partColor = new Float32Array(MAX_PARTICLES * 3);
+        const partVel = [];
+        const partLife = new Float32Array(MAX_PARTICLES);
+        const partType = new Int8Array(MAX_PARTICLES); // 0: none, 1: smoke, 2: gold
+
+        partGeo.setAttribute('position', new THREE.BufferAttribute(partPos, 3));
+        partGeo.setAttribute('color', new THREE.BufferAttribute(partColor, 3));
+
+        const partMat = new THREE.PointsMaterial({
+            size: 0.15,
+            vertexColors: true,
+            transparent: true,
+            opacity: 0.8,
+            blending: THREE.AdditiveBlending,
+            depthWrite: false
+        });
+
+        const particleSystem = new THREE.Points(partGeo, partMat);
+        scene.add(particleSystem);
+
+        for(let i=0; i<MAX_PARTICLES; i++) {
+            partVel.push(new THREE.Vector3());
+            partLife[i] = 0;
+        }
+
+        function emitParticles(type, count, origin) {
+            let emitted = 0;
+            for(let i=0; i<MAX_PARTICLES && emitted < count; i++) {
+                if(partLife[i] <= 0) {
+                    partLife[i] = type === 1 ? 0.5 : 2.0; // Smoke 0.5s, Gold 2s
+                    partType[i] = type;
+                    
+                    partPos[i*3] = origin.x + (Math.random()-0.5)*0.5;
+                    partPos[i*3+1] = origin.y + (Math.random()-0.5)*0.5;
+                    partPos[i*3+2] = origin.z + (Math.random()-0.5)*0.5;
+
+                    if(type === 1) { // Smoke
+                        partVel[i].set((Math.random()-0.5)*2, Math.random()*2, (Math.random()-0.5)*2);
+                        partColor[i*3] = 1; partColor[i*3+1] = 1; partColor[i*3+2] = 1;
+                    } else { // Gold
+                        partVel[i].set((Math.random()-0.5)*8, Math.random()*5 + 2, (Math.random()-0.5)*8);
+                        partColor[i*3] = 1; partColor[i*3+1] = 0.84; partColor[i*3+2] = 0;
+                    }
+                    emitted++;
+                }
+            }
+        }
+
+        function updateParticles(dt) {
+            let active = 0;
+            for(let i=0; i<MAX_PARTICLES; i++) {
+                if(partLife[i] > 0) {
+                    partLife[i] -= dt;
+                    if(partLife[i] > 0) {
+                        active++;
+                        partPos[i*3] += partVel[i].x * dt;
+                        partPos[i*3+1] += partVel[i].y * dt;
+                        partPos[i*3+2] += partVel[i].z * dt;
+                        
+                        if(partType[i] === 2) { // Gravity for gold
+                            partVel[i].y += GRAVITY * dt;
+                        }
+                    } else {
+                        partPos[i*3] = 999; // Hide
+                    }
+                }
+            }
+            partGeo.attributes.position.needsUpdate = true;
+            state.particleCount = active;
+        }
+
+        // --- INPUT HANDLING ---
+        const keys = { Space: false, ArrowUp: false, ArrowDown: false, ArrowLeft: false, ArrowRight: false };
+
+        window.addEventListener('keydown', (e) => {
+            if (keys.hasOwnProperty(e.code)) {
+                e.preventDefault();
+                keys[e.code] = true;
+            }
+
+            if (e.code === 'Space' && state.phase === 'idle') {
+                state.phase = 'charging';
+                state.isCharging = true;
+                state.power = 0;
+            }
+
+            if (e.code === 'Enter') {
+                if (state.phase === 'aiming' || state.phase === 'ready') {
+                    launchBall();
+                }
+            }
+
+            if (e.code === 'KeyR') {
+                resetGame();
+            }
+        });
+
+        window.addEventListener('keyup', (e) => {
+            if (keys.hasOwnProperty(e.code)) {
+                keys[e.code] = false;
+            }
+
+            if (e.code === 'Space' && state.phase === 'charging') {
+                state.isCharging = false;
+                state.phase = 'aiming';
+            }
+        });
+
+        function launchBall() {
+            state.phase = 'flying';
+            state.shots++;
+            hasScoredThisShot = false;
+            
+            const speed = state.power;
+            const angleRad = state.angle * Math.PI / 180;
+            
+            state.ballVelocity.x = state.aimX;
+            state.ballVelocity.y = speed * Math.sin(angleRad);
+            state.ballVelocity.z = -speed * Math.cos(angleRad);
+            
+            emitParticles(1, 20, ball.position);
+            updateUI();
+        }
+
+        function resetGame() {
+            state.phase = 'idle';
+            state.power = 0;
+            state.angle = 45;
+            state.aimX = 0;
+            state.ballVelocity = { x: 0, y: 0, z: 0 };
+            ball.position.copy(START_POS);
+            ball.rotation.set(0,0,0);
+            state.lastShotResult = 'none';
+            updateUI();
+        }
+
+        // --- UPDATE LOOP ---
+        const clock = new THREE.Clock();
+        let accumulator = 0;
+
+        function updatePhysics() {
+            if (state.phase === 'flying') {
+                prevBallY = ball.position.y;
+
+                // Apply gravity
+                state.ballVelocity.y += GRAVITY * TIMESTEP;
+
+                // Move ball
+                ball.position.x += state.ballVelocity.x * TIMESTEP;
+                ball.position.y += state.ballVelocity.y * TIMESTEP;
+                ball.position.z += state.ballVelocity.z * TIMESTEP;
+
+                // Spin ball
+                ball.rotation.x += state.ballVelocity.z * 0.1;
+                ball.rotation.z -= state.ballVelocity.x * 0.1;
+
+                // Floor Collision
+                if (ball.position.y <= 0.35) {
+                    ball.position.y = 0.35;
+                    state.ballVelocity.y *= -0.4;
+                    state.ballVelocity.x *= 0.8;
+                    state.ballVelocity.z *= 0.8;
+                }
+
+                // Backboard Collision
+                if (ball.position.z < -8.35 && ball.position.z > -8.65 && 
+                    ball.position.y > 8 && ball.position.y < 10 && 
+                    Math.abs(ball.position.x) < 1.25) {
+                    
+                    if (state.ballVelocity.z < 0) {
+                        state.ballVelocity.z *= -0.5;
+                        ball.position.z = -8.35;
+                    }
+                }
+
+                // Hoop Collision / Score Detection
+                if (!hasScoredThisShot && prevBallY > 8 && ball.position.y <= 8) {
+                    const distToCenter = Math.hypot(ball.position.x - HOOP_POS.x, ball.position.z - HOOP_POS.z);
+                    if (distToCenter < 0.6) {
+                        scoreBasket();
+                    } else if (distToCenter >= 0.6 && distToCenter < 0.7) {
+                        // Hit rim
+                        state.ballVelocity.y *= -0.5;
+                        state.ballVelocity.x += (ball.position.x - HOOP_POS.x) * 5;
+                        state.ballVelocity.z += (ball.position.z - HOOP_POS.z) * 5;
+                    }
+                }
+
+                // Check if stopped
+                state.ballSpeed = Math.hypot(state.ballVelocity.x, state.ballVelocity.y, state.ballVelocity.z);
+                if (ball.position.y <= 0.36 && state.ballSpeed < 0.1) {
+                    state.ballVelocity = {x:0, y:0, z:0};
+                    if (state.phase === 'flying') {
+                        state.phase = hasScoredThisShot ? 'scored' : 'missed';
+                        state.lastShotResult = hasScoredThisShot ? 'score' : 'miss';
+                        updateUI();
+                    }
+                }
+            }
+
+            // Sync state object
+            state.ballPosition.x = ball.position.x;
+            state.ballPosition.y = ball.position.y;
+            state.ballPosition.z = ball.position.z;
+        }
+
+        function scoreBasket() {
+            hasScoredThisShot = true;
+            state.score++;
+            state.lastShotResult = 'score';
+            emitParticles(2, 100, HOOP_POS);
+            
+            state.fishCelebrating = true;
+            fishAnimTime = 0;
+            
+            updateUI();
+        }
+
+        function updateLogic(dt) {
+            // Charging Power
+            if (state.phase === 'charging') {
+                state.power += dt * 10;
+                if (state.power > 20) state.power = 20;
+                updateUI();
+            }
+
+            // Aiming
+            if (state.phase === 'aiming' || state.phase === 'ready') {
+                if (keys.ArrowUp) state.angle = Math.min(75, state.angle + dt * 30);
+                if (keys.ArrowDown) state.angle = Math.max(30, state.angle - dt * 30);
+                if (keys.ArrowLeft) state.aimX = Math.max(-3, state.aimX - dt * 5);
+                if (keys.ArrowRight) state.aimX = Math.min(3, state.aimX + dt * 5);
+                
+                if(state.phase === 'aiming') state.phase = 'ready'; // Transition to ready once aiming starts
+                updateUI();
+            }
+
+            // Fish Animation
+            if (state.fishCelebrating && window.__fishModel) {
+                fishAnimTime += dt;
+                window.__fishModel.rotation.y += dt * 5;
+                window.__fishModel.position.y = 10.5 + Math.abs(Math.sin(fishAnimTime * 8)) * 0.5;
+                
+                if (fishAnimTime > 2) {
+                    state.fishCelebrating = false;
+                    window.__fishModel.rotation.y = 0;
+                    window.__fishModel.position.y = 10.5;
+                }
+            }
+
+            updateParticles(dt);
+        }
+
+        function updateUI() {
+            uiScore.innerText = `Score: ${state.score}`;
+            uiShots.innerText = `Shots: ${state.shots}`;
+            
+            const powerPercent = (state.power / 20) * 100;
+            uiPowerFill.style.width = `${powerPercent}%`;
+            
+            uiAngle.innerText = `Angle: ${state.angle.toFixed(1)}°`;
+            uiAim.innerText = `Aim: ${state.aimX.toFixed(1)}`;
+
+            switch(state.phase) {
+                case 'idle': uiStatus.innerText = 'Hold SPACE to charge'; break;
+                case 'charging': uiStatus.innerText = 'Charging... Release to lock'; break;
+                case 'aiming': 
+                case 'ready': uiStatus.innerText = 'Arrows to aim. ENTER to launch'; break;
+                case 'flying': uiStatus.innerText = ''; break;
+                case 'scored': uiStatus.innerText = 'SCORE! Press R to reset'; uiStatus.style.color = '#00ff00'; break;
+                case 'missed': uiStatus.innerText = 'Miss! Press R to reset'; uiStatus.style.color = '#ff0000'; break;
+            }
+            
+            if(state.phase !== 'scored' && state.phase !== 'missed') {
+                uiStatus.style.color = 'white';
+            }
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const dt = Math.min(clock.getDelta(), 0.1);
+            accumulator += dt;
+
+            while (accumulator >= TIMESTEP) {
+                updatePhysics();
+                accumulator -= TIMESTEP;
+            }
+
+            updateLogic(dt);
+            renderer.render(scene, camera);
+        }
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // Start
+        updateUI();
+        animate();
+
+    </script>
+</body>
+</html>

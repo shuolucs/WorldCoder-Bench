@@ -1,0 +1,584 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3D Fish Catch Histogram</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { overflow: hidden; background: #1a1a2e; font-family: 'Segoe UI', Arial, sans-serif; }
+canvas { display: block; }
+#hud {
+    position: absolute;
+    top: 15px;
+    left: 15px;
+    color: #e0e0e0;
+    font-size: 14px;
+    background: rgba(0,0,0,0.6);
+    padding: 12px 16px;
+    border-radius: 8px;
+    line-height: 1.8;
+    pointer-events: none;
+    min-width: 200px;
+}
+#hud span { font-weight: bold; color: #fff; }
+#sortBtn {
+    position: absolute;
+    top: 15px;
+    right: 15px;
+    padding: 10px 20px;
+    background: linear-gradient(135deg, #3498db, #2980b9);
+    color: white;
+    border: none;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 14px;
+    font-weight: bold;
+    transition: all 0.3s;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+}
+#sortBtn:hover { background: linear-gradient(135deg, #2980b9, #2471a3); transform: translateY(-1px); }
+.bar-label {
+    position: absolute;
+    color: #fff;
+    font-size: 12px;
+    text-align: center;
+    pointer-events: none;
+    white-space: pre-line;
+    text-shadow: 0 0 6px rgba(0,0,0,0.8);
+    font-weight: bold;
+    transform: translate(-50%, -100%);
+}
+</style>
+</head>
+<body>
+<div id="hud">
+    Total: <span id="hudTotal">0</span><br>
+    Max: <span id="hudMax">-</span><br>
+    Selected: <span id="hudSelected">None</span>
+</div>
+<button id="sortBtn">Sort Ascending</button>
+<div id="labels"></div>
+
+<script type="importmap">
+{
+    "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.163.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.163.0/examples/jsm/"
+    }
+}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+// ---- Constants ----
+const CATEGORIES = ['Salmon', 'Trout', 'Bass', 'Catfish', 'Perch'];
+const INITIAL_VALUES = [4.0, 7.0, 3.0, 5.5, 6.0];
+const BAR_COLORS = [0xe74c3c, 0x3498db, 0x2ecc71, 0xf39c12, 0x9b59b6];
+const BAR_POSITIONS_X = [-5, -2.5, 0, 2.5, 5];
+const BAR_WIDTH = 1.5;
+const BAR_DEPTH = 1.5;
+const MAX_VALUE = 10.0;
+const MIN_VALUE = 0.5;
+
+// ---- State ----
+const state = {
+    barValues: [...INITIAL_VALUES],
+    barHeights: [...INITIAL_VALUES],
+    selectedBarIndex: -1,
+    totalValue: 0,
+    maxBarIndex: 0,
+    maxBarValue: 0,
+    sortState: 'none',
+    wireframeMode: false,
+    fishPosition: { x: 0, y: 0, z: 0 },
+    fishLoaded: false,
+    barPositionsX: [...BAR_POSITIONS_X],
+    categoryNames: [...CATEGORIES],
+    pulsingBarIndex: -1,
+    resetCount: 0,
+    cameraDistance: 0
+};
+window.__3D_STATE__ = state;
+
+function round1(v) { return Math.round(v * 10) / 10; }
+
+// ---- Scene Setup ----
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x1a1a2e);
+
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+camera.position.set(12, 10, 12);
+camera.lookAt(0, 0, 0);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+
+// Lights
+const ambientLight = new THREE.AmbientLight(0x404060, 0.5);
+scene.add(ambientLight);
+
+const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+dirLight.position.set(10, 15, 10);
+dirLight.castShadow = true;
+dirLight.shadow.mapSize.width = 2048;
+dirLight.shadow.mapSize.height = 2048;
+dirLight.shadow.camera.near = 0.5;
+dirLight.shadow.camera.far = 50;
+dirLight.shadow.camera.left = -15;
+dirLight.shadow.camera.right = 15;
+dirLight.shadow.camera.top = 15;
+dirLight.shadow.camera.bottom = -15;
+scene.add(dirLight);
+
+// Ground
+const groundGeo = new THREE.PlaneGeometry(20, 20);
+const groundMat = new THREE.MeshStandardMaterial({ color: 0x2a2a4a });
+const ground = new THREE.Mesh(groundGeo, groundMat);
+ground.rotation.x = -Math.PI / 2;
+ground.position.y = 0;
+ground.receiveShadow = true;
+scene.add(ground);
+
+// Controls
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+controls.target.set(0, 3, 0);
+
+// ---- Bars ----
+const bars = [];
+const barMaterials = [];
+const barCurrentX = [...BAR_POSITIONS_X];
+const barTargetX = [...BAR_POSITIONS_X];
+const barCurrentHeight = [...INITIAL_VALUES];
+const barTargetHeight = [...INITIAL_VALUES];
+const barOriginalOrder = [0, 1, 2, 3, 4]; // track which bar is at which logical index
+
+for (let i = 0; i < 5; i++) {
+    const geo = new THREE.BoxGeometry(BAR_WIDTH, 1, BAR_DEPTH);
+    // Shift geometry so bottom is at y=0 when scale.y = height
+    geo.translate(0, 0.5, 0);
+    const mat = new THREE.MeshStandardMaterial({
+        color: BAR_COLORS[i],
+        metalness: 0.3,
+        roughness: 0.6
+    });
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.position.set(BAR_POSITIONS_X[i], 0, 0);
+    mesh.scale.y = INITIAL_VALUES[i];
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+    mesh.userData.barIndex = i;
+    scene.add(mesh);
+    bars.push(mesh);
+    barMaterials.push(mat);
+}
+
+// ---- Labels ----
+const labelsContainer = document.getElementById('labels');
+const labelDivs = [];
+for (let i = 0; i < 5; i++) {
+    const div = document.createElement('div');
+    div.className = 'bar-label';
+    labelsContainer.appendChild(div);
+    labelDivs.push(div);
+}
+
+function updateLabels() {
+    for (let i = 0; i < 5; i++) {
+        const bar = bars[i];
+        const worldPos = new THREE.Vector3(bar.position.x, bar.scale.y + 0.5, bar.position.z);
+        const screenPos = worldPos.clone().project(camera);
+        const x = (screenPos.x * 0.5 + 0.5) * window.innerWidth;
+        const y = (-screenPos.y * 0.5 + 0.5) * window.innerHeight;
+        
+        if (screenPos.z > 1) {
+            labelDivs[i].style.display = 'none';
+        } else {
+            labelDivs[i].style.display = 'block';
+            labelDivs[i].style.left = x + 'px';
+            labelDivs[i].style.top = y + 'px';
+            labelDivs[i].textContent = CATEGORIES[i] + '\n' + round1(state.barValues[i]);
+        }
+    }
+}
+
+// ---- Fish Model ----
+let fishModel = null;
+let fishTargetPos = new THREE.Vector3();
+let fishCurrentPos = new THREE.Vector3();
+let fishMoving = false;
+let fishMoveStart = 0;
+const FISH_MOVE_DURATION = 1000;
+let fishMoveFrom = new THREE.Vector3();
+let fishMoveTo = new THREE.Vector3();
+
+function getFishTargetPosition() {
+    let maxIdx = 0;
+    let maxVal = state.barValues[0];
+    for (let i = 1; i < 5; i++) {
+        if (state.barValues[i] > maxVal) {
+            maxVal = state.barValues[i];
+            maxIdx = i;
+        }
+    }
+    return new THREE.Vector3(bars[maxIdx].position.x, barCurrentHeight[maxIdx] + 0.5, bars[maxIdx].position.z);
+}
+
+function startFishMove() {
+    if (!fishModel) return;
+    const target = getFishTargetPosition();
+    if (fishCurrentPos.distanceTo(target) < 0.01) return;
+    fishMoveFrom.copy(fishCurrentPos);
+    fishMoveTo.copy(target);
+    fishMoving = true;
+    fishMoveStart = performance.now();
+}
+
+const loader = new GLTFLoader();
+// Try loading the fish model, create a placeholder if it fails
+function createFishPlaceholder() {
+    const group = new THREE.Group();
+    // Body
+    const bodyGeo = new THREE.ConeGeometry(0.3, 1.2, 8);
+    bodyGeo.rotateZ(-Math.PI / 2);
+    const bodyMat = new THREE.MeshStandardMaterial({ color: 0x4488cc, metalness: 0.4, roughness: 0.5 });
+    const body = new THREE.Mesh(bodyGeo, bodyMat);
+    group.add(body);
+    // Tail
+    const tailGeo = new THREE.ConeGeometry(0.3, 0.4, 4);
+    tailGeo.rotateZ(Math.PI / 2);
+    const tail = new THREE.Mesh(tailGeo, bodyMat);
+    tail.position.set(0.7, 0, 0);
+    group.add(tail);
+    // Eye
+    const eyeGeo = new THREE.SphereGeometry(0.06, 8, 8);
+    const eyeMat = new THREE.MeshStandardMaterial({ color: 0xffffff });
+    const eye = new THREE.Mesh(eyeGeo, eyeMat);
+    eye.position.set(-0.35, 0.15, 0.2);
+    group.add(eye);
+    // Fin
+    const finGeo = new THREE.ConeGeometry(0.15, 0.4, 4);
+    finGeo.rotateZ(Math.PI);
+    const fin = new THREE.Mesh(finGeo, new THREE.MeshStandardMaterial({ color: 0x3377aa, metalness: 0.3, roughness: 0.6 }));
+    fin.position.set(0, 0.35, 0);
+    group.add(fin);
+    return group;
+}
+
+function initFish(model) {
+    fishModel = model;
+    fishModel.scale.set(1.5, 1.5, 1.5);
+    const pos = getFishTargetPosition();
+    fishModel.position.copy(pos);
+    fishCurrentPos.copy(pos);
+    scene.add(fishModel);
+    state.fishLoaded = true;
+}
+
+loader.load('BarramundiFish.glb', (gltf) => {
+    initFish(gltf.scene);
+}, undefined, () => {
+    // Also try with dot prefix
+    loader.load('./BarramundiFish.glb', (gltf) => {
+        initFish(gltf.scene);
+    }, undefined, () => {
+        // Use placeholder
+        const placeholder = createFishPlaceholder();
+        initFish(placeholder);
+    });
+});
+
+// ---- Raycaster for clicks ----
+const raycaster = new THREE.Raycaster();
+const mouse = new THREE.Vector2();
+
+function getClickedBar(event) {
+    mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+    mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+    raycaster.setFromCamera(mouse, camera);
+    const intersects = raycaster.intersectObjects(bars);
+    if (intersects.length > 0) {
+        return intersects[0].object.userData.barIndex;
+    }
+    return -1;
+}
+
+// ---- Animations ----
+const heightAnimations = []; // { barIndex, from, to, startTime, duration }
+const posAnimations = []; // { barIndex, from, to, startTime, duration }
+let pulsingBar = -1;
+let pulsingActive = false;
+let pulsingStartTime = 0;
+
+function animateHeight(barIndex, targetValue, duration = 300) {
+    // Remove existing animation for this bar
+    for (let i = heightAnimations.length - 1; i >= 0; i--) {
+        if (heightAnimations[i].barIndex === barIndex) heightAnimations.splice(i, 1);
+    }
+    heightAnimations.push({
+        barIndex,
+        from: barCurrentHeight[barIndex],
+        to: targetValue,
+        startTime: performance.now(),
+        duration
+    });
+    barTargetHeight[barIndex] = targetValue;
+}
+
+function animatePosition(barIndex, targetX, duration = 800) {
+    for (let i = posAnimations.length - 1; i >= 0; i--) {
+        if (posAnimations[i].barIndex === barIndex) posAnimations.splice(i, 1);
+    }
+    posAnimations.push({
+        barIndex,
+        from: barCurrentX[barIndex],
+        to: targetX,
+        startTime: performance.now(),
+        duration
+    });
+    barTargetX[barIndex] = targetX;
+}
+
+function easeInOutCubic(t) {
+    return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+}
+
+// ---- Click Handler ----
+renderer.domElement.addEventListener('click', (event) => {
+    const idx = getClickedBar(event);
+    // Deselect previous
+    if (state.selectedBarIndex >= 0) {
+        barMaterials[state.selectedBarIndex].emissive.setHex(0x000000);
+    }
+    if (idx >= 0) {
+        state.selectedBarIndex = idx;
+        barMaterials[idx].emissive.setHex(0x444444);
+    } else {
+        state.selectedBarIndex = -1;
+    }
+});
+
+// ---- Double Click Handler ----
+renderer.domElement.addEventListener('dblclick', (event) => {
+    const idx = getClickedBar(event);
+    if (idx >= 0) {
+        if (pulsingBar === idx) {
+            // Stop pulsing
+            pulsingBar = -1;
+            pulsingActive = false;
+            bars[idx].scale.x = 1;
+            bars[idx].scale.z = 1;
+            state.pulsingBarIndex = -1;
+        } else {
+            // Stop previous pulsing
+            if (pulsingBar >= 0) {
+                bars[pulsingBar].scale.x = 1;
+                bars[pulsingBar].scale.z = 1;
+            }
+            pulsingBar = idx;
+            pulsingActive = true;
+            pulsingStartTime = performance.now();
+            state.pulsingBarIndex = idx;
+        }
+    }
+});
+
+// ---- Keyboard Handler ----
+document.addEventListener('keydown', (event) => {
+    const key = event.key;
+    
+    if (key === 'ArrowUp' && state.selectedBarIndex >= 0) {
+        event.preventDefault();
+        const idx = state.selectedBarIndex;
+        const newVal = Math.min(MAX_VALUE, round1(state.barValues[idx] + 0.5));
+        state.barValues[idx] = newVal;
+        animateHeight(idx, newVal, 300);
+        startFishMove();
+    }
+    
+    if (key === 'ArrowDown' && state.selectedBarIndex >= 0) {
+        event.preventDefault();
+        const idx = state.selectedBarIndex;
+        const newVal = Math.max(MIN_VALUE, round1(state.barValues[idx] - 0.5));
+        state.barValues[idx] = newVal;
+        animateHeight(idx, newVal, 300);
+        startFishMove();
+    }
+    
+    if (key === 'r' || key === 'R') {
+        state.resetCount++;
+        for (let i = 0; i < 5; i++) {
+            state.barValues[i] = INITIAL_VALUES[i];
+            animateHeight(i, INITIAL_VALUES[i], 300);
+            animatePosition(i, BAR_POSITIONS_X[i], 800);
+        }
+        state.sortState = 'none';
+        document.getElementById('sortBtn').textContent = 'Sort Ascending';
+        startFishMove();
+    }
+    
+    if (key === 's' || key === 'S') {
+        state.wireframeMode = !state.wireframeMode;
+        for (let i = 0; i < 5; i++) {
+            barMaterials[i].wireframe = state.wireframeMode;
+        }
+    }
+});
+
+// ---- Sort Button ----
+const sortBtn = document.getElementById('sortBtn');
+sortBtn.addEventListener('click', () => {
+    if (state.sortState === 'ascending') {
+        // Sort descending
+        state.sortState = 'descending';
+        sortBtn.textContent = 'Sort Ascending';
+    } else {
+        // Sort ascending
+        state.sortState = 'ascending';
+        sortBtn.textContent = 'Sort Descending';
+    }
+    
+    // Create index-value pairs
+    const pairs = state.barValues.map((v, i) => ({ index: i, value: v }));
+    if (state.sortState === 'ascending') {
+        pairs.sort((a, b) => a.value - b.value);
+    } else {
+        pairs.sort((a, b) => b.value - a.value);
+    }
+    
+    // Assign new positions
+    for (let pos = 0; pos < 5; pos++) {
+        const barIdx = pairs[pos].index;
+        animatePosition(barIdx, BAR_POSITIONS_X[pos], 800);
+    }
+    
+    setTimeout(() => startFishMove(), 850);
+});
+
+// ---- HUD Update ----
+function updateHUD() {
+    let total = 0;
+    let maxIdx = 0;
+    let maxVal = state.barValues[0];
+    for (let i = 0; i < 5; i++) {
+        total += state.barValues[i];
+        if (state.barValues[i] > maxVal) {
+            maxVal = state.barValues[i];
+            maxIdx = i;
+        }
+    }
+    state.totalValue = round1(total);
+    state.maxBarIndex = maxIdx;
+    state.maxBarValue = round1(maxVal);
+    
+    document.getElementById('hudTotal').textContent = round1(total);
+    document.getElementById('hudMax').textContent = CATEGORIES[maxIdx] + ' (' + round1(maxVal) + ')';
+    document.getElementById('hudSelected').textContent = state.selectedBarIndex >= 0 ? CATEGORIES[state.selectedBarIndex] : 'None';
+}
+
+// ---- Animation Loop ----
+const clock = new THREE.Clock();
+
+function animate() {
+    requestAnimationFrame(animate);
+    const now = performance.now();
+    const dt = clock.getDelta();
+    
+    controls.update();
+    
+    // Process height animations
+    for (let i = heightAnimations.length - 1; i >= 0; i--) {
+        const anim = heightAnimations[i];
+        let t = (now - anim.startTime) / anim.duration;
+        if (t >= 1) {
+            t = 1;
+            heightAnimations.splice(i, 1);
+        }
+        const eased = easeInOutCubic(t);
+        const h = anim.from + (anim.to - anim.from) * eased;
+        barCurrentHeight[anim.barIndex] = h;
+        bars[anim.barIndex].scale.y = h;
+    }
+    
+    // Process position animations
+    for (let i = posAnimations.length - 1; i >= 0; i--) {
+        const anim = posAnimations[i];
+        let t = (now - anim.startTime) / anim.duration;
+        if (t >= 1) {
+            t = 1;
+            posAnimations.splice(i, 1);
+        }
+        const eased = easeInOutCubic(t);
+        const x = anim.from + (anim.to - anim.from) * eased;
+        barCurrentX[anim.barIndex] = x;
+        bars[anim.barIndex].position.x = x;
+    }
+    
+    // Pulsing animation
+    if (pulsingActive && pulsingBar >= 0) {
+        const elapsed = (now - pulsingStartTime) / 500;
+        const scale = 1.0 + 0.1 * Math.sin(elapsed * Math.PI * 2);
+        bars[pulsingBar].scale.x = scale;
+        bars[pulsingBar].scale.z = scale;
+    }
+    
+    // Fish rotation and movement
+    if (fishModel) {
+        fishModel.rotation.y += 0.5 * dt;
+        
+        if (fishMoving) {
+            let t = (now - fishMoveStart) / FISH_MOVE_DURATION;
+            if (t >= 1) {
+                t = 1;
+                fishMoving = false;
+            }
+            const eased = easeInOutCubic(t);
+            fishCurrentPos.lerpVectors(fishMoveFrom, fishMoveTo, eased);
+            fishModel.position.copy(fishCurrentPos);
+        } else {
+            // Keep fish on top of tallest bar
+            const target = getFishTargetPosition();
+            if (fishCurrentPos.distanceTo(target) > 0.1) {
+                startFishMove();
+            }
+        }
+        
+        state.fishPosition = {
+            x: round1(fishModel.position.x),
+            y: round1(fishModel.position.y),
+            z: round1(fishModel.position.z)
+        };
+    }
+    
+    // Update state
+    for (let i = 0; i < 5; i++) {
+        state.barHeights[i] = round1(barCurrentHeight[i]);
+        state.barPositionsX[i] = round1(barCurrentX[i]);
+    }
+    state.cameraDistance = round1(camera.position.length());
+    
+    updateHUD();
+    updateLabels();
+    
+    renderer.render(scene, camera);
+}
+
+// ---- Resize ----
+window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+animate();
+</script>
+</body>
+</html>

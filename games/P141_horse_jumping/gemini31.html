@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>马术跳跃赛</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #87CEEB;
+        }
+        #hud {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            background: rgba(0, 0, 0, 0.6);
+            color: white;
+            padding: 15px;
+            border-radius: 8px;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            pointer-events: none;
+            user-select: none;
+        }
+        #hud div {
+            margin-bottom: 5px;
+            font-size: 16px;
+        }
+        #hud span {
+            font-weight: bold;
+            color: #FFD700;
+        }
+        #instructions {
+            position: absolute;
+            bottom: 20px;
+            width: 100%;
+            text-align: center;
+            color: white;
+            font-family: sans-serif;
+            font-size: 18px;
+            text-shadow: 1px 1px 2px black;
+            pointer-events: none;
+        }
+    </style>
+    <script type="importmap">
+    { "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+    } }
+    </script>
+</head>
+<body>
+    <div id="hud">
+        <div>得分: <span id="score">0</span></div>
+        <div>已通过: <span id="cleared">0</span></div>
+        <div>失误: <span id="faults">0</span></div>
+        <div>速度: <span id="speed">0</span> m/s</div>
+    </div>
+    <div id="instructions">按【空格键】跳跃</div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+        // --- State ---
+        const state = {
+            modelLoaded: false,
+            score: 0,
+            hurdlesCleared: 0,
+            faults: 0,
+            speed: 0,
+            position: 0,
+            isJumping: false
+        };
+        window.__3D_STATE__ = state;
+
+        let gameState = 'RUNNING'; // RUNNING, CRASHED
+        let crashTimer = 0;
+        const BASE_SPEED = 6;
+        const JUMP_VY = 8;
+        const GRAVITY = 15;
+        let vy = 0;
+        let perfectJumpHurdleId = -1;
+
+        // --- DOM Elements ---
+        const elScore = document.getElementById('score');
+        const elCleared = document.getElementById('cleared');
+        const elFaults = document.getElementById('faults');
+        const elSpeed = document.getElementById('speed');
+
+        // --- Scene Setup ---
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x87CEEB);
+        scene.fog = new THREE.Fog(0x87CEEB, 20, 80);
+
+        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+        
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.shadowMap.enabled = true;
+        document.body.appendChild(renderer.domElement);
+
+        // --- Lights ---
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+        dirLight.position.set(10, 20, 10);
+        dirLight.castShadow = true;
+        dirLight.shadow.camera.top = 20;
+        dirLight.shadow.camera.bottom = -20;
+        dirLight.shadow.camera.left = -20;
+        dirLight.shadow.camera.right = 20;
+        scene.add(dirLight);
+
+        // --- Environment (Track) ---
+        // Striped ground texture
+        const canvas = document.createElement('canvas');
+        canvas.width = 512;
+        canvas.height = 512;
+        const ctx = canvas.getContext('2d');
+        ctx.fillStyle = '#4CAF50';
+        ctx.fillRect(0, 0, 512, 512);
+        ctx.fillStyle = '#388E3C';
+        ctx.fillRect(0, 0, 512, 256);
+        const groundTex = new THREE.CanvasTexture(canvas);
+        groundTex.wrapS = THREE.RepeatWrapping;
+        groundTex.wrapT = THREE.RepeatWrapping;
+        groundTex.repeat.set(2, 60);
+
+        const groundGeo = new THREE.PlaneGeometry(20, 120);
+        const groundMat = new THREE.MeshStandardMaterial({ map: groundTex });
+        const ground = new THREE.Mesh(groundGeo, groundMat);
+        ground.rotation.x = -Math.PI / 2;
+        ground.position.z = -30;
+        ground.receiveShadow = true;
+        scene.add(ground);
+
+        // --- Hurdles ---
+        const hurdleHeights = [0.5, 0.8, 1.0, 1.2, 1.0, 1.5];
+        const hurdles = [];
+        const hurdleSpacing = 10;
+        const startZ = -10;
+
+        const postMat = new THREE.MeshStandardMaterial({ color: 0x8B4513 });
+        const barMat = new THREE.MeshStandardMaterial({ color: 0xFFFFFF });
+
+        function createHurdles() {
+            hurdles.forEach(h => {
+                scene.remove(h.group);
+            });
+            hurdles.length = 0;
+
+            for (let i = 0; i < 6; i++) {
+                const height = hurdleHeights[i];
+                const zPos = startZ - i * hurdleSpacing;
+                
+                const group = new THREE.Group();
+                group.position.z = zPos;
+
+                // Posts
+                const postGeo = new THREE.BoxGeometry(0.2, height, 0.2);
+                const postL = new THREE.Mesh(postGeo, postMat);
+                postL.position.set(-2, height / 2, 0);
+                postL.castShadow = true;
+                const postR = new THREE.Mesh(postGeo, postMat);
+                postR.position.set(2, height / 2, 0);
+                postR.castShadow = true;
+                group.add(postL, postR);
+
+                // Bar
+                const barGeo = new THREE.BoxGeometry(4.2, 0.15, 0.15);
+                const bar = new THREE.Mesh(barGeo, barMat);
+                bar.position.set(0, height, 0);
+                bar.castShadow = true;
+                group.add(bar);
+
+                scene.add(group);
+
+                hurdles.push({
+                    id: i,
+                    z: zPos,
+                    height: height,
+                    group: group,
+                    bar: bar,
+                    evaluated: false,
+                    knocked: false
+                });
+            }
+        }
+        createHurdles();
+
+        // --- Horse Model ---
+        const horseGroup = new THREE.Group();
+        scene.add(horseGroup);
+
+        // Placeholder
+        const placeholderGeo = new THREE.BoxGeometry(1, 1.5, 2);
+        const placeholderMat = new THREE.MeshStandardMaterial({ color: 0x8B4513 });
+        const placeholder = new THREE.Mesh(placeholderGeo, placeholderMat);
+        placeholder.position.y = 0.75;
+        placeholder.castShadow = true;
+        horseGroup.add(placeholder);
+
+        let mixer, runAction;
+        const loader = new GLTFLoader();
+        loader.load('assets/horse.glb', (gltf) => {
+            const model = gltf.scene;
+            // Adjust scale and position based on typical three.js horse model
+            model.scale.set(0.01, 0.01, 0.01);
+            model.traverse((child) => {
+                if (child.isMesh) child.castShadow = true;
+            });
+            
+            horseGroup.remove(placeholder);
+            horseGroup.add(model);
+
+            if (gltf.animations && gltf.animations.length > 0) {
+                mixer = new THREE.AnimationMixer(model);
+                runAction = mixer.clipAction(gltf.animations[0]);
+                runAction.play();
+            }
+            state.modelLoaded = true;
+        }, undefined, (error) => {
+            console.warn('Could not load horse.glb, using placeholder.', error);
+            state.modelLoaded = true; // Proceed anyway
+        });
+
+        // --- Input ---
+        window.addEventListener('keydown', (e) => {
+            if (e.code === 'Space' && !state.isJumping && gameState === 'RUNNING') {
+                state.isJumping = true;
+                vy = JUMP_VY;
+                
+                // Check for "Good Timing" (< 1m from next hurdle)
+                const nextHurdle = hurdles.find(h => !h.evaluated);
+                if (nextHurdle) {
+                    const distance = horseGroup.position.z - nextHurdle.z;
+                    if (distance > 0 && distance <= 1.0) {
+                        perfectJumpHurdleId = nextHurdle.id;
+                    }
+                }
+            }
+        });
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // --- Game Loop ---
+        const clock = new THREE.Clock();
+
+        function updateHUD() {
+            elScore.innerText = state.score;
+            elCleared.innerText = state.hurdlesCleared;
+            elFaults.innerText = state.faults;
+            elSpeed.innerText = state.speed.toFixed(1);
+        }
+
+        function resetTrack() {
+            horseGroup.position.z = 0;
+            createHurdles();
+            perfectJumpHurdleId = -1;
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            const dt = Math.min(clock.getDelta(), 0.1);
+
+            if (mixer) mixer.update(dt);
+
+            if (gameState === 'RUNNING') {
+                state.speed = BASE_SPEED;
+                horseGroup.position.z -= state.speed * dt;
+
+                // Jump Physics
+                if (state.isJumping) {
+                    horseGroup.position.y += vy * dt;
+                    vy -= GRAVITY * dt;
+
+                    if (horseGroup.position.y <= 0) {
+                        horseGroup.position.y = 0;
+                        state.isJumping = false;
+                        vy = 0;
+                    }
+                }
+
+                // Collision & Scoring Logic
+                const nextHurdle = hurdles.find(h => !h.evaluated);
+                if (nextHurdle && horseGroup.position.z <= nextHurdle.z) {
+                    nextHurdle.evaluated = true;
+
+                    if (!state.isJumping && horseGroup.position.y < 0.1) {
+                        // Didn't jump: Crash
+                        gameState = 'CRASHED';
+                        crashTimer = 2.0;
+                        state.score -= 10;
+                        state.faults++;
+                        state.speed = 0;
+                        if (runAction) runAction.paused = true;
+                    } else {
+                        // Jumped
+                        const isPerfect = (perfectJumpHurdleId === nextHurdle.id);
+                        // Approximate horse belly height clearance
+                        const physicalClear = (horseGroup.position.y + 0.4 >= nextHurdle.height);
+
+                        if (isPerfect || physicalClear) {
+                            // Clear
+                            state.score += 10;
+                            state.hurdlesCleared++;
+                        } else {
+                            // Knock down
+                            state.score -= 5;
+                            state.faults++;
+                            nextHurdle.knocked = true;
+                        }
+                    }
+                }
+
+                // Loop track
+                if (horseGroup.position.z < -65) {
+                    resetTrack();
+                }
+
+            } else if (gameState === 'CRASHED') {
+                crashTimer -= dt;
+                if (crashTimer <= 0) {
+                    gameState = 'RUNNING';
+                    if (runAction) runAction.paused = false;
+                    // Move slightly past the hurdle to avoid re-colliding immediately
+                    horseGroup.position.z -= 1; 
+                }
+            }
+
+            // Hurdle Fall Animation
+            hurdles.forEach(h => {
+                if (h.knocked && h.bar.position.y > 0.1) {
+                    h.bar.position.y -= 5 * dt;
+                    h.bar.rotation.x += 10 * dt;
+                    h.bar.position.z -= 2 * dt;
+                }
+            });
+
+            // Camera Follow
+            camera.position.x = horseGroup.position.x;
+            camera.position.y = horseGroup.position.y + 3;
+            camera.position.z = horseGroup.position.z + 6;
+            camera.lookAt(horseGroup.position.x, horseGroup.position.y + 1, horseGroup.position.z - 2);
+
+            // Update State & HUD
+            state.position = -horseGroup.position.z;
+            updateHUD();
+
+            renderer.render(scene, camera);
+        }
+
+        animate();
+    </script>
+</body>
+</html>

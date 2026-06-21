@@ -1,0 +1,489 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Drone Assembly</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #1a1a2e;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            user-select: none;
+        }
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+        }
+        .ui-panel {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            display: flex;
+            gap: 10px;
+            z-index: 10;
+        }
+        button {
+            background: #2a2a4a;
+            color: white;
+            border: 1px solid #4a4a7a;
+            padding: 8px 16px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-weight: bold;
+            transition: all 0.2s;
+        }
+        button:hover:not(:disabled) {
+            background: #3a3a6a;
+            border-color: #6a6a9a;
+        }
+        button:disabled {
+            background: #1a1a2e;
+            color: #444;
+            border-color: #333;
+            cursor: not-allowed;
+        }
+        #hud-progress {
+            position: absolute;
+            top: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            color: white;
+            font-size: 24px;
+            font-weight: bold;
+            background: rgba(0, 0, 0, 0.5);
+            padding: 10px 20px;
+            border-radius: 8px;
+            z-index: 10;
+            pointer-events: none;
+        }
+        #hud-tooltip {
+            position: absolute;
+            background: rgba(255, 255, 255, 0.9);
+            color: black;
+            padding: 5px 10px;
+            border-radius: 4px;
+            font-size: 14px;
+            pointer-events: none;
+            display: none;
+            z-index: 20;
+            transform: translate(15px, 15px);
+        }
+        #hud-complete {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: #4ade80;
+            font-size: 48px;
+            font-weight: bold;
+            text-shadow: 0 0 20px rgba(74, 222, 128, 0.5);
+            display: none;
+            z-index: 10;
+            pointer-events: none;
+        }
+        #hud-warning {
+            position: absolute;
+            top: 80px;
+            left: 50%;
+            transform: translateX(-50%);
+            color: #f87171;
+            font-size: 18px;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 8px 16px;
+            border-radius: 4px;
+            display: none;
+            z-index: 10;
+            pointer-events: none;
+            opacity: 0;
+            transition: opacity 0.3s;
+        }
+    </style>
+    <!-- Import maps polyfill -->
+    <script async src="https://unpkg.com/es-module-shims@1.8.0/dist/es-module-shims.js"></script>
+    
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
+                "@tweenjs/tween.js": "https://unpkg.com/@tweenjs/tween.js@23.1.1/dist/tween.esm.js"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="canvas-container"></div>
+    
+    <div class="ui-panel">
+        <button id="btn-undo" disabled>Undo (Ctrl+Z)</button>
+        <button id="btn-redo" disabled>Redo (Ctrl+Y)</button>
+        <button id="btn-reset">Reset</button>
+    </div>
+    
+    <div id="hud-progress">Parts Assembled: 0/5</div>
+    <div id="hud-tooltip"></div>
+    <div id="hud-complete">Assembly Complete!</div>
+    <div id="hud-warning">Assemble the Frame first!</div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+        import * as TWEEN from '@tweenjs/tween.js';
+
+        // State Management
+        window.__3D_STATE__ = {
+            assembledParts: [],
+            undoStack: [],
+            redoStack: [],
+            totalAssembled: 0,
+            isComplete: false,
+            hoveredPart: null,
+            storkLoaded: false,
+            animating: false,
+            undoEnabled: false,
+            redoEnabled: false
+        };
+
+        // DOM Elements
+        const btnUndo = document.getElementById('btn-undo');
+        const btnRedo = document.getElementById('btn-redo');
+        const btnReset = document.getElementById('btn-reset');
+        const hudProgress = document.getElementById('hud-progress');
+        const hudTooltip = document.getElementById('hud-tooltip');
+        const hudComplete = document.getElementById('hud-complete');
+        const hudWarning = document.getElementById('hud-warning');
+
+        // Scene Setup
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color('#1a1a2e');
+
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+        camera.position.set(0, 5, 10);
+        camera.lookAt(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        container.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.05;
+
+        // Lights
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+        dirLight.position.set(5, 10, 5);
+        scene.add(dirLight);
+
+        // Load Stork
+        let stork;
+        const loader = new GLTFLoader();
+        loader.load('https://raw.githubusercontent.com/mrdoob/three.js/master/examples/models/gltf/Stork.glb', (gltf) => {
+            stork = gltf.scene;
+            stork.scale.set(0.3, 0.3, 0.3);
+            stork.position.set(0, 4, 0);
+            
+            // Fix materials for better look
+            stork.traverse((child) => {
+                if (child.isMesh) {
+                    child.material.side = THREE.DoubleSide;
+                }
+            });
+            
+            scene.add(stork);
+            window.__3D_STATE__.storkLoaded = true;
+        });
+
+        // Drone Parts Definition
+        const partsConfig = [
+            { id: 'frame', name: 'Frame', geo: new THREE.BoxGeometry(2, 0.2, 2), color: 0x333333, tray: new THREE.Vector3(5, 0.5, -3), target: new THREE.Vector3(0, 0.5, 0) },
+            { id: 'motor_fl', name: 'Motor FL', geo: new THREE.CylinderGeometry(0.2, 0.2, 0.5, 32), color: 0xff0000, tray: new THREE.Vector3(5, 0.5, -1.5), target: new THREE.Vector3(-0.8, 0.8, -0.8) },
+            { id: 'motor_fr', name: 'Motor FR', geo: new THREE.CylinderGeometry(0.2, 0.2, 0.5, 32), color: 0x0000ff, tray: new THREE.Vector3(5, 0.5, 0), target: new THREE.Vector3(0.8, 0.8, -0.8) },
+            { id: 'motor_bl', name: 'Motor BL', geo: new THREE.CylinderGeometry(0.2, 0.2, 0.5, 32), color: 0x00ff00, tray: new THREE.Vector3(5, 0.5, 1.5), target: new THREE.Vector3(-0.8, 0.8, 0.8) },
+            { id: 'motor_br', name: 'Motor BR', geo: new THREE.CylinderGeometry(0.2, 0.2, 0.5, 32), color: 0xffff00, tray: new THREE.Vector3(5, 0.5, 3), target: new THREE.Vector3(0.8, 0.8, 0.8) }
+        ];
+
+        const parts = {};
+        const interactableObjects = [];
+
+        // Create Parts and Ghosts
+        partsConfig.forEach(config => {
+            // Ghost
+            const ghostMat = new THREE.MeshBasicMaterial({ color: config.color, wireframe: true, transparent: true, opacity: 0.3 });
+            const ghost = new THREE.Mesh(config.geo, ghostMat);
+            ghost.position.copy(config.target);
+            scene.add(ghost);
+
+            // Actual Part
+            const mat = new THREE.MeshStandardMaterial({ color: config.color, roughness: 0.4, metalness: 0.1 });
+            const mesh = new THREE.Mesh(config.geo, mat);
+            mesh.position.copy(config.tray);
+            
+            mesh.userData = {
+                id: config.id,
+                name: config.name,
+                trayPos: config.tray,
+                targetPos: config.target,
+                state: 'tray', // 'tray' or 'assembled'
+                originalEmissive: mat.emissive.clone()
+            };
+
+            scene.add(mesh);
+            parts[config.id] = mesh;
+            interactableObjects.push(mesh);
+        });
+
+        // Tray Base (Visual only)
+        const trayGeo = new THREE.BoxGeometry(1.5, 0.1, 8);
+        const trayMat = new THREE.MeshStandardMaterial({ color: 0x222222 });
+        const trayMesh = new THREE.Mesh(trayGeo, trayMat);
+        trayMesh.position.set(5, 0.2, 0);
+        scene.add(trayMesh);
+
+        // Assembly Base (Visual only)
+        const baseGeo = new THREE.CylinderGeometry(2.5, 2.5, 0.1, 32);
+        const baseMat = new THREE.MeshStandardMaterial({ color: 0x222222 });
+        const baseMesh = new THREE.Mesh(baseGeo, baseMat);
+        baseMesh.position.set(0, 0.2, 0);
+        scene.add(baseMesh);
+
+        // Raycaster
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+
+        // State Update Function
+        function updateStateUI() {
+            const state = window.__3D_STATE__;
+            state.totalAssembled = state.assembledParts.length;
+            state.undoEnabled = state.undoStack.length > 0 && !state.animating;
+            state.redoEnabled = state.redoStack.length > 0 && !state.animating;
+            state.isComplete = state.totalAssembled === 5;
+
+            hudProgress.innerText = `Parts Assembled: ${state.totalAssembled}/5`;
+            btnUndo.disabled = !state.undoEnabled;
+            btnRedo.disabled = !state.redoEnabled;
+
+            if (state.isComplete) {
+                hudComplete.style.display = 'block';
+                triggerCelebration();
+            } else {
+                hudComplete.style.display = 'none';
+            }
+        }
+
+        let warningTimeout;
+        function showWarning() {
+            hudWarning.style.display = 'block';
+            hudWarning.style.opacity = 1;
+            clearTimeout(warningTimeout);
+            warningTimeout = setTimeout(() => {
+                hudWarning.style.opacity = 0;
+                setTimeout(() => hudWarning.style.display = 'none', 300);
+            }, 2000);
+        }
+
+        function triggerCelebration() {
+            window.__3D_STATE__.assembledParts.forEach(id => {
+                const part = parts[id];
+                const origScale = part.scale.clone();
+                new TWEEN.Tween(part.scale)
+                    .to({ x: 1.2, y: 1.2, z: 1.2 }, 300)
+                    .yoyo(true)
+                    .repeat(3)
+                    .easing(TWEEN.Easing.Quadratic.InOut)
+                    .onComplete(() => part.scale.copy(origScale))
+                    .start();
+            });
+        }
+
+        // Actions
+        function assemble(partId, isRedo = false) {
+            const state = window.__3D_STATE__;
+            if (state.animating) return;
+
+            const part = parts[partId];
+            if (part.userData.state === 'assembled') return;
+
+            if (partId !== 'frame' && !state.assembledParts.includes('frame')) {
+                showWarning();
+                return;
+            }
+
+            state.animating = true;
+            updateStateUI();
+
+            new TWEEN.Tween(part.position)
+                .to({ x: part.userData.targetPos.x, y: part.userData.targetPos.y, z: part.userData.targetPos.z }, 500)
+                .easing(TWEEN.Easing.Cubic.Out)
+                .onComplete(() => {
+                    part.userData.state = 'assembled';
+                    state.assembledParts.push(partId);
+                    if (!isRedo) {
+                        state.undoStack.push(partId);
+                        state.redoStack = [];
+                    }
+                    state.animating = false;
+                    updateStateUI();
+                })
+                .start();
+        }
+
+        function disassemble(partId, isUndo = false) {
+            const state = window.__3D_STATE__;
+            if (state.animating) return;
+
+            const part = parts[partId];
+            if (part.userData.state === 'tray') return;
+
+            state.animating = true;
+            updateStateUI();
+
+            new TWEEN.Tween(part.position)
+                .to({ x: part.userData.trayPos.x, y: part.userData.trayPos.y, z: part.userData.trayPos.z }, 500)
+                .easing(TWEEN.Easing.Cubic.Out)
+                .onComplete(() => {
+                    part.userData.state = 'tray';
+                    state.assembledParts = state.assembledParts.filter(id => id !== partId);
+                    state.animating = false;
+                    updateStateUI();
+                })
+                .start();
+        }
+
+        function handleUndo() {
+            const state = window.__3D_STATE__;
+            if (!state.undoEnabled) return;
+            const partId = state.undoStack.pop();
+            state.redoStack.push(partId);
+            disassemble(partId, true);
+        }
+
+        function handleRedo() {
+            const state = window.__3D_STATE__;
+            if (!state.redoEnabled) return;
+            const partId = state.redoStack.pop();
+            state.undoStack.push(partId);
+            assemble(partId, true);
+        }
+
+        function handleReset() {
+            const state = window.__3D_STATE__;
+            if (state.animating) return;
+            
+            const partsToReset = [...state.assembledParts];
+            if (partsToReset.length === 0) return;
+
+            state.animating = true;
+            updateStateUI();
+
+            let completed = 0;
+            partsToReset.forEach(partId => {
+                const part = parts[partId];
+                new TWEEN.Tween(part.position)
+                    .to({ x: part.userData.trayPos.x, y: part.userData.trayPos.y, z: part.userData.trayPos.z }, 500)
+                    .easing(TWEEN.Easing.Cubic.Out)
+                    .onComplete(() => {
+                        part.userData.state = 'tray';
+                        completed++;
+                        if (completed === partsToReset.length) {
+                            state.assembledParts = [];
+                            state.undoStack = [];
+                            state.redoStack = [];
+                            state.animating = false;
+                            updateStateUI();
+                        }
+                    })
+                    .start();
+            });
+        }
+
+        // Event Listeners
+        btnUndo.addEventListener('click', handleUndo);
+        btnRedo.addEventListener('click', handleRedo);
+        btnReset.addEventListener('click', handleReset);
+
+        window.addEventListener('keydown', (e) => {
+            if (e.ctrlKey && e.key.toLowerCase() === 'z') {
+                handleUndo();
+            } else if (e.ctrlKey && e.key.toLowerCase() === 'y') {
+                handleRedo();
+            }
+        });
+
+        window.addEventListener('mousemove', (event) => {
+            mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+            hudTooltip.style.left = event.clientX + 'px';
+            hudTooltip.style.top = event.clientY + 'px';
+
+            raycaster.setFromCamera(mouse, camera);
+            const intersects = raycaster.intersectObjects(interactableObjects);
+
+            // Reset emissive
+            interactableObjects.forEach(obj => {
+                obj.material.emissive.copy(obj.userData.originalEmissive);
+            });
+
+            if (intersects.length > 0) {
+                const object = intersects[0].object;
+                object.material.emissive.setHex(0x444444);
+                
+                window.__3D_STATE__.hoveredPart = object.userData.id;
+                hudTooltip.innerText = object.userData.name;
+                hudTooltip.style.display = 'block';
+                document.body.style.cursor = 'pointer';
+            } else {
+                window.__3D_STATE__.hoveredPart = null;
+                hudTooltip.style.display = 'none';
+                document.body.style.cursor = 'default';
+            }
+        });
+
+        window.addEventListener('click', () => {
+            const state = window.__3D_STATE__;
+            if (state.animating || !state.hoveredPart) return;
+
+            const part = parts[state.hoveredPart];
+            if (part.userData.state === 'tray') {
+                assemble(state.hoveredPart);
+            }
+        });
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // Animation Loop
+        const clock = new THREE.Clock();
+
+        function animate(time) {
+            requestAnimationFrame(animate);
+            
+            TWEEN.update(time);
+            controls.update();
+
+            if (stork) {
+                stork.rotation.y += 0.01;
+                // Gentle bobbing
+                stork.position.y = 4 + Math.sin(clock.getElapsedTime() * 2) * 0.2;
+            }
+
+            renderer.render(scene, camera);
+        }
+
+        animate();
+        updateStateUI();
+    </script>
+</body>
+</html>

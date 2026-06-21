@@ -1,0 +1,609 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Procedural City Builder</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { overflow: hidden; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+body.demolish-active { border: 4px solid red; }
+canvas { display: block; }
+
+#ui-container {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    pointer-events: none;
+    z-index: 10;
+}
+
+#hud {
+    position: absolute;
+    top: 10px;
+    left: 10px;
+    background: rgba(0,0,0,0.7);
+    color: white;
+    padding: 12px 16px;
+    border-radius: 8px;
+    font-size: 14px;
+    line-height: 1.8;
+    pointer-events: none;
+}
+
+#hud div { white-space: nowrap; }
+
+#toolbar {
+    position: absolute;
+    top: 10px;
+    left: 50%;
+    transform: translateX(-50%);
+    display: flex;
+    gap: 8px;
+    pointer-events: all;
+}
+
+#toolbar button {
+    padding: 10px 20px;
+    font-size: 14px;
+    font-weight: bold;
+    border: 3px solid transparent;
+    border-radius: 6px;
+    cursor: pointer;
+    color: white;
+    transition: all 0.2s;
+}
+
+#toolbar button:hover { opacity: 0.85; }
+#toolbar button.selected { border-color: #f1c40f; }
+
+#btn-house { background: #c0392b; }
+#btn-office { background: #2980b9; }
+#btn-factory { background: #7f8c8d; }
+#btn-park { background: #27ae60; }
+#btn-reset { background: #e74c3c; margin-left: 20px; }
+
+#instructions {
+    position: absolute;
+    bottom: 10px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: rgba(0,0,0,0.6);
+    color: white;
+    padding: 8px 16px;
+    border-radius: 6px;
+    font-size: 12px;
+    pointer-events: none;
+}
+</style>
+</head>
+<body>
+<div id="ui-container">
+    <div id="hud">
+        <div id="hud-p1-budget">Player 1 Budget: $2000</div>
+        <div id="hud-p2-budget">Player 2 Budget: $2000</div>
+        <div id="hud-buildings">Buildings: 0</div>
+        <div id="hud-population">Population: 0</div>
+        <div id="hud-mode">Mode: Build</div>
+    </div>
+    <div id="toolbar">
+        <button id="btn-house" class="selected" onclick="selectType(0)">House ($100)</button>
+        <button id="btn-office" onclick="selectType(1)">Office ($250)</button>
+        <button id="btn-factory" onclick="selectType(2)">Factory ($400)</button>
+        <button id="btn-park" onclick="selectType(3)">Park ($50)</button>
+        <button id="btn-reset" onclick="resetAll()">Reset</button>
+    </div>
+    <div id="instructions">Click to place | U = Undo | D = Toggle Demolish | Scroll to zoom</div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<script>
+// Building definitions
+const BUILDING_TYPES = [
+    { name: 'House',   width: 6,  height: 8,  depth: 6,  color: 0xc0392b, cost: 100, population: 10 },
+    { name: 'Office',  width: 8,  height: 16, depth: 8,  color: 0x2980b9, cost: 250, population: 50 },
+    { name: 'Factory', width: 12, height: 10, depth: 10, color: 0x7f8c8d, cost: 400, population: 30 },
+    { name: 'Park',    width: 10, height: 1,  depth: 10, color: 0x27ae60, cost: 50,  population: 5 }
+];
+
+// State
+const state = {
+    player1Budget: 2000,
+    player2Budget: 2000,
+    selectedType: 0,
+    totalBuildings: 0,
+    player1Buildings: 0,
+    player2Buildings: 0,
+    population: 0,
+    demolishMode: false,
+    gridOccupied: {},
+    lastAction: 'none',
+    undoStack: [],
+    aiPlacementCount: 0
+};
+window.__3D_STATE__ = state;
+
+// Scene setup
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x87CEEB);
+
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+camera.position.set(30, 40, 30);
+camera.lookAt(0, 0, 0);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+
+const controls = new THREE.OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.05;
+controls.target.set(0, 0, 0);
+
+// Lights
+const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+dirLight.position.set(50, 80, 50);
+dirLight.castShadow = true;
+dirLight.shadow.mapSize.width = 2048;
+dirLight.shadow.mapSize.height = 2048;
+dirLight.shadow.camera.near = 0.5;
+dirLight.shadow.camera.far = 200;
+dirLight.shadow.camera.left = -60;
+dirLight.shadow.camera.right = 60;
+dirLight.shadow.camera.top = 60;
+dirLight.shadow.camera.bottom = -60;
+scene.add(dirLight);
+
+const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+scene.add(ambientLight);
+
+// Ground
+const groundGeom = new THREE.PlaneGeometry(100, 100);
+const groundMat = new THREE.MeshLambertMaterial({ color: 0x4a7c4f });
+const ground = new THREE.Mesh(groundGeom, groundMat);
+ground.rotation.x = -Math.PI / 2;
+ground.position.y = 0;
+ground.receiveShadow = true;
+scene.add(ground);
+
+// Grid helper
+const gridHelper = new THREE.GridHelper(100, 10, 0x000000, 0x333333);
+gridHelper.position.y = 0.01;
+scene.add(gridHelper);
+
+// Raycaster
+const raycaster = new THREE.Raycaster();
+const mouse = new THREE.Vector2();
+
+// Preview mesh
+let previewMesh = null;
+
+// Building meshes group
+const buildingsGroup = new THREE.Group();
+scene.add(buildingsGroup);
+
+// Map from grid key to mesh
+const gridMeshMap = {};
+
+function getGridCell(worldX, worldZ) {
+    // Grid cells from -50 to 50, each 10 units wide
+    // Cell centers at -45, -35, -25, -15, -5, 5, 15, 25, 35, 45
+    const gx = Math.floor((worldX + 50) / 10);
+    const gz = Math.floor((worldZ + 50) / 10);
+    if (gx < 0 || gx > 9 || gz < 0 || gz > 9) return null;
+    return { gx, gz };
+}
+
+function gridCenterFromCell(gx, gz) {
+    return {
+        x: gx * 10 - 45,
+        z: gz * 10 - 45
+    };
+}
+
+function gridKey(gx, gz) {
+    return gx + '_' + gz;
+}
+
+function createBuildingMesh(type, player) {
+    const bt = BUILDING_TYPES[type];
+    const geometry = new THREE.BoxGeometry(bt.width, bt.height, bt.depth);
+
+    let color = new THREE.Color(bt.color);
+    if (player === 2) {
+        // Slightly lighter tint for AI
+        color.r = Math.min(1, color.r + 0.15);
+        color.g = Math.min(1, color.g + 0.15);
+        color.b = Math.min(1, color.b + 0.15);
+    }
+
+    const material = new THREE.MeshLambertMaterial({ color: color });
+    const mesh = new THREE.Mesh(geometry, material);
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+
+    // Add some detail
+    if (type === 0) {
+        // House: add a roof (pyramid)
+        const roofGeom = new THREE.ConeGeometry(5, 4, 4);
+        const roofMat = new THREE.MeshLambertMaterial({ color: 0x8b4513 });
+        const roof = new THREE.Mesh(roofGeom, roofMat);
+        roof.position.y = bt.height / 2 + 2;
+        roof.rotation.y = Math.PI / 4;
+        roof.castShadow = true;
+        mesh.add(roof);
+    } else if (type === 1) {
+        // Office: add window strips
+        for (let i = 0; i < 3; i++) {
+            const stripGeom = new THREE.BoxGeometry(bt.width + 0.1, 0.5, bt.depth + 0.1);
+            const stripMat = new THREE.MeshLambertMaterial({ color: 0x1a5276 });
+            const strip = new THREE.Mesh(stripGeom, stripMat);
+            strip.position.y = -bt.height / 2 + 4 + i * 5;
+            mesh.add(strip);
+        }
+    } else if (type === 2) {
+        // Factory: add chimney
+        const chimneyGeom = new THREE.CylinderGeometry(1, 1, 6, 8);
+        const chimneyMat = new THREE.MeshLambertMaterial({ color: 0x555555 });
+        const chimney = new THREE.Mesh(chimneyGeom, chimneyMat);
+        chimney.position.set(3, bt.height / 2 + 3, 2);
+        chimney.castShadow = true;
+        mesh.add(chimney);
+    } else if (type === 3) {
+        // Park: add some trees
+        for (let i = 0; i < 3; i++) {
+            const trunkGeom = new THREE.CylinderGeometry(0.3, 0.3, 3, 6);
+            const trunkMat = new THREE.MeshLambertMaterial({ color: 0x8B4513 });
+            const trunk = new THREE.Mesh(trunkGeom, trunkMat);
+            trunk.position.set(-3 + i * 3, bt.height / 2 + 1.5, -1 + i * 1);
+            trunk.castShadow = true;
+            mesh.add(trunk);
+
+            const leavesGeom = new THREE.SphereGeometry(1.5, 6, 6);
+            const leavesMat = new THREE.MeshLambertMaterial({ color: 0x2ecc71 });
+            const leaves = new THREE.Mesh(leavesGeom, leavesMat);
+            leaves.position.set(-3 + i * 3, bt.height / 2 + 4, -1 + i * 1);
+            leaves.castShadow = true;
+            mesh.add(leaves);
+        }
+    }
+
+    return mesh;
+}
+
+function createPreviewMesh(type) {
+    const bt = BUILDING_TYPES[type];
+    const geometry = new THREE.BoxGeometry(bt.width, bt.height, bt.depth);
+    const material = new THREE.MeshLambertMaterial({
+        color: bt.color,
+        transparent: true,
+        opacity: 0.4
+    });
+    const mesh = new THREE.Mesh(geometry, material);
+    return mesh;
+}
+
+function updatePreview(type) {
+    if (previewMesh) {
+        scene.remove(previewMesh);
+        previewMesh = null;
+    }
+    if (!state.demolishMode) {
+        previewMesh = createPreviewMesh(type);
+        previewMesh.visible = false;
+        scene.add(previewMesh);
+    }
+}
+
+function placeBuilding(gx, gz, type, player) {
+    const key = gridKey(gx, gz);
+    if (state.gridOccupied[key]) return false;
+
+    const bt = BUILDING_TYPES[type];
+    const budget = player === 1 ? state.player1Budget : state.player2Budget;
+    if (budget < bt.cost) return false;
+
+    const center = gridCenterFromCell(gx, gz);
+    const mesh = createBuildingMesh(type, player);
+    mesh.position.set(center.x, bt.height / 2, center.z);
+    buildingsGroup.add(mesh);
+
+    state.gridOccupied[key] = { player, type, cost: bt.cost };
+    gridMeshMap[key] = mesh;
+
+    if (player === 1) {
+        state.player1Budget -= bt.cost;
+        state.player1Buildings++;
+    } else {
+        state.player2Budget -= bt.cost;
+        state.player2Buildings++;
+    }
+
+    state.totalBuildings++;
+    state.population += bt.population;
+
+    return true;
+}
+
+function removeBuilding(gx, gz, refundPercent) {
+    const key = gridKey(gx, gz);
+    const info = state.gridOccupied[key];
+    if (!info) return null;
+
+    const mesh = gridMeshMap[key];
+    if (mesh) {
+        buildingsGroup.remove(mesh);
+        // Dispose geometry and materials
+        mesh.traverse(child => {
+            if (child.geometry) child.geometry.dispose();
+            if (child.material) child.material.dispose();
+        });
+    }
+
+    const bt = BUILDING_TYPES[info.type];
+    const refund = Math.floor(info.cost * refundPercent);
+
+    if (info.player === 1) {
+        state.player1Budget += refund;
+        state.player1Buildings--;
+    } else {
+        state.player2Budget += refund;
+        state.player2Buildings--;
+    }
+
+    state.totalBuildings--;
+    state.population -= bt.population;
+
+    delete state.gridOccupied[key];
+    delete gridMeshMap[key];
+
+    return info;
+}
+
+function selectType(type) {
+    state.selectedType = type;
+    const buttons = document.querySelectorAll('#toolbar button');
+    buttons.forEach(b => b.classList.remove('selected'));
+    const ids = ['btn-house', 'btn-office', 'btn-factory', 'btn-park'];
+    document.getElementById(ids[type]).classList.add('selected');
+    updatePreview(type);
+}
+
+function updateHUD() {
+    document.getElementById('hud-p1-budget').textContent = 'Player 1 Budget: $' + state.player1Budget;
+    document.getElementById('hud-p2-budget').textContent = 'Player 2 Budget: $' + state.player2Budget;
+    document.getElementById('hud-buildings').textContent = 'Buildings: ' + state.totalBuildings;
+    document.getElementById('hud-population').textContent = 'Population: ' + state.population;
+    document.getElementById('hud-mode').textContent = 'Mode: ' + (state.demolishMode ? 'Demolish' : 'Build');
+
+    if (state.demolishMode) {
+        document.body.classList.add('demolish-active');
+    } else {
+        document.body.classList.remove('demolish-active');
+    }
+}
+
+function resetAll() {
+    // Remove all buildings
+    while (buildingsGroup.children.length > 0) {
+        const mesh = buildingsGroup.children[0];
+        buildingsGroup.remove(mesh);
+        mesh.traverse(child => {
+            if (child.geometry) child.geometry.dispose();
+            if (child.material) child.material.dispose();
+        });
+    }
+
+    state.player1Budget = 2000;
+    state.player2Budget = 2000;
+    state.totalBuildings = 0;
+    state.player1Buildings = 0;
+    state.player2Buildings = 0;
+    state.population = 0;
+    state.demolishMode = false;
+    state.gridOccupied = {};
+    state.lastAction = 'reset';
+    state.undoStack = [];
+    state.aiPlacementCount = 0;
+
+    // Clear mesh map
+    for (const key in gridMeshMap) {
+        delete gridMeshMap[key];
+    }
+
+    updateHUD();
+}
+
+// Mouse events
+function onMouseMove(event) {
+    mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+    mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+    raycaster.setFromCamera(mouse, camera);
+    const intersects = raycaster.intersectObject(ground);
+
+    if (intersects.length > 0 && previewMesh && !state.demolishMode) {
+        const point = intersects[0].point;
+        const cell = getGridCell(point.x, point.z);
+        if (cell) {
+            const center = gridCenterFromCell(cell.gx, cell.gz);
+            const bt = BUILDING_TYPES[state.selectedType];
+            const key = gridKey(cell.gx, cell.gz);
+
+            if (!state.gridOccupied[key]) {
+                previewMesh.visible = true;
+                previewMesh.position.set(center.x, bt.height / 2, center.z);
+            } else {
+                previewMesh.visible = false;
+            }
+        } else {
+            previewMesh.visible = false;
+        }
+    } else if (previewMesh) {
+        previewMesh.visible = false;
+    }
+}
+
+function onClick(event) {
+    // Ignore clicks on UI
+    if (event.target.tagName === 'BUTTON') return;
+
+    mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+    mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+    raycaster.setFromCamera(mouse, camera);
+
+    if (state.demolishMode) {
+        // Check if clicking on a building
+        const buildingIntersects = raycaster.intersectObjects(buildingsGroup.children, false);
+        if (buildingIntersects.length > 0) {
+            const mesh = buildingIntersects[0].object;
+            // Find which grid cell this belongs to
+            for (const key in gridMeshMap) {
+                if (gridMeshMap[key] === mesh) {
+                    const info = state.gridOccupied[key];
+                    if (info && info.player === 1) {
+                        const [gxStr, gzStr] = key.split('_');
+                        removeBuilding(parseInt(gxStr), parseInt(gzStr), 0.5);
+                        state.lastAction = 'demolish';
+                        updateHUD();
+                    }
+                    break;
+                }
+            }
+        }
+        // Also try ground intersection to find building by grid
+        const groundIntersects = raycaster.intersectObject(ground);
+        if (groundIntersects.length > 0) {
+            const point = groundIntersects[0].point;
+            const cell = getGridCell(point.x, point.z);
+            if (cell) {
+                const key = gridKey(cell.gx, cell.gz);
+                const info = state.gridOccupied[key];
+                if (info && info.player === 1) {
+                    removeBuilding(cell.gx, cell.gz, 0.5);
+                    state.lastAction = 'demolish';
+                    updateHUD();
+                }
+            }
+        }
+    } else {
+        // Build mode
+        const intersects = raycaster.intersectObject(ground);
+        if (intersects.length > 0) {
+            const point = intersects[0].point;
+            const cell = getGridCell(point.x, point.z);
+            if (cell) {
+                const key = gridKey(cell.gx, cell.gz);
+                if (!state.gridOccupied[key]) {
+                    const type = state.selectedType;
+                    if (state.player1Budget >= BUILDING_TYPES[type].cost) {
+                        if (placeBuilding(cell.gx, cell.gz, type, 1)) {
+                            state.undoStack.push({ gx: cell.gx, gz: cell.gz, type, cost: BUILDING_TYPES[type].cost });
+                            state.lastAction = 'place';
+                            updateHUD();
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+function onKeyDown(event) {
+    if (event.key === 'u' || event.key === 'U') {
+        // Undo last Player 1 action
+        if (state.undoStack.length > 0) {
+            const action = state.undoStack.pop();
+            const key = gridKey(action.gx, action.gz);
+            if (state.gridOccupied[key] && state.gridOccupied[key].player === 1) {
+                removeBuilding(action.gx, action.gz, 1.0); // Full refund
+                state.lastAction = 'undo';
+                updateHUD();
+            }
+        }
+    } else if (event.key === 'd' || event.key === 'D') {
+        state.demolishMode = !state.demolishMode;
+        updatePreview(state.selectedType);
+        updateHUD();
+    }
+}
+
+window.addEventListener('mousemove', onMouseMove, false);
+window.addEventListener('click', onClick, false);
+window.addEventListener('keydown', onKeyDown, false);
+
+window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// AI Player
+let aiTimer = 0;
+const AI_INTERVAL = 8; // seconds
+
+function aiTurn() {
+    // Find empty cells
+    const emptyCells = [];
+    for (let gx = 0; gx < 10; gx++) {
+        for (let gz = 0; gz < 10; gz++) {
+            const key = gridKey(gx, gz);
+            if (!state.gridOccupied[key]) {
+                emptyCells.push({ gx, gz });
+            }
+        }
+    }
+
+    if (emptyCells.length === 0) return;
+
+    // Pick random type that AI can afford
+    const affordableTypes = [];
+    for (let t = 0; t < 4; t++) {
+        if (state.player2Budget >= BUILDING_TYPES[t].cost) {
+            affordableTypes.push(t);
+        }
+    }
+
+    if (affordableTypes.length === 0) return;
+
+    const type = affordableTypes[Math.floor(Math.random() * affordableTypes.length)];
+    const cell = emptyCells[Math.floor(Math.random() * emptyCells.length)];
+
+    if (placeBuilding(cell.gx, cell.gz, type, 2)) {
+        state.aiPlacementCount++;
+        updateHUD();
+    }
+}
+
+// Initialize preview
+updatePreview(0);
+updateHUD();
+
+// Animation loop
+const clock = new THREE.Clock();
+
+function animate() {
+    requestAnimationFrame(animate);
+
+    const delta = clock.getDelta();
+    aiTimer += delta;
+
+    if (aiTimer >= AI_INTERVAL) {
+        aiTimer = 0;
+        aiTurn();
+    }
+
+    controls.update();
+    renderer.render(scene, camera);
+}
+
+animate();
+</script>
+</body>
+</html>

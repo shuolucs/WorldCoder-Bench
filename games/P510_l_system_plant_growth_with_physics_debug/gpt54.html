@@ -1,0 +1,694 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>3D L-System Plant Growth Debug Simulation</title>
+  <style>
+    html, body {
+      margin: 0;
+      overflow: hidden;
+      background: #0a0a1a;
+      font-family: Arial, sans-serif;
+      color: white;
+    }
+
+    #hud {
+      position: fixed;
+      top: 12px;
+      right: 12px;
+      min-width: 260px;
+      background: rgba(0,0,0,0.55);
+      color: #fff;
+      padding: 10px 12px;
+      border-radius: 8px;
+      font-size: 12px;
+      line-height: 1.4;
+      pointer-events: none;
+      white-space: pre-line;
+      border: 1px solid rgba(255,255,255,0.12);
+    }
+
+    #buttonBar {
+      position: fixed;
+      bottom: 14px;
+      left: 50%;
+      transform: translateX(-50%);
+      display: flex;
+      gap: 8px;
+      z-index: 10;
+    }
+
+    #buttonBar button {
+      background: rgba(20,20,30,0.75);
+      color: white;
+      border: 1px solid rgba(255,255,255,0.18);
+      border-radius: 6px;
+      padding: 8px 12px;
+      cursor: pointer;
+      font-size: 13px;
+      transition: background 0.2s, transform 0.1s;
+    }
+
+    #buttonBar button:hover {
+      background: rgba(40,40,60,0.9);
+    }
+
+    #buttonBar button:active {
+      transform: scale(0.98);
+    }
+
+    #info {
+      position: fixed;
+      top: 12px;
+      left: 12px;
+      background: rgba(0,0,0,0.35);
+      padding: 8px 10px;
+      border-radius: 6px;
+      font-size: 12px;
+      border: 1px solid rgba(255,255,255,0.08);
+      pointer-events: none;
+    }
+  </style>
+</head>
+<body>
+  <div id="info">
+    Keys: G = Grow, R = Reset, D = Debug, W = Wind, C = Color
+  </div>
+  <div id="hud"></div>
+
+  <div id="buttonBar">
+    <button id="growBtn">Grow (G)</button>
+    <button id="resetBtn">Reset (R)</button>
+    <button id="debugBtn">Debug (D)</button>
+    <button id="windBtn">Wind (W)</button>
+    <button id="colorBtn">Color (C)</button>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0a0a1a);
+
+    const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+    camera.position.set(0, 5, 12);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    document.body.appendChild(renderer.domElement);
+
+    const ambient = new THREE.AmbientLight(0x334455, 0.4);
+    scene.add(ambient);
+
+    const dirLight = new THREE.DirectionalLight(0xffeedd, 0.8);
+    dirLight.position.set(5, 10, 5);
+    scene.add(dirLight);
+
+    const ground = new THREE.Mesh(
+      new THREE.PlaneGeometry(20, 20),
+      new THREE.MeshPhongMaterial({ color: 0x1a3a1a, side: THREE.DoubleSide })
+    );
+    ground.rotation.x = -Math.PI / 2;
+    ground.position.y = 0;
+    scene.add(ground);
+
+    const grid = new THREE.GridHelper(20, 20, 0x446644, 0x335533);
+    grid.position.y = 0.001;
+    scene.add(grid);
+
+    const plantGroup = new THREE.Group();
+    scene.add(plantGroup);
+
+    const debugGroup = new THREE.Group();
+    scene.add(debugGroup);
+
+    const hud = document.getElementById('hud');
+
+    const SEGMENT_LENGTH = 0.4;
+    const BASE_RADIUS = 0.05;
+    const ANGLE = THREE.MathUtils.degToRad(25);
+    const MAX_GENERATION = 5;
+
+    let generation = 0;
+    let lsystemString = 'F';
+    let branchData = [];
+    let leafData = [];
+
+    let debugOverlayActive = false;
+    let windStrength = 0;
+    let colorMode = 'natural';
+    let isGrowing = false;
+    let growthStartTime = 0;
+    let growthDuration = 2.0;
+    let currentGrowthGen = 0;
+
+    let lastFrameTime = performance.now();
+    let fps = 0;
+
+    const windModes = [0, 0.5, 1.0];
+    const colorModes = ['natural', 'depth', 'stress'];
+
+    const clock = new THREE.Clock();
+
+    window.__3D_STATE__ = {
+      generation: 0,
+      branchCount: 0,
+      leafCount: 0,
+      totalMeshCount: 0,
+      debugOverlayActive: false,
+      windStrength: 0,
+      windActive: false,
+      colorMode: 'natural',
+      isGrowing: false,
+      boundingBox: { width: 0, height: 0, depth: 0 },
+      centerOfMass: { x: 0, y: 0, z: 0 },
+      fps: 0,
+      plantPosition: { x: 0, y: 0, z: 0 },
+      lsystemString: 'F',
+      maxGeneration: 5
+    };
+
+    function expandLSystem(str) {
+      const rules = {
+        'F': 'FF+[+F-F-F]-[-F+F+F]'
+      };
+      let result = '';
+      for (const ch of str) result += rules[ch] || ch;
+      return result;
+    }
+
+    function computeStringForGeneration(gen) {
+      let s = 'F';
+      for (let i = 0; i < gen; i++) s = expandLSystem(s);
+      return s;
+    }
+
+    function lerpColorHex(c1, c2, t) {
+      const a = new THREE.Color(c1);
+      const b = new THREE.Color(c2);
+      return a.lerp(b, t);
+    }
+
+    function getBranchColor(depth, maxDepth, startPos, endPos) {
+      if (colorMode === 'natural') {
+        const t = maxDepth > 0 ? depth / maxDepth : 0;
+        return lerpColorHex(0x8B4513, 0x228B22, t);
+      } else if (colorMode === 'depth') {
+        const t = maxDepth > 0 ? depth / maxDepth : 0;
+        const c = new THREE.Color();
+        c.setHSL(0.08 + 0.75 * t, 0.7, 0.45);
+        return c;
+      } else {
+        const dist = endPos.length();
+        const normalized = Math.min(dist / 5.0, 1.0);
+        return lerpColorHex(0xff3333, 0x3366ff, normalized);
+      }
+    }
+
+    function getLeafColor(depth, maxDepth, pos) {
+      if (colorMode === 'natural') return new THREE.Color(0x44cc44);
+      if (colorMode === 'depth') {
+        const c = new THREE.Color();
+        c.setHSL(0.25 + 0.5 * (maxDepth > 0 ? depth / maxDepth : 0), 0.8, 0.55);
+        return c;
+      }
+      const dist = pos.length();
+      const normalized = Math.min(dist / 5.0, 1.0);
+      return lerpColorHex(0xff4444, 0x4444ff, normalized);
+    }
+
+    function clearGroup(group) {
+      while (group.children.length) {
+        const child = group.children.pop();
+        if (child.geometry) child.geometry.dispose();
+        if (child.material) {
+          if (Array.isArray(child.material)) child.material.forEach(m => m.dispose());
+          else child.material.dispose();
+        }
+      }
+    }
+
+    function buildPlant(gen) {
+      clearGroup(plantGroup);
+      clearGroup(debugGroup);
+
+      branchData = [];
+      leafData = [];
+      lsystemString = computeStringForGeneration(gen);
+
+      const stack = [];
+      const pos = new THREE.Vector3(0, 0, 0);
+      const quat = new THREE.Quaternion();
+      const upAxis = new THREE.Vector3(0, 1, 0);
+
+      let depth = 0;
+      let maxDepth = 0;
+
+      for (const ch of lsystemString) {
+        if (ch === '[') {
+          stack.push({
+            pos: pos.clone(),
+            quat: quat.clone(),
+            depth
+          });
+          depth++;
+          maxDepth = Math.max(maxDepth, depth);
+        } else if (ch === ']') {
+          const s = stack.pop();
+          if (s) {
+            pos.copy(s.pos);
+            quat.copy(s.quat);
+            depth = s.depth;
+          }
+        }
+      }
+
+      pos.set(0, 0, 0);
+      quat.identity();
+      depth = 0;
+
+      const branchGeo = new THREE.CylinderGeometry(1, 1, 1, 8);
+      const leafGeo = new THREE.IcosahedronGeometry(0.08, 0);
+
+      let branchIndex = 0;
+      let leafCandidateTips = [];
+
+      for (let i = 0; i < lsystemString.length; i++) {
+        const ch = lsystemString[i];
+
+        if (ch === 'F') {
+          const start = pos.clone();
+          const dir = upAxis.clone().applyQuaternion(quat).normalize();
+          const end = start.clone().add(dir.clone().multiplyScalar(SEGMENT_LENGTH));
+          const mid = start.clone().add(end).multiplyScalar(0.5);
+
+          const radius = Math.max(0.012, BASE_RADIUS * (1.0 - depth * 0.12));
+          const color = getBranchColor(depth, maxDepth, start, end);
+
+          const mat = new THREE.MeshPhongMaterial({ color });
+          const mesh = new THREE.Mesh(branchGeo, mat);
+
+          mesh.position.copy(mid);
+          mesh.quaternion.copy(quat);
+          mesh.scale.set(radius, SEGMENT_LENGTH, radius);
+
+          plantGroup.add(mesh);
+
+          branchData.push({
+            mesh,
+            start: start.clone(),
+            end: end.clone(),
+            baseMid: mid.clone(),
+            quat: quat.clone(),
+            dir: dir.clone(),
+            depth,
+            radius,
+            growthGen: gen,
+            isNew: false,
+            branchIndex
+          });
+
+          branchIndex++;
+          pos.copy(end);
+
+          const next = lsystemString[i + 1];
+          if (next !== 'F' && next !== '+' && next !== '-') {
+            leafCandidateTips.push({
+              position: end.clone(),
+              depth,
+              quat: quat.clone(),
+              dir: dir.clone()
+            });
+          }
+        } else if (ch === '+') {
+          const q = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), ANGLE);
+          quat.multiply(q);
+        } else if (ch === '-') {
+          const q = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), -ANGLE);
+          quat.multiply(q);
+        } else if (ch === '[') {
+          stack.push({
+            pos: pos.clone(),
+            quat: quat.clone(),
+            depth
+          });
+          depth++;
+        } else if (ch === ']') {
+          const s = stack.pop();
+          if (s) {
+            pos.copy(s.pos);
+            quat.copy(s.quat);
+            depth = s.depth;
+          }
+        }
+      }
+
+      for (const tip of leafCandidateTips) {
+        const mat = new THREE.MeshPhongMaterial({ color: getLeafColor(tip.depth, maxDepth, tip.position) });
+        const leaf = new THREE.Mesh(leafGeo, mat);
+        leaf.position.copy(tip.position);
+        leaf.quaternion.copy(tip.quat);
+        plantGroup.add(leaf);
+
+        leafData.push({
+          mesh: leaf,
+          basePosition: tip.position.clone(),
+          depth: tip.depth,
+          dir: tip.dir.clone(),
+          growthGen: gen,
+          isNew: false
+        });
+      }
+
+      const prevString = gen > 0 ? computeStringForGeneration(gen - 1) : '';
+      const prevBranchCount = (prevString.match(/F/g) || []).length;
+      const prevLeafCount = estimateLeafCount(prevString);
+
+      branchData.forEach((b, idx) => b.isNew = idx >= prevBranchCount);
+      leafData.forEach((l, idx) => l.isNew = idx >= prevLeafCount);
+
+      applyCurrentColors();
+      if (debugOverlayActive) rebuildDebugOverlay();
+    }
+
+    function estimateLeafCount(str) {
+      if (!str) return 0;
+      let count = 0;
+      for (let i = 0; i < str.length; i++) {
+        if (str[i] === 'F') {
+          const next = str[i + 1];
+          if (next !== 'F' && next !== '+' && next !== '-') count++;
+        }
+      }
+      return count;
+    }
+
+    function applyCurrentColors() {
+      const maxDepth = Math.max(
+        1,
+        ...branchData.map(b => b.depth),
+        ...leafData.map(l => l.depth)
+      );
+
+      for (const b of branchData) {
+        b.mesh.material.color.copy(getBranchColor(b.depth, maxDepth, b.start, b.end));
+      }
+      for (const l of leafData) {
+        l.mesh.material.color.copy(getLeafColor(l.depth, maxDepth, l.basePosition));
+      }
+    }
+
+    function startGrow() {
+      if (isGrowing || generation >= MAX_GENERATION) return;
+      generation++;
+      currentGrowthGen = generation;
+      buildPlant(generation);
+      isGrowing = true;
+      growthStartTime = clock.getElapsedTime();
+
+      for (const b of branchData) {
+        if (b.isNew) {
+          b.mesh.scale.y = 0.001;
+          const currentMid = b.start.clone().add(b.dir.clone().multiplyScalar(0.0005));
+          b.mesh.position.copy(currentMid);
+        } else {
+          b.mesh.scale.y = SEGMENT_LENGTH;
+          b.mesh.position.copy(b.baseMid);
+        }
+      }
+
+      for (const l of leafData) {
+        l.mesh.scale.setScalar(l.isNew ? 0.001 : 1.0);
+      }
+    }
+
+    function resetPlant() {
+      generation = 0;
+      isGrowing = false;
+      currentGrowthGen = 0;
+      buildPlant(0);
+      for (const b of branchData) {
+        b.mesh.scale.y = SEGMENT_LENGTH;
+        b.mesh.position.copy(b.baseMid);
+      }
+      for (const l of leafData) {
+        l.mesh.scale.setScalar(1);
+      }
+    }
+
+    function toggleDebug() {
+      debugOverlayActive = !debugOverlayActive;
+      debugGroup.visible = debugOverlayActive;
+      hud.style.display = debugOverlayActive ? 'block' : 'none';
+      if (debugOverlayActive) rebuildDebugOverlay();
+    }
+
+    function cycleWind() {
+      const idx = windModes.indexOf(windStrength);
+      windStrength = windModes[(idx + 1) % windModes.length];
+    }
+
+    function cycleColor() {
+      const idx = colorModes.indexOf(colorMode);
+      colorMode = colorModes[(idx + 1) % colorModes.length];
+      applyCurrentColors();
+      if (debugOverlayActive) rebuildDebugOverlay();
+    }
+
+    function rebuildDebugOverlay() {
+      clearGroup(debugGroup);
+
+      const bboxMat = new THREE.LineBasicMaterial({ color: 0xffff00 });
+      const velMat = new THREE.LineBasicMaterial({ color: 0x0000ff });
+      const comMat = new THREE.LineBasicMaterial({ color: 0xff0000 });
+
+      for (const b of branchData) {
+        const box = new THREE.Box3().setFromObject(b.mesh);
+        const helper = new THREE.Box3Helper(box, 0xffff00);
+        debugGroup.add(helper);
+
+        const velocityGeom = new THREE.BufferGeometry().setFromPoints([
+          new THREE.Vector3(0, 0, 0),
+          b.dir.clone().multiplyScalar(0.35)
+        ]);
+        const velocityLine = new THREE.Line(velocityGeom, velMat);
+        velocityLine.position.copy(b.mesh.position);
+        velocityLine.userData.branchRef = b;
+        velocityLine.userData.type = 'velocity';
+        debugGroup.add(velocityLine);
+      }
+
+      for (const l of leafData) {
+        const box = new THREE.Box3().setFromObject(l.mesh);
+        const helper = new THREE.Box3Helper(box, 0xffff00);
+        debugGroup.add(helper);
+      }
+
+      const com = computeCenterOfMass();
+      const comPathGeom = new THREE.BufferGeometry().setFromPoints([
+        new THREE.Vector3(0, 0, 0),
+        com.clone()
+      ]);
+      const comLine = new THREE.Line(comPathGeom, comMat);
+      comLine.userData.type = 'comPath';
+      debugGroup.add(comLine);
+
+      debugGroup.visible = debugOverlayActive;
+    }
+
+    function computeCenterOfMass() {
+      const positions = [];
+      for (const b of branchData) positions.push(b.mesh.position.clone());
+      for (const l of leafData) positions.push(l.mesh.position.clone());
+
+      if (positions.length === 0) return new THREE.Vector3(0, 0, 0);
+
+      const sum = new THREE.Vector3();
+      for (const p of positions) sum.add(p);
+      return sum.multiplyScalar(1 / positions.length);
+    }
+
+    function updateGrowthAndWind(time) {
+      const elapsedGrowth = time - growthStartTime;
+      let growthT = isGrowing ? Math.min(elapsedGrowth / growthDuration, 1) : 1;
+      growthT = growthT * growthT * (3 - 2 * growthT);
+
+      const simTime = clock.getElapsedTime();
+
+      for (const b of branchData) {
+        const newFactor = b.isNew ? growthT : 1;
+        const segLen = Math.max(0.001, SEGMENT_LENGTH * newFactor);
+        b.mesh.scale.set(b.radius, segLen, b.radius);
+
+        const mid = b.start.clone().add(b.dir.clone().multiplyScalar(segLen * 0.5));
+        b.mesh.position.copy(mid);
+
+        let windOffset = 0;
+        if (windStrength > 0) {
+          windOffset = Math.sin(simTime * 2 + b.end.y) * 0.1 * windStrength;
+        }
+        b.mesh.position.x += windOffset;
+      }
+
+      for (const l of leafData) {
+        const scale = l.isNew ? Math.max(0.001, growthT) : 1;
+        l.mesh.scale.setScalar(scale);
+        l.mesh.position.copy(l.basePosition);
+
+        if (windStrength > 0) {
+          const offset = Math.sin(simTime * 2 + l.basePosition.y) * 0.1 * windStrength * 1.5;
+          l.mesh.position.x += offset;
+        }
+      }
+
+      if (isGrowing && elapsedGrowth >= growthDuration) {
+        isGrowing = false;
+        for (const b of branchData) {
+          b.mesh.scale.set(b.radius, SEGMENT_LENGTH, b.radius);
+          b.mesh.position.copy(b.baseMid);
+          if (windStrength > 0) {
+            const offset = Math.sin(simTime * 2 + b.end.y) * 0.1 * windStrength;
+            b.mesh.position.x += offset;
+          }
+        }
+        for (const l of leafData) {
+          l.mesh.scale.setScalar(1);
+        }
+      }
+    }
+
+    function updateDebugOverlay() {
+      if (!debugOverlayActive) return;
+
+      const com = computeCenterOfMass();
+
+      clearGroup(debugGroup);
+
+      for (const b of branchData) {
+        const box = new THREE.Box3().setFromObject(b.mesh);
+        const helper = new THREE.Box3Helper(box, 0xffff00);
+        debugGroup.add(helper);
+
+        const showVelocity = isGrowing && b.isNew;
+        if (showVelocity) {
+          const points = [
+            b.mesh.position.clone(),
+            b.mesh.position.clone().add(b.dir.clone().multiplyScalar(0.5))
+          ];
+          const geom = new THREE.BufferGeometry().setFromPoints(points);
+          const line = new THREE.Line(geom, new THREE.LineBasicMaterial({ color: 0x0000ff }));
+          debugGroup.add(line);
+        }
+      }
+
+      for (const l of leafData) {
+        const box = new THREE.Box3().setFromObject(l.mesh);
+        const helper = new THREE.Box3Helper(box, 0xffff00);
+        debugGroup.add(helper);
+      }
+
+      const root = new THREE.Vector3(0, 0, 0);
+      const comGeom = new THREE.BufferGeometry().setFromPoints([root, com]);
+      const comLine = new THREE.Line(comGeom, new THREE.LineBasicMaterial({ color: 0xff0000 }));
+      debugGroup.add(comLine);
+
+      const box = new THREE.Box3().setFromObject(plantGroup);
+      const size = new THREE.Vector3();
+      box.getSize(size);
+
+      hud.textContent =
+`Generation: ${generation}
+Branch Count: ${branchData.length}
+Leaf Count: ${leafData.length}
+Total Mesh Count: ${plantGroup.children.length}
+Bounding Box: ${size.x.toFixed(2)} x ${size.y.toFixed(2)} x ${size.z.toFixed(2)}
+Center of Mass: (${com.x.toFixed(2)}, ${com.y.toFixed(2)}, ${com.z.toFixed(2)})
+FPS: ${fps.toFixed(1)}
+Debug: ON
+Wind Strength: ${windStrength}
+Color Mode: ${colorMode}
+Growing: ${isGrowing}`;
+    }
+
+    function updateState() {
+      const box = new THREE.Box3().setFromObject(plantGroup);
+      const size = new THREE.Vector3();
+      if (!box.isEmpty()) box.getSize(size);
+
+      const com = computeCenterOfMass();
+
+      window.__3D_STATE__ = {
+        generation,
+        branchCount: branchData.length,
+        leafCount: leafData.length,
+        totalMeshCount: plantGroup.children.length,
+        debugOverlayActive,
+        windStrength,
+        windActive: windStrength > 0,
+        colorMode,
+        isGrowing,
+        boundingBox: {
+          width: size.x,
+          height: size.y,
+          depth: size.z
+        },
+        centerOfMass: {
+          x: com.x,
+          y: com.y,
+          z: com.z
+        },
+        fps,
+        plantPosition: { x: 0, y: 0, z: 0 },
+        lsystemString,
+        maxGeneration: MAX_GENERATION
+      };
+    }
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      const now = performance.now();
+      const dt = Math.max(0.0001, (now - lastFrameTime) / 1000);
+      fps = 1 / dt;
+      lastFrameTime = now;
+
+      const time = clock.getElapsedTime();
+
+      updateGrowthAndWind(time);
+      updateDebugOverlay();
+      updateState();
+
+      renderer.render(scene, camera);
+    }
+
+    window.addEventListener('keydown', (e) => {
+      const key = e.key.toLowerCase();
+      if (key === 'g') startGrow();
+      if (key === 'r') resetPlant();
+      if (key === 'd') toggleDebug();
+      if (key === 'w') cycleWind();
+      if (key === 'c') cycleColor();
+    });
+
+    document.getElementById('growBtn').addEventListener('click', startGrow);
+    document.getElementById('resetBtn').addEventListener('click', resetPlant);
+    document.getElementById('debugBtn').addEventListener('click', toggleDebug);
+    document.getElementById('windBtn').addEventListener('click', cycleWind);
+    document.getElementById('colorBtn').addEventListener('click', cycleColor);
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    buildPlant(0);
+    hud.style.display = 'none';
+    debugGroup.visible = false;
+    animate();
+  </script>
+</body>
+</html>

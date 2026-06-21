@@ -1,0 +1,572 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Supply Chain Flow Visualization</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #1a2030;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            color: white;
+            user-select: none;
+        }
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+        }
+        #hud {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(26, 32, 48, 0.8);
+            padding: 15px;
+            border-radius: 8px;
+            border: 1px solid #445566;
+            pointer-events: none;
+            min-width: 200px;
+        }
+        .hud-item {
+            margin-bottom: 8px;
+            font-size: 14px;
+        }
+        .hud-value {
+            font-weight: bold;
+            color: #44aa88;
+            float: right;
+            margin-left: 15px;
+        }
+        #controls {
+            position: absolute;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: rgba(26, 32, 48, 0.8);
+            padding: 15px 25px;
+            border-radius: 8px;
+            border: 1px solid #445566;
+            display: flex;
+            gap: 20px;
+            align-items: center;
+        }
+        .control-group {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        .control-label {
+            font-size: 12px;
+            margin-bottom: 5px;
+            color: #aaa;
+        }
+        input[type=range] {
+            width: 150px;
+            cursor: pointer;
+        }
+        .instructions {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            background: rgba(26, 32, 48, 0.8);
+            padding: 15px;
+            border-radius: 8px;
+            border: 1px solid #445566;
+            font-size: 12px;
+            color: #aaa;
+            pointer-events: none;
+        }
+        kbd {
+            background: #334455;
+            padding: 2px 5px;
+            border-radius: 3px;
+            color: white;
+        }
+    </style>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+                "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="canvas-container"></div>
+
+    <div id="hud">
+        <div class="hud-item">Throughput: <span id="hud-throughput" class="hud-value">0.0</span></div>
+        <div class="hud-item">Bottlenecks: <span id="hud-bottlenecks" class="hud-value">0</span></div>
+        <div class="hud-item">Selected: <span id="hud-selected" class="hud-value">None</span></div>
+        <div class="hud-item">Particles: <span id="hud-particles" class="hud-value">0</span></div>
+        <div class="hud-item">Models: <span id="hud-models" class="hud-value">0</span></div>
+        <div class="hud-item">Status: <span id="hud-paused" class="hud-value">Playing</span></div>
+    </div>
+
+    <div id="controls">
+        <div class="control-group">
+            <span class="control-label">Selected Flow Rate</span>
+            <input type="range" id="slider-flow" min="0" max="10" step="0.5" value="3" disabled>
+        </div>
+    </div>
+
+    <div class="instructions">
+        <div>Click tube to select</div>
+        <div><kbd>Space</kbd> Play/Pause</div>
+        <div><kbd>R</kbd> Randomize Flow</div>
+        <div><kbd>B</kbd> Toggle Bottlenecks</div>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+        // --- Global State ---
+        window.__3D_STATE__ = {
+            totalThroughput: 0,
+            bottleneckCount: 0,
+            selectedConnection: null,
+            activeParticles: 0,
+            modelsLoaded: 0,
+            isPaused: false,
+            frameCount: 0,
+            flowRates: [],
+            warehouseInventories: [0, 0, 0, 0],
+            nodesValid: true
+        };
+
+        // --- Scene Setup ---
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x1a2030);
+
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.set(0, 20, 30);
+        camera.lookAt(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        container.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.05;
+
+        // Lights
+        const ambientLight = new THREE.AmbientLight(0x445566, 0.5);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 0.6);
+        dirLight.position.set(10, 15, 10);
+        scene.add(dirLight);
+
+        // Ground
+        const groundGeo = new THREE.PlaneGeometry(50, 50);
+        const groundMat = new THREE.MeshStandardMaterial({ color: 0x223344 });
+        const ground = new THREE.Mesh(groundGeo, groundMat);
+        ground.rotation.x = -Math.PI / 2;
+        scene.add(ground);
+
+        const gridHelper = new THREE.GridHelper(50, 50, 0x445566, 0x2a3a4a);
+        gridHelper.position.y = 0.01;
+        scene.add(gridHelper);
+
+        // --- Data Structures ---
+        const nodes = [];
+        const connections = [];
+        const particles = [];
+        let showBottlenecks = true;
+
+        // Materials
+        const matFactory = new THREE.MeshStandardMaterial({ color: 0xaa3333 });
+        const matWarehouse = new THREE.MeshStandardMaterial({ color: 0x886644 });
+        const matStore = new THREE.MeshStandardMaterial({ color: 0x44aa88 });
+        const matSelected = new THREE.MeshBasicMaterial({ color: 0xffffff });
+        
+        const matTubeLow = new THREE.MeshStandardMaterial({ color: 0xff3333, roughness: 0.2, metalness: 0.1 });
+        const matTubeMed = new THREE.MeshStandardMaterial({ color: 0xffff33, roughness: 0.2, metalness: 0.1 });
+        const matTubeHigh = new THREE.MeshStandardMaterial({ color: 0x33ff33, roughness: 0.2, metalness: 0.1 });
+
+        const particleGeo = new THREE.SphereGeometry(0.15, 8, 8);
+
+        // Loaders
+        const gltfLoader = new GLTFLoader();
+        const models = {
+            truck: 'https://raw.githubusercontent.com/mrdoob/three.js/master/examples/models/gltf/CesiumMilkTruck/glTF-Binary/CesiumMilkTruck.glb',
+            bottle: 'https://raw.githubusercontent.com/mrdoob/three.js/master/examples/models/gltf/WaterBottle.glb'
+        };
+
+        function loadModel(url, scale, yOffset, parentGroup) {
+            gltfLoader.load(url, (gltf) => {
+                const model = gltf.scene;
+                model.scale.setScalar(scale);
+                model.position.y = yOffset;
+                
+                // Center model
+                const box = new THREE.Box3().setFromObject(model);
+                const center = box.getCenter(new THREE.Vector3());
+                model.position.x -= center.x;
+                model.position.z -= center.z;
+
+                parentGroup.add(model);
+                window.__3D_STATE__.modelsLoaded++;
+                document.getElementById('hud-models').innerText = window.__3D_STATE__.modelsLoaded;
+            }, undefined, (error) => {
+                console.error('Error loading model:', url, error);
+            });
+        }
+
+        // --- Build Network ---
+        function createNode(id, type, x, z, color, size) {
+            const group = new THREE.Group();
+            group.position.set(x, 0, z);
+            scene.add(group);
+
+            const nodeData = {
+                id, type, group,
+                inflow: 0, outflow: 0, inventory: 0,
+                baseScale: 1,
+                inventoryMesh: null
+            };
+
+            if (type === 'Factory') {
+                // Placeholder base
+                const baseGeo = new THREE.BoxGeometry(2, 0.5, 3);
+                const base = new THREE.Mesh(baseGeo, matFactory);
+                base.position.y = 0.25;
+                group.add(base);
+
+                // Indicator sphere
+                const indGeo = new THREE.SphereGeometry(0.4, 16, 16);
+                const indMat = new THREE.MeshBasicMaterial({ color: 0xff0000 });
+                const indicator = new THREE.Mesh(indGeo, indMat);
+                indicator.position.y = 3;
+                group.add(indicator);
+
+                loadModel(models.truck, 1.5, 0.5, group);
+            } 
+            else if (type === 'Warehouse') {
+                const boxGeo = new THREE.BoxGeometry(2, 3, 2);
+                const box = new THREE.Mesh(boxGeo, matWarehouse);
+                box.position.y = 1.5;
+                group.add(box);
+
+                // Inventory Bar
+                const invGeo = new THREE.CylinderGeometry(0.3, 0.3, 1, 8);
+                invGeo.translate(0, 0.5, 0); // Pivot at bottom
+                const invMat = new THREE.MeshBasicMaterial({ color: 0x00aaff });
+                const invMesh = new THREE.Mesh(invGeo, invMat);
+                invMesh.position.set(1.5, 0, 0);
+                invMesh.scale.y = 0.01; // Start empty
+                group.add(invMesh);
+                nodeData.inventoryMesh = invMesh;
+
+                loadModel(models.bottle, 0.4, 3, group);
+            }
+            else if (type === 'Store') {
+                const shopGeo = new THREE.BoxGeometry(1.5, 2, 1.5);
+                const shop = new THREE.Mesh(shopGeo, matStore);
+                shop.position.y = 1;
+                group.add(shop);
+            }
+
+            nodes.push(nodeData);
+            return nodeData;
+        }
+
+        // Create Nodes
+        const factories = [
+            createNode('F0', 'Factory', -12, -15),
+            createNode('F1', 'Factory', 0, -15),
+            createNode('F2', 'Factory', 12, -15)
+        ];
+
+        const warehouses = [
+            createNode('W0', 'Warehouse', -9, 0),
+            createNode('W1', 'Warehouse', -3, 0),
+            createNode('W2', 'Warehouse', 3, 0),
+            createNode('W3', 'Warehouse', 9, 0)
+        ];
+
+        const stores = [
+            createNode('S0', 'Store', -12, 15),
+            createNode('S1', 'Store', -6, 15),
+            createNode('S2', 'Store', 0, 15),
+            createNode('S3', 'Store', 6, 15),
+            createNode('S4', 'Store', 12, 15)
+        ];
+
+        function createConnection(sourceNode, targetNode) {
+            const id = `${sourceNode.id}→${targetNode.id}`;
+            const flowRate = Math.random() * 4 + 1; // 1 to 5
+
+            const p1 = sourceNode.group.position.clone();
+            const p2 = targetNode.group.position.clone();
+            
+            // Raise connection points slightly
+            p1.y = 0.5;
+            p2.y = 0.5;
+
+            // Create a slight arc
+            const mid = p1.clone().lerp(p2, 0.5);
+            mid.y += 2; // Arc height
+
+            const curve = new THREE.QuadraticBezierCurve3(p1, mid, p2);
+            const tubeGeo = new THREE.TubeGeometry(curve, 20, 0.08, 8, false);
+            const tubeMesh = new THREE.Mesh(tubeGeo, matTubeMed);
+            tubeMesh.userData = { id, isConnection: true };
+            scene.add(tubeMesh);
+
+            const conn = {
+                id, source: sourceNode, target: targetNode,
+                flowRate, curve, tubeMesh,
+                spawnAccumulator: 0,
+                tier: sourceNode.type === 'Factory' ? 1 : 2
+            };
+            connections.push(conn);
+        }
+
+        // Create Links
+        createConnection(factories[0], warehouses[0]);
+        createConnection(factories[0], warehouses[1]);
+        createConnection(factories[1], warehouses[1]);
+        createConnection(factories[1], warehouses[2]);
+        createConnection(factories[2], warehouses[2]);
+        createConnection(factories[2], warehouses[3]);
+
+        createConnection(warehouses[0], stores[0]);
+        createConnection(warehouses[0], stores[1]);
+        createConnection(warehouses[1], stores[1]);
+        createConnection(warehouses[1], stores[2]);
+        createConnection(warehouses[2], stores[2]);
+        createConnection(warehouses[2], stores[3]);
+        createConnection(warehouses[3], stores[3]);
+        createConnection(warehouses[3], stores[4]);
+
+        // --- Interaction ---
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+        const sliderFlow = document.getElementById('slider-flow');
+
+        window.addEventListener('click', (event) => {
+            mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+            raycaster.setFromCamera(mouse, camera);
+            const intersects = raycaster.intersectObjects(scene.children);
+
+            let clickedConnection = null;
+            for (let i = 0; i < intersects.length; i++) {
+                if (intersects[i].object.userData.isConnection) {
+                    clickedConnection = intersects[i].object.userData.id;
+                    break;
+                }
+            }
+
+            window.__3D_STATE__.selectedConnection = clickedConnection;
+            updateSelectionVisuals();
+        });
+
+        function updateSelectionVisuals() {
+            const selectedId = window.__3D_STATE__.selectedConnection;
+            document.getElementById('hud-selected').innerText = selectedId || 'None';
+
+            connections.forEach(conn => {
+                if (conn.id === selectedId) {
+                    conn.tubeMesh.material = matSelected;
+                    sliderFlow.disabled = false;
+                    sliderFlow.value = conn.flowRate;
+                } else {
+                    updateTubeColor(conn);
+                }
+            });
+
+            if (!selectedId) {
+                sliderFlow.disabled = true;
+            }
+        }
+
+        sliderFlow.addEventListener('input', (e) => {
+            const selectedId = window.__3D_STATE__.selectedConnection;
+            if (selectedId) {
+                const conn = connections.find(c => c.id === selectedId);
+                if (conn) {
+                    conn.flowRate = parseFloat(e.target.value);
+                }
+            }
+        });
+
+        window.addEventListener('keydown', (e) => {
+            if (e.code === 'Space') {
+                window.__3D_STATE__.isPaused = !window.__3D_STATE__.isPaused;
+                document.getElementById('hud-paused').innerText = window.__3D_STATE__.isPaused ? 'Paused' : 'Playing';
+            }
+            if (e.code === 'KeyR') {
+                connections.forEach(conn => {
+                    conn.flowRate = Math.random() * 4 + 1;
+                });
+                if (window.__3D_STATE__.selectedConnection) {
+                    const conn = connections.find(c => c.id === window.__3D_STATE__.selectedConnection);
+                    if (conn) sliderFlow.value = conn.flowRate;
+                }
+            }
+            if (e.code === 'KeyB') {
+                showBottlenecks = !showBottlenecks;
+                if (!showBottlenecks) {
+                    nodes.forEach(n => n.group.scale.setScalar(1));
+                }
+            }
+        });
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // --- Animation & Logic ---
+        const clock = new THREE.Clock();
+
+        function updateTubeColor(conn) {
+            if (conn.id === window.__3D_STATE__.selectedConnection) return; // Keep white if selected
+            
+            if (conn.flowRate < 2) conn.tubeMesh.material = matTubeLow;
+            else if (conn.flowRate <= 4) conn.tubeMesh.material = matTubeMed;
+            else conn.tubeMesh.material = matTubeHigh;
+        }
+
+        function spawnParticle(conn) {
+            const color = conn.tier === 1 ? 0xff6666 : 0x66ccff;
+            const mat = new THREE.MeshBasicMaterial({ color: color });
+            const mesh = new THREE.Mesh(particleGeo, mat);
+            scene.add(mesh);
+
+            particles.push({
+                mesh,
+                conn,
+                progress: 0,
+                speed: conn.flowRate * 0.05 + 0.1 // Base speed + proportional
+            });
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const dt = clock.getDelta();
+            const time = clock.getElapsedTime();
+            window.__3D_STATE__.frameCount++;
+
+            controls.update();
+
+            if (!window.__3D_STATE__.isPaused) {
+                // Reset node flows
+                nodes.forEach(n => { n.inflow = 0; n.outflow = 0; });
+                let totalThroughput = 0;
+
+                // Process Connections
+                connections.forEach((conn, idx) => {
+                    updateTubeColor(conn);
+                    
+                    conn.source.outflow += conn.flowRate;
+                    conn.target.inflow += conn.flowRate;
+                    totalThroughput += conn.flowRate;
+
+                    window.__3D_STATE__.flowRates[idx] = conn.flowRate;
+
+                    // Spawn particles
+                    if (conn.flowRate > 0) {
+                        conn.spawnAccumulator += conn.flowRate * dt;
+                        while (conn.spawnAccumulator >= 1) {
+                            spawnParticle(conn);
+                            conn.spawnAccumulator -= 1;
+                        }
+                    }
+                });
+
+                window.__3D_STATE__.totalThroughput = Math.round(totalThroughput * 10) / 10;
+                document.getElementById('hud-throughput').innerText = window.__3D_STATE__.totalThroughput.toFixed(1);
+
+                // Process Particles
+                for (let i = particles.length - 1; i >= 0; i--) {
+                    const p = particles[i];
+                    // Update speed dynamically based on current flow rate
+                    p.speed = p.conn.flowRate * 0.05 + 0.1;
+                    p.progress += p.speed * dt;
+
+                    if (p.progress >= 1) {
+                        scene.remove(p.mesh);
+                        p.mesh.geometry.dispose();
+                        p.mesh.material.dispose();
+                        particles.splice(i, 1);
+                    } else {
+                        const pos = p.conn.curve.getPointAt(p.progress);
+                        p.mesh.position.copy(pos);
+                    }
+                }
+                window.__3D_STATE__.activeParticles = particles.length;
+                document.getElementById('hud-particles').innerText = particles.length;
+
+                // Process Nodes & Bottlenecks
+                let bottlenecks = 0;
+                let nodesValid = true;
+
+                nodes.forEach((node, idx) => {
+                    // Check validity
+                    if (isNaN(node.group.position.x)) nodesValid = false;
+
+                    // Inventory logic for warehouses
+                    if (node.type === 'Warehouse') {
+                        const netFlow = node.inflow - node.outflow;
+                        node.inventory += netFlow * dt;
+                        node.inventory = Math.max(0, Math.min(10, node.inventory)); // Clamp 0-10
+                        
+                        // Update inventory bar visual
+                        if (node.inventoryMesh) {
+                            const scaleY = Math.max(0.01, node.inventory / 2); // Max height 5
+                            node.inventoryMesh.scale.y = scaleY;
+                        }
+
+                        // Map to state array (W0-W3 are indices 3-6 in nodes array, but we want 0-3)
+                        const wIdx = parseInt(node.id.replace('W', ''));
+                        if (!isNaN(wIdx)) {
+                            window.__3D_STATE__.warehouseInventories[wIdx] = node.inventory;
+                        }
+                    }
+
+                    // Bottleneck visualization
+                    const flowDiff = Math.abs(node.inflow - node.outflow);
+                    const isBottleneck = (node.type === 'Warehouse' && flowDiff > 0.5) || 
+                                         (node.type === 'Factory' && node.outflow === 0) ||
+                                         (node.type === 'Store' && node.inflow === 0);
+
+                    if (isBottleneck && (node.inflow > 0 || node.outflow > 0)) {
+                        bottlenecks++;
+                        if (showBottlenecks) {
+                            const scale = 1 + 0.15 * Math.sin(time * 8);
+                            node.group.scale.setScalar(scale);
+                        }
+                    } else {
+                        node.group.scale.setScalar(1);
+                    }
+                });
+
+                window.__3D_STATE__.bottleneckCount = bottlenecks;
+                window.__3D_STATE__.nodesValid = nodesValid;
+                document.getElementById('hud-bottlenecks').innerText = bottlenecks;
+            }
+
+            renderer.render(scene, camera);
+        }
+
+        // Initialize state arrays
+        window.__3D_STATE__.flowRates = new Array(connections.length).fill(0);
+        
+        animate();
+    </script>
+</body>
+</html>

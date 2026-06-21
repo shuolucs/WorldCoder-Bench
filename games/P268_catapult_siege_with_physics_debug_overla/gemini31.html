@@ -1,0 +1,391 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Catapult Siege</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #000;
+            font-family: monospace;
+            user-select: none;
+        }
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+        }
+        #hud {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            color: white;
+            background: rgba(0, 0, 0, 0.6);
+            padding: 15px;
+            border-radius: 8px;
+            font-size: 16px;
+            line-height: 1.5;
+            pointer-events: none;
+        }
+        #powerBarContainer {
+            margin-top: 10px;
+            width: 200px;
+            height: 20px;
+            background: #333;
+            border: 2px solid #fff;
+            border-radius: 10px;
+            overflow: hidden;
+        }
+        #powerBar {
+            width: 0%;
+            height: 100%;
+            background: #00ff00;
+            transition: background-color 0.1s;
+        }
+        #debugIndicator {
+            position: absolute;
+            bottom: 20px;
+            right: 20px;
+            color: white;
+            background: rgba(0, 0, 0, 0.6);
+            padding: 10px;
+            border-radius: 8px;
+            font-size: 16px;
+            pointer-events: none;
+        }
+        .instructions {
+            margin-top: 10px;
+            font-size: 12px;
+            color: #aaa;
+        }
+    </style>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="hud">
+        <div>Power: <span id="ui-power">0</span>%</div>
+        <div>Angle: <span id="ui-angle">45</span>°</div>
+        <div>Bricks Hit: <span id="ui-bricks">0</span>/15</div>
+        <div>Shots Fired: <span id="ui-shots">0</span></div>
+        <div id="powerBarContainer"><div id="powerBar"></div></div>
+        <div class="instructions">
+            SPACE: Hold to charge, release to fire<br>
+            UP/DOWN: Adjust angle<br>
+            R: Reset game<br>
+            D: Toggle Debug<br>
+            Mouse: Orbit Camera
+        </div>
+    </div>
+    <div id="debugIndicator">Debug: OFF</div>
+    <div id="canvas-container"></div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        // --- State Management ---
+        window.__3D_STATE__ = {
+            power: 0,
+            angle: 45,
+            isCharging: false,
+            isFiring: false,
+            boulderPosition: { x: 0, y: 0, z: 0 },
+            boulderVelocity: { x: 0, y: 0, z: 0 },
+            bricksDestroyed: 0,
+            shotsFired: 0,
+            debugMode: false,
+            gamePhase: 'ready', // ready, charging, swinging, flying, landed
+            bricks: [],
+            armAngle: 0
+        };
+        const state = window.__3D_STATE__;
+
+        // --- Scene Setup ---
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x87CEEB); // Sky blue
+
+        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.set(0, 15, 30);
+        camera.lookAt(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        container.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+
+        // Lights
+        const ambientLight = new THREE.AmbientLight(0x404040);
+        scene.add(ambientLight);
+        const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+        dirLight.position.set(10, 20, 10);
+        scene.add(dirLight);
+
+        // --- Materials ---
+        const matGround = new THREE.MeshLambertMaterial({ color: 0x228B22 });
+        const matWood = new THREE.MeshLambertMaterial({ color: 0x8B4513 });
+        const matMetal = new THREE.MeshLambertMaterial({ color: 0x888888 });
+        const matBoulder = new THREE.MeshLambertMaterial({ color: 0x666666 });
+        const matBrick = new THREE.MeshLambertMaterial({ color: 0xCC6633 });
+        
+        const matDebugStatic = new THREE.MeshBasicMaterial({ color: 0x00ff00, wireframe: true });
+        const matDebugDynamic = new THREE.MeshBasicMaterial({ color: 0xff0000, wireframe: true });
+
+        const debugMeshes = [];
+
+        function addDebugWireframe(mesh, isDynamic) {
+            const wireframe = new THREE.Mesh(mesh.geometry, isDynamic ? matDebugDynamic : matDebugStatic);
+            wireframe.visible = state.debugMode;
+            mesh.add(wireframe);
+            debugMeshes.push(wireframe);
+        }
+
+        // --- Objects ---
+        // Ground
+        const ground = new THREE.Mesh(new THREE.PlaneGeometry(100, 100), matGround);
+        ground.rotation.x = -Math.PI / 2;
+        scene.add(ground);
+        addDebugWireframe(ground, false);
+
+        // Catapult
+        const catapult = new THREE.Group();
+        catapult.name = 'catapult';
+        catapult.position.set(-20, 0, 0);
+        scene.add(catapult);
+
+        const base = new THREE.Mesh(new THREE.BoxGeometry(4, 1, 2), matWood);
+        base.position.y = 0.5;
+        catapult.add(base);
+        addDebugWireframe(base, false);
+
+        const support = new THREE.Mesh(new THREE.BoxGeometry(0.5, 3, 0.5), matWood);
+        support.position.set(1.5, 2, 0);
+        catapult.add(support);
+        addDebugWireframe(support, false);
+
+        const pivot = new THREE.Group();
+        pivot.position.set(1.5, 3.5, 0);
+        catapult.add(pivot);
+
+        const armGeom = new THREE.BoxGeometry(6, 0.3, 0.3);
+        armGeom.translate(3, 0, 0); // Pivot at left end
+        const arm = new THREE.Mesh(armGeom, matWood);
+        pivot.add(arm);
+        addDebugWireframe(arm, true);
+
+        const bucket = new THREE.Mesh(new THREE.SphereGeometry(0.5), matMetal);
+        bucket.position.set(6, 0, 0);
+        pivot.add(bucket);
+        addDebugWireframe(bucket, true);
+
+        // Boulder
+        const boulder = new THREE.Mesh(new THREE.SphereGeometry(0.6), matBoulder);
+        scene.add(boulder);
+        addDebugWireframe(boulder, true);
+
+        // Velocity Arrow (Debug)
+        const velocityArrow = new THREE.ArrowHelper(new THREE.Vector3(1,0,0), new THREE.Vector3(0,0,0), 1, 0xff0000);
+        velocityArrow.visible = false;
+        scene.add(velocityArrow);
+
+        // Castle Wall
+        const castleWall = new THREE.Group();
+        castleWall.name = 'castleWall';
+        castleWall.position.set(20, 0, 0);
+        scene.add(castleWall);
+
+        const bricksData = [];
+        for (let row = 0; row < 3; row++) {
+            for (let col = 0; col < 5; col++) {
+                const brick = new THREE.Mesh(new THREE.BoxGeometry(2, 2, 2), matBrick);
+                brick.position.set(0, row * 2 + 1, col * 2 - 4);
+                castleWall.add(brick);
+                addDebugWireframe(brick, false);
+                
+                const worldPos = new THREE.Vector3();
+                brick.getWorldPosition(worldPos);
+                
+                bricksData.push({
+                    mesh: brick,
+                    intact: true,
+                    pos: worldPos
+                });
+            }
+        }
+
+        // --- Logic & Physics ---
+        const RESTING_ANGLE = Math.PI; // 180 degrees, pointing backwards
+        let swingTimer = 0;
+        const SWING_DURATION = 0.1;
+
+        function resetGame() {
+            state.gamePhase = 'ready';
+            state.power = 0;
+            state.isCharging = false;
+            state.isFiring = false;
+            state.boulderVelocity = { x: 0, y: 0, z: 0 };
+            state.bricksDestroyed = 0;
+            
+            bricksData.forEach(b => {
+                b.intact = true;
+                b.mesh.visible = true;
+            });
+            
+            pivot.rotation.z = RESTING_ANGLE;
+            updateBoulderPositionToBucket();
+        }
+
+        function updateBoulderPositionToBucket() {
+            const pos = new THREE.Vector3();
+            bucket.getWorldPosition(pos);
+            boulder.position.copy(pos);
+        }
+
+        function toggleDebug() {
+            state.debugMode = !state.debugMode;
+            debugMeshes.forEach(m => m.visible = state.debugMode);
+            document.getElementById('debugIndicator').innerText = `Debug: ${state.debugMode ? 'ON' : 'OFF'}`;
+        }
+
+        // --- Input Handling ---
+        window.addEventListener('keydown', (e) => {
+            if (e.code === 'Space' && state.gamePhase === 'ready') {
+                state.isCharging = true;
+                state.gamePhase = 'charging';
+            }
+            if (e.code === 'ArrowUp') {
+                state.angle = Math.min(80, state.angle + 2);
+            }
+            if (e.code === 'ArrowDown') {
+                state.angle = Math.max(20, state.angle - 2);
+            }
+            if (e.code === 'KeyR') resetGame();
+            if (e.code === 'KeyD') toggleDebug();
+        });
+
+        window.addEventListener('keyup', (e) => {
+            if (e.code === 'Space' && state.isCharging) {
+                state.isCharging = false;
+                state.gamePhase = 'swinging';
+                swingTimer = 0;
+                state.shotsFired++;
+            }
+        });
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // --- Main Loop ---
+        const clock = new THREE.Clock();
+        resetGame();
+
+        function animate() {
+            requestAnimationFrame(animate);
+            const dt = Math.min(clock.getDelta(), 0.1); // Cap dt to prevent physics explosions
+
+            if (state.gamePhase === 'charging') {
+                state.power = Math.min(100, state.power + 50 * dt);
+            } 
+            else if (state.gamePhase === 'swinging') {
+                swingTimer += dt;
+                const progress = Math.min(1, swingTimer / SWING_DURATION);
+                const targetAngleRad = state.angle * Math.PI / 180;
+                
+                pivot.rotation.z = RESTING_ANGLE + (targetAngleRad - RESTING_ANGLE) * progress;
+                updateBoulderPositionToBucket();
+
+                if (progress >= 1) {
+                    state.gamePhase = 'flying';
+                    state.isFiring = true;
+                    
+                    const speed = state.power * 0.4;
+                    state.boulderVelocity.x = speed * Math.cos(targetAngleRad);
+                    state.boulderVelocity.y = speed * Math.sin(targetAngleRad);
+                    state.boulderVelocity.z = 0;
+                }
+            } 
+            else if (state.gamePhase === 'flying') {
+                // Physics
+                state.boulderVelocity.y -= 9.81 * dt;
+                boulder.position.x += state.boulderVelocity.x * dt;
+                boulder.position.y += state.boulderVelocity.y * dt;
+                boulder.position.z += state.boulderVelocity.z * dt;
+
+                // Ground Collision
+                if (boulder.position.y <= 0.6) {
+                    boulder.position.y = 0.6;
+                    state.gamePhase = 'landed';
+                    state.isFiring = false;
+                    state.boulderVelocity = {x:0, y:0, z:0};
+                }
+
+                // Brick Collision
+                bricksData.forEach(b => {
+                    if (b.intact) {
+                        if (boulder.position.distanceTo(b.pos) < 1.5) {
+                            b.intact = false;
+                            b.mesh.visible = false;
+                            state.bricksDestroyed++;
+                        }
+                    }
+                });
+            } 
+            else if (state.gamePhase === 'ready') {
+                updateBoulderPositionToBucket();
+            }
+
+            // Update State Object
+            state.boulderPosition = { x: boulder.position.x, y: boulder.position.y, z: boulder.position.z };
+            state.armAngle = pivot.rotation.z * 180 / Math.PI;
+            state.bricks = bricksData.map(b => ({ intact: b.intact, position: { x: b.pos.x, y: b.pos.y, z: b.pos.z } }));
+
+            // Update UI
+            document.getElementById('ui-power').innerText = Math.floor(state.power);
+            document.getElementById('ui-angle').innerText = state.angle;
+            document.getElementById('ui-bricks').innerText = state.bricksDestroyed;
+            document.getElementById('ui-shots').innerText = state.shotsFired;
+            
+            const pb = document.getElementById('powerBar');
+            pb.style.width = state.power + '%';
+            // Color gradient from green to red
+            const hue = 120 - (state.power * 1.2);
+            pb.style.backgroundColor = `hsl(${hue}, 100%, 50%)`;
+
+            // Debug Velocity Vector
+            if (state.debugMode && state.gamePhase === 'flying') {
+                velocityArrow.position.copy(boulder.position);
+                const dir = new THREE.Vector3(state.boulderVelocity.x, state.boulderVelocity.y, state.boulderVelocity.z);
+                const length = dir.length();
+                if (length > 0.1) {
+                    velocityArrow.setDirection(dir.normalize());
+                    velocityArrow.setLength(length * 0.2);
+                    velocityArrow.visible = true;
+                } else {
+                    velocityArrow.visible = false;
+                }
+            } else {
+                velocityArrow.visible = false;
+            }
+
+            controls.update();
+            renderer.render(scene, camera);
+        }
+
+        animate();
+    </script>
+</body>
+</html>

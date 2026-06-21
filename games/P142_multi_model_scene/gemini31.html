@@ -1,0 +1,635 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Scene Builder</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #1a1a1a;
+            font-family: sans-serif;
+            user-select: none;
+        }
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+        }
+        .panel {
+            position: absolute;
+            background: rgba(30, 30, 30, 0.8);
+            color: white;
+            padding: 15px;
+            border-radius: 8px;
+            border: 1px solid #444;
+            backdrop-filter: blur(4px);
+        }
+        #hud {
+            top: 20px;
+            left: 20px;
+            pointer-events: none;
+        }
+        #hud div {
+            margin-bottom: 5px;
+            font-size: 14px;
+        }
+        #palette {
+            top: 120px;
+            left: 20px;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+        .palette-btn {
+            background: #333;
+            color: white;
+            border: 1px solid #555;
+            padding: 10px;
+            cursor: pointer;
+            border-radius: 4px;
+            text-align: center;
+            transition: background 0.2s;
+        }
+        .palette-btn:hover {
+            background: #444;
+        }
+        .palette-btn.active {
+            background: #2196F3;
+            border-color: #64b5f6;
+        }
+        #controls {
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            gap: 20px;
+            align-items: center;
+        }
+        button {
+            background: #4CAF50;
+            color: white;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        button:hover {
+            background: #45a049;
+        }
+        button:disabled {
+            background: #555;
+            color: #888;
+            cursor: not-allowed;
+        }
+        .slider-container {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        #loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: white;
+            font-size: 24px;
+            background: rgba(0,0,0,0.7);
+            padding: 20px;
+            border-radius: 10px;
+            display: none;
+        }
+    </style>
+    <script type="importmap">
+    { "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+    } }
+    </script>
+</head>
+<body>
+    <div id="canvas-container"></div>
+
+    <div id="hud" class="panel">
+        <div>Objects: <span id="objectCount">0</span></div>
+        <div>Selected: <span id="selectedCount">0</span></div>
+        <div>Grid Snap: <span id="gridSnap">OFF</span></div>
+    </div>
+
+    <div id="palette" class="panel">
+        <div style="font-size: 12px; margin-bottom: 5px; color: #aaa;">Model Library</div>
+        <!-- Buttons will be injected here -->
+    </div>
+
+    <div id="controls" class="panel">
+        <div class="slider-container">
+            <label for="scaleSlider">Scale:</label>
+            <input type="range" id="scaleSlider" min="0.5" max="3" step="0.1" value="1">
+        </div>
+        <button id="alignBtn">Align to Grid</button>
+        <label style="display: flex; align-items: center; gap: 5px; cursor: pointer;">
+            <input type="checkbox" id="gridSnapToggle"> Auto Snap
+        </label>
+        <div style="font-size: 12px; color: #aaa; margin-left: 10px;">
+            Shift+Click: Multi-select | Del: Remove | Wheel: Rotate
+        </div>
+    </div>
+
+    <div id="loading">Loading Models...</div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        // --- State ---
+        const state = {
+            modelsLoaded: false,
+            objectCount: 0,
+            selectedCount: 0,
+            gridSnap: false,
+            placementMode: ""
+        };
+        window.__3D_STATE__ = state;
+
+        // --- Globals ---
+        let scene, camera, renderer, controls;
+        let groundPlane;
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+        
+        const modelDefs = [
+            { name: 'Ferrari', url: 'assets/ferrari.glb', color: 0xff0000 },
+            { name: 'Robot', url: 'assets/robot.glb', color: 0x0000ff },
+            { name: 'Duck', url: 'assets/Duck.glb', color: 0xffff00 },
+            { name: 'Lantern', url: 'assets/Lantern.glb', color: 0xff8800 }
+        ];
+        const loadedModels = {};
+        const sceneObjects = [];
+        let selectedObjects = [];
+        
+        let previewMesh = null;
+        
+        // Interaction state
+        let isDragging = false;
+        let dragStartIntersection = new THREE.Vector3();
+        const planeMath = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+
+        // DOM Elements
+        const elObjectCount = document.getElementById('objectCount');
+        const elSelectedCount = document.getElementById('selectedCount');
+        const elGridSnap = document.getElementById('gridSnap');
+        const elPalette = document.getElementById('palette');
+        const elScaleSlider = document.getElementById('scaleSlider');
+        const elAlignBtn = document.getElementById('alignBtn');
+        const elGridSnapToggle = document.getElementById('gridSnapToggle');
+        const elLoading = document.getElementById('loading');
+
+        init();
+        loadModels();
+        animate();
+
+        function init() {
+            const container = document.getElementById('canvas-container');
+
+            // Scene
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x222222);
+
+            // Camera
+            camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.position.set(0, 15, 20);
+
+            // Renderer
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.shadowMap.enabled = true;
+            container.appendChild(renderer.domElement);
+
+            // Controls
+            controls = new OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+            controls.dampingFactor = 0.05;
+            controls.maxPolarAngle = Math.PI / 2 - 0.05; // Don't go below ground
+
+            // Lights
+            const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+            scene.add(ambientLight);
+
+            const dirLight = new THREE.DirectionalLight(0xffffff, 1.2);
+            dirLight.position.set(10, 20, 10);
+            dirLight.castShadow = true;
+            dirLight.shadow.camera.top = 20;
+            dirLight.shadow.camera.bottom = -20;
+            dirLight.shadow.camera.left = -20;
+            dirLight.shadow.camera.right = 20;
+            dirLight.shadow.mapSize.width = 2048;
+            dirLight.shadow.mapSize.height = 2048;
+            scene.add(dirLight);
+
+            // Ground
+            const groundGeo = new THREE.PlaneGeometry(100, 100);
+            const groundMat = new THREE.MeshStandardMaterial({ color: 0x333333, depthWrite: true });
+            groundPlane = new THREE.Mesh(groundGeo, groundMat);
+            groundPlane.rotation.x = -Math.PI / 2;
+            groundPlane.receiveShadow = true;
+            scene.add(groundPlane);
+
+            const gridHelper = new THREE.GridHelper(100, 50, 0x888888, 0x444444);
+            gridHelper.position.y = 0.01;
+            scene.add(gridHelper);
+
+            // Events
+            window.addEventListener('resize', onWindowResize);
+            renderer.domElement.addEventListener('pointerdown', onPointerDown);
+            renderer.domElement.addEventListener('pointermove', onPointerMove);
+            window.addEventListener('pointerup', onPointerUp);
+            renderer.domElement.addEventListener('wheel', onWheel, { passive: false });
+            window.addEventListener('keydown', onKeyDown);
+
+            // UI Events
+            elScaleSlider.addEventListener('input', (e) => {
+                const scale = parseFloat(e.target.value);
+                selectedObjects.forEach(obj => {
+                    obj.scale.set(scale, scale, scale);
+                });
+            });
+
+            elAlignBtn.addEventListener('click', () => {
+                alignSelectedToGrid();
+            });
+
+            elGridSnapToggle.addEventListener('change', (e) => {
+                state.gridSnap = e.target.checked;
+            });
+            
+            // Cancel placement on right click
+            renderer.domElement.addEventListener('contextmenu', (e) => {
+                e.preventDefault();
+                exitPlacementMode();
+            });
+        }
+
+        function createMockModel(def) {
+            const group = new THREE.Group();
+            let geo;
+            if (def.name === 'Ferrari') geo = new THREE.BoxGeometry(2, 1, 4);
+            else if (def.name === 'Robot') geo = new THREE.CylinderGeometry(0.5, 0.5, 2);
+            else if (def.name === 'Duck') geo = new THREE.SphereGeometry(0.8);
+            else geo = new THREE.ConeGeometry(0.8, 1.5);
+            
+            const mat = new THREE.MeshStandardMaterial({ color: def.color });
+            const mesh = new THREE.Mesh(geo, mat);
+            mesh.position.y = geo.parameters.height ? geo.parameters.height / 2 : (geo.parameters.radius || 1);
+            mesh.castShadow = true;
+            mesh.receiveShadow = true;
+            group.add(mesh);
+            return group;
+        }
+
+        async function loadModels() {
+            elLoading.style.display = 'block';
+            const loader = new GLTFLoader();
+            
+            const loadPromises = modelDefs.map(def => {
+                return new Promise((resolve) => {
+                    loader.load(
+                        def.url,
+                        (gltf) => {
+                            const model = gltf.scene;
+                            model.traverse(child => {
+                                if (child.isMesh) {
+                                    child.castShadow = true;
+                                    child.receiveShadow = true;
+                                }
+                            });
+                            loadedModels[def.name] = model;
+                            resolve();
+                        },
+                        undefined,
+                        (error) => {
+                            console.warn(`Failed to load ${def.url}, using mock model.`);
+                            loadedModels[def.name] = createMockModel(def);
+                            resolve();
+                        }
+                    );
+                });
+            });
+
+            await Promise.all(loadPromises);
+            
+            state.modelsLoaded = true;
+            elLoading.style.display = 'none';
+            buildPalette();
+        }
+
+        function buildPalette() {
+            modelDefs.forEach(def => {
+                const btn = document.createElement('div');
+                btn.className = 'palette-btn';
+                btn.textContent = def.name;
+                btn.onclick = () => enterPlacementMode(def.name, btn);
+                elPalette.appendChild(btn);
+            });
+        }
+
+        function enterPlacementMode(modelName, btnElement) {
+            clearSelection();
+            state.placementMode = modelName;
+            
+            document.querySelectorAll('.palette-btn').forEach(b => b.classList.remove('active'));
+            if (btnElement) btnElement.classList.add('active');
+
+            if (previewMesh) {
+                scene.remove(previewMesh);
+            }
+
+            const originalModel = loadedModels[modelName];
+            previewMesh = originalModel.clone();
+            
+            // Make preview transparent
+            previewMesh.traverse(child => {
+                if (child.isMesh) {
+                    child.material = child.material.clone();
+                    child.material.transparent = true;
+                    child.material.opacity = 0.5;
+                    child.material.depthWrite = false;
+                    child.castShadow = false;
+                    child.receiveShadow = false;
+                }
+            });
+            
+            scene.add(previewMesh);
+        }
+
+        function exitPlacementMode() {
+            state.placementMode = "";
+            document.querySelectorAll('.palette-btn').forEach(b => b.classList.remove('active'));
+            if (previewMesh) {
+                scene.remove(previewMesh);
+                previewMesh = null;
+            }
+        }
+
+        function getIntersects(event, objects) {
+            const rect = renderer.domElement.getBoundingClientRect();
+            mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+            mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+            raycaster.setFromCamera(mouse, camera);
+            return raycaster.intersectObjects(objects, true);
+        }
+
+        function getGroundIntersection(event) {
+            const rect = renderer.domElement.getBoundingClientRect();
+            mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+            mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+            raycaster.setFromCamera(mouse, camera);
+            const target = new THREE.Vector3();
+            raycaster.ray.intersectPlane(planeMath, target);
+            return target;
+        }
+
+        function onPointerDown(event) {
+            if (event.button !== 0) return; // Only left click
+
+            if (state.placementMode) {
+                // Place object
+                const pt = getGroundIntersection(event);
+                if (pt) {
+                    const newObj = loadedModels[state.placementMode].clone();
+                    
+                    if (state.gridSnap) {
+                        pt.x = Math.round(pt.x / 2) * 2;
+                        pt.z = Math.round(pt.z / 2) * 2;
+                    }
+                    
+                    newObj.position.copy(pt);
+                    // Ensure materials are cloned so highlighting works independently
+                    newObj.traverse(child => {
+                        if (child.isMesh) {
+                            child.material = child.material.clone();
+                        }
+                    });
+                    
+                    scene.add(newObj);
+                    sceneObjects.push(newObj);
+                    
+                    // Keep placement mode active for continuous placement, or exit.
+                    // Let's keep it active.
+                }
+                return;
+            }
+
+            // Selection / Dragging logic
+            const intersects = getIntersects(event, sceneObjects);
+            
+            if (intersects.length > 0) {
+                // Find root object in sceneObjects
+                let object = intersects[0].object;
+                while (object.parent && object.parent !== scene) {
+                    if (sceneObjects.includes(object)) break;
+                    object = object.parent;
+                }
+
+                if (sceneObjects.includes(object)) {
+                    const isShiftDown = event.shiftKey;
+                    const isAlreadySelected = selectedObjects.includes(object);
+
+                    if (isShiftDown) {
+                        if (isAlreadySelected) {
+                            deselectObject(object);
+                        } else {
+                            selectObject(object, true);
+                        }
+                    } else {
+                        if (!isAlreadySelected) {
+                            clearSelection();
+                            selectObject(object, false);
+                        }
+                    }
+
+                    // Start drag
+                    if (selectedObjects.length > 0) {
+                        isDragging = true;
+                        controls.enabled = false;
+                        const pt = getGroundIntersection(event);
+                        if (pt) {
+                            dragStartIntersection.copy(pt);
+                            selectedObjects.forEach(obj => {
+                                obj.userData.dragStartPos = obj.position.clone();
+                            });
+                        }
+                    }
+                }
+            } else {
+                // Clicked on empty space / ground
+                clearSelection();
+            }
+        }
+
+        function onPointerMove(event) {
+            if (state.placementMode && previewMesh) {
+                const pt = getGroundIntersection(event);
+                if (pt) {
+                    if (state.gridSnap) {
+                        pt.x = Math.round(pt.x / 2) * 2;
+                        pt.z = Math.round(pt.z / 2) * 2;
+                    }
+                    previewMesh.position.copy(pt);
+                }
+                return;
+            }
+
+            if (isDragging) {
+                const pt = getGroundIntersection(event);
+                if (pt) {
+                    const delta = new THREE.Vector3().subVectors(pt, dragStartIntersection);
+                    
+                    selectedObjects.forEach(obj => {
+                        const newPos = new THREE.Vector3().addVectors(obj.userData.dragStartPos, delta);
+                        if (state.gridSnap) {
+                            newPos.x = Math.round(newPos.x / 2) * 2;
+                            newPos.z = Math.round(newPos.z / 2) * 2;
+                        }
+                        obj.position.copy(newPos);
+                    });
+                }
+            }
+        }
+
+        function onPointerUp(event) {
+            if (isDragging) {
+                isDragging = false;
+                controls.enabled = true;
+            }
+        }
+
+        function onWheel(event) {
+            if (selectedObjects.length > 0 && !state.placementMode) {
+                event.preventDefault();
+                const angle = (Math.PI / 12) * Math.sign(event.deltaY); // 15 degrees
+                selectedObjects.forEach(obj => {
+                    obj.rotation.y += angle;
+                });
+            }
+        }
+
+        function onKeyDown(event) {
+            if (event.key === 'Escape') {
+                exitPlacementMode();
+                clearSelection();
+            }
+            if ((event.key === 'Delete' || event.key === 'Backspace') && selectedObjects.length > 0) {
+                deleteSelected();
+            }
+        }
+
+        function selectObject(object, multi) {
+            if (!multi) clearSelection();
+            if (!selectedObjects.includes(object)) {
+                selectedObjects.push(object);
+                setHighlight(object, true);
+                
+                // Update slider to match first selected object's scale
+                if (selectedObjects.length === 1) {
+                    elScaleSlider.value = object.scale.x;
+                }
+            }
+        }
+
+        function deselectObject(object) {
+            const index = selectedObjects.indexOf(object);
+            if (index > -1) {
+                selectedObjects.splice(index, 1);
+                setHighlight(object, false);
+            }
+        }
+
+        function clearSelection() {
+            selectedObjects.forEach(obj => setHighlight(obj, false));
+            selectedObjects = [];
+        }
+
+        function setHighlight(object, isSelected) {
+            object.traverse(child => {
+                if (child.isMesh) {
+                    if (isSelected) {
+                        if (!child.userData.origEmissive) {
+                            child.userData.origEmissive = child.material.emissive ? child.material.emissive.clone() : new THREE.Color(0x000000);
+                        }
+                        child.material.emissive = new THREE.Color(0x555500); // Yellow highlight
+                    } else {
+                        if (child.userData.origEmissive) {
+                            child.material.emissive.copy(child.userData.origEmissive);
+                        }
+                    }
+                }
+            });
+        }
+
+        function deleteSelected() {
+            selectedObjects.forEach(obj => {
+                scene.remove(obj);
+                const index = sceneObjects.indexOf(obj);
+                if (index > -1) sceneObjects.splice(index, 1);
+                
+                // Cleanup memory
+                obj.traverse(child => {
+                    if (child.isMesh) {
+                        child.geometry.dispose();
+                        if (Array.isArray(child.material)) {
+                            child.material.forEach(m => m.dispose());
+                        } else {
+                            child.material.dispose();
+                        }
+                    }
+                });
+            });
+            selectedObjects = [];
+        }
+
+        function alignSelectedToGrid() {
+            selectedObjects.forEach(obj => {
+                obj.position.x = Math.round(obj.position.x / 2) * 2;
+                obj.position.z = Math.round(obj.position.z / 2) * 2;
+            });
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        function updateHUD() {
+            state.objectCount = sceneObjects.length;
+            state.selectedCount = selectedObjects.length;
+            
+            elObjectCount.textContent = state.objectCount;
+            elSelectedCount.textContent = state.selectedCount;
+            elGridSnap.textContent = state.gridSnap ? "ON" : "OFF";
+            elGridSnap.style.color = state.gridSnap ? "#4CAF50" : "white";
+            
+            elAlignBtn.disabled = state.selectedCount === 0;
+            elScaleSlider.disabled = state.selectedCount === 0;
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            
+            if (controls.enabled) {
+                controls.update();
+            }
+            
+            updateHUD();
+            
+            // Expose state
+            window.__3D_STATE__ = state;
+
+            renderer.render(scene, camera);
+        }
+    </script>
+</body>
+</html>

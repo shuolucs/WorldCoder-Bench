@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Three.js Depth to Point Cloud</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #111; color: #fff; font-family: sans-serif; }
+        canvas { display: block; width: 100vw; height: 100vh; }
+        #ui {
+            position: absolute; top: 10px; left: 10px;
+            background: rgba(0, 0, 0, 0.7); padding: 15px; border-radius: 8px;
+            display: flex; flex-direction: column; gap: 10px;
+            pointer-events: auto; z-index: 10;
+        }
+        .control-group { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+        label { font-size: 12px; width: 80px; }
+        input[type="range"] { width: 120px; }
+        select { width: 125px; background: #333; color: #fff; border: 1px solid #555; padding: 2px; }
+        span.val { font-size: 12px; width: 30px; text-align: right; }
+    </style>
+    <script type="importmap">
+    { "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+    } }
+    </script>
+</head>
+<body>
+    <div id="ui">
+        <div class="control-group">
+            <label for="fov">FOV</label>
+            <input type="range" id="fov" min="30" max="90" value="60">
+            <span id="fovVal" class="val">60</span>
+        </div>
+        <div class="control-group">
+            <label for="aspect">Aspect</label>
+            <input type="range" id="aspect" min="0.5" max="2.0" step="0.1" value="1.0">
+            <span id="aspectVal" class="val">1.0</span>
+        </div>
+        <div class="control-group">
+            <label for="pointSize">Point Size</label>
+            <input type="range" id="pointSize" min="1" max="10" step="0.1" value="3.0">
+            <span id="pointSizeVal" class="val">3.0</span>
+        </div>
+        <div class="control-group">
+            <label for="renderMode">Mode</label>
+            <select id="renderMode">
+                <option value="pointcloud">Point Cloud</option>
+                <option value="depth">Depth Map</option>
+                <option value="rgb">RGB Map</option>
+            </select>
+        </div>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        // --- State ---
+        window.__3D_STATE__ = {
+            pointCount: 0,
+            depthRange: { near: 0.1, far: 30.0 },
+            fov: 60,
+            aspect: 1.0,
+            pointSize: 3.0,
+            renderMode: 'pointcloud',
+            cameraPos: { x: 0, y: 0, z: 0 }
+        };
+
+        // --- UI Elements ---
+        const fovSlider = document.getElementById('fov');
+        const aspectSlider = document.getElementById('aspect');
+        const pointSizeSlider = document.getElementById('pointSize');
+        const renderModeSelect = document.getElementById('renderMode');
+        
+        const fovVal = document.getElementById('fovVal');
+        const aspectVal = document.getElementById('aspectVal');
+        const pointSizeVal = document.getElementById('pointSizeVal');
+
+        // --- Setup Renderer ---
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        document.body.appendChild(renderer.domElement);
+
+        // --- Main Scene (Viewing the Point Cloud) ---
+        const mainScene = new THREE.Scene();
+        const mainCamera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 100);
+        mainCamera.position.set(15, 15, 15);
+        const controls = new OrbitControls(mainCamera, renderer.domElement);
+        controls.enableDamping = true;
+
+        // Add a grid and axes to main scene for reference
+        mainScene.add(new THREE.GridHelper(20, 20, 0x444444, 0x222222));
+        mainScene.add(new THREE.AxesHelper(5));
+
+        // --- Source Scene (Generating Depth) ---
+        const sourceScene = new THREE.Scene();
+        sourceScene.background = new THREE.Color(0x222222);
+        const sourceCamera = new THREE.PerspectiveCamera(60, 1.0, 0.1, 30.0);
+        sourceCamera.position.set(0, 4, 8);
+        sourceCamera.lookAt(0, 0, 0);
+
+        // Add objects to source scene
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+        sourceScene.add(ambientLight);
+        const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+        dirLight.position.set(5, 10, 5);
+        sourceScene.add(dirLight);
+
+        const floor = new THREE.Mesh(new THREE.PlaneGeometry(15, 15), new THREE.MeshStandardMaterial({ color: 0x555555 }));
+        floor.rotation.x = -Math.PI / 2;
+        sourceScene.add(floor);
+
+        const cube1 = new THREE.Mesh(new THREE.BoxGeometry(2, 2, 2), new THREE.MeshStandardMaterial({ color: 0xff4444 }));
+        cube1.position.set(-2, 1, 0);
+        sourceScene.add(cube1);
+
+        const sphere = new THREE.Mesh(new THREE.SphereGeometry(1.5, 32, 32), new THREE.MeshStandardMaterial({ color: 0x4444ff }));
+        sphere.position.set(2, 1.5, 1);
+        sourceScene.add(sphere);
+
+        const cube2 = new THREE.Mesh(new THREE.BoxGeometry(1, 4, 1), new THREE.MeshStandardMaterial({ color: 0x44ff44 }));
+        cube2.position.set(0, 2, -3);
+        sourceScene.add(cube2);
+
+        // Visualize source camera in main scene
+        const cameraHelper = new THREE.CameraHelper(sourceCamera);
+        mainScene.add(cameraHelper);
+
+        // --- Render Target (256x256) ---
+        const depthRes = 256;
+        const renderTarget = new THREE.WebGLRenderTarget(depthRes, depthRes, {
+            format: THREE.RGBAFormat,
+            type: THREE.UnsignedByteType
+        });
+        renderTarget.depthTexture = new THREE.DepthTexture(depthRes, depthRes);
+        renderTarget.depthTexture.type = THREE.UnsignedIntType;
+
+        // --- Point Cloud Setup ---
+        const pointCount = depthRes * depthRes;
+        const geometry = new THREE.BufferGeometry();
+        const positions = new Float32Array(pointCount * 3);
+        
+        let idx = 0;
+        for (let y = 0; y < depthRes; y++) {
+            for (let x = 0; x < depthRes; x++) {
+                // Store UV coordinates in position.xy
+                positions[idx++] = (x + 0.5) / depthRes;
+                positions[idx++] = (y + 0.5) / depthRes;
+                positions[idx++] = 0;
+            }
+        }
+        geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+
+        const pointCloudMaterial = new THREE.ShaderMaterial({
+            uniforms: {
+                depthMap: { value: renderTarget.depthTexture },
+                camInverseProj: { value: new THREE.Matrix4() },
+                camMatrixWorld: { value: new THREE.Matrix4() },
+                pointSize: { value: 3.0 },
+                cameraNear: { value: sourceCamera.near },
+                cameraFar: { value: sourceCamera.far }
+            },
+            vertexShader: `
+                uniform sampler2D depthMap;
+                uniform mat4 camInverseProj;
+                uniform mat4 camMatrixWorld;
+                uniform float pointSize;
+                uniform float cameraNear;
+                uniform float cameraFar;
+
+                varying float vDepth;
+
+                void main() {
+                    vec2 uv = position.xy;
+                    float depthVal = texture2D(depthMap, uv).r;
+
+                    // Discard background points
+                    if (depthVal >= 0.9999) {
+                        gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+                        return;
+                    }
+
+                    // NDC coordinates
+                    vec4 ndc = vec4(uv * 2.0 - 1.0, depthVal * 2.0 - 1.0, 1.0);
+                    
+                    // Unproject to view space
+                    vec4 viewPos = camInverseProj * ndc;
+                    viewPos /= viewPos.w;
+                    
+                    // Transform to world space
+                    vec4 worldPos = camMatrixWorld * viewPos;
+
+                    gl_Position = projectionMatrix * viewMatrix * worldPos;
+                    gl_PointSize = pointSize;
+
+                    // Calculate linear depth for coloring
+                    float z = depthVal * 2.0 - 1.0;
+                    float linDepth = (2.0 * cameraNear * cameraFar) / (cameraFar + cameraNear - z * (cameraFar - cameraNear));
+                    vDepth = (linDepth - cameraNear) / (cameraFar - cameraNear);
+                }
+            `,
+            fragmentShader: `
+                varying float vDepth;
+                void main() {
+                    // Warm to cold color mapping based on depth
+                    vec3 colorNear = vec3(1.0, 0.2, 0.0); // Red/Orange
+                    vec3 colorMid = vec3(0.8, 0.8, 0.0);  // Yellow
+                    vec3 colorFar = vec3(0.0, 0.4, 1.0);  // Blue
+
+                    vec3 col;
+                    if (vDepth < 0.5) {
+                        col = mix(colorNear, colorMid, vDepth * 2.0);
+                    } else {
+                        col = mix(colorMid, colorFar, (vDepth - 0.5) * 2.0);
+                    }
+
+                    gl_FragColor = vec4(col, 1.0);
+                }
+            `,
+            transparent: true
+        });
+
+        const pointCloud = new THREE.Points(geometry, pointCloudMaterial);
+        mainScene.add(pointCloud);
+
+        // --- 2D Quad Setup (for RGB / Depth modes) ---
+        const quadScene = new THREE.Scene();
+        const quadCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+        const quadGeometry = new THREE.PlaneGeometry(2, 2);
+        
+        const rgbMaterial = new THREE.ShaderMaterial({
+            uniforms: { tDiffuse: { value: renderTarget.texture } },
+            vertexShader: `varying vec2 vUv; void main() { vUv = uv; gl_Position = vec4(position, 1.0); }`,
+            fragmentShader: `uniform sampler2D tDiffuse; varying vec2 vUv; void main() { gl_FragColor = texture2D(tDiffuse, vUv); }`
+        });
+
+        const depthMaterial = new THREE.ShaderMaterial({
+            uniforms: { 
+                tDepth: { value: renderTarget.depthTexture },
+                cameraNear: { value: sourceCamera.near },
+                cameraFar: { value: sourceCamera.far }
+            },
+            vertexShader: `varying vec2 vUv; void main() { vUv = uv; gl_Position = vec4(position, 1.0); }`,
+            fragmentShader: `
+                uniform sampler2D tDepth;
+                uniform float cameraNear;
+                uniform float cameraFar;
+                varying vec2 vUv;
+                void main() {
+                    float depthVal = texture2D(tDepth, vUv).r;
+                    float z = depthVal * 2.0 - 1.0;
+                    float linDepth = (2.0 * cameraNear * cameraFar) / (cameraFar + cameraNear - z * (cameraFar - cameraNear));
+                    float normDepth = (linDepth - cameraNear) / (cameraFar - cameraNear);
+                    gl_FragColor = vec4(vec3(normDepth), 1.0);
+                }
+            `
+        });
+
+        const quadMesh = new THREE.Mesh(quadGeometry, rgbMaterial);
+        quadScene.add(quadMesh);
+
+        // --- Event Listeners ---
+        window.addEventListener('resize', () => {
+            mainCamera.aspect = window.innerWidth / window.innerHeight;
+            mainCamera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // --- Animation Loop ---
+        const clock = new THREE.Clock();
+
+        function animate() {
+            requestAnimationFrame(animate);
+            const time = clock.getElapsedTime();
+
+            // Animate source scene
+            cube1.rotation.x = time * 0.5;
+            cube1.rotation.y = time * 0.5;
+            sphere.position.y = 1.5 + Math.sin(time * 2) * 0.5;
+
+            // Update UI values & Source Camera
+            const fov = parseFloat(fovSlider.value);
+            const aspect = parseFloat(aspectSlider.value);
+            const pSize = parseFloat(pointSizeSlider.value);
+            const mode = renderModeSelect.value;
+
+            fovVal.textContent = fov;
+            aspectVal.textContent = aspect.toFixed(1);
+            pointSizeVal.textContent = pSize.toFixed(1);
+
+            sourceCamera.fov = fov;
+            sourceCamera.aspect = aspect;
+            sourceCamera.updateProjectionMatrix();
+            cameraHelper.update();
+
+            // 1. Render Source Scene to Offscreen Target
+            renderer.setRenderTarget(renderTarget);
+            renderer.clear();
+            renderer.render(sourceScene, sourceCamera);
+            renderer.setRenderTarget(null);
+
+            // 2. Update Point Cloud Uniforms
+            pointCloudMaterial.uniforms.camInverseProj.value.copy(sourceCamera.projectionMatrixInverse);
+            pointCloudMaterial.uniforms.camMatrixWorld.value.copy(sourceCamera.matrixWorld);
+            pointCloudMaterial.uniforms.pointSize.value = pSize;
+
+            // 3. Render Main View based on Mode
+            controls.update();
+
+            if (mode === 'pointcloud') {
+                renderer.render(mainScene, mainCamera);
+            } else {
+                quadMesh.material = (mode === 'rgb') ? rgbMaterial : depthMaterial;
+                renderer.render(quadScene, quadCamera);
+            }
+
+            // 4. Update State Object
+            window.__3D_STATE__.pointCount = (mode === 'pointcloud') ? pointCount : pointCount; // Always report 256x256 as requested
+            window.__3D_STATE__.depthRange.near = sourceCamera.near;
+            window.__3D_STATE__.depthRange.far = sourceCamera.far;
+            window.__3D_STATE__.fov = fov;
+            window.__3D_STATE__.aspect = aspect;
+            window.__3D_STATE__.pointSize = pSize;
+            window.__3D_STATE__.renderMode = mode;
+            window.__3D_STATE__.cameraPos.x = mainCamera.position.x;
+            window.__3D_STATE__.cameraPos.y = mainCamera.position.y;
+            window.__3D_STATE__.cameraPos.z = mainCamera.position.z;
+        }
+
+        animate();
+    </script>
+</body>
+</html>

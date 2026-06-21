@@ -1,0 +1,571 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Avocado Traffic Simulation</title>
+<style>
+  body { margin: 0; overflow: hidden; background: #000; }
+  canvas { display: block; }
+  #hud {
+    position: absolute;
+    top: 10px;
+    left: 10px;
+    color: white;
+    background: rgba(0,0,0,0.7);
+    padding: 10px;
+    font-family: monospace;
+    font-size: 14px;
+    line-height: 1.6;
+    border-radius: 5px;
+    z-index: 10;
+    user-select: none;
+  }
+  #buttons {
+    position: absolute;
+    top: 220px;
+    left: 10px;
+    z-index: 10;
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+  }
+  #buttons button {
+    font-family: monospace;
+    font-size: 14px;
+    padding: 8px 16px;
+    cursor: pointer;
+    background: rgba(0,0,0,0.7);
+    color: white;
+    border: 1px solid #666;
+    border-radius: 4px;
+  }
+  #buttons button:hover {
+    background: rgba(50,50,50,0.9);
+  }
+</style>
+</head>
+<body>
+
+<div id="hud">
+  <div id="hud-vehicles">Vehicles: 8</div>
+  <div id="hud-speed">Speed Multiplier: 1x</div>
+  <div id="hud-xroad">X-Road: GREEN</div>
+  <div id="hud-zroad">Z-Road: RED</div>
+  <div id="hud-wraps">Total Wraps: 0</div>
+  <div id="hud-time">Simulation Time: 0s</div>
+</div>
+
+<div id="buttons">
+  <button id="btn-speedup">Speed Up</button>
+  <button id="btn-slowdown">Slow Down</button>
+  <button id="btn-pause">Toggle Pause</button>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+// --- State ---
+const BASE_SPEED = 0.05;
+let speedMultiplier = 1;
+let paused = false;
+let totalWraps = 0;
+let simulationTime = 0;
+let lightCycleCount = 0;
+let lightTimer = 0;
+let lightPhase = 0; // 0: X green, 1: X yellow, 2: Z green, 3: Z yellow
+const phaseDurations = [5, 1, 5, 1];
+let xRoadLight = 'GREEN';
+let zRoadLight = 'RED';
+
+let cameraTheta = Math.atan2(50, 0); // angle in XZ
+let cameraPhi = Math.atan2(40, 50);  // polar angle from horizontal
+let cameraRadius = Math.sqrt(40*40 + 50*50);
+
+// Scene
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x111111);
+
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 500);
+camera.position.set(0, 40, 50);
+camera.lookAt(0, 0, 0);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(window.devicePixelRatio);
+document.body.appendChild(renderer.domElement);
+
+// Lights
+const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+scene.add(ambientLight);
+
+const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+dirLight.position.set(10, 30, 10);
+scene.add(dirLight);
+
+// Ground
+const groundGeo = new THREE.PlaneGeometry(100, 100);
+const groundMat = new THREE.MeshStandardMaterial({ color: 0x333333 });
+const ground = new THREE.Mesh(groundGeo, groundMat);
+ground.rotation.x = -Math.PI / 2;
+ground.position.y = 0;
+scene.add(ground);
+
+// Roads
+function createRoad(width, length, rotation, position) {
+  const geo = new THREE.PlaneGeometry(width, length);
+  const mat = new THREE.MeshStandardMaterial({ color: 0x555555 });
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.rotation.x = -Math.PI / 2;
+  if (rotation) mesh.rotation.z = rotation;
+  mesh.position.copy(position);
+  mesh.position.y = 0.01;
+  scene.add(mesh);
+  return mesh;
+}
+
+// X-axis road
+createRoad(6, 100, 0, new THREE.Vector3(0, 0, 0));
+// Z-axis road
+createRoad(100, 6, 0, new THREE.Vector3(0, 0, 0));
+
+// Dashed center lines
+function createDashedLine(axis) {
+  const points = [];
+  if (axis === 'x') {
+    points.push(new THREE.Vector3(-50, 0.02, 0));
+    points.push(new THREE.Vector3(50, 0.02, 0));
+  } else {
+    points.push(new THREE.Vector3(0, 0.02, -50));
+    points.push(new THREE.Vector3(0, 0.02, 50));
+  }
+  const geo = new THREE.BufferGeometry().setFromPoints(points);
+  const mat = new THREE.LineDashedMaterial({
+    color: 0xffff00,
+    dashSize: 2,
+    gapSize: 1,
+    linewidth: 1
+  });
+  const line = new THREE.Line(geo, mat);
+  line.computeLineDistances();
+  scene.add(line);
+}
+
+createDashedLine('x');
+createDashedLine('z');
+
+// Traffic Light creation
+function createTrafficLight(position, facingAxis) {
+  const group = new THREE.Group();
+
+  // Pole
+  const poleGeo = new THREE.CylinderGeometry(0.3, 0.3, 8, 16);
+  const poleMat = new THREE.MeshStandardMaterial({ color: 0x444444 });
+  const pole = new THREE.Mesh(poleGeo, poleMat);
+  pole.position.y = 4;
+  group.add(pole);
+
+  // Housing
+  const boxGeo = new THREE.BoxGeometry(1.5, 4, 1.5);
+  const boxMat = new THREE.MeshStandardMaterial({ color: 0x222222 });
+  const box = new THREE.Mesh(boxGeo, boxMat);
+  box.position.y = 10;
+  group.add(box);
+
+  // Lights (red, yellow, green from top to bottom)
+  const lightColors = [0xff0000, 0xffff00, 0x00ff00];
+  const lightPositions = [11, 10, 9];
+  const spheres = [];
+
+  for (let i = 0; i < 3; i++) {
+    const sphereGeo = new THREE.SphereGeometry(0.4, 16, 16);
+    const sphereMat = new THREE.MeshStandardMaterial({
+      color: lightColors[i],
+      emissive: lightColors[i],
+      emissiveIntensity: 0.1
+    });
+    const sphere = new THREE.Mesh(sphereGeo, sphereMat);
+    sphere.position.y = lightPositions[i];
+    sphere.position.z = 0.6;
+    group.add(sphere);
+    spheres.push(sphere);
+  }
+
+  group.position.copy(new THREE.Vector3(position.x, position.y, position.z));
+  scene.add(group);
+
+  return {
+    group,
+    redLight: spheres[0],
+    yellowLight: spheres[1],
+    greenLight: spheres[2],
+    setLight(state) {
+      const dim = 0.05;
+      const bright = 1.5;
+      this.redLight.material.emissiveIntensity = state === 'RED' ? bright : dim;
+      this.yellowLight.material.emissiveIntensity = state === 'YELLOW' ? bright : dim;
+      this.greenLight.material.emissiveIntensity = state === 'GREEN' ? bright : dim;
+    }
+  };
+}
+
+const trafficLightX = createTrafficLight({ x: 5, y: 0, z: 5 }, 'x');
+const trafficLightZ = createTrafficLight({ x: -5, y: 0, z: -5 }, 'z');
+
+// Vehicle definitions
+const vehicles = [];
+
+const vehicleConfigs = [
+  // X-road vehicles
+  { axis: 'x', dir: 1, startPos: -30 },
+  { axis: 'x', dir: 1, startPos: -15 },
+  { axis: 'x', dir: -1, startPos: 30 },
+  { axis: 'x', dir: -1, startPos: 15 },
+  // Z-road vehicles
+  { axis: 'z', dir: 1, startPos: -30 },
+  { axis: 'z', dir: 1, startPos: -15 },
+  { axis: 'z', dir: -1, startPos: 30 },
+  { axis: 'z', dir: -1, startPos: 15 },
+];
+
+let avocadoTemplate = null;
+let modelsLoaded = false;
+
+// Load avocado model
+const loader = new GLTFLoader();
+loader.load(
+  'https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/Avocado/glTF-Binary/Avocado.glb',
+  (gltf) => {
+    avocadoTemplate = gltf.scene;
+    avocadoTemplate.scale.set(15, 15, 15);
+
+    for (let i = 0; i < 8; i++) {
+      const config = vehicleConfigs[i];
+      const model = avocadoTemplate.clone();
+      model.scale.set(15, 15, 15);
+
+      const x = config.axis === 'x' ? config.startPos : 0;
+      const z = config.axis === 'z' ? config.startPos : 0;
+      model.position.set(x, 0.5, z);
+
+      // Rotation based on direction
+      if (config.axis === 'x') {
+        model.rotation.y = config.dir > 0 ? Math.PI / 2 : -Math.PI / 2;
+      } else {
+        model.rotation.y = config.dir > 0 ? Math.PI : 0;
+      }
+
+      scene.add(model);
+
+      vehicles.push({
+        model,
+        axis: config.axis,
+        dir: config.dir,
+        startPos: config.startPos,
+        currentSpeed: BASE_SPEED,
+        position: config.startPos
+      });
+    }
+    modelsLoaded = true;
+  },
+  undefined,
+  (error) => {
+    console.error('Error loading Avocado model, using fallback:', error);
+    // Fallback: create avocado-shaped objects
+    for (let i = 0; i < 8; i++) {
+      const config = vehicleConfigs[i];
+
+      const group = new THREE.Group();
+      // Body (ellipsoid)
+      const bodyGeo = new THREE.SphereGeometry(1, 16, 16);
+      const bodyMat = new THREE.MeshStandardMaterial({ color: 0x2d5a27 });
+      const body = new THREE.Mesh(bodyGeo, bodyMat);
+      body.scale.set(0.8, 1.2, 0.8);
+      group.add(body);
+
+      // Seed
+      const seedGeo = new THREE.SphereGeometry(0.4, 16, 16);
+      const seedMat = new THREE.MeshStandardMaterial({ color: 0x8B4513 });
+      const seed = new THREE.Mesh(seedGeo, seedMat);
+      seed.position.y = -0.2;
+      group.add(seed);
+
+      group.scale.set(1.5, 1.5, 1.5);
+
+      const x = config.axis === 'x' ? config.startPos : 0;
+      const z = config.axis === 'z' ? config.startPos : 0;
+      group.position.set(x, 1.5, z);
+
+      if (config.axis === 'x') {
+        group.rotation.y = config.dir > 0 ? Math.PI / 2 : -Math.PI / 2;
+      } else {
+        group.rotation.y = config.dir > 0 ? Math.PI : 0;
+      }
+
+      scene.add(group);
+
+      vehicles.push({
+        model: group,
+        axis: config.axis,
+        dir: config.dir,
+        startPos: config.startPos,
+        currentSpeed: BASE_SPEED,
+        position: config.startPos
+      });
+    }
+    modelsLoaded = true;
+  }
+);
+
+// Update traffic lights
+function updateTrafficLights(dt) {
+  lightTimer += dt;
+
+  if (lightTimer >= phaseDurations[lightPhase]) {
+    lightTimer -= phaseDurations[lightPhase];
+    lightPhase = (lightPhase + 1) % 4;
+    if (lightPhase === 0) {
+      lightCycleCount++;
+    }
+  }
+
+  switch (lightPhase) {
+    case 0: xRoadLight = 'GREEN'; zRoadLight = 'RED'; break;
+    case 1: xRoadLight = 'YELLOW'; zRoadLight = 'RED'; break;
+    case 2: xRoadLight = 'RED'; zRoadLight = 'GREEN'; break;
+    case 3: xRoadLight = 'RED'; zRoadLight = 'YELLOW'; break;
+  }
+
+  trafficLightX.setLight(xRoadLight);
+  trafficLightZ.setLight(zRoadLight);
+}
+
+// Get vehicles on same road sorted by position
+function getVehiclesOnRoad(axis, dir) {
+  return vehicles
+    .filter(v => v.axis === axis && v.dir === dir)
+    .sort((a, b) => dir > 0 ? a.position - b.position : b.position - a.position);
+}
+
+// Update vehicles
+function updateVehicles() {
+  if (!modelsLoaded) return;
+
+  for (const vehicle of vehicles) {
+    const light = vehicle.axis === 'x' ? xRoadLight : zRoadLight;
+    const distToOrigin = Math.abs(vehicle.position);
+    const approachingIntersection = (vehicle.dir > 0 && vehicle.position < 0 && vehicle.position > -12) ||
+                                     (vehicle.dir < 0 && vehicle.position > 0 && vehicle.position < 12);
+
+    let targetSpeed = BASE_SPEED;
+
+    // Traffic light logic
+    if ((light === 'RED' || light === 'YELLOW') && approachingIntersection && distToOrigin < 12) {
+      targetSpeed = 0;
+    }
+
+    // Anti-collision: check vehicle ahead on same road
+    const sameRoadVehicles = vehicles.filter(v => v.axis === vehicle.axis && v.dir === vehicle.dir && v !== vehicle);
+    for (const other of sameRoadVehicles) {
+      const gap = (other.position - vehicle.position) * vehicle.dir;
+      if (gap > 0 && gap < 4) {
+        targetSpeed = 0;
+      } else if (gap > 0 && gap < 8) {
+        targetSpeed = Math.min(targetSpeed, other.currentSpeed * 0.5);
+      }
+    }
+
+    // Clamp target speed
+    targetSpeed = Math.max(0, Math.min(BASE_SPEED, targetSpeed));
+
+    // Smooth interpolation
+    vehicle.currentSpeed += (targetSpeed - vehicle.currentSpeed) * 0.05;
+    vehicle.currentSpeed = Math.max(0, Math.min(BASE_SPEED * speedMultiplier, vehicle.currentSpeed));
+
+    // Move
+    vehicle.position += vehicle.dir * vehicle.currentSpeed * speedMultiplier;
+
+    // Wrap
+    if (vehicle.position > 45) {
+      vehicle.position = -45;
+      totalWraps++;
+    } else if (vehicle.position < -45) {
+      vehicle.position = 45;
+      totalWraps++;
+    }
+
+    // Update 3D position
+    if (vehicle.axis === 'x') {
+      vehicle.model.position.x = vehicle.position;
+      vehicle.model.position.z = vehicle.dir > 0 ? -1.5 : 1.5;
+    } else {
+      vehicle.model.position.z = vehicle.position;
+      vehicle.model.position.x = vehicle.dir > 0 ? 1.5 : -1.5;
+    }
+  }
+}
+
+// Camera orbit
+function updateCamera() {
+  const x = cameraRadius * Math.cos(cameraPhi) * Math.sin(cameraTheta);
+  const y = cameraRadius * Math.sin(cameraPhi);
+  const z = cameraRadius * Math.cos(cameraPhi) * Math.cos(cameraTheta);
+  camera.position.set(x, y, z);
+  camera.lookAt(0, 0, 0);
+}
+
+// HUD update
+function updateHUD() {
+  document.getElementById('hud-vehicles').textContent = `Vehicles: 8`;
+  document.getElementById('hud-speed').textContent = `Speed Multiplier: ${speedMultiplier}x`;
+  document.getElementById('hud-xroad').textContent = `X-Road: ${xRoadLight}`;
+  document.getElementById('hud-zroad').textContent = `Z-Road: ${zRoadLight}`;
+  document.getElementById('hud-wraps').textContent = `Total Wraps: ${totalWraps}`;
+  document.getElementById('hud-time').textContent = `Simulation Time: ${simulationTime.toFixed(1)}s`;
+}
+
+// State exposure
+function updateState() {
+  const avgSpeed = vehicles.length > 0
+    ? vehicles.reduce((sum, v) => sum + v.currentSpeed, 0) / vehicles.length
+    : 0;
+
+  window.__3D_STATE__ = {
+    vehicleCount: vehicles.length,
+    speedMultiplier,
+    paused,
+    xRoadLight,
+    zRoadLight,
+    totalWraps,
+    simulationTime,
+    vehiclePositions: vehicles.map(v => ({
+      x: v.axis === 'x' ? v.position : (v.dir > 0 ? 1.5 : -1.5),
+      z: v.axis === 'z' ? v.position : (v.dir > 0 ? -1.5 : 1.5)
+    })),
+    lightCycleCount,
+    avgSpeed
+  };
+}
+
+// Initialize state
+window.__3D_STATE__ = {
+  vehicleCount: 8,
+  speedMultiplier: 1,
+  paused: false,
+  xRoadLight: 'GREEN',
+  zRoadLight: 'RED',
+  totalWraps: 0,
+  simulationTime: 0,
+  vehiclePositions: [],
+  lightCycleCount: 0,
+  avgSpeed: 0
+};
+
+// Reset function
+function resetSimulation() {
+  speedMultiplier = 1;
+  paused = false;
+  totalWraps = 0;
+  simulationTime = 0;
+  lightCycleCount = 0;
+  lightTimer = 0;
+  lightPhase = 0;
+
+  for (let i = 0; i < vehicles.length; i++) {
+    const config = vehicleConfigs[i];
+    vehicles[i].position = config.startPos;
+    vehicles[i].currentSpeed = BASE_SPEED;
+    vehicles[i].dir = config.dir;
+
+    if (config.axis === 'x') {
+      vehicles[i].model.position.x = config.startPos;
+      vehicles[i].model.position.z = config.dir > 0 ? -1.5 : 1.5;
+    } else {
+      vehicles[i].model.position.z = config.startPos;
+      vehicles[i].model.position.x = config.dir > 0 ? 1.5 : -1.5;
+    }
+  }
+}
+
+// Button handlers
+document.getElementById('btn-speedup').addEventListener('click', () => {
+  if (speedMultiplier < 8) speedMultiplier *= 2;
+});
+
+document.getElementById('btn-slowdown').addEventListener('click', () => {
+  if (speedMultiplier > 0.25) speedMultiplier /= 2;
+});
+
+document.getElementById('btn-pause').addEventListener('click', () => {
+  paused = !paused;
+});
+
+// Keyboard
+document.addEventListener('keydown', (e) => {
+  switch (e.code) {
+    case 'ArrowUp':
+      cameraPhi = Math.min(Math.PI / 2 - 0.05, cameraPhi + 0.1);
+      updateCamera();
+      break;
+    case 'ArrowDown':
+      cameraPhi = Math.max(0.05, cameraPhi - 0.1);
+      updateCamera();
+      break;
+    case 'Space':
+      e.preventDefault();
+      paused = !paused;
+      break;
+    case 'KeyR':
+      resetSimulation();
+      break;
+  }
+});
+
+// Window resize
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// Initialize camera angles from initial position
+cameraTheta = Math.atan2(0, 50); // camera at (0, 40, 50)
+cameraPhi = Math.atan2(40, 50);
+cameraRadius = Math.sqrt(40 * 40 + 50 * 50);
+updateCamera();
+
+// Animation loop
+let lastTime = performance.now();
+
+function animate(currentTime) {
+  requestAnimationFrame(animate);
+
+  const rawDt = (currentTime - lastTime) / 1000;
+  lastTime = currentTime;
+
+  if (!paused) {
+    const dt = rawDt * speedMultiplier;
+    simulationTime += dt;
+    updateTrafficLights(dt);
+    updateVehicles();
+  }
+
+  updateHUD();
+  updateState();
+  renderer.render(scene, camera);
+}
+
+requestAnimationFrame(animate);
+</script>
+</body>
+</html>

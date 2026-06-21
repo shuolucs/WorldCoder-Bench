@@ -1,0 +1,537 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Three.js 简化城市场景 + LOD + 昼夜雾效</title>
+  <style>
+    html, body {
+      margin: 0;
+      height: 100%;
+      overflow: hidden;
+      font-family: Arial, sans-serif;
+      background: #111;
+    }
+
+    #app {
+      width: 100%;
+      height: 100%;
+      display: block;
+    }
+
+    #ui {
+      position: fixed;
+      top: 12px;
+      left: 12px;
+      z-index: 10;
+      background: rgba(255,255,255,0.88);
+      padding: 12px 14px;
+      border-radius: 10px;
+      box-shadow: 0 4px 18px rgba(0,0,0,0.18);
+      line-height: 1.6;
+      min-width: 220px;
+    }
+
+    #ui label {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin: 6px 0;
+      font-size: 14px;
+      color: #222;
+    }
+
+    #ui input[type="range"] {
+      width: 140px;
+    }
+
+    #info {
+      font-size: 12px;
+      color: #444;
+      margin-top: 6px;
+    }
+  </style>
+
+  <script type="importmap">
+  { "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+  } }
+  </script>
+</head>
+<body>
+  <div id="ui">
+    <label>
+      <input id="dayNightToggle" type="checkbox" checked />
+      白天 / 夜晚
+    </label>
+    <label>
+      雾距
+      <input id="fogSlider" type="range" min="120" max="700" step="1" value="420" />
+      <span id="fogValue">420</span>
+    </label>
+    <div id="info">拖拽旋转，滚轮缩放，观察建筑 LOD 切换</div>
+  </div>
+  <canvas id="app"></canvas>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+    const canvas = document.getElementById('app');
+    const dayNightToggle = document.getElementById('dayNightToggle');
+    const fogSlider = document.getElementById('fogSlider');
+    const fogValue = document.getElementById('fogValue');
+
+    const scene = new THREE.Scene();
+
+    const renderer = new THREE.WebGLRenderer({
+      canvas,
+      antialias: true
+    });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+    const camera = new THREE.PerspectiveCamera(
+      55,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      2000
+    );
+    camera.position.set(180, 180, 180);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.set(0, 0, 0);
+    controls.enableDamping = true;
+    controls.minDistance = 60;
+    controls.maxDistance = 800;
+    controls.maxPolarAngle = Math.PI * 0.48;
+
+    const cityGroup = new THREE.Group();
+    scene.add(cityGroup);
+
+    const buildingLODs = [];
+    const buildingCenters = [];
+
+    const ambientLight = new THREE.AmbientLight(0xffffff, 1.0);
+    scene.add(ambientLight);
+
+    const dirLight = new THREE.DirectionalLight(0xffffff, 1.8);
+    dirLight.position.set(180, 260, 100);
+    dirLight.castShadow = true;
+    dirLight.shadow.mapSize.set(2048, 2048);
+    dirLight.shadow.camera.left = -350;
+    dirLight.shadow.camera.right = 350;
+    dirLight.shadow.camera.top = 350;
+    dirLight.shadow.camera.bottom = -350;
+    dirLight.shadow.camera.near = 10;
+    dirLight.shadow.camera.far = 900;
+    scene.add(dirLight);
+
+    const hemiLight = new THREE.HemisphereLight(0xbfdfff, 0x445566, 0.7);
+    scene.add(hemiLight);
+
+    const nightPointLights = [];
+
+    function makeWindowGrid(frontGroup, width, height, depth, emissiveIntensity = 0.0) {
+      const cols = Math.max(2, Math.floor(width / 5));
+      const rows = Math.max(3, Math.floor(height / 6));
+      const winW = Math.min(2.2, width / (cols + 1));
+      const winH = Math.min(2.6, height / (rows + 1));
+
+      const litMat = new THREE.MeshStandardMaterial({
+        color: 0x87a6c4,
+        emissive: 0xffd77a,
+        emissiveIntensity,
+        roughness: 0.5,
+        metalness: 0.08
+      });
+
+      for (let r = 0; r < rows; r++) {
+        for (let c = 0; c < cols; c++) {
+          if ((r + c) % 3 === 0) continue;
+          const windowMesh = new THREE.Mesh(
+            new THREE.PlaneGeometry(winW, winH),
+            litMat
+          );
+          const x = -width / 2 + (c + 1) * (width / (cols + 1));
+          const y = 2 + (r + 1) * (height / (rows + 1));
+          windowMesh.position.set(x, y, depth / 2 + 0.06);
+          frontGroup.add(windowMesh);
+
+          const backWindow = windowMesh.clone();
+          backWindow.position.z = -depth / 2 - 0.06;
+          backWindow.rotation.y = Math.PI;
+          frontGroup.add(backWindow);
+        }
+      }
+    }
+
+    function createLowDetailBuilding(width, height, depth, color) {
+      const group = new THREE.Group();
+
+      const body = new THREE.Mesh(
+        new THREE.BoxGeometry(width, height, depth),
+        new THREE.MeshStandardMaterial({
+          color,
+          roughness: 0.85,
+          metalness: 0.05
+        })
+      );
+      body.position.y = height / 2;
+      body.castShadow = true;
+      body.receiveShadow = true;
+      group.add(body);
+
+      return group;
+    }
+
+    function createMidDetailBuilding(width, height, depth, color) {
+      const group = new THREE.Group();
+
+      const body = new THREE.Mesh(
+        new THREE.BoxGeometry(width, height, depth),
+        new THREE.MeshStandardMaterial({
+          color,
+          roughness: 0.8,
+          metalness: 0.08
+        })
+      );
+      body.position.y = height / 2;
+      body.castShadow = true;
+      body.receiveShadow = true;
+      group.add(body);
+
+      makeWindowGrid(group, width * 0.86, height * 0.9, depth, 0.0);
+
+      const roof = new THREE.Mesh(
+        new THREE.BoxGeometry(width * 0.72, Math.max(1.2, height * 0.06), depth * 0.72),
+        new THREE.MeshStandardMaterial({
+          color: 0x666666,
+          roughness: 0.9
+        })
+      );
+      roof.position.y = height + Math.max(0.6, height * 0.03);
+      roof.castShadow = true;
+      roof.receiveShadow = true;
+      group.add(roof);
+
+      return group;
+    }
+
+    function createHighDetailBuilding(width, height, depth, color) {
+      const group = new THREE.Group();
+
+      const base = new THREE.Mesh(
+        new THREE.BoxGeometry(width, height, depth, 2, 3, 2),
+        new THREE.MeshStandardMaterial({
+          color,
+          roughness: 0.75,
+          metalness: 0.1
+        })
+      );
+      base.position.y = height / 2;
+      base.castShadow = true;
+      base.receiveShadow = true;
+      group.add(base);
+
+      makeWindowGrid(group, width * 0.88, height * 0.92, depth, 0.0);
+
+      const topTower = new THREE.Mesh(
+        new THREE.BoxGeometry(width * 0.55, height * 0.18, depth * 0.55),
+        new THREE.MeshStandardMaterial({
+          color: new THREE.Color(color).offsetHSL(0, -0.03, 0.06),
+          roughness: 0.72
+        })
+      );
+      topTower.position.y = height + height * 0.09;
+      topTower.castShadow = true;
+      topTower.receiveShadow = true;
+      group.add(topTower);
+
+      const antenna = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.25, 0.25, Math.max(4, height * 0.14), 8),
+        new THREE.MeshStandardMaterial({ color: 0xdddddd })
+      );
+      antenna.position.y = height + height * 0.18;
+      antenna.castShadow = true;
+      group.add(antenna);
+
+      const ledgesMat = new THREE.MeshStandardMaterial({ color: 0x4f5963, roughness: 0.85 });
+      for (let i = 1; i <= 2; i++) {
+        const ledge = new THREE.Mesh(
+          new THREE.BoxGeometry(width * (0.98 - i * 0.08), 0.6, depth * (0.98 - i * 0.08)),
+          ledgesMat
+        );
+        ledge.position.y = (height / 3) * i;
+        ledge.castShadow = true;
+        ledge.receiveShadow = true;
+        group.add(ledge);
+      }
+
+      return group;
+    }
+
+    function applyNightWindowsToLOD(lod) {
+      lod.levels.forEach(level => {
+        level.object.traverse(obj => {
+          if (obj.isMesh && obj.material && obj.material.emissive !== undefined) {
+            if (obj.material.emissive.getHex() === 0xffd77a) {
+              obj.material.emissiveIntensity = dayNightToggle.checked ? 0.0 : 1.6;
+            }
+          }
+        });
+      });
+    }
+
+    function createBuilding(width, height, depth, color, x, z) {
+      const lod = new THREE.LOD();
+
+      const high = createHighDetailBuilding(width, height, depth, color);
+      const mid = createMidDetailBuilding(width, height, depth, color);
+      const low = createLowDetailBuilding(width, height, depth, color);
+
+      lod.addLevel(high, 0);
+      lod.addLevel(mid, 90);
+      lod.addLevel(low, 180);
+
+      lod.position.set(x, 0, z);
+      cityGroup.add(lod);
+
+      const glow = new THREE.PointLight(0xffcc88, 0, 45, 2);
+      glow.position.set(x, Math.min(height * 0.65, 38), z);
+      cityGroup.add(glow);
+      nightPointLights.push(glow);
+
+      buildingLODs.push(lod);
+      buildingCenters.push(new THREE.Vector3(x, height / 2, z));
+
+      applyNightWindowsToLOD(lod);
+    }
+
+    function createGroundAndRoads() {
+      const ground = new THREE.Mesh(
+        new THREE.PlaneGeometry(520, 520),
+        new THREE.MeshStandardMaterial({
+          color: 0xd7dccf,
+          roughness: 1.0,
+          metalness: 0.0
+        })
+      );
+      ground.rotation.x = -Math.PI / 2;
+      ground.receiveShadow = true;
+      cityGroup.add(ground);
+
+      const roadMat = new THREE.MeshStandardMaterial({
+        color: 0x44484d,
+        roughness: 0.95
+      });
+
+      const roadWidth = 14;
+      const roadLength = 520;
+      const positions = [-200, -120, -40, 40, 120, 200];
+
+      positions.forEach(p => {
+        const roadX = new THREE.Mesh(
+          new THREE.PlaneGeometry(roadLength, roadWidth),
+          roadMat
+        );
+        roadX.rotation.x = -Math.PI / 2;
+        roadX.position.set(0, 0.02, p);
+        cityGroup.add(roadX);
+
+        const roadZ = new THREE.Mesh(
+          new THREE.PlaneGeometry(roadWidth, roadLength),
+          roadMat
+        );
+        roadZ.rotation.x = -Math.PI / 2;
+        roadZ.position.set(p, 0.02, 0);
+        cityGroup.add(roadZ);
+      });
+
+      const grid = new THREE.GridHelper(520, 26, 0x8a8a8a, 0xbcbcbc);
+      grid.position.y = 0.05;
+      cityGroup.add(grid);
+    }
+
+    function createBuildingsExactly50() {
+      const coords = [];
+      const blocks = [-160, -80, 0, 80, 160];
+      for (let ix = 0; ix < blocks.length; ix++) {
+        for (let iz = 0; iz < blocks.length; iz++) {
+          coords.push([blocks[ix], blocks[iz]]);
+        }
+      }
+
+      const offsets = [
+        [-14, -14], [14, 14]
+      ];
+
+      let index = 0;
+      for (let i = 0; i < coords.length; i++) {
+        for (let j = 0; j < offsets.length; j++) {
+          const [cx, cz] = coords[i];
+          const [ox, oz] = offsets[j];
+
+          const width = 14 + (index % 5) * 2;
+          const depth = 14 + ((index * 3) % 5) * 2;
+          const height = 24 + ((index * 17) % 70);
+          const hue = 0.58 + ((index % 7) * 0.02);
+          const sat = 0.14 + ((index % 3) * 0.04);
+          const light = 0.42 + ((index % 5) * 0.04);
+          const color = new THREE.Color().setHSL(hue, sat, light);
+
+          createBuilding(width, height, depth, color, cx + ox, cz + oz);
+          index++;
+        }
+      }
+      // 5x5 地块，每块 2 栋，共恰好 50 栋
+    }
+
+    createGroundAndRoads();
+    createBuildingsExactly50();
+
+    const frustum = new THREE.Frustum();
+    const projScreenMatrix = new THREE.Matrix4();
+
+    function updateFog() {
+      const far = Number(fogSlider.value);
+      fogValue.textContent = String(far);
+      scene.fog = new THREE.Fog(scene.background ?? new THREE.Color(0xcfe8ff), 80, far);
+    }
+
+    function updateDayNight() {
+      const isDay = dayNightToggle.checked;
+
+      if (isDay) {
+        scene.background = new THREE.Color(0xcfe8ff);
+        renderer.toneMappingExposure = 1.0;
+        ambientLight.intensity = 1.0;
+        dirLight.intensity = 1.8;
+        hemiLight.intensity = 0.7;
+        dirLight.color.set(0xffffff);
+        ambientLight.color.set(0xffffff);
+        hemiLight.color.set(0xbfdfff);
+        hemiLight.groundColor.set(0x445566);
+
+        cityGroup.traverse(obj => {
+          if (obj.isMesh && obj.material) {
+            if (obj.material.color) {
+              // 保持原色，不做统一覆盖
+            }
+          }
+        });
+
+        nightPointLights.forEach(l => l.intensity = 0);
+      } else {
+        scene.background = new THREE.Color(0x09111d);
+        renderer.toneMappingExposure = 0.85;
+        ambientLight.intensity = 0.28;
+        dirLight.intensity = 0.22;
+        hemiLight.intensity = 0.18;
+        dirLight.color.set(0x9bb6ff);
+        ambientLight.color.set(0x7f8fb3);
+        hemiLight.color.set(0x223355);
+        hemiLight.groundColor.set(0x05070b);
+
+        nightPointLights.forEach(l => l.intensity = 0.9);
+      }
+
+      buildingLODs.forEach(applyNightWindowsToLOD);
+      updateFog();
+    }
+
+    dayNightToggle.addEventListener('change', updateDayNight);
+    fogSlider.addEventListener('input', updateFog);
+
+    function getDominantLODLevel() {
+      // 含义说明：
+      // 这里的 lodLevel 为“全场建筑中主导的可见/最近似 LOD 层级索引”
+      // 0 = 高细节, 1 = 中细节, 2 = 低细节
+      // 通过统计相机到每栋建筑中心距离，按 addLevel 阈值近似判断当前主导层级。
+      const counts = [0, 0, 0];
+      for (let i = 0; i < buildingCenters.length; i++) {
+        const d = camera.position.distanceTo(buildingCenters[i]);
+        let level = 2;
+        if (d < 90) level = 0;
+        else if (d < 180) level = 1;
+        counts[level]++;
+      }
+      let dominant = 0;
+      if (counts[1] > counts[dominant]) dominant = 1;
+      if (counts[2] > counts[dominant]) dominant = 2;
+      return dominant;
+    }
+
+    function estimateVisibleBuildings() {
+      camera.updateMatrixWorld();
+      camera.updateProjectionMatrix();
+      projScreenMatrix.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+      frustum.setFromProjectionMatrix(projScreenMatrix);
+
+      let count = 0;
+      for (let i = 0; i < buildingCenters.length; i++) {
+        if (frustum.containsPoint(buildingCenters[i])) count++;
+      }
+      return count;
+    }
+
+    window.__3D_STATE__ = {
+      buildingCount: 50,
+      lodLevel: 0,
+      cameraDistance: 0,
+      fogDistance: Number(fogSlider.value),
+      isDayTime: true,
+      visibleBuildings: 50
+    };
+
+    function updateState() {
+      window.__3D_STATE__.buildingCount = 50;
+      window.__3D_STATE__.lodLevel = getDominantLODLevel();
+      window.__3D_STATE__.cameraDistance = Number(camera.position.length().toFixed(2));
+      window.__3D_STATE__.fogDistance = Number(fogSlider.value);
+      window.__3D_STATE__.isDayTime = dayNightToggle.checked;
+      window.__3D_STATE__.visibleBuildings = estimateVisibleBuildings();
+    }
+
+    window.__ICG_setCameraDistance__ = function(d) {
+      const dist = Math.max(60, Number(d) || 180);
+      const dir = new THREE.Vector3(1, 0.72, 1).normalize();
+      camera.position.copy(dir.multiplyScalar(dist));
+      controls.target.set(0, 0, 0);
+      controls.update();
+      buildingLODs.forEach(lod => lod.update(camera));
+      updateState();
+    };
+
+    function onResize() {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    }
+
+    window.addEventListener('resize', onResize);
+
+    updateDayNight();
+    updateFog();
+    updateState();
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      controls.update();
+
+      for (let i = 0; i < buildingLODs.length; i++) {
+        buildingLODs[i].update(camera);
+      }
+
+      updateState();
+      renderer.render(scene, camera);
+    }
+
+    animate();
+  </script>
+</body>
+</html>

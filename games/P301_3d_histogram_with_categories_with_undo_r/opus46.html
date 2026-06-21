@@ -1,0 +1,469 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3D Histogram with Undo/Redo</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { overflow: hidden; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+  canvas { display: block; }
+  #hud {
+    position: absolute;
+    top: 15px;
+    left: 15px;
+    background: rgba(0, 0, 0, 0.75);
+    color: #e0e0e0;
+    padding: 15px 20px;
+    border-radius: 10px;
+    font-size: 14px;
+    line-height: 1.8;
+    backdrop-filter: blur(10px);
+    border: 1px solid rgba(255,255,255,0.1);
+    min-width: 220px;
+  }
+  #hud h3 {
+    margin-bottom: 8px;
+    color: #fff;
+    font-size: 16px;
+    border-bottom: 1px solid rgba(255,255,255,0.2);
+    padding-bottom: 6px;
+  }
+  #hud .label { color: #aaa; }
+  #hud .value { color: #fff; font-weight: bold; }
+  .btn-group {
+    position: absolute;
+    top: 15px;
+    right: 15px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .btn-group button {
+    padding: 10px 20px;
+    border: 1px solid rgba(255,255,255,0.2);
+    border-radius: 8px;
+    background: rgba(0,0,0,0.7);
+    color: #fff;
+    font-size: 14px;
+    cursor: pointer;
+    backdrop-filter: blur(10px);
+    transition: all 0.2s;
+    min-width: 120px;
+  }
+  .btn-group button:hover { background: rgba(255,255,255,0.15); }
+  .btn-group button:active { transform: scale(0.97); }
+  .btn-group button:disabled { opacity: 0.4; cursor: not-allowed; }
+  #instructions {
+    position: absolute;
+    bottom: 15px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: rgba(0,0,0,0.7);
+    color: #aaa;
+    padding: 10px 20px;
+    border-radius: 8px;
+    font-size: 12px;
+    text-align: center;
+    backdrop-filter: blur(10px);
+    border: 1px solid rgba(255,255,255,0.1);
+  }
+</style>
+</head>
+<body>
+
+<div id="hud">
+  <h3>📊 3D Histogram</h3>
+  <div><span class="label">Selected: </span><span class="value" id="hud-selected">None</span></div>
+  <div><span class="label">Undo Stack: </span><span class="value" id="hud-undo">0</span></div>
+  <div><span class="label">Redo Stack: </span><span class="value" id="hud-redo">0</span></div>
+  <div><span class="label">Total: </span><span class="value" id="hud-total">0</span></div>
+</div>
+
+<div class="btn-group">
+  <button id="btn-undo">⟲ Undo (Z)</button>
+  <button id="btn-redo">⟳ Redo (Y)</button>
+  <button id="btn-reset">↺ Reset</button>
+</div>
+
+<div id="instructions">
+  Click a bar to select · Arrow Up/Down to change value · Z/Ctrl+Z Undo · Y/Ctrl+Y Redo · Drag to orbit
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<script>
+(function() {
+  // Data
+  const categoryNames = ['Sales', 'Marketing', 'Engineering', 'Design', 'Support'];
+  const initialValues = [4, 7, 10, 5, 8];
+  const categoryValues = [...initialValues];
+  const barColors = [0xe74c3c, 0x3498db, 0x2ecc71, 0xf39c12, 0x9b59b6];
+  const barPositionsX = [-3.6, -1.8, 0, 1.8, 3.6];
+  const MAX_VALUE = 15;
+  const MIN_VALUE = 0;
+  const MAX_UNDO = 20;
+  const ANIM_DURATION = 300;
+
+  let selectedIndex = -1;
+  let undoStack = [];
+  let redoStack = [];
+  let lastAction = 'none';
+
+  // Animation state per bar
+  const barAnimations = categoryNames.map(() => ({
+    animating: false,
+    startValue: 0,
+    endValue: 0,
+    startTime: 0,
+    currentVisualHeight: 0
+  }));
+
+  // Scene setup
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x1a1a2e);
+
+  const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+  camera.position.set(8, 6, 8);
+  camera.lookAt(0, 0, 0);
+
+  const renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.setPixelRatio(window.devicePixelRatio);
+  renderer.shadowMap.enabled = true;
+  document.body.appendChild(renderer.domElement);
+
+  // Lights
+  const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+  scene.add(ambientLight);
+
+  const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+  dirLight.position.set(5, 10, 5);
+  dirLight.castShadow = true;
+  scene.add(dirLight);
+
+  // Grid
+  const gridHelper = new THREE.GridHelper(10, 10, 0x444466, 0x333355);
+  scene.add(gridHelper);
+
+  // Controls
+  const controls = new THREE.OrbitControls(camera, renderer.domElement);
+  controls.enableDamping = true;
+  controls.dampingFactor = 0.08;
+
+  // Bar meshes
+  const barMeshes = [];
+  const barMaterials = [];
+  const valueLabelSprites = [];
+  const nameLabelSprites = [];
+
+  function createTextTexture(text, fontSize, color, bgColor, width, height) {
+    const canvas = document.createElement('canvas');
+    canvas.width = width || 256;
+    canvas.height = height || 128;
+    const ctx = canvas.getContext('2d');
+    if (bgColor) {
+      ctx.fillStyle = bgColor;
+      ctx.roundRect ? ctx.roundRect(0, 0, canvas.width, canvas.height, 10) : ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.fill();
+    } else {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+    }
+    ctx.font = `bold ${fontSize}px Segoe UI, Arial, sans-serif`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = color || '#ffffff';
+    ctx.fillText(text, canvas.width / 2, canvas.height / 2);
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.needsUpdate = true;
+    return texture;
+  }
+
+  function createSprite(text, fontSize, color, bgColor, scale) {
+    const texture = createTextTexture(text, fontSize, color, bgColor, 256, 128);
+    const material = new THREE.SpriteMaterial({ map: texture, transparent: true, depthTest: false });
+    const sprite = new THREE.Sprite(material);
+    sprite.scale.set(scale || 1.2, scale ? scale * 0.5 : 0.6, 1);
+    return sprite;
+  }
+
+  function updateSpriteText(sprite, text, fontSize, color, bgColor) {
+    const texture = createTextTexture(text, fontSize, color, bgColor, 256, 128);
+    sprite.material.map.dispose();
+    sprite.material.map = texture;
+    sprite.material.needsUpdate = true;
+  }
+
+  for (let i = 0; i < categoryNames.length; i++) {
+    const value = categoryValues[i];
+    const geometry = new THREE.BoxGeometry(1.0, 1.0, 1.0);
+    const material = new THREE.MeshStandardMaterial({
+      color: barColors[i],
+      metalness: 0.3,
+      roughness: 0.7
+    });
+    const mesh = new THREE.Mesh(geometry, material);
+    mesh.position.set(barPositionsX[i], value / 2, 0);
+    mesh.scale.set(1, value, 1);
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+    mesh.userData.categoryIndex = i;
+    scene.add(mesh);
+    barMeshes.push(mesh);
+    barMaterials.push(material);
+    barAnimations[i].currentVisualHeight = value;
+
+    // Value label above bar
+    const valueSprite = createSprite(String(value), 48, '#ffffff', 'rgba(0,0,0,0.6)', 1.0);
+    valueSprite.position.set(barPositionsX[i], value + 0.5, 0);
+    scene.add(valueSprite);
+    valueLabelSprites.push(valueSprite);
+
+    // Name label below bar
+    const nameSprite = createSprite(categoryNames[i], 36, '#cccccc', null, 1.4);
+    nameSprite.position.set(barPositionsX[i], -0.5, 0);
+    scene.add(nameSprite);
+    nameLabelSprites.push(nameSprite);
+  }
+
+  // Selection
+  function selectBar(index) {
+    // Deselect previous
+    if (selectedIndex >= 0 && selectedIndex < barMaterials.length) {
+      barMaterials[selectedIndex].emissive.setHex(0x000000);
+      barMaterials[selectedIndex].emissiveIntensity = 0;
+    }
+    if (index >= 0 && index < barMaterials.length) {
+      selectedIndex = index;
+      barMaterials[index].emissive.setHex(0xffffff);
+      barMaterials[index].emissiveIntensity = 0.3;
+      lastAction = 'select';
+    } else {
+      selectedIndex = -1;
+      lastAction = 'deselect';
+    }
+    updateHUD();
+  }
+
+  // Animation
+  function animateBar(index, targetValue) {
+    const anim = barAnimations[index];
+    anim.animating = true;
+    anim.startValue = anim.currentVisualHeight;
+    anim.endValue = targetValue;
+    anim.startTime = performance.now();
+  }
+
+  function updateAnimations(now) {
+    for (let i = 0; i < barAnimations.length; i++) {
+      const anim = barAnimations[i];
+      if (!anim.animating) continue;
+
+      const elapsed = now - anim.startTime;
+      const t = Math.min(elapsed / ANIM_DURATION, 1);
+      // Smooth easing
+      const eased = t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t;
+
+      const currentHeight = anim.startValue + (anim.endValue - anim.startValue) * eased;
+      anim.currentVisualHeight = currentHeight;
+
+      const displayHeight = Math.max(currentHeight, 0.01);
+      barMeshes[i].scale.set(1, displayHeight, 1);
+      barMeshes[i].position.y = displayHeight / 2;
+
+      // Update value label position
+      valueLabelSprites[i].position.y = displayHeight + 0.5;
+
+      if (t >= 1) {
+        anim.animating = false;
+        anim.currentVisualHeight = anim.endValue;
+        const finalHeight = Math.max(anim.endValue, 0.01);
+        barMeshes[i].scale.set(1, finalHeight, 1);
+        barMeshes[i].position.y = finalHeight / 2;
+        valueLabelSprites[i].position.y = finalHeight + 0.5;
+        updateSpriteText(valueLabelSprites[i], String(categoryValues[i]), 48, '#ffffff', 'rgba(0,0,0,0.6)');
+      }
+    }
+  }
+
+  // Value changes
+  function changeValue(index, delta) {
+    const oldValue = categoryValues[index];
+    const newValue = Math.max(MIN_VALUE, Math.min(MAX_VALUE, oldValue + delta));
+    if (newValue === oldValue) return;
+
+    categoryValues[index] = newValue;
+    undoStack.push({ categoryIndex: index, oldValue, newValue });
+    if (undoStack.length > MAX_UNDO) undoStack.shift();
+    redoStack = [];
+
+    animateBar(index, newValue);
+    updateSpriteText(valueLabelSprites[index], String(newValue), 48, '#ffffff', 'rgba(0,0,0,0.6)');
+    lastAction = delta > 0 ? 'increment' : 'decrement';
+    updateHUD();
+  }
+
+  function performUndo() {
+    if (undoStack.length === 0) return;
+    const entry = undoStack.pop();
+    // Handle batch (reset)
+    if (Array.isArray(entry)) {
+      const batchRedo = [];
+      for (let i = entry.length - 1; i >= 0; i--) {
+        const e = entry[i];
+        categoryValues[e.categoryIndex] = e.oldValue;
+        animateBar(e.categoryIndex, e.oldValue);
+        updateSpriteText(valueLabelSprites[e.categoryIndex], String(e.oldValue), 48, '#ffffff', 'rgba(0,0,0,0.6)');
+        batchRedo.push(e);
+      }
+      redoStack.push(entry);
+    } else {
+      categoryValues[entry.categoryIndex] = entry.oldValue;
+      animateBar(entry.categoryIndex, entry.oldValue);
+      updateSpriteText(valueLabelSprites[entry.categoryIndex], String(entry.oldValue), 48, '#ffffff', 'rgba(0,0,0,0.6)');
+      redoStack.push(entry);
+    }
+    lastAction = 'undo';
+    updateHUD();
+  }
+
+  function performRedo() {
+    if (redoStack.length === 0) return;
+    const entry = redoStack.pop();
+    if (Array.isArray(entry)) {
+      for (const e of entry) {
+        categoryValues[e.categoryIndex] = e.newValue;
+        animateBar(e.categoryIndex, e.newValue);
+        updateSpriteText(valueLabelSprites[e.categoryIndex], String(e.newValue), 48, '#ffffff', 'rgba(0,0,0,0.6)');
+      }
+      undoStack.push(entry);
+    } else {
+      categoryValues[entry.categoryIndex] = entry.newValue;
+      animateBar(entry.categoryIndex, entry.newValue);
+      updateSpriteText(valueLabelSprites[entry.categoryIndex], String(entry.newValue), 48, '#ffffff', 'rgba(0,0,0,0.6)');
+      undoStack.push(entry);
+    }
+    if (undoStack.length > MAX_UNDO) undoStack.shift();
+    lastAction = 'redo';
+    updateHUD();
+  }
+
+  function performReset() {
+    const batch = [];
+    let anyChanged = false;
+    for (let i = 0; i < categoryValues.length; i++) {
+      if (categoryValues[i] !== initialValues[i]) {
+        batch.push({ categoryIndex: i, oldValue: categoryValues[i], newValue: initialValues[i] });
+        categoryValues[i] = initialValues[i];
+        animateBar(i, initialValues[i]);
+        updateSpriteText(valueLabelSprites[i], String(initialValues[i]), 48, '#ffffff', 'rgba(0,0,0,0.6)');
+        anyChanged = true;
+      }
+    }
+    if (anyChanged) {
+      undoStack.push(batch);
+      if (undoStack.length > MAX_UNDO) undoStack.shift();
+      redoStack = [];
+    }
+    lastAction = 'reset';
+    updateHUD();
+  }
+
+  // HUD
+  function updateHUD() {
+    document.getElementById('hud-selected').textContent = selectedIndex >= 0 ? categoryNames[selectedIndex] : 'None';
+    document.getElementById('hud-undo').textContent = undoStack.length;
+    document.getElementById('hud-redo').textContent = redoStack.length;
+    document.getElementById('hud-total').textContent = categoryValues.reduce((a, b) => a + b, 0);
+    document.getElementById('btn-undo').disabled = undoStack.length === 0;
+    document.getElementById('btn-redo').disabled = redoStack.length === 0;
+  }
+
+  // Raycasting
+  const raycaster = new THREE.Raycaster();
+  const mouse = new THREE.Vector2();
+
+  renderer.domElement.addEventListener('click', (event) => {
+    mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+    mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+    raycaster.setFromCamera(mouse, camera);
+    const intersects = raycaster.intersectObjects(barMeshes);
+    if (intersects.length > 0) {
+      const idx = intersects[0].object.userData.categoryIndex;
+      selectBar(idx);
+    } else {
+      selectBar(-1);
+    }
+  });
+
+  // Keyboard
+  window.addEventListener('keydown', (event) => {
+    if (event.key === 'ArrowUp' && selectedIndex >= 0) {
+      event.preventDefault();
+      changeValue(selectedIndex, 1);
+    } else if (event.key === 'ArrowDown' && selectedIndex >= 0) {
+      event.preventDefault();
+      changeValue(selectedIndex, -1);
+    } else if ((event.key === 'z' || event.key === 'Z') && (event.ctrlKey || event.metaKey || !event.shiftKey)) {
+      event.preventDefault();
+      performUndo();
+    } else if ((event.key === 'y' || event.key === 'Y') && (event.ctrlKey || event.metaKey || !event.shiftKey)) {
+      event.preventDefault();
+      performRedo();
+    }
+  });
+
+  // Buttons
+  document.getElementById('btn-undo').addEventListener('click', performUndo);
+  document.getElementById('btn-redo').addEventListener('click', performRedo);
+  document.getElementById('btn-reset').addEventListener('click', performReset);
+
+  // Resize
+  window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  });
+
+  // Global state
+  window.__3D_STATE__ = {
+    categoryNames: [...categoryNames],
+    categoryValues: [...categoryValues],
+    selectedIndex: -1,
+    undoStackSize: 0,
+    redoStackSize: 0,
+    totalSum: 0,
+    barHeights: [],
+    lastAction: 'none',
+    animating: false
+  };
+
+  function updateGlobalState() {
+    const state = window.__3D_STATE__;
+    state.categoryNames = [...categoryNames];
+    state.categoryValues = [...categoryValues];
+    state.selectedIndex = selectedIndex;
+    state.undoStackSize = undoStack.length;
+    state.redoStackSize = redoStack.length;
+    state.totalSum = categoryValues.reduce((a, b) => a + b, 0);
+    state.barHeights = barAnimations.map(a => a.currentVisualHeight);
+    state.lastAction = lastAction;
+    state.animating = barAnimations.some(a => a.animating);
+  }
+
+  // Animation loop
+  function animate() {
+    requestAnimationFrame(animate);
+    const now = performance.now();
+    updateAnimations(now);
+    controls.update();
+    updateGlobalState();
+    renderer.render(scene, camera);
+  }
+
+  updateHUD();
+  animate();
+})();
+</script>
+</body>
+</html>

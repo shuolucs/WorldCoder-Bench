@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sunglasses Virtual Try-On</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background: linear-gradient(to bottom, #1a1a2e, #16213e);
+            font-family: sans-serif;
+            user-select: none;
+        }
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            position: absolute;
+            top: 0;
+            left: 0;
+            z-index: 1;
+        }
+        #debug-overlay {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            width: 300px;
+            background: #000000cc;
+            color: white;
+            font-family: monospace;
+            padding: 15px;
+            z-index: 10;
+            border-radius: 5px;
+            pointer-events: none;
+            box-sizing: border-box;
+            line-height: 1.5;
+        }
+        #ui-container {
+            position: absolute;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 10;
+            display: flex;
+            gap: 10px;
+        }
+        button {
+            background: rgba(0, 0, 0, 0.6);
+            color: white;
+            border: 1px solid #555;
+            padding: 10px 20px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: background 0.2s;
+        }
+        button:hover {
+            background: rgba(50, 50, 50, 0.8);
+        }
+    </style>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="canvas-container"></div>
+    <div id="debug-overlay"></div>
+    <div id="ui-container">
+        <button id="btn-tryon">Try On</button>
+        <button id="btn-remove">Remove</button>
+        <button id="btn-reset">Reset Position</button>
+        <button id="toggle-debug">Toggle Debug</button>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+        // Initialize State
+        window.__3D_STATE__ = {
+            sunglassesPosition: { x: 0, y: 0, z: 0 },
+            sunglassesVelocity: { x: 0, y: 0, z: 0 },
+            isWorn: false,
+            debugVisible: true,
+            physicsActive: true,
+            physicsSteps: 0,
+            collisionCount: 0,
+            lensTintIndex: 0,
+            lanternLoaded: false,
+            headRotationY: 0,
+            fps: 0,
+            bounceCoefficient: 0.3
+        };
+
+        // Scene Setup
+        const scene = new THREE.Scene();
+        
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+        camera.position.set(0, 1.6, 3);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        document.getElementById('canvas-container').appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.target.set(0, 1.3, 0);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.05;
+
+        // Lighting
+        scene.add(new THREE.AmbientLight(0xffffff, 0.4));
+        
+        const keyLight = new THREE.DirectionalLight(0xffffff, 0.8);
+        keyLight.position.set(3, 4, 2);
+        scene.add(keyLight);
+        
+        const fillLight = new THREE.DirectionalLight(0xffffff, 0.3);
+        fillLight.position.set(-2, 1, -1);
+        scene.add(fillLight);
+
+        // Platform
+        const platformGeo = new THREE.CylinderGeometry(1.5, 1.5, 0.05, 32);
+        const platformMat = new THREE.MeshStandardMaterial({ color: 0x888888, metalness: 0.6, roughness: 0.4 });
+        const platform = new THREE.Mesh(platformGeo, platformMat);
+        platform.position.y = 0;
+        scene.add(platform);
+
+        // Mannequin Head
+        const headGroup = new THREE.Group();
+        
+        const skinMat = new THREE.MeshStandardMaterial({ color: 0xe8beac, roughness: 0.5 });
+        const headGeo = new THREE.SphereGeometry(0.35, 32, 32);
+        const head = new THREE.Mesh(headGeo, skinMat);
+        head.position.set(0, 1.5, 0);
+        
+        const neckGeo = new THREE.CylinderGeometry(0.05, 0.05, 0.4, 16);
+        const neck = new THREE.Mesh(neckGeo, skinMat);
+        neck.position.set(0, 1.1, 0);
+        
+        headGroup.add(head);
+        headGroup.add(neck);
+        scene.add(headGroup);
+
+        // Target for sunglasses when worn
+        const glassesTarget = new THREE.Object3D();
+        glassesTarget.position.set(0, 0.08, 0.33); // Relative to head center (0, 1.5, 0) -> World (0, 1.58, 0.33)
+        head.add(glassesTarget);
+
+        // Sunglasses
+        const sunglassesGroup = new THREE.Group();
+        const frameMat = new THREE.MeshStandardMaterial({ color: 0x111111, roughness: 0.3 });
+        
+        const frameGeo = new THREE.TorusGeometry(0.08, 0.015, 16, 32);
+        const leftFrame = new THREE.Mesh(frameGeo, frameMat);
+        leftFrame.position.set(-0.09, 0, 0);
+        const rightFrame = new THREE.Mesh(frameGeo, frameMat);
+        rightFrame.position.set(0.09, 0, 0);
+
+        const lensGeo = new THREE.CircleGeometry(0.07, 32);
+        const lensMat = new THREE.MeshPhysicalMaterial({ 
+            color: 0x222222, 
+            transparent: true, 
+            opacity: 0.7, 
+            side: THREE.DoubleSide,
+            roughness: 0.1,
+            metalness: 0.2
+        });
+        const leftLens = new THREE.Mesh(lensGeo, lensMat);
+        leftLens.position.set(-0.09, 0, 0);
+        const rightLens = new THREE.Mesh(lensGeo, lensMat);
+        rightLens.position.set(0.09, 0, 0);
+
+        const bridgeGeo = new THREE.BoxGeometry(0.04, 0.01, 0.01);
+        const bridge = new THREE.Mesh(bridgeGeo, frameMat);
+
+        const templeGeo = new THREE.CylinderGeometry(0.005, 0.005, 0.2);
+        const leftTemple = new THREE.Mesh(templeGeo, frameMat);
+        leftTemple.rotation.x = Math.PI / 2;
+        leftTemple.position.set(-0.17, 0, -0.1);
+        const rightTemple = new THREE.Mesh(templeGeo, frameMat);
+        rightTemple.rotation.x = Math.PI / 2;
+        rightTemple.position.set(0.17, 0, -0.1);
+
+        sunglassesGroup.add(leftFrame, rightFrame, leftLens, rightLens, bridge, leftTemple, rightTemple);
+        sunglassesGroup.position.set(0, 2.5, 0.33);
+        scene.add(sunglassesGroup);
+
+        // Load Lantern
+        const loader = new GLTFLoader();
+        loader.load('Lantern.glb', (gltf) => {
+            const lantern = gltf.scene;
+            lantern.position.set(-1.5, 0, -1);
+            lantern.scale.set(0.5, 0.5, 0.5);
+            scene.add(lantern);
+            window.__3D_STATE__.lanternLoaded = true;
+        }, undefined, (error) => {
+            console.warn('Lantern.glb could not be loaded. Ensure it exists in the same directory.', error);
+        });
+
+        // Physics Variables
+        const gravity = -9.81;
+        const mass = 0.05;
+        const bounce = window.__3D_STATE__.bounceCoefficient;
+        let velocity = new THREE.Vector3(0, 0, 0);
+        const sunglassesHalfHeight = 0.08;
+        const floorY = 0.05 + sunglassesHalfHeight;
+
+        // Lens Tints
+        const tints = [
+            { color: 0x222222, opacity: 0.7 }, // Dark
+            { color: 0x1a3a5c, opacity: 0.6 }, // Blue
+            { color: 0x5c1a1a, opacity: 0.6 }  // Red
+        ];
+
+        // Event Listeners
+        document.getElementById('btn-tryon').addEventListener('click', () => {
+            window.__3D_STATE__.isWorn = true;
+            window.__3D_STATE__.physicsActive = false;
+        });
+
+        document.getElementById('btn-remove').addEventListener('click', () => {
+            window.__3D_STATE__.isWorn = false;
+            window.__3D_STATE__.physicsActive = true;
+        });
+
+        document.getElementById('btn-reset').addEventListener('click', () => {
+            window.__3D_STATE__.isWorn = false;
+            window.__3D_STATE__.physicsActive = true;
+            sunglassesGroup.position.set(0, 2.5, 0.33);
+            sunglassesGroup.rotation.set(0, 0, 0);
+            velocity.set(0, 0, 0);
+        });
+
+        document.getElementById('toggle-debug').addEventListener('click', () => {
+            window.__3D_STATE__.debugVisible = !window.__3D_STATE__.debugVisible;
+        });
+
+        window.addEventListener('keydown', (e) => {
+            const key = e.key.toLowerCase();
+            if (key === 'd') {
+                window.__3D_STATE__.debugVisible = !window.__3D_STATE__.debugVisible;
+            } else if (key === 'l') {
+                window.__3D_STATE__.lensTintIndex = (window.__3D_STATE__.lensTintIndex + 1) % 3;
+                const t = tints[window.__3D_STATE__.lensTintIndex];
+                lensMat.color.setHex(t.color);
+                lensMat.opacity = t.opacity;
+            } else if (key === 'p') {
+                window.__3D_STATE__.physicsActive = !window.__3D_STATE__.physicsActive;
+            } else if (key === 'r') {
+                headGroup.rotation.y += Math.PI / 4;
+                window.__3D_STATE__.headRotationY = (headGroup.rotation.y * 180 / Math.PI) % 360;
+            }
+        });
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // Animation Loop
+        const clock = new THREE.Clock();
+        let frameCount = 0;
+        let lastFpsTime = performance.now();
+
+        function updateDebugOverlay() {
+            const overlay = document.getElementById('debug-overlay');
+            if (!window.__3D_STATE__.debugVisible) {
+                overlay.style.display = 'none';
+                return;
+            }
+            overlay.style.display = 'block';
+            const s = window.__3D_STATE__;
+            overlay.innerHTML = `
+                <div style="font-weight:bold; margin-bottom:5px; border-bottom:1px solid #555; padding-bottom:5px;">Physics Debug</div>
+                Gravity: -9.81 m/s²<br>
+                Mass: 0.05 kg<br>
+                Bounce Coeff: ${s.bounceCoefficient}<br>
+                Velocity: (${s.sunglassesVelocity.x}, ${s.sunglassesVelocity.y}, ${s.sunglassesVelocity.z})<br>
+                Position: (${s.sunglassesPosition.x}, ${s.sunglassesPosition.y}, ${s.sunglassesPosition.z})<br>
+                Physics Steps: ${s.physicsSteps}<br>
+                Collisions: ${s.collisionCount}<br>
+                FPS: ${s.fps}<br>
+                <div style="margin-top:5px; font-size:11px; color:#aaa;">
+                [D] Toggle Debug | [L] Cycle Tint<br>
+                [P] Pause Physics | [R] Rotate Head
+                </div>
+            `;
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            
+            const dt = Math.min(clock.getDelta(), 0.1); // Cap dt to prevent huge jumps
+            const now = performance.now();
+
+            // FPS Calculation
+            frameCount++;
+            if (now - lastFpsTime >= 1000) {
+                window.__3D_STATE__.fps = Math.round((frameCount * 1000) / (now - lastFpsTime));
+                frameCount = 0;
+                lastFpsTime = now;
+            }
+
+            if (window.__3D_STATE__.isWorn) {
+                // Lerp to head position
+                const targetPos = new THREE.Vector3();
+                const targetQuat = new THREE.Quaternion();
+                glassesTarget.getWorldPosition(targetPos);
+                glassesTarget.getWorldQuaternion(targetQuat);
+
+                sunglassesGroup.position.lerp(targetPos, 0.1);
+                sunglassesGroup.quaternion.slerp(targetQuat, 0.1);
+                velocity.set(0, 0, 0);
+            } else {
+                if (window.__3D_STATE__.physicsActive) {
+                    window.__3D_STATE__.physicsSteps++;
+                    
+                    velocity.y += gravity * dt;
+                    sunglassesGroup.position.addScaledVector(velocity, dt);
+
+                    // Floor collision
+                    if (sunglassesGroup.position.y <= floorY) {
+                        sunglassesGroup.position.y = floorY;
+                        if (velocity.y < -0.1) {
+                            velocity.y = -velocity.y * bounce;
+                            window.__3D_STATE__.collisionCount++;
+                        } else {
+                            velocity.y = 0;
+                        }
+                    }
+                }
+            }
+
+            // Update State Object
+            window.__3D_STATE__.sunglassesPosition.x = Number(sunglassesGroup.position.x.toFixed(2));
+            window.__3D_STATE__.sunglassesPosition.y = Number(sunglassesGroup.position.y.toFixed(2));
+            window.__3D_STATE__.sunglassesPosition.z = Number(sunglassesGroup.position.z.toFixed(2));
+            
+            window.__3D_STATE__.sunglassesVelocity.x = Number(velocity.x.toFixed(3));
+            window.__3D_STATE__.sunglassesVelocity.y = Number(velocity.y.toFixed(3));
+            window.__3D_STATE__.sunglassesVelocity.z = Number(velocity.z.toFixed(3));
+
+            updateDebugOverlay();
+            controls.update();
+            renderer.render(scene, camera);
+        }
+
+        animate();
+    </script>
+</body>
+</html>

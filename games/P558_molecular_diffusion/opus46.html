@@ -1,0 +1,589 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3D Molecular Diffusion Simulation</title>
+<script type="importmap">
+{ "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+} }
+</script>
+<style>
+body { margin: 0; overflow: hidden; background: #0a0a1a; font-family: 'Courier New', monospace; }
+canvas { display: block; }
+#controls {
+    position: absolute; top: 10px; right: 10px; background: rgba(10,10,26,0.85);
+    padding: 15px; border-radius: 8px; color: #aabbcc; border: 1px solid rgba(100,150,200,0.3);
+    min-width: 220px;
+}
+#controls label { display: block; margin: 8px 0 3px; font-size: 12px; }
+#controls input[type="range"] { width: 100%; }
+#controls .val { float: right; color: #88ccff; }
+#hud {
+    position: absolute; top: 10px; left: 10px; background: rgba(10,10,26,0.85);
+    padding: 15px; border-radius: 8px; color: #aabbcc; border: 1px solid rgba(100,150,200,0.3);
+    font-size: 12px; line-height: 1.8;
+}
+#hud span { color: #88ccff; }
+#instructions {
+    position: absolute; bottom: 10px; left: 50%; transform: translateX(-50%);
+    background: rgba(10,10,26,0.85); padding: 8px 16px; border-radius: 8px;
+    color: #667788; font-size: 11px; border: 1px solid rgba(100,150,200,0.2);
+}
+</style>
+</head>
+<body>
+
+<div id="controls">
+    <strong style="color:#88ccff;">Controls</strong>
+    <label>Temperature (kT): <span class="val" id="temp-val">1.0</span></label>
+    <input type="range" id="slider-temperature" min="0.1" max="5.0" step="0.1" value="1.0">
+    <label>Drag: <span class="val" id="drag-val">2.0</span></label>
+    <input type="range" id="slider-drag" min="0" max="10" step="0.5" value="2.0">
+</div>
+
+<div id="hud">
+    <strong style="color:#88ccff;">HUD</strong><br>
+    Temperature: <span id="hud-temp">1.0</span><br>
+    Avg Speed A: <span id="hud-speed-a">0.00</span><br>
+    Avg Speed B: <span id="hud-speed-b">0.00</span><br>
+    Mixing Index: <span id="hud-mixing">0.000</span><br>
+    Collisions/Frame: <span id="hud-collisions">0</span><br>
+    Status: <span id="hud-paused">Playing</span>
+</div>
+
+<div id="instructions">
+    [R] Reset | [Space] Pause/Play | [T] Toggle Trails | [H] Toggle Heatmap | Mouse: Orbit/Zoom
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// --- State ---
+window.__3D_STATE__ = {
+    particleCount: 100,
+    typeACount: 30,
+    typeBCount: 70,
+    temperature: 1.0,
+    drag: 2.0,
+    avgSpeedA: 0,
+    avgSpeedB: 0,
+    mixingIndex: 0,
+    collisionsThisFrame: 0,
+    isPaused: false,
+    trailsEnabled: true,
+    heatmapEnabled: true,
+    frameCount: 0,
+    particlesValid: true,
+    totalKE: 0
+};
+
+// --- Scene Setup ---
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0a0a1a);
+
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+camera.position.set(0, 15, 25);
+camera.lookAt(0, 0, 0);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+document.body.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.05;
+
+// Lights
+const ambientLight = new THREE.AmbientLight(0x334455, 0.3);
+scene.add(ambientLight);
+const dirLight = new THREE.DirectionalLight(0xffffff, 0.6);
+dirLight.position.set(5, 10, 5);
+scene.add(dirLight);
+
+// --- Simulation Container ---
+const boxSize = 10;
+const halfBox = boxSize / 2;
+
+const boxGeo = new THREE.BoxGeometry(boxSize, boxSize, boxSize);
+const edgesGeo = new THREE.EdgesGeometry(boxGeo);
+const edgesMat = new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.3 });
+const boxLines = new THREE.LineSegments(edgesGeo, edgesMat);
+scene.add(boxLines);
+
+// --- Particle Data ---
+const TRAIL_LENGTH = 15;
+const dt = 0.01;
+const substeps = 5;
+
+let temperature = 1.0;
+let drag = 2.0;
+let isPaused = false;
+let trailsEnabled = true;
+let heatmapEnabled = true;
+let frameCount = 0;
+let collisionsThisFrame = 0;
+
+class Particle {
+    constructor(type, x, y, z) {
+        this.type = type;
+        this.radius = type === 'A' ? 0.2 : 0.15;
+        this.mass = type === 'A' ? 2.0 : 1.0;
+        this.baseColor = type === 'A' ? new THREE.Color(0xff4444) : new THREE.Color(0x4488ff);
+        this.pos = new THREE.Vector3(x, y, z);
+        this.vel = new THREE.Vector3(
+            (Math.random() - 0.5) * 2,
+            (Math.random() - 0.5) * 2,
+            (Math.random() - 0.5) * 2
+        );
+        this.trail = [];
+    }
+}
+
+let particles = [];
+
+function randomInRange(min, max) {
+    return min + Math.random() * (max - min);
+}
+
+function initParticles() {
+    particles = [];
+    // Type A: left half
+    for (let i = 0; i < 30; i++) {
+        const r = 0.2;
+        const x = randomInRange(-halfBox + r, 0 - r);
+        const y = randomInRange(-halfBox + r, halfBox - r);
+        const z = randomInRange(-halfBox + r, halfBox - r);
+        particles.push(new Particle('A', x, y, z));
+    }
+    // Type B: entire box
+    for (let i = 0; i < 70; i++) {
+        const r = 0.15;
+        const x = randomInRange(-halfBox + r, halfBox - r);
+        const y = randomInRange(-halfBox + r, halfBox - r);
+        const z = randomInRange(-halfBox + r, halfBox - r);
+        particles.push(new Particle('B', x, y, z));
+    }
+}
+
+initParticles();
+
+// --- 3D Objects ---
+const particleMeshes = [];
+const trailMeshGroups = [];
+
+const sphereGeoA = new THREE.SphereGeometry(0.2, 12, 8);
+const sphereGeoB = new THREE.SphereGeometry(0.15, 10, 6);
+const trailGeoA = new THREE.SphereGeometry(0.06, 4, 3);
+const trailGeoB = new THREE.SphereGeometry(0.045, 4, 3);
+
+function createParticleMeshes() {
+    // Clear old
+    particleMeshes.forEach(m => scene.remove(m));
+    particleMeshes.length = 0;
+    trailMeshGroups.forEach(group => {
+        group.forEach(m => scene.remove(m));
+    });
+    trailMeshGroups.length = 0;
+
+    for (let i = 0; i < particles.length; i++) {
+        const p = particles[i];
+        const geo = p.type === 'A' ? sphereGeoA : sphereGeoB;
+        const mat = new THREE.MeshPhongMaterial({
+            color: p.baseColor.clone(),
+            emissive: p.baseColor.clone().multiplyScalar(0.2),
+            shininess: 60
+        });
+        const mesh = new THREE.Mesh(geo, mat);
+        mesh.position.copy(p.pos);
+        scene.add(mesh);
+        particleMeshes.push(mesh);
+
+        // Trail meshes
+        const trailGroup = [];
+        const trailGeo = p.type === 'A' ? trailGeoA : trailGeoB;
+        for (let t = 0; t < TRAIL_LENGTH; t++) {
+            const tMat = new THREE.MeshBasicMaterial({
+                color: p.baseColor.clone(),
+                transparent: true,
+                opacity: 0
+            });
+            const tMesh = new THREE.Mesh(trailGeo, tMat);
+            tMesh.visible = false;
+            scene.add(tMesh);
+            trailGroup.push(tMesh);
+        }
+        trailMeshGroups.push(trailGroup);
+    }
+}
+
+createParticleMeshes();
+
+// --- Heatmap ---
+const heatmapGridSize = 10;
+const heatmapMeshes = [];
+const heatmapGroup = new THREE.Group();
+scene.add(heatmapGroup);
+
+function createHeatmap() {
+    heatmapMeshes.forEach(m => heatmapGroup.remove(m));
+    heatmapMeshes.length = 0;
+
+    const cellSize = boxSize / heatmapGridSize;
+    const planeGeo = new THREE.PlaneGeometry(cellSize * 0.95, cellSize * 0.95);
+
+    for (let ix = 0; ix < heatmapGridSize; ix++) {
+        for (let iz = 0; iz < heatmapGridSize; iz++) {
+            const mat = new THREE.MeshBasicMaterial({
+                color: 0x0000ff,
+                transparent: true,
+                opacity: 0.4,
+                side: THREE.DoubleSide
+            });
+            const mesh = new THREE.Mesh(planeGeo, mat);
+            mesh.rotation.x = -Math.PI / 2;
+            mesh.position.set(
+                -halfBox + cellSize * (ix + 0.5),
+                -halfBox + 0.01,
+                -halfBox + cellSize * (iz + 0.5)
+            );
+            heatmapGroup.add(mesh);
+            heatmapMeshes.push(mesh);
+        }
+    }
+}
+
+createHeatmap();
+
+// --- Physics ---
+function randomGaussian() {
+    // Box-Muller
+    let u = 0, v = 0;
+    while (u === 0) u = Math.random();
+    while (v === 0) v = Math.random();
+    return Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
+}
+
+function simulate() {
+    collisionsThisFrame = 0;
+
+    for (let step = 0; step < substeps; step++) {
+        // Brownian kicks
+        for (const p of particles) {
+            const sigma = Math.sqrt(2 * temperature / p.mass * dt);
+            p.vel.x += randomGaussian() * sigma;
+            p.vel.y += randomGaussian() * sigma;
+            p.vel.z += randomGaussian() * sigma;
+        }
+
+        // Drag
+        const dragFactor = 1 - drag * dt;
+        const clampedDrag = Math.max(0, Math.min(1, dragFactor));
+        for (const p of particles) {
+            p.vel.x *= clampedDrag;
+            p.vel.y *= clampedDrag;
+            p.vel.z *= clampedDrag;
+        }
+
+        // Integration
+        for (const p of particles) {
+            p.pos.x += p.vel.x * dt;
+            p.pos.y += p.vel.y * dt;
+            p.pos.z += p.vel.z * dt;
+        }
+
+        // Particle-particle collisions
+        const n = particles.length;
+        for (let i = 0; i < n; i++) {
+            for (let j = i + 1; j < n; j++) {
+                const pi = particles[i];
+                const pj = particles[j];
+                const dx = pj.pos.x - pi.pos.x;
+                const dy = pj.pos.y - pi.pos.y;
+                const dz = pj.pos.z - pi.pos.z;
+                const distSq = dx * dx + dy * dy + dz * dz;
+                const minDist = pi.radius + pj.radius;
+
+                if (distSq < minDist * minDist && distSq > 0.0001) {
+                    const dist = Math.sqrt(distSq);
+                    const nx = dx / dist;
+                    const ny = dy / dist;
+                    const nz = dz / dist;
+
+                    // Relative velocity along normal
+                    const dvx = pi.vel.x - pj.vel.x;
+                    const dvy = pi.vel.y - pj.vel.y;
+                    const dvz = pi.vel.z - pj.vel.z;
+                    const vRelN = dvx * nx + dvy * ny + dvz * nz;
+
+                    if (vRelN > 0) {
+                        const impulse = (2 * vRelN) / (1 / pi.mass + 1 / pj.mass);
+                        const impI = impulse / pi.mass;
+                        const impJ = impulse / pj.mass;
+
+                        pi.vel.x -= impI * nx;
+                        pi.vel.y -= impI * ny;
+                        pi.vel.z -= impI * nz;
+                        pj.vel.x += impJ * nx;
+                        pj.vel.y += impJ * ny;
+                        pj.vel.z += impJ * nz;
+
+                        collisionsThisFrame++;
+                    }
+
+                    // Separate overlapping
+                    const overlap = minDist - dist;
+                    if (overlap > 0) {
+                        const totalMass = pi.mass + pj.mass;
+                        const moveI = overlap * (pj.mass / totalMass);
+                        const moveJ = overlap * (pi.mass / totalMass);
+                        pi.pos.x -= nx * moveI;
+                        pi.pos.y -= ny * moveI;
+                        pi.pos.z -= nz * moveI;
+                        pj.pos.x += nx * moveJ;
+                        pj.pos.y += ny * moveJ;
+                        pj.pos.z += nz * moveJ;
+                    }
+                }
+            }
+        }
+
+        // Wall collisions
+        for (const p of particles) {
+            const r = p.radius;
+            for (const axis of ['x', 'y', 'z']) {
+                if (p.pos[axis] - r < -halfBox) {
+                    p.pos[axis] = -halfBox + r;
+                    p.vel[axis] = Math.abs(p.vel[axis]);
+                } else if (p.pos[axis] + r > halfBox) {
+                    p.pos[axis] = halfBox - r;
+                    p.vel[axis] = -Math.abs(p.vel[axis]);
+                }
+            }
+        }
+    }
+
+    // Update trails
+    for (let i = 0; i < particles.length; i++) {
+        const p = particles[i];
+        p.trail.unshift(p.pos.clone());
+        if (p.trail.length > TRAIL_LENGTH) {
+            p.trail.pop();
+        }
+    }
+}
+
+// --- Update Visuals ---
+const whiteColor = new THREE.Color(0xffffff);
+const tmpColor = new THREE.Color();
+
+function updateVisuals() {
+    // Find max speed for color lerp
+    let maxSpeed = 1;
+    for (const p of particles) {
+        const spd = p.vel.length();
+        if (spd > maxSpeed) maxSpeed = spd;
+    }
+
+    for (let i = 0; i < particles.length; i++) {
+        const p = particles[i];
+        const mesh = particleMeshes[i];
+
+        mesh.position.copy(p.pos);
+
+        // Color by speed
+        const speed = p.vel.length();
+        const t = Math.min(speed / maxSpeed, 1);
+        tmpColor.copy(p.baseColor).lerp(whiteColor, t * 0.7);
+        mesh.material.color.copy(tmpColor);
+        mesh.material.emissive.copy(p.baseColor).multiplyScalar(0.2 + t * 0.3);
+
+        // Trails
+        const trailGroup = trailMeshGroups[i];
+        for (let ti = 0; ti < TRAIL_LENGTH; ti++) {
+            const tMesh = trailGroup[ti];
+            if (trailsEnabled && ti < p.trail.length) {
+                tMesh.visible = true;
+                tMesh.position.copy(p.trail[ti]);
+                const opacity = (1 - ti / TRAIL_LENGTH) * 0.4;
+                tMesh.material.opacity = opacity;
+                tMesh.material.color.copy(p.baseColor);
+            } else {
+                tMesh.visible = false;
+            }
+        }
+    }
+
+    // Heatmap
+    heatmapGroup.visible = heatmapEnabled;
+    if (heatmapEnabled) {
+        const cellSize = boxSize / heatmapGridSize;
+        const counts = new Float32Array(heatmapGridSize * heatmapGridSize);
+        let maxCount = 1;
+
+        for (const p of particles) {
+            const ix = Math.floor((p.pos.x + halfBox) / cellSize);
+            const iz = Math.floor((p.pos.z + halfBox) / cellSize);
+            const cix = Math.max(0, Math.min(heatmapGridSize - 1, ix));
+            const ciz = Math.max(0, Math.min(heatmapGridSize - 1, iz));
+            counts[cix * heatmapGridSize + ciz]++;
+        }
+
+        for (let k = 0; k < counts.length; k++) {
+            if (counts[k] > maxCount) maxCount = counts[k];
+        }
+
+        const coldColor = new THREE.Color(0x0000ff);
+        const hotColor = new THREE.Color(0xff0000);
+
+        for (let ix = 0; ix < heatmapGridSize; ix++) {
+            for (let iz = 0; iz < heatmapGridSize; iz++) {
+                const idx = ix * heatmapGridSize + iz;
+                const mesh = heatmapMeshes[idx];
+                const ratio = counts[idx] / maxCount;
+                tmpColor.copy(coldColor).lerp(hotColor, ratio);
+                mesh.material.color.copy(tmpColor);
+                mesh.material.opacity = 0.15 + ratio * 0.5;
+            }
+        }
+    }
+}
+
+// --- Compute Stats ---
+function computeStats() {
+    let speedSumA = 0, countA = 0;
+    let speedSumB = 0, countB = 0;
+    let totalKE = 0;
+    let aInLeft = 0;
+    let valid = true;
+
+    for (const p of particles) {
+        const spd = p.vel.length();
+        if (isNaN(p.pos.x) || isNaN(p.pos.y) || isNaN(p.pos.z) ||
+            isNaN(p.vel.x) || isNaN(p.vel.y) || isNaN(p.vel.z)) {
+            valid = false;
+        }
+        totalKE += 0.5 * p.mass * spd * spd;
+
+        if (p.type === 'A') {
+            speedSumA += spd;
+            countA++;
+            if (p.pos.x < 0) aInLeft++;
+        } else {
+            speedSumB += spd;
+            countB++;
+        }
+    }
+
+    const avgSpeedA = countA > 0 ? speedSumA / countA : 0;
+    const avgSpeedB = countB > 0 ? speedSumB / countB : 0;
+
+    // Mixing index: 1 - |fraction_A_in_left - 0.5| / 0.5
+    const fractionALeft = countA > 0 ? aInLeft / countA : 0.5;
+    let mixingIndex = 1 - Math.abs(fractionALeft - 0.5) / 0.5;
+    mixingIndex = Math.max(0, Math.min(1, mixingIndex));
+
+    return { avgSpeedA, avgSpeedB, mixingIndex, totalKE, valid, collisionsThisFrame };
+}
+
+// --- HUD Update ---
+function updateHUD(stats) {
+    document.getElementById('hud-temp').textContent = temperature.toFixed(1);
+    document.getElementById('hud-speed-a').textContent = stats.avgSpeedA.toFixed(2);
+    document.getElementById('hud-speed-b').textContent = stats.avgSpeedB.toFixed(2);
+    document.getElementById('hud-mixing').textContent = stats.mixingIndex.toFixed(3);
+    document.getElementById('hud-collisions').textContent = stats.collisionsThisFrame;
+    document.getElementById('hud-paused').textContent = isPaused ? 'Paused' : 'Playing';
+}
+
+// --- Controls ---
+const tempSlider = document.getElementById('slider-temperature');
+const dragSlider = document.getElementById('slider-drag');
+
+tempSlider.addEventListener('input', () => {
+    temperature = parseFloat(tempSlider.value);
+    document.getElementById('temp-val').textContent = temperature.toFixed(1);
+});
+
+dragSlider.addEventListener('input', () => {
+    drag = parseFloat(dragSlider.value);
+    document.getElementById('drag-val').textContent = drag.toFixed(1);
+});
+
+document.addEventListener('keydown', (e) => {
+    if (e.code === 'KeyR') {
+        resetSimulation();
+    } else if (e.code === 'Space') {
+        e.preventDefault();
+        isPaused = !isPaused;
+    } else if (e.code === 'KeyT') {
+        trailsEnabled = !trailsEnabled;
+    } else if (e.code === 'KeyH') {
+        heatmapEnabled = !heatmapEnabled;
+    }
+});
+
+function resetSimulation() {
+    initParticles();
+    // Update meshes positions and clear trails
+    for (let i = 0; i < particles.length; i++) {
+        particleMeshes[i].position.copy(particles[i].pos);
+        particles[i].trail = [];
+        const trailGroup = trailMeshGroups[i];
+        for (const tMesh of trailGroup) {
+            tMesh.visible = false;
+        }
+    }
+}
+
+// --- Resize ---
+window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// --- Animation Loop ---
+function animate() {
+    requestAnimationFrame(animate);
+
+    if (!isPaused) {
+        simulate();
+    }
+
+    updateVisuals();
+    const stats = computeStats();
+    updateHUD(stats);
+
+    frameCount++;
+
+    // Update state
+    const state = window.__3D_STATE__;
+    state.particleCount = 100;
+    state.typeACount = 30;
+    state.typeBCount = 70;
+    state.temperature = temperature;
+    state.drag = drag;
+    state.avgSpeedA = parseFloat(stats.avgSpeedA.toFixed(3));
+    state.avgSpeedB = parseFloat(stats.avgSpeedB.toFixed(3));
+    state.mixingIndex = parseFloat(stats.mixingIndex.toFixed(3));
+    state.collisionsThisFrame = stats.collisionsThisFrame;
+    state.isPaused = isPaused;
+    state.trailsEnabled = trailsEnabled;
+    state.heatmapEnabled = heatmapEnabled;
+    state.frameCount = frameCount;
+    state.particlesValid = stats.valid;
+    state.totalKE = parseFloat(stats.totalKE.toFixed(3));
+
+    controls.update();
+    renderer.render(scene, camera);
+}
+
+animate();
+</script>
+</body>
+</html>

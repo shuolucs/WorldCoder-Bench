@@ -1,0 +1,370 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Globe Flight Routes</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #000;
+            font-family: monospace;
+        }
+        #container {
+            width: 100vw;
+            height: 100vh;
+        }
+        #hud-panel {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            color: white;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 15px;
+            border-radius: 5px;
+            pointer-events: auto;
+            user-select: none;
+            border: 1px solid #333;
+            z-index: 10;
+        }
+        #hud-panel div {
+            margin-bottom: 5px;
+        }
+        button {
+            background: #333;
+            color: white;
+            border: 1px solid #555;
+            padding: 5px 10px;
+            cursor: pointer;
+            font-family: monospace;
+            margin-top: 5px;
+        }
+        button:hover {
+            background: #555;
+        }
+    </style>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="hud-panel">
+        <div>Total routes: 5</div>
+        <div>Active planes: <span id="hud-planes">0</span></div>
+        <div>Selected route: <span id="hud-selected">None</span></div>
+        <div>Debug mode: <span id="hud-debug">OFF</span></div>
+        <div>Simulation speed: <span id="hud-speed">1.0x</span></div>
+        <button id="pause-btn">Pause</button>
+    </div>
+    <div id="container"></div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        window.__3D_STATE__ = {
+            globeRadius: 5,
+            routeCount: 5,
+            cityCount: 6,
+            planePositions: [],
+            selectedRoute: -1,
+            debugMode: false,
+            simulationSpeed: 1.0,
+            isPaused: false,
+            autoRotate: false,
+            debugObjectCount: 0,
+            planeVelocities: [0, 0, 0, 0, 0],
+            frameCount: 0
+        };
+
+        const state = window.__3D_STATE__;
+
+        const scene = new THREE.Scene();
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.set(0, 0, 18);
+        camera.lookAt(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        document.getElementById('container').appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+        dirLight.position.set(10, 10, 10);
+        scene.add(dirLight);
+
+        const globeGroup = new THREE.Group();
+        scene.add(globeGroup);
+
+        const earthGeo = new THREE.SphereGeometry(state.globeRadius, 64, 64);
+        const earthMat = new THREE.MeshStandardMaterial({ color: 0x1a4d8f });
+        const earthMesh = new THREE.Mesh(earthGeo, earthMat);
+        globeGroup.add(earthMesh);
+
+        const wireMat = new THREE.MeshBasicMaterial({ 
+            color: 0x00ff44, 
+            wireframe: true, 
+            transparent: true, 
+            opacity: 0.15 
+        });
+        const wireMesh = new THREE.Mesh(earthGeo, wireMat);
+        globeGroup.add(wireMesh);
+
+        function latLonToVector3(lat, lon, radius) {
+            const phi = (90 - lat) * (Math.PI / 180);
+            const theta = (lon + 180) * (Math.PI / 180);
+            const x = -(radius * Math.sin(phi) * Math.cos(theta));
+            const z = (radius * Math.sin(phi) * Math.sin(theta));
+            const y = (radius * Math.cos(phi));
+            return new THREE.Vector3(x, y, z);
+        }
+
+        const cities = {
+            'NYC': { lat: 40.7, lon: -74.0 },
+            'London': { lat: 51.5, lon: -0.1 },
+            'Dubai': { lat: 25.3, lon: 55.3 },
+            'Tokyo': { lat: 35.7, lon: 139.7 },
+            'Sydney': { lat: -33.9, lon: 151.2 },
+            'LA': { lat: 34.1, lon: -118.2 }
+        };
+
+        const cityGeo = new THREE.SphereGeometry(0.12, 16, 16);
+        const cityMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
+        
+        for (const key in cities) {
+            const pos = latLonToVector3(cities[key].lat, cities[key].lon, state.globeRadius);
+            const cityMesh = new THREE.Mesh(cityGeo, cityMat);
+            cityMesh.position.copy(pos);
+            globeGroup.add(cityMesh);
+        }
+
+        class GreatCircleCurve extends THREE.Curve {
+            constructor(start, end, radius, peakAltitude) {
+                super();
+                this.start = start.clone().normalize();
+                this.end = end.clone().normalize();
+                this.radius = radius;
+                this.peakAltitude = peakAltitude;
+                this.axis = new THREE.Vector3().crossVectors(this.start, this.end).normalize();
+                this.angle = this.start.angleTo(this.end);
+            }
+            getPoint(t, optionalTarget = new THREE.Vector3()) {
+                const v = this.start.clone().applyAxisAngle(this.axis, this.angle * t);
+                const altitude = this.radius + Math.sin(t * Math.PI) * (this.peakAltitude - this.radius);
+                return optionalTarget.copy(v).multiplyScalar(altitude);
+            }
+        }
+
+        const routesData = [
+            { start: 'NYC', end: 'London', color: 0xff4444 },
+            { start: 'London', end: 'Dubai', color: 0x44ff44 },
+            { start: 'Tokyo', end: 'Sydney', color: 0x4444ff },
+            { start: 'LA', end: 'Tokyo', color: 0xffff44 },
+            { start: 'Dubai', end: 'Sydney', color: 0xff44ff }
+        ];
+
+        const routeMeshes = [];
+        const planeMeshes = [];
+        const planes = [];
+
+        const planeGeo = new THREE.ConeGeometry(0.1, 0.3, 16);
+        planeGeo.rotateX(Math.PI / 2);
+
+        routesData.forEach((data, index) => {
+            const startPos = latLonToVector3(cities[data.start].lat, cities[data.start].lon, state.globeRadius);
+            const endPos = latLonToVector3(cities[data.end].lat, cities[data.end].lon, state.globeRadius);
+            
+            const curve = new GreatCircleCurve(startPos, endPos, state.globeRadius, state.globeRadius + 0.8);
+            
+            const tubeGeo = new THREE.TubeGeometry(curve, 64, 0.03, 8, false);
+            const tubeMat = new THREE.MeshStandardMaterial({ 
+                color: data.color,
+                emissive: 0x000000,
+                emissiveIntensity: 0
+            });
+            const tubeMesh = new THREE.Mesh(tubeGeo, tubeMat);
+            tubeMesh.userData = { routeIndex: index };
+            globeGroup.add(tubeMesh);
+            routeMeshes.push(tubeMesh);
+
+            const planeMat = new THREE.MeshStandardMaterial({ color: data.color });
+            const planeMesh = new THREE.Mesh(planeGeo, planeMat);
+            planeMesh.userData = { routeIndex: index };
+            globeGroup.add(planeMesh);
+            planeMeshes.push(planeMesh);
+
+            const debugObjects = new THREE.Group();
+            
+            const velArrow = new THREE.ArrowHelper(new THREE.Vector3(0,1,0), new THREE.Vector3(), 1, 0xffff00);
+            debugObjects.add(velArrow);
+            
+            const sphereGeo = new THREE.SphereGeometry(0.5, 16, 16);
+            const sphereMat = new THREE.MeshBasicMaterial({ color: 0xff8800, wireframe: true, transparent: true, opacity: 0.3 });
+            const boundingSphere = new THREE.Mesh(sphereGeo, sphereMat);
+            debugObjects.add(boundingSphere);
+            
+            const gravArrow = new THREE.ArrowHelper(new THREE.Vector3(0,1,0), new THREE.Vector3(), 1, 0xff0000);
+            debugObjects.add(gravArrow);
+
+            planes.push({
+                mesh: planeMesh,
+                curve: curve,
+                t: 0,
+                routeIndex: index,
+                debugObjects: debugObjects,
+                velArrow: velArrow,
+                boundingSphere: boundingSphere,
+                gravArrow: gravArrow
+            });
+        });
+
+        function selectRoute(index) {
+            state.selectedRoute = index;
+            routeMeshes.forEach((mesh, i) => {
+                if (i === index) {
+                    mesh.material.emissive.setHex(0xffffff);
+                    mesh.material.emissiveIntensity = 0.5;
+                } else {
+                    mesh.material.emissive.setHex(0x000000);
+                    mesh.material.emissiveIntensity = 0;
+                }
+            });
+            updateHUD();
+        }
+
+        function updateHUD() {
+            document.getElementById('hud-selected').innerText = state.selectedRoute === -1 ? 'None' : state.selectedRoute;
+            document.getElementById('hud-debug').innerText = state.debugMode ? 'ON' : 'OFF';
+            document.getElementById('hud-speed').innerText = state.simulationSpeed.toFixed(1) + 'x';
+            document.getElementById('pause-btn').innerText = state.isPaused ? 'Resume' : 'Pause';
+        }
+
+        window.addEventListener('keydown', (e) => {
+            const key = e.key.toUpperCase();
+            if (key === 'D') {
+                state.debugMode = !state.debugMode;
+            } else if (key === 'R') {
+                state.autoRotate = !state.autoRotate;
+            } else if (e.key === '+' || e.key === '=') {
+                state.simulationSpeed = Math.min(4.0, state.simulationSpeed + 0.5);
+            } else if (e.key === '-' || e.key === '_') {
+                state.simulationSpeed = Math.max(0.5, state.simulationSpeed - 0.5);
+            } else if (e.key >= '1' && e.key <= '5') {
+                selectRoute(parseInt(e.key) - 1);
+            }
+            updateHUD();
+        });
+
+        document.getElementById('pause-btn').addEventListener('click', () => {
+            state.isPaused = !state.isPaused;
+            updateHUD();
+        });
+
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+
+        window.addEventListener('click', (e) => {
+            if (e.target.id === 'pause-btn') return;
+            mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+            raycaster.setFromCamera(mouse, camera);
+            const intersects = raycaster.intersectObjects([...routeMeshes, ...planeMeshes]);
+            if (intersects.length > 0) {
+                selectRoute(intersects[0].object.userData.routeIndex);
+            } else {
+                selectRoute(-1);
+            }
+        });
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        const clock = new THREE.Clock();
+
+        function animate() {
+            requestAnimationFrame(animate);
+            const dt = clock.getDelta();
+            state.frameCount++;
+
+            if (state.autoRotate) {
+                globeGroup.rotation.y += 0.005;
+            }
+
+            let activePlanes = 0;
+
+            planes.forEach((plane, i) => {
+                if (!state.isPaused) {
+                    plane.t += (dt / 8) * state.simulationSpeed;
+                    if (plane.t >= 1) plane.t -= 1;
+                }
+                activePlanes++;
+
+                const pos = plane.curve.getPoint(plane.t);
+                plane.mesh.position.copy(pos);
+
+                const nextT = (plane.t + 0.001) % 1;
+                const nextPos = plane.curve.getPoint(nextT);
+                const worldNextPos = globeGroup.localToWorld(nextPos.clone());
+                plane.mesh.lookAt(worldNextPos);
+
+                state.planePositions[i] = { x: pos.x, y: pos.y, z: pos.z, t: plane.t };
+                state.planeVelocities[i] = (plane.curve.getLength() / 8) * state.simulationSpeed;
+            });
+
+            document.getElementById('hud-planes').innerText = activePlanes;
+
+            if (state.debugMode) {
+                let count = 0;
+                planes.forEach(plane => {
+                    if (!plane.debugObjects.parent) {
+                        globeGroup.add(plane.debugObjects);
+                    }
+                    const pos = plane.mesh.position;
+                    const tangent = plane.curve.getTangent(plane.t);
+                    const speed = state.planeVelocities[plane.routeIndex];
+
+                    plane.velArrow.position.copy(pos);
+                    plane.velArrow.setDirection(tangent);
+                    plane.velArrow.setLength(speed * 2.0);
+
+                    plane.boundingSphere.position.copy(pos);
+
+                    const gravityDir = pos.clone().negate().normalize();
+                    plane.gravArrow.position.copy(pos);
+                    plane.gravArrow.setDirection(gravityDir);
+
+                    count += 3;
+                });
+                state.debugObjectCount = count;
+            } else {
+                planes.forEach(plane => {
+                    if (plane.debugObjects.parent) {
+                        globeGroup.remove(plane.debugObjects);
+                    }
+                });
+                state.debugObjectCount = 0;
+            }
+
+            controls.update();
+            renderer.render(scene, camera);
+        }
+
+        animate();
+    </script>
+</body>
+</html>

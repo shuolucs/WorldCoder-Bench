@@ -1,0 +1,595 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Network Topology Visualization</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #0a0a1a;
+            color: #ffffff;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            user-select: none;
+        }
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+        }
+        #ui-layer {
+            position: absolute;
+            top: 15px;
+            left: 15px;
+            z-index: 10;
+            pointer-events: none;
+        }
+        .controls {
+            pointer-events: auto;
+            margin-bottom: 15px;
+        }
+        button {
+            background: #2a2a4a;
+            color: #fff;
+            border: 1px solid #4a4a7a;
+            padding: 8px 12px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-weight: bold;
+            margin-right: 8px;
+            transition: background 0.2s;
+        }
+        button:hover {
+            background: #3a3a6a;
+        }
+        .instructions {
+            font-size: 12px;
+            color: #8888aa;
+            background: rgba(10, 10, 26, 0.7);
+            padding: 8px;
+            border-radius: 4px;
+            border: 1px solid #2a2a4a;
+            display: inline-block;
+        }
+        #debug-overlay {
+            pointer-events: auto;
+            background: rgba(0, 0, 0, 0.85);
+            border: 1px solid #555555;
+            padding: 15px;
+            border-radius: 4px;
+            font-family: monospace;
+            font-size: 13px;
+            display: none;
+            min-width: 250px;
+        }
+        .debug-row {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 5px;
+            border-bottom: 1px solid #333;
+            padding-bottom: 2px;
+        }
+        .debug-label { color: #aaaaaa; }
+        .debug-val { color: #00ffcc; font-weight: bold; }
+    </style>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+</head>
+<body>
+    <div id="ui-layer">
+        <div class="controls">
+            <button id="btn-debug">Toggle Debug</button>
+            <button id="btn-add-node">Add Client Node</button>
+        </div>
+        <div class="instructions">
+            <strong>Interactions:</strong><br>
+            Click: Select/Deselect Node<br>
+            Drag: Move Selected Node<br>
+            [P]: Pause/Resume Physics<br>
+            [R]: Reset Positions<br>
+            [G]: Toggle Gravity
+        </div>
+        <div id="debug-overlay" style="margin-top: 15px;">
+            <div style="color: #fff; font-weight: bold; margin-bottom: 10px; text-align: center;">PHYSICS DEBUG</div>
+            <div class="debug-row"><span class="debug-label">Kinetic Energy:</span> <span class="debug-val" id="dbg-ke">0.00</span></div>
+            <div class="debug-row"><span class="debug-label">Sim Steps:</span> <span class="debug-val" id="dbg-steps">0</span></div>
+            <div class="debug-row"><span class="debug-label">Avg Velocity:</span> <span class="debug-val" id="dbg-vel">0.000</span></div>
+            <div class="debug-row"><span class="debug-label">Min Edge Dist:</span> <span class="debug-val" id="dbg-min-dist">0.0</span></div>
+            <div class="debug-row"><span class="debug-label">Max Edge Dist:</span> <span class="debug-val" id="dbg-max-dist">0.0</span></div>
+        </div>
+    </div>
+    <div id="canvas-container"></div>
+
+    <script>
+        // Initialize State
+        window.__3D_STATE__ = {
+            nodeCount: 0,
+            edgeCount: 0,
+            selectedNodeId: null,
+            simulationRunning: true,
+            simulationSteps: 0,
+            totalKineticEnergy: 0,
+            averageVelocity: 0,
+            gravityEnabled: true,
+            debugVisible: false,
+            minEdgeDistance: 0,
+            maxEdgeDistance: 0,
+            routerCount: 0,
+            serverCount: 0,
+            clientCount: 0,
+            nodePositions: [],
+            isDragging: false
+        };
+
+        // Scene Setup
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x0a0a1a);
+
+        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.set(0, 0, 80);
+        camera.lookAt(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        container.appendChild(renderer.domElement);
+
+        const controls = new THREE.OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.05;
+
+        // Lighting
+        const ambientLight = new THREE.AmbientLight(0x404060, 0.4);
+        scene.add(ambientLight);
+
+        const pointLight = new THREE.PointLight(0xffffff, 1.0);
+        pointLight.position.set(50, 50, 50);
+        scene.add(pointLight);
+
+        // Graph Data
+        const nodes = [];
+        const edges = [];
+        const interactableMeshes = [];
+
+        // Helper to create text sprites
+        function createTextSprite(message) {
+            const canvas = document.createElement('canvas');
+            const context = canvas.getContext('2d');
+            canvas.width = 128;
+            canvas.height = 64;
+            
+            context.fillStyle = 'rgba(0, 0, 0, 0)';
+            context.fillRect(0, 0, canvas.width, canvas.height);
+            
+            context.font = 'bold 32px Arial';
+            context.textAlign = 'center';
+            context.textBaseline = 'middle';
+            context.fillStyle = 'rgba(255, 255, 255, 1.0)';
+            context.fillText(message, canvas.width / 2, canvas.height / 2);
+            
+            const texture = new THREE.CanvasTexture(canvas);
+            const spriteMaterial = new THREE.SpriteMaterial({ map: texture, depthTest: false });
+            const sprite = new THREE.Sprite(spriteMaterial);
+            sprite.scale.set(8, 4, 1);
+            return sprite;
+        }
+
+        // Node Creation
+        function createNode(id, type) {
+            let color, radius;
+            if (type === 'router') {
+                color = 0xff4444;
+                radius = 2.0;
+            } else if (type === 'server') {
+                color = 0x44ff44;
+                radius = 1.5;
+            } else {
+                color = 0x4488ff;
+                radius = 1.5;
+            }
+
+            const geometry = new THREE.SphereGeometry(radius, 32, 32);
+            const material = new THREE.MeshPhongMaterial({ 
+                color: color,
+                shininess: 50
+            });
+            const mesh = new THREE.Mesh(geometry, material);
+
+            // Random initial position within radius 30, z=0
+            const r = Math.random() * 30;
+            const theta = Math.random() * Math.PI * 2;
+            mesh.position.set(r * Math.cos(theta), r * Math.sin(theta), 0);
+
+            const sprite = createTextSprite(id);
+            sprite.position.set(0, radius + 1.5, 0);
+            mesh.add(sprite);
+
+            // Debug Force Vector Arrow
+            const arrowHelper = new THREE.ArrowHelper(
+                new THREE.Vector3(1, 0, 0),
+                mesh.position,
+                0,
+                0xffff00,
+                1,
+                0.5
+            );
+            arrowHelper.visible = false;
+            scene.add(arrowHelper);
+
+            scene.add(mesh);
+            interactableMeshes.push(mesh);
+
+            const nodeObj = {
+                id: id,
+                type: type,
+                baseColor: color,
+                radius: radius,
+                mesh: mesh,
+                arrow: arrowHelper,
+                x: mesh.position.x,
+                y: mesh.position.y,
+                z: 0,
+                vx: 0,
+                vy: 0,
+                vz: 0,
+                fx: 0,
+                fy: 0,
+                fz: 0
+            };
+
+            mesh.userData.node = nodeObj;
+            nodes.push(nodeObj);
+            return nodeObj;
+        }
+
+        // Edge Creation
+        function createEdge(sourceNode, targetNode) {
+            const material = new THREE.LineBasicMaterial({ color: 0x666688, linewidth: 1 });
+            const geometry = new THREE.BufferGeometry().setFromPoints([
+                sourceNode.mesh.position,
+                targetNode.mesh.position
+            ]);
+            const line = new THREE.Line(geometry, material);
+            scene.add(line);
+
+            const edgeObj = {
+                source: sourceNode,
+                target: targetNode,
+                line: line
+            };
+            edges.push(edgeObj);
+            return edgeObj;
+        }
+
+        // Initialize Graph Topology
+        function initGraph() {
+            const routers = [createNode('R0', 'router'), createNode('R1', 'router'), createNode('R2', 'router')];
+            const servers = [createNode('S0', 'server'), createNode('S1', 'server'), createNode('S2', 'server'), createNode('S3', 'server')];
+            const clients = [createNode('C0', 'client'), createNode('C1', 'client'), createNode('C2', 'client'), createNode('C3', 'client'), createNode('C4', 'client')];
+
+            // Routers interconnect
+            createEdge(routers[0], routers[1]);
+            createEdge(routers[1], routers[2]);
+            createEdge(routers[2], routers[0]);
+
+            // Routers connect to all servers
+            routers.forEach(r => {
+                servers.forEach(s => {
+                    createEdge(r, s);
+                });
+            });
+
+            // Servers connect to clients (1-2 each)
+            createEdge(servers[0], clients[0]);
+            createEdge(servers[0], clients[1]);
+            createEdge(servers[1], clients[2]);
+            createEdge(servers[2], clients[3]);
+            createEdge(servers[3], clients[4]);
+        }
+
+        initGraph();
+
+        // Physics Simulation
+        const REST_LENGTH = 20;
+        const DAMPING = 0.92;
+
+        function updatePhysics() {
+            if (!window.__3D_STATE__.simulationRunning) return;
+
+            // Reset forces
+            nodes.forEach(n => {
+                n.fx = 0;
+                n.fy = 0;
+            });
+
+            // 1. Repulsion Force (all pairs)
+            for (let i = 0; i < nodes.length; i++) {
+                for (let j = i + 1; j < nodes.length; j++) {
+                    const n1 = nodes[i];
+                    const n2 = nodes[j];
+                    let dx = n1.x - n2.x;
+                    let dy = n1.y - n2.y;
+                    let distSq = dx * dx + dy * dy;
+                    
+                    if (distSq === 0) {
+                        dx = (Math.random() - 0.5) * 0.1;
+                        dy = (Math.random() - 0.5) * 0.1;
+                        distSq = dx * dx + dy * dy;
+                    }
+                    
+                    const dist = Math.sqrt(distSq);
+                    const force = 500 / distSq;
+                    
+                    const fx = (dx / dist) * force;
+                    const fy = (dy / dist) * force;
+                    
+                    n1.fx += fx;
+                    n1.fy += fy;
+                    n2.fx -= fx;
+                    n2.fy -= fy;
+                }
+            }
+
+            // 2. Spring Force (edges)
+            edges.forEach(edge => {
+                const n1 = edge.source;
+                const n2 = edge.target;
+                let dx = n1.x - n2.x;
+                let dy = n1.y - n2.y;
+                const dist = Math.sqrt(dx * dx + dy * dy) || 0.001;
+                
+                const force = 0.05 * (dist - REST_LENGTH);
+                const fx = (dx / dist) * force;
+                const fy = (dy / dist) * force;
+                
+                n1.fx -= fx;
+                n1.fy -= fy;
+                n2.fx += fx;
+                n2.fy += fy;
+            });
+
+            // 3. Center Gravity
+            if (window.__3D_STATE__.gravityEnabled) {
+                nodes.forEach(n => {
+                    const dist = Math.sqrt(n.x * n.x + n.y * n.y) || 0.001;
+                    const force = 0.01 * dist;
+                    n.fx -= (n.x / dist) * force;
+                    n.fy -= (n.y / dist) * force;
+                });
+            }
+
+            // 4. Integration & State Update
+            let totalKE = 0;
+            let totalVel = 0;
+
+            nodes.forEach(n => {
+                // If dragging, override physics
+                if (window.__3D_STATE__.isDragging && window.__3D_STATE__.selectedNodeId === n.id) {
+                    n.vx = 0;
+                    n.vy = 0;
+                } else {
+                    n.vx = (n.vx + n.fx) * DAMPING;
+                    n.vy = (n.vy + n.fy) * DAMPING;
+                    n.x += n.vx;
+                    n.y += n.vy;
+                }
+
+                n.mesh.position.set(n.x, n.y, 0);
+
+                // Debug Arrows
+                if (window.__3D_STATE__.debugVisible) {
+                    const forceMag = Math.sqrt(n.fx * n.fx + n.fy * n.fy);
+                    if (forceMag > 0.01) {
+                        n.arrow.setDirection(new THREE.Vector3(n.fx, n.fy, 0).normalize());
+                        n.arrow.setLength(forceMag * 2 + 1);
+                        n.arrow.position.copy(n.mesh.position);
+                        n.arrow.visible = true;
+                    } else {
+                        n.arrow.visible = false;
+                    }
+                } else {
+                    n.arrow.visible = false;
+                }
+
+                const vSq = n.vx * n.vx + n.vy * n.vy;
+                totalKE += 0.5 * vSq;
+                totalVel += Math.sqrt(vSq);
+            });
+
+            window.__3D_STATE__.totalKineticEnergy = totalKE;
+            window.__3D_STATE__.averageVelocity = nodes.length > 0 ? totalVel / nodes.length : 0;
+            window.__3D_STATE__.simulationSteps++;
+        }
+
+        // Visual Updates
+        function updateVisuals() {
+            let minDist = Infinity;
+            let maxDist = 0;
+
+            // Update Edges
+            edges.forEach(edge => {
+                const p1 = edge.source.mesh.position;
+                const p2 = edge.target.mesh.position;
+                
+                const positions = edge.line.geometry.attributes.position.array;
+                positions[0] = p1.x; positions[1] = p1.y; positions[2] = p1.z;
+                positions[3] = p2.x; positions[4] = p2.y; positions[5] = p2.z;
+                edge.line.geometry.attributes.position.needsUpdate = true;
+
+                const dist = p1.distanceTo(p2);
+                minDist = Math.min(minDist, dist);
+                maxDist = Math.max(maxDist, dist);
+
+                // Edge Coloring
+                const isConnectedToSelected = (window.__3D_STATE__.selectedNodeId === edge.source.id || window.__3D_STATE__.selectedNodeId === edge.target.id);
+                
+                if (isConnectedToSelected) {
+                    edge.line.material.color.setHex(0xffff00);
+                } else if (window.__3D_STATE__.debugVisible) {
+                    if (dist > REST_LENGTH * 1.2) {
+                        edge.line.material.color.setHex(0xff0000); // Tension
+                    } else if (dist < REST_LENGTH * 0.8) {
+                        edge.line.material.color.setHex(0x00ff00); // Compressed
+                    } else {
+                        edge.line.material.color.setHex(0x666688);
+                    }
+                } else {
+                    edge.line.material.color.setHex(0x666688);
+                }
+            });
+
+            window.__3D_STATE__.minEdgeDistance = minDist === Infinity ? 0 : minDist;
+            window.__3D_STATE__.maxEdgeDistance = maxDist;
+
+            // Update Nodes
+            nodes.forEach(n => {
+                if (window.__3D_STATE__.selectedNodeId === n.id) {
+                    n.mesh.material.color.setHex(0xffffff);
+                } else {
+                    n.mesh.material.color.setHex(n.baseColor);
+                }
+            });
+        }
+
+        // Interaction Handling
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+        const dragPlane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0);
+        let draggedNode = null;
+
+        function getIntersects(event) {
+            const rect = renderer.domElement.getBoundingClientRect();
+            mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+            mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+            raycaster.setFromCamera(mouse, camera);
+            return raycaster.intersectObjects(interactableMeshes);
+        }
+
+        window.addEventListener('mousedown', (event) => {
+            if (event.target.tagName === 'BUTTON') return;
+            
+            const intersects = getIntersects(event);
+            if (intersects.length > 0) {
+                const node = intersects[0].object.userData.node;
+                if (window.__3D_STATE__.selectedNodeId === node.id) {
+                    // Deselect
+                    window.__3D_STATE__.selectedNodeId = null;
+                    draggedNode = null;
+                } else {
+                    // Select
+                    window.__3D_STATE__.selectedNodeId = node.id;
+                    draggedNode = node;
+                    window.__3D_STATE__.isDragging = true;
+                    controls.enabled = false;
+                }
+            } else {
+                window.__3D_STATE__.selectedNodeId = null;
+            }
+        });
+
+        window.addEventListener('mousemove', (event) => {
+            if (window.__3D_STATE__.isDragging && draggedNode) {
+                const rect = renderer.domElement.getBoundingClientRect();
+                mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+                mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+                raycaster.setFromCamera(mouse, camera);
+                
+                const target = new THREE.Vector3();
+                raycaster.ray.intersectPlane(dragPlane, target);
+                
+                if (target) {
+                    draggedNode.x = target.x;
+                    draggedNode.y = target.y;
+                    draggedNode.mesh.position.set(target.x, target.y, 0);
+                }
+            }
+        });
+
+        window.addEventListener('mouseup', () => {
+            window.__3D_STATE__.isDragging = false;
+            draggedNode = null;
+            controls.enabled = true;
+        });
+
+        // Keyboard Controls
+        window.addEventListener('keydown', (event) => {
+            const key = event.key.toLowerCase();
+            if (key === 'p') {
+                window.__3D_STATE__.simulationRunning = !window.__3D_STATE__.simulationRunning;
+            } else if (key === 'g') {
+                window.__3D_STATE__.gravityEnabled = !window.__3D_STATE__.gravityEnabled;
+            } else if (key === 'r') {
+                nodes.forEach(n => {
+                    const r = Math.random() * 30;
+                    const theta = Math.random() * Math.PI * 2;
+                    n.x = r * Math.cos(theta);
+                    n.y = r * Math.sin(theta);
+                    n.vx = 0;
+                    n.vy = 0;
+                });
+                window.__3D_STATE__.simulationSteps = 0;
+            }
+        });
+
+        // UI Buttons
+        document.getElementById('btn-debug').addEventListener('click', () => {
+            window.__3D_STATE__.debugVisible = !window.__3D_STATE__.debugVisible;
+            document.getElementById('debug-overlay').style.display = window.__3D_STATE__.debugVisible ? 'block' : 'none';
+        });
+
+        let clientCounter = 5;
+        document.getElementById('btn-add-node').addEventListener('click', () => {
+            const id = 'C' + clientCounter++;
+            const newNode = createNode(id, 'client');
+            
+            const servers = nodes.filter(n => n.type === 'server');
+            if (servers.length > 0) {
+                const randomServer = servers[Math.floor(Math.random() * servers.length)];
+                createEdge(newNode, randomServer);
+            }
+        });
+
+        // Window Resize
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // State Sync & Render Loop
+        function syncState() {
+            window.__3D_STATE__.nodeCount = nodes.length;
+            window.__3D_STATE__.edgeCount = edges.length;
+            window.__3D_STATE__.routerCount = nodes.filter(n => n.type === 'router').length;
+            window.__3D_STATE__.serverCount = nodes.filter(n => n.type === 'server').length;
+            window.__3D_STATE__.clientCount = nodes.filter(n => n.type === 'client').length;
+            window.__3D_STATE__.nodePositions = nodes.map(n => ({ id: n.id, x: n.x, y: n.y, z: n.z }));
+
+            if (window.__3D_STATE__.debugVisible) {
+                document.getElementById('dbg-ke').innerText = window.__3D_STATE__.totalKineticEnergy.toFixed(2);
+                document.getElementById('dbg-steps').innerText = window.__3D_STATE__.simulationSteps;
+                document.getElementById('dbg-vel').innerText = window.__3D_STATE__.averageVelocity.toFixed(4);
+                document.getElementById('dbg-min-dist').innerText = window.__3D_STATE__.minEdgeDistance.toFixed(2);
+                document.getElementById('dbg-max-dist').innerText = window.__3D_STATE__.maxEdgeDistance.toFixed(2);
+            }
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            
+            updatePhysics();
+            updateVisuals();
+            syncState();
+            
+            controls.update();
+            renderer.render(scene, camera);
+        }
+
+        // Start
+        syncState();
+        animate();
+    </script>
+</body>
+</html>

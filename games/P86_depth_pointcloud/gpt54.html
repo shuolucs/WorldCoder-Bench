@@ -1,0 +1,484 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Three.js 深度反投影点云</title>
+  <style>
+    html, body {
+      margin: 0;
+      height: 100%;
+      overflow: hidden;
+      background: #111;
+      color: #eee;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    }
+    #app {
+      width: 100%;
+      height: 100%;
+      position: relative;
+    }
+    #ui {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      z-index: 10;
+      background: rgba(0,0,0,0.55);
+      padding: 12px 14px;
+      border-radius: 10px;
+      backdrop-filter: blur(6px);
+      min-width: 260px;
+    }
+    #ui .row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin: 8px 0;
+    }
+    #ui label {
+      width: 90px;
+      font-size: 13px;
+      color: #ddd;
+    }
+    #ui input[type="range"] {
+      flex: 1;
+    }
+    #ui select {
+      flex: 1;
+      background: #222;
+      color: #eee;
+      border: 1px solid #555;
+      padding: 4px;
+      border-radius: 6px;
+    }
+    #ui .value {
+      width: 56px;
+      text-align: right;
+      font-size: 12px;
+      color: #9fd;
+    }
+    #info {
+      position: absolute;
+      right: 12px;
+      top: 12px;
+      z-index: 10;
+      background: rgba(0,0,0,0.55);
+      padding: 10px 12px;
+      border-radius: 10px;
+      backdrop-filter: blur(6px);
+      font-size: 12px;
+      line-height: 1.5;
+      white-space: pre-line;
+      max-width: 360px;
+    }
+    canvas {
+      display: block;
+    }
+  </style>
+
+  <script type="importmap">
+  { "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+  } }
+  </script>
+</head>
+<body>
+  <div id="app">
+    <div id="ui">
+      <div class="row">
+        <label for="fov">FOV</label>
+        <input id="fov" type="range" min="30" max="90" step="1" value="55" />
+        <div class="value" id="fovVal">55</div>
+      </div>
+      <div class="row">
+        <label for="aspect">Aspect</label>
+        <input id="aspect" type="range" min="0.5" max="2.0" step="0.01" value="1.0" />
+        <div class="value" id="aspectVal">1.00</div>
+      </div>
+      <div class="row">
+        <label for="pointSize">Point Size</label>
+        <input id="pointSize" type="range" min="1" max="8" step="0.1" value="2.0" />
+        <div class="value" id="pointSizeVal">2.0</div>
+      </div>
+      <div class="row">
+        <label for="renderMode">Mode</label>
+        <select id="renderMode">
+          <option value="pointcloud">pointcloud</option>
+          <option value="depth">depth</option>
+          <option value="rgb">rgb</option>
+        </select>
+      </div>
+    </div>
+    <div id="info"></div>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+    const app = document.getElementById('app');
+    const info = document.getElementById('info');
+
+    const fovSlider = document.getElementById('fov');
+    const aspectSlider = document.getElementById('aspect');
+    const pointSizeSlider = document.getElementById('pointSize');
+    const renderModeSelect = document.getElementById('renderMode');
+    const fovVal = document.getElementById('fovVal');
+    const aspectVal = document.getElementById('aspectVal');
+    const pointSizeVal = document.getElementById('pointSizeVal');
+
+    const DEPTH_W = 256;
+    const DEPTH_H = 256;
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: false });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    app.appendChild(renderer.domElement);
+
+    const mainScene = new THREE.Scene();
+    mainScene.background = new THREE.Color(0x111111);
+
+    const mainCamera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 100);
+    mainCamera.position.set(6, 5, 8);
+
+    const controls = new OrbitControls(mainCamera, renderer.domElement);
+    controls.target.set(0, 1, 0);
+    controls.enableDamping = true;
+
+    const ambient = new THREE.AmbientLight(0xffffff, 1.2);
+    mainScene.add(ambient);
+
+    const dir = new THREE.DirectionalLight(0xffffff, 1.5);
+    dir.position.set(5, 8, 4);
+    mainScene.add(dir);
+
+    const grid = new THREE.GridHelper(12, 12, 0x335577, 0x223344);
+    mainScene.add(grid);
+
+    // 被“深度相机”拍摄的场景
+    const captureRoot = new THREE.Group();
+    mainScene.add(captureRoot);
+
+    const floor = new THREE.Mesh(
+      new THREE.PlaneGeometry(12, 12),
+      new THREE.MeshStandardMaterial({ color: 0x404040, roughness: 0.9, metalness: 0.0 })
+    );
+    floor.rotation.x = -Math.PI / 2;
+    captureRoot.add(floor);
+
+    const objs = [];
+
+    function addBox(pos, color) {
+      const m = new THREE.Mesh(
+        new THREE.BoxGeometry(1.1, 1.1, 1.1),
+        new THREE.MeshStandardMaterial({ color, roughness: 0.5, metalness: 0.1 })
+      );
+      m.position.copy(pos);
+      captureRoot.add(m);
+      objs.push(m);
+    }
+
+    function addSphere(pos, color) {
+      const m = new THREE.Mesh(
+        new THREE.SphereGeometry(0.65, 32, 24),
+        new THREE.MeshStandardMaterial({ color, roughness: 0.35, metalness: 0.15 })
+      );
+      m.position.copy(pos);
+      captureRoot.add(m);
+      objs.push(m);
+    }
+
+    addBox(new THREE.Vector3(-2.2, 0.55, -1.0), 0xff8844);
+    addBox(new THREE.Vector3(0.2, 0.55, 1.2), 0x44ccff);
+    addSphere(new THREE.Vector3(2.1, 0.65, -0.8), 0xaaff66);
+    addSphere(new THREE.Vector3(-0.8, 1.8, -2.5), 0xff66aa);
+
+    // 深度相机
+    const captureCamera = new THREE.PerspectiveCamera(
+      parseFloat(fovSlider.value),
+      parseFloat(aspectSlider.value),
+      0.1,
+      20
+    );
+    captureCamera.position.set(0, 3.0, 6.5);
+    captureCamera.lookAt(0, 0.9, 0);
+
+    const camHelper = new THREE.CameraHelper(captureCamera);
+    mainScene.add(camHelper);
+
+    // 离屏渲染目标：颜色 + 深度
+    const renderTarget = new THREE.WebGLRenderTarget(DEPTH_W, DEPTH_H, {
+      minFilter: THREE.NearestFilter,
+      magFilter: THREE.NearestFilter,
+      format: THREE.RGBAFormat,
+      type: THREE.UnsignedByteType,
+      depthBuffer: true,
+      stencilBuffer: false
+    });
+    renderTarget.depthTexture = new THREE.DepthTexture(DEPTH_W, DEPTH_H);
+    renderTarget.depthTexture.type = THREE.UnsignedIntType;
+    renderTarget.depthTexture.format = THREE.DepthFormat;
+
+    const colorPixels = new Uint8Array(DEPTH_W * DEPTH_H * 4);
+    const depthPixels = new Float32Array(DEPTH_W * DEPTH_H);
+
+    // 右下角平面显示 depth/rgb
+    const overlayScene = new THREE.Scene();
+    const overlayCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+
+    const overlayCanvas = document.createElement('canvas');
+    overlayCanvas.width = DEPTH_W;
+    overlayCanvas.height = DEPTH_H;
+    const overlayCtx = overlayCanvas.getContext('2d');
+    const overlayImageData = overlayCtx.createImageData(DEPTH_W, DEPTH_H);
+    const overlayTexture = new THREE.CanvasTexture(overlayCanvas);
+    overlayTexture.minFilter = THREE.NearestFilter;
+    overlayTexture.magFilter = THREE.NearestFilter;
+
+    const overlayMat = new THREE.MeshBasicMaterial({
+      map: overlayTexture,
+      transparent: true
+    });
+    const overlayQuad = new THREE.Mesh(new THREE.PlaneGeometry(0.6, 0.6), overlayMat);
+    overlayQuad.position.set(0.55, -0.55, 0);
+    overlayScene.add(overlayQuad);
+
+    // 点云
+    const pointPositions = new Float32Array(DEPTH_W * DEPTH_H * 3);
+    const pointColors = new Float32Array(DEPTH_W * DEPTH_H * 3);
+    const pointGeom = new THREE.BufferGeometry();
+    pointGeom.setAttribute('position', new THREE.BufferAttribute(pointPositions, 3));
+    pointGeom.setAttribute('color', new THREE.BufferAttribute(pointColors, 3));
+    pointGeom.setDrawRange(0, DEPTH_W * DEPTH_H);
+
+    const pointsMat = new THREE.PointsMaterial({
+      size: parseFloat(pointSizeSlider.value),
+      vertexColors: true,
+      sizeAttenuation: true
+    });
+    const pointCloud = new THREE.Points(pointGeom, pointsMat);
+    mainScene.add(pointCloud);
+
+    // 热->冷颜色映射
+    function depthToColor(t, color) {
+      // t: 0 近, 1 远
+      const hue = THREE.MathUtils.lerp(0.03, 0.66, t); // 暖(橙红) -> 冷(蓝)
+      color.setHSL(hue, 1.0, 0.55);
+      return color;
+    }
+
+    function updateLabels() {
+      fovVal.textContent = fovSlider.value;
+      aspectVal.textContent = parseFloat(aspectSlider.value).toFixed(2);
+      pointSizeVal.textContent = parseFloat(pointSizeSlider.value).toFixed(1);
+    }
+
+    function syncCaptureCamera() {
+      captureCamera.fov = parseFloat(fovSlider.value);
+      captureCamera.aspect = parseFloat(aspectSlider.value);
+      captureCamera.updateProjectionMatrix();
+      camHelper.update();
+      pointsMat.size = parseFloat(pointSizeSlider.value);
+    }
+
+    function linearizeDepth(depth01, near, far) {
+      const z_ndc = depth01 * 2.0 - 1.0;
+      return (2.0 * near * far) / (far + near - z_ndc * (far - near));
+    }
+
+    function captureDepthAndColor() {
+      renderer.setRenderTarget(renderTarget);
+      renderer.clear(true, true, true);
+      renderer.render(mainScene, captureCamera);
+
+      renderer.readRenderTargetPixels(renderTarget, 0, 0, DEPTH_W, DEPTH_H, colorPixels);
+
+      const gl = renderer.getContext();
+      gl.bindFramebuffer(gl.FRAMEBUFFER, renderTarget.__webglFramebuffer);
+      gl.readPixels(0, 0, DEPTH_W, DEPTH_H, gl.DEPTH_COMPONENT, gl.FLOAT, depthPixels);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+      renderer.setRenderTarget(null);
+    }
+
+    function rebuildPointCloud() {
+      const near = captureCamera.near;
+      const far = captureCamera.far;
+      const fovRad = THREE.MathUtils.degToRad(captureCamera.fov);
+      const fy = (DEPTH_H * 0.5) / Math.tan(fovRad * 0.5);
+      const fx = fy * captureCamera.aspect;
+      const cx = DEPTH_W * 0.5;
+      const cy = DEPTH_H * 0.5;
+
+      const tempColor = new THREE.Color();
+      const camMatrixWorld = captureCamera.matrixWorld;
+
+      let count = 0;
+
+      for (let py = 0; py < DEPTH_H; py++) {
+        for (let px = 0; px < DEPTH_W; px++) {
+          const i = py * DEPTH_W + px;
+          const d01 = depthPixels[i];
+
+          if (!(d01 >= 0.0 && d01 <= 1.0) || d01 >= 0.999999) {
+            continue;
+          }
+
+          const z = linearizeDepth(d01, near, far);
+
+          const x = ((px + 0.5) - cx) * z / fx;
+          const y = -(((py + 0.5) - cy) * z / fy);
+
+          const p = new THREE.Vector3(x, y, -z);
+          p.applyMatrix4(camMatrixWorld);
+
+          pointPositions[count * 3 + 0] = p.x;
+          pointPositions[count * 3 + 1] = p.y;
+          pointPositions[count * 3 + 2] = p.z;
+
+          const t = THREE.MathUtils.clamp((z - near) / (far - near), 0, 1);
+          depthToColor(t, tempColor);
+          pointColors[count * 3 + 0] = tempColor.r;
+          pointColors[count * 3 + 1] = tempColor.g;
+          pointColors[count * 3 + 2] = tempColor.b;
+
+          count++;
+        }
+      }
+
+      pointGeom.attributes.position.needsUpdate = true;
+      pointGeom.attributes.color.needsUpdate = true;
+      pointGeom.setDrawRange(0, count);
+
+      return count;
+    }
+
+    function updateOverlay(mode) {
+      const data = overlayImageData.data;
+      const near = captureCamera.near;
+      const far = captureCamera.far;
+      const tempColor = new THREE.Color();
+
+      for (let y = 0; y < DEPTH_H; y++) {
+        for (let x = 0; x < DEPTH_W; x++) {
+          const srcY = DEPTH_H - 1 - y;
+          const i = srcY * DEPTH_W + x;
+          const j = (y * DEPTH_W + x) * 4;
+
+          if (mode === 'rgb') {
+            data[j + 0] = colorPixels[i * 4 + 0];
+            data[j + 1] = colorPixels[i * 4 + 1];
+            data[j + 2] = colorPixels[i * 4 + 2];
+            data[j + 3] = 255;
+          } else {
+            const d01 = depthPixels[i];
+            if (!(d01 >= 0.0 && d01 <= 1.0) || d01 >= 0.999999) {
+              data[j + 0] = 0;
+              data[j + 1] = 0;
+              data[j + 2] = 0;
+              data[j + 3] = 255;
+            } else {
+              const z = linearizeDepth(d01, near, far);
+              const t = THREE.MathUtils.clamp((z - near) / (far - near), 0, 1);
+              depthToColor(t, tempColor);
+              data[j + 0] = Math.round(tempColor.r * 255);
+              data[j + 1] = Math.round(tempColor.g * 255);
+              data[j + 2] = Math.round(tempColor.b * 255);
+              data[j + 3] = 255;
+            }
+          }
+        }
+      }
+
+      overlayCtx.putImageData(overlayImageData, 0, 0);
+      overlayTexture.needsUpdate = true;
+    }
+
+    function animate(time) {
+      requestAnimationFrame(animate);
+
+      updateLabels();
+      syncCaptureCamera();
+      controls.update();
+
+      objs[0].rotation.y = time * 0.0007;
+      objs[1].rotation.x = time * 0.0008;
+      objs[2].position.y = 0.8 + Math.sin(time * 0.0012) * 0.25;
+      objs[3].position.x = -0.8 + Math.cos(time * 0.0011) * 0.35;
+
+      // 为了保证离屏捕获不包含点云和相机辅助器，临时隐藏
+      const prevPointCloudVisible = pointCloud.visible;
+      const prevHelperVisible = camHelper.visible;
+      pointCloud.visible = false;
+      camHelper.visible = false;
+
+      captureDepthAndColor();
+      const pointCount = rebuildPointCloud();
+
+      pointCloud.visible = prevPointCloudVisible;
+      camHelper.visible = prevHelperVisible;
+
+      const mode = renderModeSelect.value;
+      pointCloud.visible = mode === 'pointcloud';
+
+      updateOverlay(mode);
+      overlayQuad.visible = (mode === 'depth' || mode === 'rgb');
+
+      renderer.setViewport(0, 0, window.innerWidth, window.innerHeight);
+      renderer.setScissorTest(false);
+      renderer.render(mainScene, mainCamera);
+
+      if (overlayQuad.visible) {
+        renderer.autoClear = false;
+        renderer.clearDepth();
+        renderer.render(overlayScene, overlayCamera);
+        renderer.autoClear = true;
+      }
+
+      window.__3D_STATE__ = {
+        pointCount,
+        depthRange: {
+          near: captureCamera.near,
+          far: captureCamera.far
+        },
+        fov: captureCamera.fov,
+        aspect: captureCamera.aspect,
+        pointSize: pointsMat.size,
+        renderMode: mode,
+        cameraPos: {
+          x: mainCamera.position.x,
+          y: mainCamera.position.y,
+          z: mainCamera.position.z
+        }
+      };
+
+      info.textContent =
+`离屏深度分辨率: ${DEPTH_W}×${DEPTH_H}
+点数: ${pointCount}
+捕获相机 FOV: ${captureCamera.fov.toFixed(1)}
+捕获相机 Aspect: ${captureCamera.aspect.toFixed(2)}
+主相机位置: (${mainCamera.position.x.toFixed(2)}, ${mainCamera.position.y.toFixed(2)}, ${mainCamera.position.z.toFixed(2)})
+模式: ${mode}`;
+    }
+
+    function onResize() {
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      mainCamera.aspect = window.innerWidth / window.innerHeight;
+      mainCamera.updateProjectionMatrix();
+    }
+
+    fovSlider.addEventListener('input', updateLabels);
+    aspectSlider.addEventListener('input', updateLabels);
+    pointSizeSlider.addEventListener('input', updateLabels);
+    renderModeSelect.addEventListener('change', () => {});
+
+    updateLabels();
+    onResize();
+    window.addEventListener('resize', onResize);
+
+    animate(0);
+  </script>
+</body>
+</html>

@@ -1,0 +1,507 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3D Soft Body Spring-Mass Simulation</title>
+<style>
+  body { margin: 0; overflow: hidden; background: #1a1a2e; font-family: Arial, sans-serif; }
+  canvas { display: block; }
+  #ui {
+    position: absolute; top: 10px; left: 10px; z-index: 10;
+    background: rgba(0,0,0,0.7); color: #eee; padding: 12px 16px;
+    border-radius: 8px; font-size: 13px; line-height: 1.6;
+    min-width: 240px;
+  }
+  #windBtn {
+    padding: 8px 18px; margin-top: 8px; cursor: pointer;
+    background: #2d6a4f; color: white; border: none; border-radius: 4px;
+    font-size: 14px; transition: background 0.2s;
+  }
+  #windBtn:hover { background: #40916c; }
+  #windBtn.active { background: #e63946; }
+  #stats { margin-top: 8px; font-size: 12px; color: #aaa; }
+</style>
+<script type="importmap">
+{ "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="ui">
+  <strong>Soft Body Simulation</strong><br>
+  10×10×10 Spring-Mass Grid<br>
+  <button id="windBtn">Wind: OFF</button>
+  <div id="stats"></div>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// --- Configuration ---
+const N = 10;
+const restLength = 1.0;
+const stiffness = 500;
+const damping = 5.0;
+const gravity = new THREE.Vector3(0, -9.81, 0);
+const groundY = 0;
+const groundRestitution = 0.4;
+const groundFriction = 0.3;
+const windForce = new THREE.Vector3(0, 0, 8.0);
+const initialHeight = 5.0;
+const dt = 0.001;
+const substeps = 8;
+
+let windEnabled = false;
+let simTime = 0;
+
+// --- Particles ---
+const totalNodes = N * N * N;
+const positions = new Float64Array(totalNodes * 3);
+const prevPositions = new Float64Array(totalNodes * 3);
+const velocities = new Float64Array(totalNodes * 3);
+const forces = new Float64Array(totalNodes * 3);
+const pinned = new Uint8Array(totalNodes);
+const mass = 0.1;
+
+function idx(i, j, k) { return i + j * N + k * N * N; }
+
+// Initialize positions - center the grid and raise it
+const offset = -(N - 1) * restLength * 0.5;
+for (let k = 0; k < N; k++) {
+  for (let j = 0; j < N; j++) {
+    for (let i = 0; i < N; i++) {
+      const id = idx(i, j, k);
+      const px = i * restLength + offset;
+      const py = j * restLength + initialHeight;
+      const pz = k * restLength + offset;
+      positions[id * 3] = px;
+      positions[id * 3 + 1] = py;
+      positions[id * 3 + 2] = pz;
+      prevPositions[id * 3] = px;
+      prevPositions[id * 3 + 1] = py;
+      prevPositions[id * 3 + 2] = pz;
+    }
+  }
+}
+
+// Pin top 4 corners: (0,9,0), (9,9,0), (0,9,9), (9,9,9)
+pinned[idx(0, 9, 0)] = 1;
+pinned[idx(9, 9, 0)] = 1;
+pinned[idx(0, 9, 9)] = 1;
+pinned[idx(9, 9, 9)] = 1;
+
+// --- Springs ---
+const springs = [];
+const springSet = new Set();
+
+function addSpring(a, b, rl) {
+  const key = a < b ? `${a}-${b}` : `${b}-${a}`;
+  if (springSet.has(key)) return;
+  springSet.add(key);
+  springs.push({ a, b, restLength: rl });
+}
+
+for (let k = 0; k < N; k++) {
+  for (let j = 0; j < N; j++) {
+    for (let i = 0; i < N; i++) {
+      const id = idx(i, j, k);
+
+      // Structural springs (6-adjacency)
+      if (i + 1 < N) addSpring(id, idx(i+1, j, k), restLength);
+      if (j + 1 < N) addSpring(id, idx(i, j+1, k), restLength);
+      if (k + 1 < N) addSpring(id, idx(i, j, k+1), restLength);
+
+      // Face diagonal springs (sqrt(2))
+      // XY face diagonals
+      if (i + 1 < N && j + 1 < N) {
+        addSpring(id, idx(i+1, j+1, k), restLength * Math.SQRT2);
+        addSpring(idx(i+1, j, k), idx(i, j+1, k), restLength * Math.SQRT2);
+      }
+      // XZ face diagonals
+      if (i + 1 < N && k + 1 < N) {
+        addSpring(id, idx(i+1, j, k+1), restLength * Math.SQRT2);
+        addSpring(idx(i+1, j, k), idx(i, j, k+1), restLength * Math.SQRT2);
+      }
+      // YZ face diagonals
+      if (j + 1 < N && k + 1 < N) {
+        addSpring(id, idx(i, j+1, k+1), restLength * Math.SQRT2);
+        addSpring(idx(i, j+1, k), idx(i, j, k+1), restLength * Math.SQRT2);
+      }
+
+      // Body diagonal springs (sqrt(3))
+      if (i + 1 < N && j + 1 < N && k + 1 < N) {
+        addSpring(idx(i, j, k), idx(i+1, j+1, k+1), restLength * Math.sqrt(3));
+        addSpring(idx(i+1, j, k), idx(i, j+1, k+1), restLength * Math.sqrt(3));
+        addSpring(idx(i, j+1, k), idx(i+1, j, k+1), restLength * Math.sqrt(3));
+        addSpring(idx(i, j, k+1), idx(i+1, j+1, k), restLength * Math.sqrt(3));
+      }
+    }
+  }
+}
+
+const springCount = springs.length;
+console.log(`Springs: ${springCount}`);
+
+// --- Physics: Verlet Integration ---
+function simulate(dt) {
+  // Clear forces
+  for (let i = 0; i < totalNodes * 3; i++) forces[i] = 0;
+
+  // Gravity
+  for (let i = 0; i < totalNodes; i++) {
+    forces[i * 3 + 1] += mass * gravity.y;
+  }
+
+  // Wind
+  if (windEnabled) {
+    for (let i = 0; i < totalNodes; i++) {
+      const px = positions[i * 3];
+      const py = positions[i * 3 + 1];
+      const pz = positions[i * 3 + 2];
+      const variation = 1.0 + 0.3 * Math.sin(px * 0.5 + simTime * 2.0) * Math.cos(py * 0.3 + simTime);
+      forces[i * 3]     += windForce.x * variation * mass;
+      forces[i * 3 + 1] += windForce.y * variation * mass;
+      forces[i * 3 + 2] += windForce.z * variation * mass;
+    }
+  }
+
+  // Spring forces
+  for (let s = 0; s < springCount; s++) {
+    const sp = springs[s];
+    const a = sp.a, b = sp.b;
+    const a3 = a * 3, b3 = b * 3;
+
+    const dx = positions[b3] - positions[a3];
+    const dy = positions[b3 + 1] - positions[a3 + 1];
+    const dz = positions[b3 + 2] - positions[a3 + 2];
+
+    const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    if (dist < 1e-10) continue;
+
+    const invDist = 1.0 / dist;
+    const nx = dx * invDist;
+    const ny = dy * invDist;
+    const nz = dz * invDist;
+
+    // Hooke's law
+    const stretch = dist - sp.restLength;
+    const springF = stiffness * stretch;
+
+    // Velocity from Verlet: (pos - prevPos) / dt
+    const vaX = (positions[a3] - prevPositions[a3]) / dt;
+    const vaY = (positions[a3 + 1] - prevPositions[a3 + 1]) / dt;
+    const vaZ = (positions[a3 + 2] - prevPositions[a3 + 2]) / dt;
+    const vbX = (positions[b3] - prevPositions[b3]) / dt;
+    const vbY = (positions[b3 + 1] - prevPositions[b3 + 1]) / dt;
+    const vbZ = (positions[b3 + 2] - prevPositions[b3 + 2]) / dt;
+
+    const relVx = vbX - vaX;
+    const relVy = vbY - vaY;
+    const relVz = vbZ - vaZ;
+    const relVn = relVx * nx + relVy * ny + relVz * nz;
+
+    const dampF = damping * relVn;
+
+    const totalF = springF + dampF;
+    const fx = totalF * nx;
+    const fy = totalF * ny;
+    const fz = totalF * nz;
+
+    forces[a3]     += fx;
+    forces[a3 + 1] += fy;
+    forces[a3 + 2] += fz;
+    forces[b3]     -= fx;
+    forces[b3 + 1] -= fy;
+    forces[b3 + 2] -= fz;
+  }
+
+  // Verlet integration
+  const dtSq = dt * dt;
+  for (let i = 0; i < totalNodes; i++) {
+    if (pinned[i]) continue;
+    const i3 = i * 3;
+    const ax = forces[i3] / mass;
+    const ay = forces[i3 + 1] / mass;
+    const az = forces[i3 + 2] / mass;
+
+    const newX = 2 * positions[i3] - prevPositions[i3] + ax * dtSq;
+    const newY = 2 * positions[i3 + 1] - prevPositions[i3 + 1] + ay * dtSq;
+    const newZ = 2 * positions[i3 + 2] - prevPositions[i3 + 2] + az * dtSq;
+
+    prevPositions[i3] = positions[i3];
+    prevPositions[i3 + 1] = positions[i3 + 1];
+    prevPositions[i3 + 2] = positions[i3 + 2];
+
+    positions[i3] = newX;
+    positions[i3 + 1] = newY;
+    positions[i3 + 2] = newZ;
+  }
+
+  // Ground collision
+  for (let i = 0; i < totalNodes; i++) {
+    if (pinned[i]) continue;
+    const i3 = i * 3;
+    if (positions[i3 + 1] < groundY) {
+      positions[i3 + 1] = groundY;
+      // Reflect previous position for bounce
+      const vy = (positions[i3 + 1] - prevPositions[i3 + 1]) / dt;
+      if (prevPositions[i3 + 1] < groundY) {
+        prevPositions[i3 + 1] = groundY + groundRestitution * (groundY - prevPositions[i3 + 1]);
+      } else {
+        // Bounce: reflect the prev y above ground with restitution
+        const penetration = groundY - prevPositions[i3 + 1];
+        prevPositions[i3 + 1] = groundY + groundRestitution * (positions[i3 + 1] - prevPositions[i3 + 1]);
+        // Actually for Verlet bounce: set prev so velocity reverses
+        const velY = (positions[i3 + 1] - prevPositions[i3 + 1]);
+        // We want the reflected velocity
+      }
+      // Simple approach: reflect velocity component
+      const curVelY = positions[i3 + 1] - prevPositions[i3 + 1];
+      if (curVelY < 0) {
+        prevPositions[i3 + 1] = positions[i3 + 1] + groundRestitution * (-curVelY);
+      }
+
+      // Friction on XZ
+      const curVelX = positions[i3] - prevPositions[i3];
+      const curVelZ = positions[i3 + 2] - prevPositions[i3 + 2];
+      prevPositions[i3] = positions[i3] - curVelX * (1 - groundFriction);
+      prevPositions[i3 + 2] = positions[i3 + 2] - curVelZ * (1 - groundFriction);
+    }
+  }
+
+  simTime += dt;
+}
+
+// --- Three.js Setup ---
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x1a1a2e);
+scene.fog = new THREE.Fog(0x1a1a2e, 30, 60);
+
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+camera.position.set(15, 12, 15);
+camera.lookAt(0, 5, 0);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 5, 0);
+controls.enableDamping = true;
+controls.dampingFactor = 0.05;
+
+// Lights
+const ambientLight = new THREE.AmbientLight(0x404060, 0.6);
+scene.add(ambientLight);
+
+const dirLight = new THREE.DirectionalLight(0xffffff, 1.2);
+dirLight.position.set(10, 20, 10);
+dirLight.castShadow = true;
+dirLight.shadow.mapSize.set(2048, 2048);
+dirLight.shadow.camera.left = -20;
+dirLight.shadow.camera.right = 20;
+dirLight.shadow.camera.top = 20;
+dirLight.shadow.camera.bottom = -5;
+scene.add(dirLight);
+
+const pointLight = new THREE.PointLight(0x4488ff, 0.5, 30);
+pointLight.position.set(-5, 10, -5);
+scene.add(pointLight);
+
+// Ground plane
+const groundGeo = new THREE.PlaneGeometry(60, 60);
+const groundMat = new THREE.MeshStandardMaterial({
+  color: 0x2a2a4a,
+  roughness: 0.8,
+  metalness: 0.2
+});
+const groundMesh = new THREE.Mesh(groundGeo, groundMat);
+groundMesh.rotation.x = -Math.PI / 2;
+groundMesh.position.y = 0;
+groundMesh.receiveShadow = true;
+scene.add(groundMesh);
+
+// Grid helper
+const gridHelper = new THREE.GridHelper(60, 60, 0x333355, 0x222244);
+gridHelper.position.y = 0.01;
+scene.add(gridHelper);
+
+// --- InstancedMesh for particles ---
+const sphereGeo = new THREE.SphereGeometry(0.12, 8, 6);
+const sphereMat = new THREE.MeshStandardMaterial({
+  color: 0x44aaff,
+  roughness: 0.3,
+  metalness: 0.6,
+  emissive: 0x112244,
+  emissiveIntensity: 0.2
+});
+const instancedMesh = new THREE.InstancedMesh(sphereGeo, sphereMat, totalNodes);
+instancedMesh.castShadow = true;
+instancedMesh.receiveShadow = true;
+scene.add(instancedMesh);
+
+// Color for pinned nodes
+const pinnedColor = new THREE.Color(0xff4444);
+const normalColor = new THREE.Color(0x44aaff);
+const contactColor = new THREE.Color(0x44ff88);
+
+const dummy = new THREE.Object3D();
+const tempColor = new THREE.Color();
+
+// --- Spring lines ---
+// We'll draw a subset of springs (structural only) for performance
+const structuralSprings = [];
+for (let s = 0; s < springCount; s++) {
+  if (Math.abs(springs[s].restLength - restLength) < 0.01) {
+    structuralSprings.push(springs[s]);
+  }
+}
+
+const linePositions = new Float32Array(structuralSprings.length * 6);
+const lineGeo = new THREE.BufferGeometry();
+lineGeo.setAttribute('position', new THREE.BufferAttribute(linePositions, 3));
+const lineMat = new THREE.LineBasicMaterial({
+  color: 0x3366aa,
+  transparent: true,
+  opacity: 0.3
+});
+const lineSegments = new THREE.LineSegments(lineGeo, lineMat);
+scene.add(lineSegments);
+
+// --- UI ---
+const windBtn = document.getElementById('windBtn');
+windBtn.addEventListener('click', () => {
+  windEnabled = !windEnabled;
+  windBtn.textContent = windEnabled ? 'Wind: ON (+Z)' : 'Wind: OFF';
+  windBtn.classList.toggle('active', windEnabled);
+});
+
+const statsDiv = document.getElementById('stats');
+
+// --- State ---
+window.__3D_STATE__ = {
+  nodeCount: totalNodes,
+  springCount: springCount,
+  centerOfMass: { x: 0, y: 0, z: 0 },
+  maxStretch: 1,
+  groundContacts: 0,
+  windEnabled: false,
+  simTime: 0
+};
+
+// --- Animation Loop ---
+function updateVisuals() {
+  let comX = 0, comY = 0, comZ = 0;
+  let groundContacts = 0;
+  const contactThreshold = 0.15;
+
+  for (let i = 0; i < totalNodes; i++) {
+    const i3 = i * 3;
+    const px = positions[i3];
+    const py = positions[i3 + 1];
+    const pz = positions[i3 + 2];
+
+    dummy.position.set(px, py, pz);
+    dummy.updateMatrix();
+    instancedMesh.setMatrixAt(i, dummy.matrix);
+
+    if (pinned[i]) {
+      instancedMesh.setColorAt(i, pinnedColor);
+    } else if (py < contactThreshold) {
+      instancedMesh.setColorAt(i, contactColor);
+      groundContacts++;
+    } else {
+      // Color based on height
+      const t = Math.min(1, Math.max(0, py / 15));
+      tempColor.setHSL(0.55 + t * 0.1, 0.7, 0.4 + t * 0.3);
+      instancedMesh.setColorAt(i, tempColor);
+    }
+
+    comX += px;
+    comY += py;
+    comZ += pz;
+  }
+
+  instancedMesh.instanceMatrix.needsUpdate = true;
+  if (instancedMesh.instanceColor) instancedMesh.instanceColor.needsUpdate = true;
+
+  // Update spring lines
+  for (let s = 0; s < structuralSprings.length; s++) {
+    const sp = structuralSprings[s];
+    const a3 = sp.a * 3, b3 = sp.b * 3;
+    const s6 = s * 6;
+    linePositions[s6]     = positions[a3];
+    linePositions[s6 + 1] = positions[a3 + 1];
+    linePositions[s6 + 2] = positions[a3 + 2];
+    linePositions[s6 + 3] = positions[b3];
+    linePositions[s6 + 4] = positions[b3 + 1];
+    linePositions[s6 + 5] = positions[b3 + 2];
+  }
+  lineGeo.attributes.position.needsUpdate = true;
+
+  // Max stretch
+  let maxStretch = 0;
+  for (let s = 0; s < springCount; s++) {
+    const sp = springs[s];
+    const a3 = sp.a * 3, b3 = sp.b * 3;
+    const dx = positions[b3] - positions[a3];
+    const dy = positions[b3 + 1] - positions[a3 + 1];
+    const dz = positions[b3 + 2] - positions[a3 + 2];
+    const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    const stretch = dist / sp.restLength;
+    if (stretch > maxStretch) maxStretch = stretch;
+  }
+
+  comX /= totalNodes;
+  comY /= totalNodes;
+  comZ /= totalNodes;
+
+  // Update state
+  window.__3D_STATE__.centerOfMass.x = comX;
+  window.__3D_STATE__.centerOfMass.y = comY;
+  window.__3D_STATE__.centerOfMass.z = comZ;
+  window.__3D_STATE__.maxStretch = maxStretch;
+  window.__3D_STATE__.groundContacts = groundContacts;
+  window.__3D_STATE__.windEnabled = windEnabled;
+  window.__3D_STATE__.simTime = simTime;
+
+  statsDiv.innerHTML = `
+    Nodes: ${totalNodes} | Springs: ${springCount}<br>
+    CoM: (${comX.toFixed(2)}, ${comY.toFixed(2)}, ${comZ.toFixed(2)})<br>
+    Max Stretch: ${maxStretch.toFixed(3)}<br>
+    Ground Contacts: ${groundContacts}<br>
+    Wind: ${windEnabled ? 'ON' : 'OFF'}<br>
+    Sim Time: ${simTime.toFixed(2)}s
+  `;
+}
+
+function animate() {
+  requestAnimationFrame(animate);
+
+  // Substeps
+  for (let s = 0; s < substeps; s++) {
+    simulate(dt);
+  }
+
+  updateVisuals();
+  controls.update();
+  renderer.render(scene, camera);
+}
+
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+animate();
+</script>
+</body>
+</html>

@@ -1,0 +1,558 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Procedural City Builder</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #0f0f23;
+            font-family: monospace;
+            user-select: none;
+        }
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+        }
+        #hud-panel {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(0, 0, 0, 0.7);
+            color: #fff;
+            padding: 15px;
+            border: 1px solid #333;
+            border-radius: 5px;
+            pointer-events: none;
+            z-index: 10;
+        }
+        #hud-panel div {
+            margin-bottom: 5px;
+        }
+        #controls {
+            position: absolute;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            gap: 10px;
+            z-index: 10;
+        }
+        button {
+            background: #1a1a2e;
+            color: #fff;
+            border: 1px solid #4cc9f0;
+            padding: 10px 15px;
+            cursor: pointer;
+            font-family: monospace;
+            border-radius: 3px;
+            transition: background 0.2s;
+        }
+        button:hover {
+            background: #4cc9f0;
+            color: #000;
+        }
+        #instructions {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            background: rgba(0, 0, 0, 0.7);
+            color: #aaa;
+            padding: 10px;
+            border-radius: 5px;
+            pointer-events: none;
+            text-align: right;
+            font-size: 12px;
+        }
+    </style>
+    <!-- Import Three.js -->
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="hud-panel">
+        <div id="hud-buildings">Buildings: 0</div>
+        <div id="hud-mass">Total Mass: 0</div>
+        <div id="hud-avg-height">Avg Height: 0.00</div>
+        <div id="hud-max-height">Max Height: 0.00</div>
+        <div id="hud-debug">Debug: OFF</div>
+    </div>
+
+    <div id="instructions">
+        Left Click: Place/Remove<br>
+        D: Toggle Debug Physics<br>
+        H: Toggle Density Heatmap
+    </div>
+
+    <div id="controls">
+        <button id="btn-randomize">Randomize (10)</button>
+        <button id="btn-clear">Clear City</button>
+        <button id="btn-earthquake">Earthquake!</button>
+        <button id="btn-snapshot">Snapshot</button>
+    </div>
+
+    <div id="canvas-container"></div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        // --- State Management ---
+        window.__3D_STATE__ = {
+            buildingCount: 0,
+            totalMass: 0,
+            avgHeight: 0,
+            maxHeight: 0,
+            debugMode: false,
+            heatmapMode: false,
+            earthquakeActive: false,
+            previewPosition: null,
+            buildings: [],
+            snapshot: null,
+            lastCollapsedCount: 0,
+            animatingCount: 0,
+            gridSize: 10,
+            cellSize: 5
+        };
+
+        const state = window.__3D_STATE__;
+        const buildingsMap = new Map(); // Key: "x,z", Value: building object
+        let particles = [];
+        let earthquakeStartTime = 0;
+
+        // --- Scene Setup ---
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x0f0f23);
+
+        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.set(30, 25, 30);
+        camera.lookAt(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        container.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.05;
+        controls.maxPolarAngle = Math.PI / 2 - 0.05; // Don't go below ground
+
+        // Lights
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.3);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+        dirLight.position.set(10, 20, 10);
+        dirLight.castShadow = true;
+        dirLight.shadow.camera.left = -30;
+        dirLight.shadow.camera.right = 30;
+        dirLight.shadow.camera.top = 30;
+        dirLight.shadow.camera.bottom = -30;
+        dirLight.shadow.mapSize.width = 2048;
+        dirLight.shadow.mapSize.height = 2048;
+        scene.add(dirLight);
+
+        // Ground
+        const groundGeo = new THREE.PlaneGeometry(50, 50);
+        const groundMat = new THREE.MeshStandardMaterial({ color: 0x1a1a2e });
+        const ground = new THREE.Mesh(groundGeo, groundMat);
+        ground.rotation.x = -Math.PI / 2;
+        ground.receiveShadow = true;
+        scene.add(ground);
+
+        // Debug Ground
+        const debugGroundMat = new THREE.MeshBasicMaterial({ color: 0xff0000, transparent: true, opacity: 0.3, depthWrite: false });
+        const debugGround = new THREE.Mesh(groundGeo, debugGroundMat);
+        debugGround.rotation.x = -Math.PI / 2;
+        debugGround.position.y = 0.01;
+        debugGround.visible = false;
+        scene.add(debugGround);
+
+        // Grid Helper
+        const gridHelper = new THREE.GridHelper(50, 50, 0x16213e, 0x16213e);
+        gridHelper.position.y = 0.001;
+        scene.add(gridHelper);
+
+        // Invisible plane for raycasting
+        const raycastPlane = new THREE.Mesh(new THREE.PlaneGeometry(50, 50), new THREE.MeshBasicMaterial({ visible: false }));
+        raycastPlane.rotation.x = -Math.PI / 2;
+        scene.add(raycastPlane);
+
+        // Heatmap Group
+        const heatmapGroup = new THREE.Group();
+        heatmapGroup.position.y = 0.05;
+        heatmapGroup.visible = false;
+        scene.add(heatmapGroup);
+        const heatmapPlanes = [];
+        for (let x = 0; x < 10; x++) {
+            heatmapPlanes[x] = [];
+            for (let z = 0; z < 10; z++) {
+                const p = new THREE.Mesh(new THREE.PlaneGeometry(5, 5), new THREE.MeshBasicMaterial({ color: 0x0000ff, transparent: true, opacity: 0.6 }));
+                p.rotation.x = -Math.PI / 2;
+                const w = getWorldCoords(x, z);
+                p.position.set(w.x, 0, w.z);
+                heatmapGroup.add(p);
+                heatmapPlanes[x][z] = p;
+            }
+        }
+
+        // Preview Building
+        const previewGeo = new THREE.BoxGeometry(4.5, 5, 4.5);
+        previewGeo.translate(0, 2.5, 0);
+        const previewMat = new THREE.MeshBasicMaterial({ color: 0x00ff00, transparent: true, opacity: 0.4, depthWrite: false });
+        const previewMesh = new THREE.Mesh(previewGeo, previewMat);
+        previewMesh.visible = false;
+        scene.add(previewMesh);
+        let nextRandomHeight = getRandomHeight();
+
+        // --- Utilities ---
+        function getGridCoords(worldX, worldZ) {
+            const x = Math.floor((worldX + 25) / 5);
+            const z = Math.floor((worldZ + 25) / 5);
+            return { x, z };
+        }
+
+        function getWorldCoords(gridX, gridZ) {
+            return {
+                x: gridX * 5 - 22.5,
+                z: gridZ * 5 - 22.5
+            };
+        }
+
+        function getRandomHeight() {
+            return Math.random() * 13 + 2; // 2 to 15
+        }
+
+        function getBuildingColor(h) {
+            if (h < 5) return 0x4cc9f0;
+            if (h <= 10) return 0xf72585;
+            return 0x7209b7;
+        }
+
+        function createTextSprite(text) {
+            const canvas = document.createElement('canvas');
+            canvas.width = 256;
+            canvas.height = 128;
+            const ctx = canvas.getContext('2d');
+            ctx.fillStyle = 'white';
+            ctx.font = 'bold 40px monospace';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(text, 128, 64);
+            const texture = new THREE.CanvasTexture(canvas);
+            const spriteMat = new THREE.SpriteMaterial({ map: texture, depthTest: false });
+            const sprite = new THREE.Sprite(spriteMat);
+            sprite.scale.set(5, 2.5, 1);
+            return sprite;
+        }
+
+        // --- Building System ---
+        function placeBuilding(gridX, gridZ, height) {
+            const key = `${gridX},${gridZ}`;
+            if (buildingsMap.has(key)) return;
+
+            const w = getWorldCoords(gridX, gridZ);
+            const mass = 4.5 * 4.5 * height;
+
+            const geo = new THREE.BoxGeometry(4.5, height, 4.5);
+            geo.translate(0, height / 2, 0);
+            const mat = new THREE.MeshStandardMaterial({ color: getBuildingColor(height) });
+            const mesh = new THREE.Mesh(geo, mat);
+            mesh.castShadow = true;
+            mesh.receiveShadow = true;
+
+            const edgesGeo = new THREE.EdgesGeometry(geo);
+            const edgesMat = new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.3 });
+            const edges = new THREE.LineSegments(edgesGeo, edgesMat);
+            mesh.add(edges);
+
+            // Debug Group
+            const debugGroup = new THREE.Group();
+            const bbox = new THREE.BoxHelper(mesh, 0xffff00);
+            const com = new THREE.Mesh(new THREE.SphereGeometry(0.3), new THREE.MeshBasicMaterial({ color: 0xff0000, depthTest: false }));
+            com.position.y = height / 2;
+            const sprite = createTextSprite(mass.toFixed(0));
+            sprite.position.y = height + 2;
+            const arrow = new THREE.ArrowHelper(new THREE.Vector3(0, -1, 0), new THREE.Vector3(0, height / 2, 0), 0, 0x00ff00);
+            
+            debugGroup.add(bbox, com, sprite, arrow);
+            debugGroup.visible = state.debugMode;
+            mesh.add(debugGroup);
+
+            mesh.position.set(w.x, 20, w.z);
+            scene.add(mesh);
+
+            const bData = {
+                gridX, gridZ, height, mass, mesh, debugGroup, arrow,
+                dropping: true, startTime: performance.now(), startY: 20, targetY: 0, baseX: w.x
+            };
+            buildingsMap.set(key, bData);
+            updateHeatmap();
+        }
+
+        function removeBuilding(gridX, gridZ) {
+            const key = `${gridX},${gridZ}`;
+            const b = buildingsMap.get(key);
+            if (b) {
+                scene.remove(b.mesh);
+                b.mesh.geometry.dispose();
+                b.mesh.material.dispose();
+                buildingsMap.delete(key);
+                updateHeatmap();
+            }
+        }
+
+        function collapseBuilding(b) {
+            removeBuilding(b.gridX, b.gridZ);
+            const color = getBuildingColor(b.height);
+            for (let i = 0; i < 20; i++) {
+                const pGeo = new THREE.BoxGeometry(1, 1, 1);
+                const pMat = new THREE.MeshBasicMaterial({ color: color, transparent: true, opacity: 1 });
+                const p = new THREE.Mesh(pGeo, pMat);
+                p.position.copy(b.mesh.position);
+                p.position.y += Math.random() * b.height;
+                p.position.x += (Math.random() - 0.5) * 4.5;
+                p.position.z += (Math.random() - 0.5) * 4.5;
+                p.velocity = new THREE.Vector3((Math.random() - 0.5) * 10, Math.random() * 10, (Math.random() - 0.5) * 10);
+                particles.push(p);
+                scene.add(p);
+            }
+        }
+
+        function updateHeatmap() {
+            if (!state.heatmapMode) return;
+            for (let x = 0; x < 10; x++) {
+                for (let z = 0; z < 10; z++) {
+                    let neighbors = 0;
+                    for (let dx = -1; dx <= 1; dx++) {
+                        for (let dz = -1; dz <= 1; dz++) {
+                            if (dx === 0 && dz === 0) continue;
+                            if (buildingsMap.has(`${x + dx},${z + dz}`)) neighbors++;
+                        }
+                    }
+                    const ratio = Math.min(neighbors / 4, 1);
+                    heatmapPlanes[x][z].material.color.lerpColors(new THREE.Color(0x0000ff), new THREE.Color(0xff0000), ratio);
+                }
+            }
+        }
+
+        // --- Interaction ---
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+
+        window.addEventListener('mousemove', (e) => {
+            mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+
+            raycaster.setFromCamera(mouse, camera);
+            const intersects = raycaster.intersectObject(raycastPlane);
+
+            if (intersects.length > 0) {
+                const p = intersects[0].point;
+                const grid = getGridCoords(p.x, p.z);
+                
+                if (grid.x >= 0 && grid.x < 10 && grid.z >= 0 && grid.z < 10) {
+                    const w = getWorldCoords(grid.x, grid.z);
+                    previewMesh.position.set(w.x, 0, w.z);
+                    previewMesh.visible = true;
+                    state.previewPosition = { x: grid.x, z: grid.z };
+                    
+                    // Adjust preview height to match what will be placed
+                    previewMesh.scale.y = nextRandomHeight / 5;
+                    previewMesh.position.y = 0; // Geometry is translated
+                } else {
+                    previewMesh.visible = false;
+                    state.previewPosition = null;
+                }
+            } else {
+                previewMesh.visible = false;
+                state.previewPosition = null;
+            }
+        });
+
+        window.addEventListener('mousedown', (e) => {
+            if (e.button !== 0 || !state.previewPosition) return;
+            // Prevent click if clicking on UI
+            if (e.target.tagName === 'BUTTON' || e.target.closest('#hud-panel')) return;
+
+            const { x, z } = state.previewPosition;
+            if (buildingsMap.has(`${x},${z}`)) {
+                removeBuilding(x, z);
+            } else {
+                placeBuilding(x, z, nextRandomHeight);
+                nextRandomHeight = getRandomHeight();
+                previewMesh.scale.y = nextRandomHeight / 5;
+            }
+        });
+
+        window.addEventListener('keydown', (e) => {
+            if (e.key.toLowerCase() === 'd') {
+                state.debugMode = !state.debugMode;
+                debugGround.visible = state.debugMode;
+                buildingsMap.forEach(b => b.debugGroup.visible = state.debugMode);
+            }
+            if (e.key.toLowerCase() === 'h') {
+                state.heatmapMode = !state.heatmapMode;
+                heatmapGroup.visible = state.heatmapMode;
+                if (state.heatmapMode) updateHeatmap();
+            }
+        });
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // --- Buttons ---
+        document.getElementById('btn-randomize').addEventListener('click', () => {
+            let placed = 0;
+            let attempts = 0;
+            while (placed < 10 && attempts < 100) {
+                const x = Math.floor(Math.random() * 10);
+                const z = Math.floor(Math.random() * 10);
+                if (!buildingsMap.has(`${x},${z}`)) {
+                    placeBuilding(x, z, getRandomHeight());
+                    placed++;
+                }
+                attempts++;
+            }
+        });
+
+        document.getElementById('btn-clear').addEventListener('click', () => {
+            const keys = Array.from(buildingsMap.keys());
+            keys.forEach(k => {
+                const [x, z] = k.split(',').map(Number);
+                removeBuilding(x, z);
+            });
+        });
+
+        document.getElementById('btn-earthquake').addEventListener('click', () => {
+            if (state.earthquakeActive) return;
+            state.earthquakeActive = true;
+            earthquakeStartTime = performance.now();
+        });
+
+        document.getElementById('btn-snapshot').addEventListener('click', () => {
+            state.snapshot = Array.from(buildingsMap.values()).map(b => ({
+                gridX: b.gridX,
+                gridZ: b.gridZ,
+                height: b.height
+            }));
+            console.log("Snapshot saved to window.__3D_STATE__.snapshot");
+        });
+
+        // --- Animation Loop ---
+        const clock = new THREE.Clock();
+
+        function animate() {
+            requestAnimationFrame(animate);
+            const dt = clock.getDelta();
+            const now = performance.now();
+
+            controls.update();
+
+            // Update Buildings (Drop & Earthquake)
+            let animating = 0;
+            let totalM = 0;
+            let maxH = 0;
+            let sumH = 0;
+
+            const bArray = Array.from(buildingsMap.values());
+            
+            bArray.forEach(b => {
+                // Stats
+                totalM += b.mass;
+                if (b.height > maxH) maxH = b.height;
+                sumH += b.height;
+
+                // Drop Animation
+                if (b.dropping) {
+                    animating++;
+                    let t = (now - b.startTime) / 500;
+                    if (t >= 1) {
+                        t = 1;
+                        b.dropping = false;
+                        b.arrow.setLength(0);
+                    } else {
+                        b.arrow.setLength(5); // Show velocity vector
+                    }
+                    b.mesh.position.y = THREE.MathUtils.lerp(b.startY, b.targetY, t);
+                }
+
+                // Earthquake
+                if (state.earthquakeActive) {
+                    const elapsed = (now - earthquakeStartTime) / 1000;
+                    if (elapsed < 3) {
+                        const offset = Math.sin(elapsed * Math.PI * 2 * 2) * 0.5; // 2Hz, 0.5 amp
+                        b.mesh.position.x = b.baseX + offset;
+                    }
+                }
+            });
+
+            // Earthquake Finish
+            if (state.earthquakeActive && (now - earthquakeStartTime) / 1000 >= 3) {
+                state.earthquakeActive = false;
+                let collapsed = 0;
+                const toRemove = [];
+                bArray.forEach(b => {
+                    b.mesh.position.x = b.baseX; // Reset position
+                    if (b.height > 12) {
+                        toRemove.push(b);
+                        collapsed++;
+                    }
+                });
+                toRemove.forEach(b => collapseBuilding(b));
+                state.lastCollapsedCount = collapsed;
+            }
+
+            // Update Particles
+            for (let i = particles.length - 1; i >= 0; i--) {
+                const p = particles[i];
+                p.velocity.y -= 20 * dt; // Gravity
+                p.position.addScaledVector(p.velocity, dt);
+                p.material.opacity -= dt * 0.5;
+                if (p.position.y < 0 || p.material.opacity <= 0) {
+                    scene.remove(p);
+                    p.geometry.dispose();
+                    p.material.dispose();
+                    particles.splice(i, 1);
+                }
+            }
+
+            // Update State
+            state.buildingCount = bArray.length;
+            state.totalMass = totalM;
+            state.maxHeight = maxH;
+            state.avgHeight = bArray.length > 0 ? sumH / bArray.length : 0;
+            state.animatingCount = animating;
+            state.buildings = bArray.map(b => ({
+                gridX: b.gridX, gridZ: b.gridZ, height: b.height, mass: b.mass, dropping: b.dropping
+            }));
+
+            // Update HUD
+            document.getElementById('hud-buildings').innerText = `Buildings: ${state.buildingCount}`;
+            document.getElementById('hud-mass').innerText = `Total Mass: ${state.totalMass.toFixed(1)}`;
+            document.getElementById('hud-avg-height').innerText = `Avg Height: ${state.avgHeight.toFixed(2)}`;
+            document.getElementById('hud-max-height').innerText = `Max Height: ${state.maxHeight.toFixed(2)}`;
+            document.getElementById('hud-debug').innerText = `Debug: ${state.debugMode ? 'ON' : 'OFF'}`;
+
+            renderer.render(scene, camera);
+        }
+
+        animate();
+    </script>
+</body>
+</html>

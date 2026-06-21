@@ -1,0 +1,453 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Newton's Cradle Simulation</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #1a1a2e;
+            color: #ffffff;
+            font-family: 'Courier New', Courier, monospace;
+            user-select: none;
+        }
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+        }
+        .overlay {
+            position: absolute;
+            background: rgba(15, 15, 25, 0.85);
+            border: 1px solid #445566;
+            padding: 15px;
+            border-radius: 8px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.5);
+        }
+        #hud {
+            top: 20px;
+            left: 20px;
+            pointer-events: none;
+            min-width: 250px;
+        }
+        #controls {
+            bottom: 20px;
+            left: 20px;
+            min-width: 300px;
+        }
+        h3 {
+            margin: 0 0 10px 0;
+            font-size: 16px;
+            color: #88aaff;
+            border-bottom: 1px solid #445566;
+            padding-bottom: 5px;
+        }
+        .stat-row {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 5px;
+            font-size: 14px;
+        }
+        .stat-label {
+            color: #aaaaaa;
+        }
+        .stat-value {
+            font-weight: bold;
+            color: #ffffff;
+        }
+        .control-group {
+            margin-bottom: 15px;
+        }
+        .control-group label {
+            display: block;
+            margin-bottom: 5px;
+            font-size: 14px;
+            color: #aaaaaa;
+        }
+        input[type=range] {
+            width: 100%;
+            cursor: pointer;
+        }
+        .instructions {
+            font-size: 12px;
+            color: #888888;
+            margin-top: 10px;
+            line-height: 1.4;
+        }
+        kbd {
+            background: #333;
+            padding: 2px 5px;
+            border-radius: 3px;
+            color: #fff;
+            border: 1px solid #555;
+        }
+    </style>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+                "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="canvas-container"></div>
+
+    <div id="hud" class="overlay">
+        <h3>Simulation HUD</h3>
+        <div class="stat-row"><span class="stat-label">Status:</span> <span id="hud-paused" class="stat-value">Holding</span></div>
+        <div class="stat-row"><span class="stat-label">Angles (°):</span> <span id="hud-angles" class="stat-value">0.0, 0.0, 0.0, 0.0, 0.0</span></div>
+        <div class="stat-row"><span class="stat-label">Total Energy:</span> <span id="hud-energy" class="stat-value">0.000</span></div>
+        <div class="stat-row"><span class="stat-label">Energy Loss:</span> <span id="hud-loss" class="stat-value">0.00%</span></div>
+        <div class="stat-row"><span class="stat-label">Collisions:</span> <span id="hud-collisions" class="stat-value">0</span></div>
+        <div class="stat-row"><span class="stat-label">Pull Count:</span> <span id="hud-pull" class="stat-value">1</span></div>
+    </div>
+
+    <div id="controls" class="overlay">
+        <h3>Controls</h3>
+        <div class="control-group">
+            <label for="slider-pull-count">Balls to Pull: <span id="val-pull-count">1</span></label>
+            <input type="range" id="slider-pull-count" min="1" max="3" step="1" value="1">
+        </div>
+        <div class="control-group">
+            <label for="slider-pull-angle">Pull Angle (°): <span id="val-pull-angle">30</span></label>
+            <input type="range" id="slider-pull-angle" min="10" max="60" step="5" value="30">
+        </div>
+        <div class="instructions">
+            <kbd>T</kbd> Release balls<br>
+            <kbd>R</kbd> Reset simulation<br>
+            <kbd>Space</kbd> Pause / Play<br>
+            <kbd>1</kbd>-<kbd>5</kbd> Pull individual ball
+        </div>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+
+        // --- Global State ---
+        window.__3D_STATE__ = {
+            ballAngles: [0, 0, 0, 0, 0],
+            ballOmegas: [0, 0, 0, 0, 0],
+            totalEnergy: 0,
+            totalCollisions: 0,
+            pullCount: 1,
+            pullAngle: 30,
+            isPaused: false,
+            frameCount: 0,
+            ballsValid: true,
+            energyLossPercent: 0
+        };
+
+        // --- Physics Constants ---
+        const G = 9.81;
+        const L = 2.5;
+        const R = 0.35;
+        const SPACING = 0.7; // 2 * R
+        const RESTITUTION = 0.999;
+        const DAMPING = 0.9995;
+        const SUBSTEPS = 20;
+        const DT = (1 / 60) / SUBSTEPS;
+
+        // --- Simulation Variables ---
+        let isHolding = true;
+        let isPaused = false;
+        let pullCount = 1;
+        let pullAngleDeg = 30;
+        let totalCollisions = 0;
+        let initialEnergy = 0;
+        let frameCount = 0;
+
+        // --- Scene Setup ---
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x1a1a2e);
+
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+        camera.position.set(0, 3, 8);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        container.appendChild(renderer.domElement);
+
+        // Environment Map for realistic metal reflections
+        const pmremGenerator = new THREE.PMREMGenerator(renderer);
+        scene.environment = pmremGenerator.fromScene(new RoomEnvironment(), 0.04).texture;
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.target.set(0, 1.5, 0);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.05;
+
+        // Lighting
+        const ambientLight = new THREE.AmbientLight(0x445566, 0.4);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+        dirLight.position.set(5, 10, 5);
+        scene.add(dirLight);
+
+        // --- Geometry & Materials ---
+        // Platform
+        const platGeo = new THREE.BoxGeometry(6, 0.1, 3);
+        const platMat = new THREE.MeshStandardMaterial({ color: 0x333344, metalness: 0.8, roughness: 0.2 });
+        const platform = new THREE.Mesh(platGeo, platMat);
+        platform.position.y = 0;
+        scene.add(platform);
+
+        // Frame
+        const frameMat = new THREE.MeshStandardMaterial({ color: 0xaaaaaa, metalness: 0.9, roughness: 0.2 });
+        const supportGeo = new THREE.BoxGeometry(0.1, 4, 0.1);
+        
+        const sup1 = new THREE.Mesh(supportGeo, frameMat);
+        sup1.position.set(-2.5, 2, 0);
+        scene.add(sup1);
+        
+        const sup2 = new THREE.Mesh(supportGeo, frameMat);
+        sup2.position.set(2.5, 2, 0);
+        scene.add(sup2);
+        
+        const topGeo = new THREE.BoxGeometry(5, 0.1, 0.6); // Slightly wider for V-strings
+        const topBar = new THREE.Mesh(topGeo, frameMat);
+        topBar.position.set(0, 4, 0);
+        scene.add(topBar);
+
+        // Balls & Strings
+        const balls = [];
+        const ballGeo = new THREE.SphereGeometry(R, 32, 32);
+        const ballMat = new THREE.MeshStandardMaterial({ 
+            color: 0xcccccc, 
+            metalness: 0.95, 
+            roughness: 0.1 
+        });
+        const stringMat = new THREE.LineBasicMaterial({ color: 0x888888, transparent: true, opacity: 0.8 });
+
+        for (let i = 0; i < 5; i++) {
+            const x0 = (i - 2) * SPACING;
+            
+            const ballMesh = new THREE.Mesh(ballGeo, ballMat);
+            scene.add(ballMesh);
+
+            // Two strings per ball forming a V shape
+            const strGeo1 = new THREE.BufferGeometry().setFromPoints([
+                new THREE.Vector3(x0, 4, -0.25),
+                new THREE.Vector3(x0, 1.5 + R, 0)
+            ]);
+            const str1 = new THREE.Line(strGeo1, stringMat);
+            scene.add(str1);
+
+            const strGeo2 = new THREE.BufferGeometry().setFromPoints([
+                new THREE.Vector3(x0, 4, 0.25),
+                new THREE.Vector3(x0, 1.5 + R, 0)
+            ]);
+            const str2 = new THREE.Line(strGeo2, stringMat);
+            scene.add(str2);
+
+            balls.push({
+                mesh: ballMesh,
+                str1: str1,
+                str2: str2,
+                theta: 0,
+                omega: 0,
+                x0: x0
+            });
+        }
+
+        // --- Physics Logic ---
+        function calculateEnergy() {
+            let e = 0;
+            balls.forEach(b => {
+                const ke = 0.5 * Math.pow(L * b.omega, 2); // m=1
+                const pe = G * L * (1 - Math.cos(b.theta));
+                e += ke + pe;
+            });
+            return e;
+        }
+
+        function applyHold() {
+            if (!isHolding) return;
+            balls.forEach(b => { b.theta = 0; b.omega = 0; });
+            for (let i = 0; i < pullCount; i++) {
+                balls[i].theta = pullAngleDeg * Math.PI / 180;
+            }
+        }
+
+        function reset() {
+            isHolding = true;
+            totalCollisions = 0;
+            initialEnergy = 0;
+            applyHold();
+        }
+
+        function release() {
+            if (isHolding) {
+                isHolding = false;
+                initialEnergy = calculateEnergy();
+            }
+        }
+
+        function stepPhysics() {
+            // 1. Integrate Pendulum Dynamics
+            balls.forEach(b => {
+                const alpha = -(G / L) * Math.sin(b.theta);
+                b.omega += alpha * DT;
+                b.theta += b.omega * DT;
+            });
+
+            // 2. Resolve Collisions (Left to Right)
+            // In a 1D angular approximation, collision occurs if theta_i >= theta_{i+1}
+            for (let i = 0; i < 4; i++) {
+                if (balls[i].theta > balls[i+1].theta) {
+                    const vRel = balls[i].omega - balls[i+1].omega;
+                    
+                    // If approaching
+                    if (vRel > 0) {
+                        const impulse = (1 + RESTITUTION) * vRel / 2;
+                        balls[i].omega -= impulse;
+                        balls[i+1].omega += impulse;
+                        totalCollisions++;
+                    }
+                    
+                    // Positional correction to prevent penetration
+                    const overlap = balls[i].theta - balls[i+1].theta;
+                    balls[i].theta -= overlap / 2;
+                    balls[i+1].theta += overlap / 2;
+                }
+            }
+        }
+
+        // --- UI & Controls ---
+        const sliderCount = document.getElementById('slider-pull-count');
+        const sliderAngle = document.getElementById('slider-pull-angle');
+        const valCount = document.getElementById('val-pull-count');
+        const valAngle = document.getElementById('val-pull-angle');
+
+        sliderCount.addEventListener('input', (e) => {
+            pullCount = parseInt(e.target.value);
+            valCount.innerText = pullCount;
+            if (isHolding) applyHold();
+        });
+
+        sliderAngle.addEventListener('input', (e) => {
+            pullAngleDeg = parseInt(e.target.value);
+            valAngle.innerText = pullAngleDeg;
+            if (isHolding) applyHold();
+        });
+
+        window.addEventListener('keydown', (e) => {
+            if (e.code === 'KeyT') release();
+            if (e.code === 'KeyR') reset();
+            if (e.code === 'Space') {
+                isPaused = !isPaused;
+                e.preventDefault();
+            }
+            if (e.key >= '1' && e.key <= '5') {
+                const idx = parseInt(e.key) - 1;
+                balls[idx].theta = pullAngleDeg * Math.PI / 180;
+                balls[idx].omega = 0;
+                if (!isHolding && initialEnergy === 0) {
+                    initialEnergy = calculateEnergy();
+                }
+            }
+        });
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // Initialize
+        applyHold();
+
+        // --- Animation Loop ---
+        function animate() {
+            requestAnimationFrame(animate);
+            frameCount++;
+
+            if (!isPaused && !isHolding) {
+                for (let i = 0; i < SUBSTEPS; i++) {
+                    stepPhysics();
+                }
+                // Apply slow energy decay per frame
+                balls.forEach(b => b.omega *= DAMPING);
+            } else if (isHolding) {
+                applyHold();
+            }
+
+            // Update Visuals
+            balls.forEach(b => {
+                // Ball position
+                const x = b.x0 + L * Math.sin(b.theta);
+                const y = 4 - L * Math.cos(b.theta);
+                b.mesh.position.set(x, y, 0);
+                
+                // Rotate ball to match swing for realistic reflections
+                b.mesh.rotation.z = b.theta;
+
+                // String attachment point (top of the ball, rotated)
+                const attachX = b.x0 + (L - R) * Math.sin(b.theta);
+                const attachY = 4 - (L - R) * Math.cos(b.theta);
+
+                // Update String 1
+                const p1 = b.str1.geometry.attributes.position.array;
+                p1[3] = attachX; p1[4] = attachY; p1[5] = 0;
+                b.str1.geometry.attributes.position.needsUpdate = true;
+
+                // Update String 2
+                const p2 = b.str2.geometry.attributes.position.array;
+                p2[3] = attachX; p2[4] = attachY; p2[5] = 0;
+                b.str2.geometry.attributes.position.needsUpdate = true;
+            });
+
+            controls.update();
+            renderer.render(scene, camera);
+
+            updateHUD();
+            updateState();
+        }
+
+        function updateHUD() {
+            const currentEnergy = calculateEnergy();
+            const loss = initialEnergy > 0 ? ((initialEnergy - currentEnergy) / initialEnergy * 100) : 0;
+
+            document.getElementById('hud-angles').innerText = balls.map(b => (b.theta * 180 / Math.PI).toFixed(1)).join(', ');
+            document.getElementById('hud-energy').innerText = currentEnergy.toFixed(3);
+            document.getElementById('hud-collisions').innerText = totalCollisions;
+            document.getElementById('hud-pull').innerText = pullCount;
+            document.getElementById('hud-paused').innerText = isPaused ? 'Paused' : (isHolding ? 'Holding' : 'Playing');
+            document.getElementById('hud-loss').innerText = Math.max(0, loss).toFixed(2) + '%';
+        }
+
+        function updateState() {
+            const currentEnergy = calculateEnergy();
+            const loss = initialEnergy > 0 ? ((initialEnergy - currentEnergy) / initialEnergy * 100) : 0;
+            
+            const angles = balls.map(b => Number(b.theta.toFixed(4)));
+            const omegas = balls.map(b => Number(b.omega.toFixed(4)));
+            const valid = angles.every(a => !isNaN(a)) && omegas.every(o => !isNaN(o));
+
+            window.__3D_STATE__ = {
+                ballAngles: angles,
+                ballOmegas: omegas,
+                totalEnergy: Number(currentEnergy.toFixed(4)),
+                totalCollisions: totalCollisions,
+                pullCount: pullCount,
+                pullAngle: pullAngleDeg,
+                isPaused: isPaused,
+                frameCount: frameCount,
+                ballsValid: valid,
+                energyLossPercent: Number(Math.max(0, loss).toFixed(3))
+            };
+        }
+
+        // Start loop
+        animate();
+    </script>
+</body>
+</html>

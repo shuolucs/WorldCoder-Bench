@@ -1,0 +1,594 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Three.js 3D 积木塔投射倒塌模拟</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      background: #111;
+      font-family: Arial, sans-serif;
+    }
+
+    #hud {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      z-index: 10;
+      color: #fff;
+      background: rgba(0, 0, 0, 0.45);
+      padding: 10px 12px;
+      border-radius: 8px;
+      line-height: 1.8;
+      font-size: 14px;
+      min-width: 180px;
+      user-select: none;
+    }
+
+    #resetBtn {
+      position: absolute;
+      top: 12px;
+      right: 12px;
+      z-index: 10;
+      border: none;
+      background: #ffffff;
+      color: #222;
+      padding: 10px 14px;
+      border-radius: 8px;
+      font-size: 14px;
+      cursor: pointer;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.25);
+    }
+
+    #resetBtn:hover {
+      background: #f0f0f0;
+    }
+  </style>
+
+  <script type="importmap">
+  { "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+  } }
+  </script>
+</head>
+<body>
+  <div id="hud">
+    <div>静态积木数: <span id="staticCount">0</span></div>
+    <div>动态积木数: <span id="dynamicCount">0</span></div>
+    <div>落地积木数: <span id="fallenCount">0</span></div>
+    <div>发射球数: <span id="ballCount">0</span></div>
+  </div>
+
+  <button id="resetBtn">重置</button>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+    // =========================
+    // 基础场景
+    // =========================
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0xbfd1e5);
+
+    const camera = new THREE.PerspectiveCamera(
+      60,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      200
+    );
+    camera.position.set(15, 12, 15);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.shadowMap.enabled = true;
+    document.body.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.set(0, 4, 0);
+    controls.enableDamping = true;
+
+    // =========================
+    // 光照
+    // =========================
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.65);
+    scene.add(ambientLight);
+
+    const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+    dirLight.position.set(10, 20, 8);
+    dirLight.castShadow = true;
+    dirLight.shadow.mapSize.set(2048, 2048);
+    dirLight.shadow.camera.left = -25;
+    dirLight.shadow.camera.right = 25;
+    dirLight.shadow.camera.top = 25;
+    dirLight.shadow.camera.bottom = -25;
+    dirLight.shadow.camera.near = 1;
+    dirLight.shadow.camera.far = 60;
+    scene.add(dirLight);
+
+    // =========================
+    // 地面
+    // =========================
+    const groundSize = 30;
+    const groundGeo = new THREE.PlaneGeometry(groundSize, groundSize);
+    const groundMat = new THREE.MeshStandardMaterial({
+      color: 0x888888,
+      roughness: 0.95,
+      metalness: 0.05
+    });
+    const ground = new THREE.Mesh(groundGeo, groundMat);
+    ground.rotation.x = -Math.PI / 2;
+    ground.position.y = 0;
+    ground.receiveShadow = true;
+    scene.add(ground);
+
+    const grid = new THREE.GridHelper(30, 30, 0x444444, 0x666666);
+    grid.position.y = 0.001;
+    scene.add(grid);
+
+    // =========================
+    // 常量
+    // =========================
+    const GRAVITY = new THREE.Vector3(0, -9.8, 0);
+    const RESTITUTION = 0.3;
+    const FRICTION = 0.5;
+    const BLOCK_MASS = 1.0;
+    const BALL_MASS = 2.0;
+    const MAX_BALLS = 10;
+    const FIXED_DT = 1 / 60;
+
+    const BLOCK_SIZE = new THREE.Vector3(3, 1, 1);
+    const BALL_RADIUS = 0.5;
+    const BALL_SPEED = 15;
+
+    const COLOR_A = 0xc79a5b;
+    const COLOR_B = 0x8b5a2b;
+
+    // =========================
+    // HUD 元素
+    // =========================
+    const staticCountEl = document.getElementById('staticCount');
+    const dynamicCountEl = document.getElementById('dynamicCount');
+    const fallenCountEl = document.getElementById('fallenCount');
+    const ballCountEl = document.getElementById('ballCount');
+    const resetBtn = document.getElementById('resetBtn');
+
+    // =========================
+    // 数据结构
+    // =========================
+    const blocks = [];
+    const balls = [];
+
+    const blockGeometry = new THREE.BoxGeometry(BLOCK_SIZE.x, BLOCK_SIZE.y, BLOCK_SIZE.z);
+    const blockMaterialA = new THREE.MeshStandardMaterial({ color: COLOR_A, roughness: 0.8, metalness: 0.05 });
+    const blockMaterialB = new THREE.MeshStandardMaterial({ color: COLOR_B, roughness: 0.8, metalness: 0.05 });
+
+    const ballGeometry = new THREE.SphereGeometry(BALL_RADIUS, 24, 24);
+    const ballMaterial = new THREE.MeshStandardMaterial({ color: 0xdd3333, roughness: 0.55, metalness: 0.1 });
+
+    // =========================
+    // 工具函数
+    // =========================
+    function clamp(value, min, max) {
+      return Math.max(min, Math.min(max, value));
+    }
+
+    function getBlockHalfSize(block) {
+      return new THREE.Vector3(BLOCK_SIZE.x / 2, BLOCK_SIZE.y / 2, BLOCK_SIZE.z / 2);
+    }
+
+    function getAABBForBlock(block) {
+      const half = getBlockHalfSize(block);
+      const pos = block.mesh.position;
+      return {
+        min: new THREE.Vector3(pos.x - half.x, pos.y - half.y, pos.z - half.z),
+        max: new THREE.Vector3(pos.x + half.x, pos.y + half.y, pos.z + half.z)
+      };
+    }
+
+    function sphereAABBIntersection(ball, block) {
+      const aabb = getAABBForBlock(block);
+      const c = ball.mesh.position;
+
+      const closest = new THREE.Vector3(
+        clamp(c.x, aabb.min.x, aabb.max.x),
+        clamp(c.y, aabb.min.y, aabb.max.y),
+        clamp(c.z, aabb.min.z, aabb.max.z)
+      );
+
+      const delta = new THREE.Vector3().subVectors(c, closest);
+      const distSq = delta.lengthSq();
+
+      if (distSq > BALL_RADIUS * BALL_RADIUS) return null;
+
+      let normal = new THREE.Vector3();
+      let penetration = 0;
+
+      if (distSq > 1e-8) {
+        const dist = Math.sqrt(distSq);
+        normal.copy(delta).divideScalar(dist);
+        penetration = BALL_RADIUS - dist;
+      } else {
+        const blockPos = block.mesh.position;
+        const dx = c.x - blockPos.x;
+        const dy = c.y - blockPos.y;
+        const dz = c.z - blockPos.z;
+
+        const px = (BLOCK_SIZE.x / 2 + BALL_RADIUS) - Math.abs(dx);
+        const py = (BLOCK_SIZE.y / 2 + BALL_RADIUS) - Math.abs(dy);
+        const pz = (BLOCK_SIZE.z / 2 + BALL_RADIUS) - Math.abs(dz);
+
+        penetration = Math.min(px, py, pz);
+
+        if (penetration === px) normal.set(Math.sign(dx) || 1, 0, 0);
+        else if (penetration === py) normal.set(0, Math.sign(dy) || 1, 0);
+        else normal.set(0, 0, Math.sign(dz) || 1);
+      }
+
+      return { normal, penetration };
+    }
+
+    function aabbIntersection(blockA, blockB) {
+      const a = getAABBForBlock(blockA);
+      const b = getAABBForBlock(blockB);
+
+      const overlapX = Math.min(a.max.x, b.max.x) - Math.max(a.min.x, b.min.x);
+      const overlapY = Math.min(a.max.y, b.max.y) - Math.max(a.min.y, b.min.y);
+      const overlapZ = Math.min(a.max.z, b.max.z) - Math.max(a.min.z, b.min.z);
+
+      if (overlapX <= 0 || overlapY <= 0 || overlapZ <= 0) return null;
+
+      const centerDelta = new THREE.Vector3().subVectors(blockB.mesh.position, blockA.mesh.position);
+
+      let penetration = overlapX;
+      let normal = new THREE.Vector3(Math.sign(centerDelta.x) || 1, 0, 0);
+
+      if (overlapY < penetration) {
+        penetration = overlapY;
+        normal.set(0, Math.sign(centerDelta.y) || 1, 0);
+      }
+      if (overlapZ < penetration) {
+        penetration = overlapZ;
+        normal.set(0, 0, Math.sign(centerDelta.z) || 1);
+      }
+
+      return { normal, penetration };
+    }
+
+    function applyFrictionAlongContact(vel, normal, frictionFactor) {
+      const vn = normal.clone().multiplyScalar(vel.dot(normal));
+      const vt = vel.clone().sub(vn);
+      vel.copy(vn.add(vt.multiplyScalar(Math.max(0, 1 - frictionFactor))));
+    }
+
+    function resolveDynamicDynamicCollision(objA, massA, objB, massB, normal, penetration) {
+      const invMassA = 1 / massA;
+      const invMassB = 1 / massB;
+      const totalInvMass = invMassA + invMassB;
+
+      // 位置分离
+      objA.mesh.position.addScaledVector(normal, -penetration * (invMassA / totalInvMass));
+      objB.mesh.position.addScaledVector(normal,  penetration * (invMassB / totalInvMass));
+
+      const rv = new THREE.Vector3().subVectors(objB.velocity, objA.velocity);
+      const velAlongNormal = rv.dot(normal);
+
+      if (velAlongNormal > 0) return;
+
+      const j = -(1 + RESTITUTION) * velAlongNormal / totalInvMass;
+      const impulse = normal.clone().multiplyScalar(j);
+
+      objA.velocity.addScaledVector(impulse, -invMassA);
+      objB.velocity.addScaledVector(impulse,  invMassB);
+
+      applyFrictionAlongContact(objA.velocity, normal, FRICTION * 0.25);
+      applyFrictionAlongContact(objB.velocity, normal, FRICTION * 0.25);
+    }
+
+    function resolveDynamicStaticLikeGround(obj, radiusOrHalfY) {
+      const minY = radiusOrHalfY;
+      if (obj.mesh.position.y < minY) {
+        obj.mesh.position.y = minY;
+        if (obj.velocity.y < 0) obj.velocity.y = -obj.velocity.y * RESTITUTION;
+        obj.velocity.x *= (1 - FRICTION * 0.1);
+        obj.velocity.z *= (1 - FRICTION * 0.1);
+        if (Math.abs(obj.velocity.y) < 0.03) obj.velocity.y = 0;
+      }
+    }
+
+    function awakenBlocksFrom(blockIndex) {
+      const sourceBlock = blocks[blockIndex];
+      const triggerY = sourceBlock.initialPosition.y - 1e-6;
+
+      for (const block of blocks) {
+        if (block.initialPosition.y >= triggerY) {
+          block.isKinematic = false;
+        }
+      }
+    }
+
+    function updateHUD() {
+      const staticCount = blocks.filter(b => b.isKinematic).length;
+      const dynamicCount = blocks.length - staticCount;
+      const fallenCount = blocks.filter(b => !b.isKinematic && b.mesh.position.y < 0.3).length;
+      const ballCount = balls.length;
+
+      staticCountEl.textContent = staticCount;
+      dynamicCountEl.textContent = dynamicCount;
+      fallenCountEl.textContent = fallenCount;
+      ballCountEl.textContent = ballCount;
+    }
+
+    function updateExposedState() {
+      const staticCount = blocks.filter(b => b.isKinematic).length;
+      const dynamicCount = blocks.length - staticCount;
+      const fallenCount = blocks.filter(b => !b.isKinematic && b.mesh.position.y < 0.3).length;
+
+      window.__3D_STATE__ = {
+        blocks: blocks.map(b => ({
+          x: b.mesh.position.x,
+          y: b.mesh.position.y,
+          z: b.mesh.position.z,
+          vx: b.velocity.x,
+          vy: b.velocity.y,
+          vz: b.velocity.z,
+          isKinematic: b.isKinematic
+        })),
+        balls: balls.map(ball => ({
+          x: ball.mesh.position.x,
+          y: ball.mesh.position.y,
+          z: ball.mesh.position.z,
+          vx: ball.velocity.x,
+          vy: ball.velocity.y,
+          vz: ball.velocity.z
+        })),
+        staticBlockCount: staticCount,
+        dynamicBlockCount: dynamicCount,
+        fallenBlockCount: fallenCount,
+        ballCount: balls.length,
+        towerIntact: dynamicCount === 0
+      };
+    }
+
+    // =========================
+    // 创建积木塔
+    // =========================
+    function createTower() {
+      blocks.length = 0;
+
+      for (let layer = 0; layer < 10; layer++) {
+        const y = 0.5 + layer * 1.0;
+        const isOddLayerHuman = ((layer + 1) % 2 === 1);
+        const material = (layer % 2 === 0) ? blockMaterialA : blockMaterialB;
+
+        for (let i = 0; i < 3; i++) {
+          const mesh = new THREE.Mesh(blockGeometry, material);
+          mesh.castShadow = true;
+          mesh.receiveShadow = true;
+
+          let x = 0, z = 0;
+          if (isOddLayerHuman) {
+            x = (i - 1) * 1.0;
+            z = 0;
+          } else {
+            x = 0;
+            z = (i - 1) * 1.0;
+            mesh.rotation.y = Math.PI / 2;
+          }
+
+          mesh.position.set(x, y, z);
+          scene.add(mesh);
+
+          blocks.push({
+            mesh,
+            velocity: new THREE.Vector3(),
+            mass: BLOCK_MASS,
+            isKinematic: true,
+            layer,
+            initialPosition: new THREE.Vector3(x, y, z),
+            initialRotationY: mesh.rotation.y
+          });
+        }
+      }
+    }
+
+    // =========================
+    // 球体
+    // =========================
+    function spawnBall(origin, direction) {
+      const mesh = new THREE.Mesh(ballGeometry, ballMaterial);
+      mesh.castShadow = true;
+      mesh.receiveShadow = true;
+      mesh.position.copy(origin);
+
+      scene.add(mesh);
+
+      const ball = {
+        mesh,
+        velocity: direction.clone().normalize().multiplyScalar(BALL_SPEED),
+        mass: BALL_MASS
+      };
+
+      balls.push(ball);
+
+      if (balls.length > MAX_BALLS) {
+        const removed = balls.shift();
+        scene.remove(removed.mesh);
+        removed.mesh.geometry.dispose?.();
+      }
+    }
+
+    function clearBalls() {
+      while (balls.length > 0) {
+        const b = balls.pop();
+        scene.remove(b.mesh);
+      }
+    }
+
+    // =========================
+    // 重置
+    // =========================
+    function resetScene() {
+      clearBalls();
+      for (const block of blocks) {
+        block.mesh.position.copy(block.initialPosition);
+        block.mesh.rotation.set(0, block.initialRotationY, 0);
+        block.velocity.set(0, 0, 0);
+        block.isKinematic = true;
+      }
+      updateHUD();
+      updateExposedState();
+    }
+
+    resetBtn.addEventListener('click', resetScene);
+
+    // =========================
+    // 点击发射球
+    // =========================
+    const raycaster = new THREE.Raycaster();
+    const pointer = new THREE.Vector2();
+
+    renderer.domElement.addEventListener('pointerdown', (event) => {
+      if (event.button !== 0) return;
+
+      const rect = renderer.domElement.getBoundingClientRect();
+      pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+      pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+
+      raycaster.setFromCamera(pointer, camera);
+      const direction = raycaster.ray.direction.clone();
+      const origin = camera.position.clone().add(direction.clone().multiplyScalar(1.2));
+
+      spawnBall(origin, direction);
+    });
+
+    // =========================
+    // 物理更新
+    // =========================
+    function stepPhysics(dt) {
+      // 1. 积分：动态积木
+      for (const block of blocks) {
+        if (block.isKinematic) continue;
+        block.velocity.addScaledVector(GRAVITY, dt);
+        block.mesh.position.addScaledVector(block.velocity, dt);
+      }
+
+      // 2. 积分：球
+      for (const ball of balls) {
+        ball.velocity.addScaledVector(GRAVITY, dt);
+        ball.mesh.position.addScaledVector(ball.velocity, dt);
+      }
+
+      // 3. 球-地面
+      for (const ball of balls) {
+        resolveDynamicStaticLikeGround(ball, BALL_RADIUS);
+      }
+
+      // 4. 动态积木-地面
+      for (const block of blocks) {
+        if (block.isKinematic) continue;
+        resolveDynamicStaticLikeGround(block, BLOCK_SIZE.y / 2);
+      }
+
+      // 5. 球-积木
+      for (const ball of balls) {
+        for (let i = 0; i < blocks.length; i++) {
+          const block = blocks[i];
+          const hit = sphereAABBIntersection(ball, block);
+          if (!hit) continue;
+
+          if (block.isKinematic) {
+            awakenBlocksFrom(i);
+          }
+
+          // 碰撞后按动态处理；若刚激活动态，也参与响应
+          resolveDynamicDynamicCollision(
+            ball, ball.mass,
+            block, block.mass,
+            hit.normal,
+            hit.penetration
+          );
+        }
+      }
+
+      // 6. 动态积木-动态积木
+      for (let i = 0; i < blocks.length; i++) {
+        const a = blocks[i];
+        if (a.isKinematic) continue;
+
+        for (let j = i + 1; j < blocks.length; j++) {
+          const b = blocks[j];
+          if (b.isKinematic) continue;
+
+          const hit = aabbIntersection(a, b);
+          if (!hit) continue;
+
+          resolveDynamicDynamicCollision(
+            a, a.mass,
+            b, b.mass,
+            hit.normal,
+            hit.penetration
+          );
+        }
+      }
+
+      // 7. 球的边界清理（适度）
+      for (let i = balls.length - 1; i >= 0; i--) {
+        const p = balls[i].mesh.position;
+        if (p.y < -20 || Math.abs(p.x) > 80 || Math.abs(p.z) > 80) {
+          scene.remove(balls[i].mesh);
+          balls.splice(i, 1);
+        }
+      }
+    }
+
+    // =========================
+    // 初始化
+    // =========================
+    createTower();
+    updateHUD();
+    updateExposedState();
+
+    // =========================
+    // 动画循环
+    // =========================
+    const clock = new THREE.Clock();
+    let accumulator = 0;
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      let frameDt = clock.getDelta();
+      frameDt = Math.min(frameDt, 0.05);
+      accumulator += frameDt;
+
+      while (accumulator >= FIXED_DT) {
+        stepPhysics(FIXED_DT);
+        accumulator -= FIXED_DT;
+      }
+
+      controls.update();
+      updateHUD();
+      updateExposedState();
+      renderer.render(scene, camera);
+    }
+
+    animate();
+
+    // =========================
+    // 自适应
+    // =========================
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+  </script>
+</body>
+</html>

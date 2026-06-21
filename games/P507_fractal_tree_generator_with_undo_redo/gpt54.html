@@ -1,0 +1,600 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>3D Fractal Tree Generator</title>
+  <style>
+    html, body {
+      margin: 0;
+      overflow: hidden;
+      background: #1a1a2e;
+      font-family: Arial, sans-serif;
+      color: #fff;
+    }
+
+    #ui-panel {
+      position: fixed;
+      top: 12px;
+      left: 12px;
+      z-index: 20;
+      background: rgba(20, 20, 35, 0.9);
+      border: 1px solid rgba(255,255,255,0.15);
+      border-radius: 10px;
+      padding: 12px;
+      width: 240px;
+      box-shadow: 0 8px 20px rgba(0,0,0,0.35);
+    }
+
+    #ui-panel h3 {
+      margin: 0 0 10px 0;
+      font-size: 16px;
+    }
+
+    .row {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 8px;
+      flex-wrap: wrap;
+    }
+
+    button {
+      background: #2e3a59;
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      padding: 8px 10px;
+      cursor: pointer;
+      min-width: 68px;
+    }
+
+    button:hover:not(:disabled) {
+      background: #3f4d77;
+    }
+
+    button:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
+
+    label {
+      display: block;
+      font-size: 13px;
+      margin-top: 8px;
+      margin-bottom: 4px;
+    }
+
+    input[type="range"] {
+      width: 100%;
+    }
+
+    .value {
+      float: right;
+      color: #a8d8ff;
+    }
+
+    #hud-info {
+      margin-top: 10px;
+      padding: 8px;
+      background: rgba(255,255,255,0.06);
+      border-radius: 6px;
+      font-size: 13px;
+      line-height: 1.5;
+    }
+
+    #help {
+      margin-top: 8px;
+      font-size: 11px;
+      opacity: 0.8;
+      line-height: 1.4;
+    }
+  </style>
+</head>
+<body>
+  <div id="ui-panel">
+    <h3>Fractal Tree Controls</h3>
+
+    <div class="row">
+      <button id="btn-grow">Grow</button>
+      <button id="btn-prune">Prune</button>
+    </div>
+
+    <div class="row">
+      <button id="btn-undo">Undo</button>
+      <button id="btn-redo">Redo</button>
+      <button id="btn-reset">Reset</button>
+    </div>
+
+    <label for="slider-angle">
+      Angle Spread <span class="value" id="angle-value">30°</span>
+    </label>
+    <input id="slider-angle" type="range" min="10" max="60" step="1" value="30" />
+
+    <label for="slider-ratio">
+      Branch Ratio <span class="value" id="ratio-value">0.70</span>
+    </label>
+    <input id="slider-ratio" type="range" min="0.4" max="0.9" step="0.05" value="0.7" />
+
+    <div id="hud-info">Depth: 1<br>Branches: 1<br>Leaves: 0</div>
+
+    <div id="help">
+      Keys: G = Grow, P = Prune, Ctrl+Z = Undo, Ctrl+Y = Redo
+    </div>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js';
+    import { OrbitControls } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js';
+
+    // Scene setup
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x1a1a2e);
+
+    const camera = new THREE.PerspectiveCamera(
+      60,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      1000
+    );
+    camera.position.set(0, 8, 20);
+    camera.lookAt(0, 5, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    document.body.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.set(0, 5, 0);
+    controls.enableDamping = true;
+
+    const ambientLight = new THREE.AmbientLight(0x404060, 0.4);
+    scene.add(ambientLight);
+
+    const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
+    directionalLight.position.set(10, 20, 10);
+    scene.add(directionalLight);
+
+    const ground = new THREE.Mesh(
+      new THREE.PlaneGeometry(30, 30),
+      new THREE.MeshPhongMaterial({ color: 0x2d5016 })
+    );
+    ground.rotation.x = -Math.PI / 2;
+    ground.position.y = 0;
+    scene.add(ground);
+
+    // State
+    const MAX_DEPTH = 7;
+    const TRUNK_LENGTH = 3.0;
+    const TRUNK_RADIUS = 0.15;
+    const BROWN = 0x8B4513;
+    const GREEN = 0x228B22;
+
+    let currentDepth = 1;
+    let branchRatio = 0.7;
+    let angleSpread = 30;
+
+    let undoStack = [];
+    let redoStack = [];
+
+    let branchGroup = new THREE.Group();
+    scene.add(branchGroup);
+
+    let branchMeshes = [];
+    let selectedBranch = null;
+    let selectedBranchId = null;
+
+    let animating = false;
+    let growthAnimations = [];
+
+    let nextBranchId = 0;
+    let leafCount = 0;
+    let treeHeight = TRUNK_LENGTH;
+
+    const raycaster = new THREE.Raycaster();
+    const mouse = new THREE.Vector2();
+
+    // Deterministic pseudo-random from branch path
+    function seededRandomFromPath(path) {
+      let hash = 2166136261;
+      for (let i = 0; i < path.length; i++) {
+        hash ^= path.charCodeAt(i);
+        hash = Math.imul(hash, 16777619);
+      }
+      hash += hash << 13;
+      hash ^= hash >>> 7;
+      hash += hash << 3;
+      hash ^= hash >>> 17;
+      hash += hash << 5;
+      return ((hash >>> 0) % 1000000) / 1000000;
+    }
+
+    function snapshot() {
+      return {
+        depth: currentDepth,
+        branchRatio: branchRatio,
+        angleSpread: angleSpread
+      };
+    }
+
+    function applySnapshot(state, animateNewDepth = false, previousDepth = currentDepth) {
+      currentDepth = state.depth;
+      branchRatio = state.branchRatio;
+      angleSpread = state.angleSpread;
+
+      angleSlider.value = String(angleSpread);
+      ratioSlider.value = String(branchRatio);
+      angleValue.textContent = `${angleSpread}°`;
+      ratioValue.textContent = Number(branchRatio).toFixed(2);
+
+      rebuildTree(animateNewDepth, previousDepth);
+    }
+
+    function pushUndo() {
+      undoStack.push(snapshot());
+      if (undoStack.length > 200) undoStack.shift();
+    }
+
+    function clearRedo() {
+      redoStack.length = 0;
+    }
+
+    function deselectBranch() {
+      if (selectedBranch && selectedBranch.material && selectedBranch.material.emissive) {
+        selectedBranch.material.emissive.setHex(0x000000);
+      }
+      selectedBranch = null;
+      selectedBranchId = null;
+      update3DState();
+    }
+
+    function selectBranch(mesh) {
+      if (selectedBranch === mesh) return;
+      deselectBranch();
+      selectedBranch = mesh;
+      selectedBranchId = mesh.userData.branchId;
+      if (selectedBranch.material && selectedBranch.material.emissive) {
+        selectedBranch.material.emissive.setHex(0xffff00);
+      }
+      update3DState();
+    }
+
+    function clearBranchGroup() {
+      branchGroup.traverse(obj => {
+        if (obj.isMesh) {
+          obj.geometry.dispose();
+          obj.material.dispose();
+        }
+      });
+      scene.remove(branchGroup);
+      branchGroup = new THREE.Group();
+      scene.add(branchGroup);
+      branchMeshes = [];
+      nextBranchId = 0;
+      leafCount = 0;
+      treeHeight = 0;
+      growthAnimations = [];
+      deselectBranch();
+    }
+
+    function createBranchMesh(length, radius, color, branchId, depth, position, direction, animateScale = false) {
+      const geometry = new THREE.CylinderGeometry(radius, radius, length, 8);
+      geometry.translate(0, length / 2, 0);
+
+      const material = new THREE.MeshPhongMaterial({
+        color,
+        emissive: 0x000000
+      });
+
+      const mesh = new THREE.Mesh(geometry, material);
+      mesh.position.copy(position);
+
+      const up = new THREE.Vector3(0, 1, 0);
+      const quat = new THREE.Quaternion().setFromUnitVectors(up, direction.clone().normalize());
+      mesh.quaternion.copy(quat);
+
+      mesh.userData.branchId = branchId;
+      mesh.userData.depth = depth;
+      mesh.userData.length = length;
+      mesh.userData.radius = radius;
+      mesh.userData.base = position.clone();
+      mesh.userData.tip = position.clone().add(direction.clone().normalize().multiplyScalar(length));
+
+      if (animateScale) {
+        mesh.scale.set(1, 0.001, 1);
+        growthAnimations.push({
+          mesh,
+          start: performance.now(),
+          duration: 500
+        });
+      }
+
+      branchGroup.add(mesh);
+      branchMeshes.push(mesh);
+
+      treeHeight = Math.max(treeHeight, mesh.userData.tip.y);
+      if (depth >= 4) leafCount++;
+
+      return mesh;
+    }
+
+    function rotateAroundAxis(vec, axis, angleRad) {
+      return vec.clone().applyAxisAngle(axis, angleRad);
+    }
+
+    function buildBranchRecursive(basePos, direction, length, radius, depth, maxDepth, path, animateThresholdDepth) {
+      const color = depth >= 4 ? GREEN : BROWN;
+      const branchId = nextBranchId++;
+      const shouldAnimate = depth >= animateThresholdDepth;
+
+      createBranchMesh(
+        length,
+        radius,
+        color,
+        branchId,
+        depth,
+        basePos,
+        direction,
+        shouldAnimate
+      );
+
+      if (depth >= maxDepth - 1) return;
+
+      const tip = basePos.clone().add(direction.clone().normalize().multiplyScalar(length));
+      const dirNorm = direction.clone().normalize();
+
+      let randomVec = new THREE.Vector3(1, 0, 0);
+      if (Math.abs(dirNorm.dot(randomVec)) > 0.95) randomVec = new THREE.Vector3(0, 0, 1);
+
+      let planeAxis = new THREE.Vector3().crossVectors(dirNorm, randomVec).normalize();
+
+      const randAngle = seededRandomFromPath(path) * Math.PI * 2;
+      planeAxis = rotateAroundAxis(planeAxis, dirNorm, randAngle).normalize();
+
+      const angleRad = THREE.MathUtils.degToRad(angleSpread);
+
+      const childDir1 = dirNorm.clone().applyAxisAngle(planeAxis, angleRad).normalize();
+      const childDir2 = dirNorm.clone().applyAxisAngle(planeAxis, -angleRad).normalize();
+
+      const childLength = length * branchRatio;
+      const childRadius = radius * 0.65;
+
+      buildBranchRecursive(tip, childDir1, childLength, childRadius, depth + 1, maxDepth, path + 'L', animateThresholdDepth);
+      buildBranchRecursive(tip, childDir2, childLength, childRadius, depth + 1, maxDepth, path + 'R', animateThresholdDepth);
+    }
+
+    function rebuildTree(animateNew = false, previousDepth = currentDepth) {
+      clearBranchGroup();
+
+      const animateThresholdDepth = animateNew && currentDepth > previousDepth ? previousDepth : 999;
+
+      if (animateNew && currentDepth > previousDepth) {
+        animating = true;
+      } else {
+        animating = false;
+      }
+
+      buildBranchRecursive(
+        new THREE.Vector3(0, 0, 0),
+        new THREE.Vector3(0, 1, 0),
+        TRUNK_LENGTH,
+        TRUNK_RADIUS,
+        0,
+        currentDepth,
+        'T',
+        animateThresholdDepth
+      );
+
+      updateUI();
+      update3DState();
+    }
+
+    function updateHUD() {
+      hudInfo.innerHTML =
+        `Depth: ${currentDepth}<br>` +
+        `Branches: ${branchMeshes.length}<br>` +
+        `Leaves: ${leafCount}`;
+    }
+
+    function updateButtons() {
+      btnGrow.disabled = currentDepth >= MAX_DEPTH || animating;
+      btnPrune.disabled = currentDepth <= 1 || animating;
+      btnUndo.disabled = undoStack.length === 0 || animating;
+      btnRedo.disabled = redoStack.length === 0 || animating;
+      btnReset.disabled = animating;
+      angleSlider.disabled = animating;
+      ratioSlider.disabled = animating;
+    }
+
+    function updateUI() {
+      updateHUD();
+      updateButtons();
+    }
+
+    function update3DState() {
+      window.__3D_STATE__ = {
+        depth: currentDepth,
+        branchCount: branchMeshes.length,
+        branchRatio: branchRatio,
+        angleSpread: angleSpread,
+        undoStackSize: undoStack.length,
+        redoStackSize: redoStack.length,
+        selectedBranchId: selectedBranchId,
+        treeHeight: treeHeight,
+        leafCount: currentDepth === 1 ? 0 : leafCount,
+        animating: animating
+      };
+      updateUI();
+    }
+
+    // UI elements
+    const btnGrow = document.getElementById('btn-grow');
+    const btnPrune = document.getElementById('btn-prune');
+    const btnUndo = document.getElementById('btn-undo');
+    const btnRedo = document.getElementById('btn-redo');
+    const btnReset = document.getElementById('btn-reset');
+    const angleSlider = document.getElementById('slider-angle');
+    const ratioSlider = document.getElementById('slider-ratio');
+    const angleValue = document.getElementById('angle-value');
+    const ratioValue = document.getElementById('ratio-value');
+    const hudInfo = document.getElementById('hud-info');
+
+    function doGrow() {
+      if (animating || currentDepth >= MAX_DEPTH) return;
+      pushUndo();
+      clearRedo();
+      const prevDepth = currentDepth;
+      currentDepth += 1;
+      rebuildTree(true, prevDepth);
+    }
+
+    function doPrune() {
+      if (animating || currentDepth <= 1) return;
+      pushUndo();
+      clearRedo();
+      currentDepth -= 1;
+      rebuildTree(false, currentDepth + 1);
+    }
+
+    function doUndo() {
+      if (animating || undoStack.length === 0) return;
+      const curr = snapshot();
+      const prev = undoStack.pop();
+      redoStack.push(curr);
+      applySnapshot(prev, false, currentDepth);
+    }
+
+    function doRedo() {
+      if (animating || redoStack.length === 0) return;
+      const curr = snapshot();
+      const next = redoStack.pop();
+      undoStack.push(curr);
+      applySnapshot(next, false, currentDepth);
+    }
+
+    function doReset() {
+      if (animating) return;
+      currentDepth = 1;
+      branchRatio = 0.7;
+      angleSpread = 30;
+      undoStack = [];
+      redoStack = [];
+      applySnapshot(snapshot(), false, currentDepth);
+    }
+
+    btnGrow.addEventListener('click', doGrow);
+    btnPrune.addEventListener('click', doPrune);
+    btnUndo.addEventListener('click', doUndo);
+    btnRedo.addEventListener('click', doRedo);
+    btnReset.addEventListener('click', doReset);
+
+    angleSlider.addEventListener('input', () => {
+      angleValue.textContent = `${angleSlider.value}°`;
+    });
+
+    ratioSlider.addEventListener('input', () => {
+      ratioValue.textContent = Number(ratioSlider.value).toFixed(2);
+    });
+
+    angleSlider.addEventListener('change', () => {
+      if (animating) return;
+      const newAngle = parseFloat(angleSlider.value);
+      if (newAngle === angleSpread) return;
+      pushUndo();
+      clearRedo();
+      angleSpread = newAngle;
+      rebuildTree(false, currentDepth);
+    });
+
+    ratioSlider.addEventListener('change', () => {
+      if (animating) return;
+      const newRatio = parseFloat(ratioSlider.value);
+      if (newRatio === branchRatio) return;
+      pushUndo();
+      clearRedo();
+      branchRatio = newRatio;
+      rebuildTree(false, currentDepth);
+    });
+
+    window.addEventListener('keydown', (e) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
+        e.preventDefault();
+        doUndo();
+        return;
+      }
+
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'y') {
+        e.preventDefault();
+        doRedo();
+        return;
+      }
+
+      if (e.target && (e.target.tagName === 'INPUT')) return;
+
+      if (e.key.toLowerCase() === 'g') {
+        doGrow();
+      } else if (e.key.toLowerCase() === 'p') {
+        doPrune();
+      }
+    });
+
+    // Branch selection
+    renderer.domElement.addEventListener('pointerdown', (event) => {
+      const rect = renderer.domElement.getBoundingClientRect();
+      mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+      mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+
+      raycaster.setFromCamera(mouse, camera);
+      const intersects = raycaster.intersectObjects(branchMeshes, false);
+
+      if (intersects.length > 0) {
+        selectBranch(intersects[0].object);
+      } else {
+        deselectBranch();
+      }
+    });
+
+    // Animation loop
+    function animate(now) {
+      requestAnimationFrame(animate);
+
+      controls.update();
+
+      if (growthAnimations.length > 0) {
+        let anyActive = false;
+        for (const anim of growthAnimations) {
+          const t = Math.min((now - anim.start) / anim.duration, 1);
+          const eased = 1 - Math.pow(1 - t, 3);
+          anim.mesh.scale.y = Math.max(0.001, eased);
+          if (t < 1) anyActive = true;
+        }
+
+        if (!anyActive) {
+          for (const anim of growthAnimations) {
+            anim.mesh.scale.y = 1;
+          }
+          growthAnimations = [];
+          animating = false;
+          update3DState();
+        } else {
+          animating = true;
+          updateButtons();
+          window.__3D_STATE__.animating = true;
+        }
+      }
+
+      renderer.render(scene, camera);
+    }
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    // Initial build
+    rebuildTree(false, 1);
+    animate(performance.now());
+  </script>
+</body>
+</html>

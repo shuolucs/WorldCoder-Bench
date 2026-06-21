@@ -1,0 +1,490 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Three.js Buoyancy Simulation - BrainStem</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      background: #1a1a2e;
+      font-family: Arial, sans-serif;
+      color: #fff;
+    }
+
+    canvas {
+      display: block;
+    }
+
+    #control-panel {
+      position: absolute;
+      top: 16px;
+      left: 16px;
+      z-index: 10;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      background: rgba(0, 0, 0, 0.45);
+      padding: 12px;
+      border-radius: 10px;
+      backdrop-filter: blur(6px);
+      max-width: 280px;
+    }
+
+    #control-panel button {
+      padding: 10px 12px;
+      border: none;
+      border-radius: 8px;
+      background: #1976d2;
+      color: white;
+      cursor: pointer;
+      font-size: 14px;
+      text-align: left;
+      transition: background 0.2s ease;
+    }
+
+    #control-panel button:hover {
+      background: #2196f3;
+    }
+
+    #hud {
+      position: absolute;
+      top: 16px;
+      right: 16px;
+      z-index: 10;
+      background: rgba(0, 0, 0, 0.5);
+      padding: 12px 14px;
+      border-radius: 10px;
+      backdrop-filter: blur(6px);
+      min-width: 280px;
+      line-height: 1.5;
+      font-size: 14px;
+      white-space: pre-line;
+    }
+
+    #info {
+      position: absolute;
+      bottom: 14px;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 10;
+      background: rgba(0,0,0,0.35);
+      padding: 8px 12px;
+      border-radius: 8px;
+      font-size: 13px;
+      color: #d6e4ff;
+    }
+  </style>
+</head>
+<body>
+  <div id="control-panel">
+    <button id="btn-increase-density">Increase Object Density +50</button>
+    <button id="btn-decrease-density">Decrease Object Density -50</button>
+    <button id="btn-increase-fluid">Increase Fluid Density +100</button>
+    <button id="btn-decrease-fluid">Decrease Fluid Density -100</button>
+    <button id="btn-drop">Drop Object</button>
+    <button id="btn-reset">Reset All</button>
+  </div>
+
+  <div id="hud">Loading...</div>
+  <div id="info">Keyboard: ArrowUp / ArrowDown = Fluid Density, R = Reset</div>
+
+  <script type="module">
+    import * as THREE from 'https://unpkg.com/three@0.152.2/build/three.module.js';
+    import { GLTFLoader } from 'https://unpkg.com/three@0.152.2/examples/jsm/loaders/GLTFLoader.js';
+
+    let scene, camera, renderer, clock;
+    let tank, waterSurface, ground;
+    let modelRoot = null;
+    let fallbackMesh = null;
+
+    const hud = document.getElementById('hud');
+
+    const FIXED_DT = 1 / 60;
+
+    const initialState = {
+      objectDensity: 800,
+      fluidDensity: 1000,
+      gravity: 9.81,
+      objectVolume: 0.5,
+      velocityY: 0,
+      objectY: 2.0,
+      waterLevel: 1.0,
+      dampingFactor: 0.95,
+      timeElapsed: 0
+    };
+
+    const sim = {
+      objectDensity: initialState.objectDensity,
+      fluidDensity: initialState.fluidDensity,
+      gravity: initialState.gravity,
+      objectVolume: initialState.objectVolume,
+      objectMass: initialState.objectDensity * initialState.objectVolume,
+      velocityY: initialState.velocityY,
+      objectY: initialState.objectY,
+      waterLevel: initialState.waterLevel,
+      dampingFactor: initialState.dampingFactor,
+      buoyantForce: 0,
+      weight: 0,
+      netForce: 0,
+      submergedFraction: 0,
+      simState: 'falling',
+      timeElapsed: 0,
+      modelLoaded: false
+    };
+
+    // Approximate visual object height for submerged fraction calculations
+    const objectHeight = 1.5;
+    const objectHalfHeight = objectHeight / 2;
+
+    window.__3D_STATE__ = {};
+
+    init();
+    animate();
+
+    function init() {
+      scene = new THREE.Scene();
+      scene.background = new THREE.Color('#1a1a2e');
+
+      camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+      camera.position.set(0, 3, 8);
+      camera.lookAt(0, 0, 0);
+
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.outputColorSpace = THREE.SRGBColorSpace;
+      document.body.appendChild(renderer.domElement);
+
+      clock = new THREE.Clock();
+
+      const directionalLight = new THREE.DirectionalLight(0xffffff, 1.0);
+      directionalLight.position.set(5, 10, 5);
+      scene.add(directionalLight);
+
+      const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+      scene.add(ambientLight);
+
+      createTank();
+      createGround();
+      createFallbackObject();
+      loadModel();
+      setupControls();
+
+      window.addEventListener('resize', onWindowResize);
+    }
+
+    function createTank() {
+      const tankGeometry = new THREE.BoxGeometry(6, 5, 4);
+      const tankMaterial = new THREE.MeshPhysicalMaterial({
+        color: new THREE.Color('#2196F3'),
+        transparent: true,
+        opacity: 0.25,
+        transmission: 0.5,
+        roughness: 0.15,
+        metalness: 0,
+        side: THREE.DoubleSide
+      });
+
+      tank = new THREE.Mesh(tankGeometry, tankMaterial);
+      tank.position.set(0, 0, 0);
+      scene.add(tank);
+
+      const edges = new THREE.EdgesGeometry(tankGeometry);
+      const edgeLines = new THREE.LineSegments(
+        edges,
+        new THREE.LineBasicMaterial({ color: 0x90caf9, transparent: true, opacity: 0.5 })
+      );
+      tank.add(edgeLines);
+
+      const waterGeometry = new THREE.PlaneGeometry(6, 4);
+      const waterMaterial = new THREE.MeshBasicMaterial({
+        color: new THREE.Color('#1976D2'),
+        transparent: true,
+        opacity: 0.4,
+        side: THREE.DoubleSide
+      });
+
+      waterSurface = new THREE.Mesh(waterGeometry, waterMaterial);
+      waterSurface.rotation.x = -Math.PI / 2;
+      waterSurface.position.set(0, sim.waterLevel, 0);
+      scene.add(waterSurface);
+    }
+
+    function createGround() {
+      const groundGeometry = new THREE.PlaneGeometry(6, 4);
+      const groundMaterial = new THREE.MeshStandardMaterial({
+        color: 0x555555,
+        roughness: 0.9,
+        metalness: 0.05
+      });
+
+      ground = new THREE.Mesh(groundGeometry, groundMaterial);
+      ground.rotation.x = -Math.PI / 2;
+      ground.position.y = -2.5;
+      scene.add(ground);
+    }
+
+    function createFallbackObject() {
+      const geo = new THREE.SphereGeometry(0.45, 32, 32);
+      const mat = new THREE.MeshStandardMaterial({
+        color: 0xff8a65,
+        roughness: 0.5,
+        metalness: 0.1
+      });
+      fallbackMesh = new THREE.Mesh(geo, mat);
+      fallbackMesh.position.set(0, sim.objectY, 0);
+      fallbackMesh.visible = true;
+      scene.add(fallbackMesh);
+    }
+
+    function loadModel() {
+      const loader = new GLTFLoader();
+
+      loader.load(
+        '._BrainStem.glb',
+        (gltf) => {
+          modelRoot = gltf.scene;
+
+          const box = new THREE.Box3().setFromObject(modelRoot);
+          const size = new THREE.Vector3();
+          const center = new THREE.Vector3();
+          box.getSize(size);
+          box.getCenter(center);
+
+          const maxHeight = size.y || 1;
+          const scale = 1.5 / maxHeight;
+          modelRoot.scale.setScalar(scale);
+
+          // Recompute after scaling
+          const box2 = new THREE.Box3().setFromObject(modelRoot);
+          const center2 = new THREE.Vector3();
+          box2.getCenter(center2);
+
+          modelRoot.position.sub(center2);
+          modelRoot.position.y += sim.objectY;
+
+          scene.add(modelRoot);
+
+          fallbackMesh.visible = false;
+          sim.modelLoaded = true;
+        },
+        undefined,
+        (err) => {
+          console.warn('Failed to load ._BrainStem.glb, using fallback mesh.', err);
+          sim.modelLoaded = false;
+        }
+      );
+    }
+
+    function setupControls() {
+      document.getElementById('btn-increase-density').addEventListener('click', () => {
+        sim.objectDensity += 50;
+        recalcMass();
+      });
+
+      document.getElementById('btn-decrease-density').addEventListener('click', () => {
+        sim.objectDensity = Math.max(100, sim.objectDensity - 50);
+        recalcMass();
+      });
+
+      document.getElementById('btn-increase-fluid').addEventListener('click', () => {
+        sim.fluidDensity = Math.min(2000, sim.fluidDensity + 100);
+      });
+
+      document.getElementById('btn-decrease-fluid').addEventListener('click', () => {
+        sim.fluidDensity = Math.max(500, sim.fluidDensity - 100);
+      });
+
+      document.getElementById('btn-drop').addEventListener('click', () => {
+        sim.objectY = 3.0;
+        sim.velocityY = 0;
+        updateObjectPosition();
+      });
+
+      document.getElementById('btn-reset').addEventListener('click', resetAll);
+
+      window.addEventListener('keydown', (e) => {
+        if (e.key === 'ArrowUp') {
+          sim.fluidDensity = Math.min(2000, sim.fluidDensity + 100);
+        } else if (e.key === 'ArrowDown') {
+          sim.fluidDensity = Math.max(500, sim.fluidDensity - 100);
+        } else if (e.key.toLowerCase() === 'r') {
+          resetAll();
+        }
+      });
+    }
+
+    function resetAll() {
+      sim.objectDensity = initialState.objectDensity;
+      sim.fluidDensity = initialState.fluidDensity;
+      sim.gravity = initialState.gravity;
+      sim.objectVolume = initialState.objectVolume;
+      sim.velocityY = initialState.velocityY;
+      sim.objectY = initialState.objectY;
+      sim.waterLevel = initialState.waterLevel;
+      sim.dampingFactor = initialState.dampingFactor;
+      sim.timeElapsed = 0;
+      sim.buoyantForce = 0;
+      sim.weight = 0;
+      sim.netForce = 0;
+      sim.submergedFraction = 0;
+      sim.simState = 'falling';
+      recalcMass();
+      updateObjectPosition();
+    }
+
+    function recalcMass() {
+      sim.objectMass = sim.objectDensity * sim.objectVolume;
+      if (!Number.isFinite(sim.objectMass)) {
+        sim.objectMass = initialState.objectDensity * initialState.objectVolume;
+      }
+    }
+
+    function getSubmergedFraction(yCenter) {
+      const objectBottom = yCenter - objectHalfHeight;
+      const objectTop = yCenter + objectHalfHeight;
+
+      if (objectBottom > sim.waterLevel) {
+        return 0;
+      }
+      if (objectTop <= sim.waterLevel) {
+        return 1;
+      }
+
+      const submergedHeight = sim.waterLevel - objectBottom;
+      const fraction = submergedHeight / objectHeight;
+      return THREE.MathUtils.clamp(fraction, 0, 1);
+    }
+
+    function sanitizePhysics() {
+      const keys = [
+        'objectDensity', 'fluidDensity', 'gravity', 'objectVolume', 'objectMass',
+        'velocityY', 'objectY', 'waterLevel', 'dampingFactor',
+        'buoyantForce', 'weight', 'netForce', 'submergedFraction', 'timeElapsed'
+      ];
+
+      for (const key of keys) {
+        if (!Number.isFinite(sim[key])) {
+          console.warn(`NaN/Invalid detected in ${key}, resetting to safe defaults.`);
+          resetAll();
+          return;
+        }
+      }
+    }
+
+    function updatePhysics() {
+      recalcMass();
+
+      const submergedFraction = getSubmergedFraction(sim.objectY);
+      const submergedVolume = submergedFraction * sim.objectVolume;
+
+      sim.submergedFraction = submergedFraction;
+      sim.buoyantForce = sim.fluidDensity * sim.gravity * submergedVolume;
+      sim.weight = sim.objectMass * sim.gravity;
+      sim.netForce = sim.buoyantForce - sim.weight;
+
+      const accelerationY = sim.netForce / sim.objectMass;
+      if (Number.isFinite(accelerationY)) {
+        sim.velocityY += accelerationY * FIXED_DT;
+      } else {
+        sim.velocityY = 0;
+      }
+
+      sim.velocityY *= sim.dampingFactor;
+      sim.objectY += sim.velocityY * FIXED_DT;
+
+      // Boundaries
+      if (sim.objectY <= -2.0) {
+        sim.objectY = -2.0;
+        if (sim.velocityY < 0) sim.velocityY = 0;
+      }
+
+      if (sim.objectY >= 3.0) {
+        sim.objectY = 3.0;
+        if (sim.velocityY > 0) sim.velocityY = 0;
+      }
+
+      // State logic
+      if (sim.objectY <= -2.0) {
+        sim.simState = 'resting';
+      } else if ((sim.objectY - objectHalfHeight) > sim.waterLevel && sim.velocityY < 0) {
+        sim.simState = 'falling';
+      } else if (sim.submergedFraction > 0 && Math.abs(sim.velocityY) < 0.01 && sim.objectY > -2.0) {
+        sim.simState = 'floating';
+      } else if (sim.submergedFraction > 0 && sim.netForce < 0 && sim.objectY > -2.0) {
+        sim.simState = 'sinking';
+      } else if (sim.submergedFraction > 0 && sim.netForce >= 0) {
+        sim.simState = Math.abs(sim.velocityY) < 0.01 ? 'floating' : 'falling';
+      } else {
+        sim.simState = sim.velocityY < 0 ? 'falling' : 'floating';
+      }
+
+      sanitizePhysics();
+      updateObjectPosition();
+    }
+
+    function updateObjectPosition() {
+      if (modelRoot) {
+        const currentBox = new THREE.Box3().setFromObject(modelRoot);
+        const center = new THREE.Vector3();
+        currentBox.getCenter(center);
+
+        modelRoot.position.y += sim.objectY - center.y;
+      }
+
+      if (fallbackMesh) {
+        fallbackMesh.position.y = sim.objectY;
+      }
+    }
+
+    function updateHUD() {
+      hud.textContent =
+`Object Density: ${sim.objectDensity.toFixed(0)} kg/m³
+Fluid Density: ${sim.fluidDensity.toFixed(0)} kg/m³
+Object Y: ${sim.objectY.toFixed(2)}
+Velocity Y: ${sim.velocityY.toFixed(3)}
+Buoyant Force: ${sim.buoyantForce.toFixed(2)} N
+Weight: ${sim.weight.toFixed(2)} N
+Net Force: ${sim.netForce.toFixed(2)} N
+Submerged Fraction: ${sim.submergedFraction.toFixed(2)}
+State: ${sim.simState}`;
+
+      window.__3D_STATE__ = {
+        objectDensity: sim.objectDensity,
+        fluidDensity: sim.fluidDensity,
+        objectY: Number(sim.objectY.toFixed(2)),
+        velocityY: Number(sim.velocityY.toFixed(3)),
+        buoyantForce: Number(sim.buoyantForce.toFixed(2)),
+        weight: Number(sim.weight.toFixed(2)),
+        netForce: Number(sim.netForce.toFixed(2)),
+        submergedFraction: Number(THREE.MathUtils.clamp(sim.submergedFraction, 0, 1).toFixed(2)),
+        waterLevel: sim.waterLevel,
+        simState: sim.simState,
+        modelLoaded: sim.modelLoaded,
+        timeElapsed: Number(sim.timeElapsed.toFixed(2)),
+        dampingFactor: sim.dampingFactor,
+        objectVolume: sim.objectVolume
+      };
+    }
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      updatePhysics();
+      sim.timeElapsed += FIXED_DT;
+
+      updateHUD();
+      renderer.render(scene, camera);
+    }
+
+    function onWindowResize() {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    }
+  </script>
+</body>
+</html>

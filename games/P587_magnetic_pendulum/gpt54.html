@@ -1,0 +1,679 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>3D Magnetic Pendulum Chaos</title>
+  <style>
+    html, body {
+      margin: 0;
+      overflow: hidden;
+      background: #111122;
+      font-family: monospace;
+    }
+
+    #hud {
+      position: fixed;
+      top: 12px;
+      left: 12px;
+      background: rgba(0,0,0,0.7);
+      color: white;
+      padding: 12px;
+      font: 13px monospace;
+      border-radius: 8px;
+      z-index: 1000;
+      line-height: 1.45;
+      min-width: 260px;
+    }
+
+    #controls-panel {
+      margin-top: 10px;
+      border-top: 1px solid rgba(255,255,255,0.15);
+      padding-top: 10px;
+    }
+
+    .control-row {
+      display: grid;
+      grid-template-columns: 130px 1fr 44px;
+      gap: 8px;
+      align-items: center;
+      margin: 6px 0;
+    }
+
+    .control-row input[type="range"] {
+      width: 100%;
+    }
+
+    #fractal-canvas {
+      position: fixed;
+      right: 12px;
+      bottom: 12px;
+      width: 200px;
+      height: 200px;
+      border: 1px solid rgba(255,255,255,0.3);
+      background: #000;
+      z-index: 1000;
+      image-rendering: pixelated;
+    }
+
+    #help {
+      margin-top: 8px;
+      color: #cfd8ff;
+      font-size: 12px;
+      opacity: 0.9;
+    }
+  </style>
+
+  <script type="importmap">
+  { "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+  } }
+  </script>
+</head>
+<body>
+  <div id="hud">
+    <div>Magnet strength: <span id="hud-magnet">1.0</span></div>
+    <div>Damping: <span id="hud-damping">0.10</span></div>
+    <div>Pendulum length: <span id="hud-length">5.0</span></div>
+    <div>Bob speed: <span id="hud-speed">0.000</span></div>
+    <div>Nearest magnet: <span id="hud-nearest">Red(1)</span></div>
+    <div>Fractal progress: <span id="hud-fractal">0</span>%</div>
+    <div>Paused: <span id="hud-paused">Playing</span></div>
+
+    <div id="controls-panel">
+      <div class="control-row">
+        <label for="slider-magnet-strength">Magnet strength</label>
+        <input id="slider-magnet-strength" type="range" min="0.1" max="5.0" step="0.1" value="1.0" />
+        <span id="label-magnet-strength">1.0</span>
+      </div>
+      <div class="control-row">
+        <label for="slider-damping">Damping</label>
+        <input id="slider-damping" type="range" min="0.01" max="0.50" step="0.01" value="0.10" />
+        <span id="label-damping">0.10</span>
+      </div>
+      <div class="control-row">
+        <label for="slider-pendulum-length">Pendulum length</label>
+        <input id="slider-pendulum-length" type="range" min="3.0" max="8.0" step="0.1" value="5.0" />
+        <span id="label-pendulum-length">5.0</span>
+      </div>
+      <div id="help">
+        Keys: <b>R</b> reset, <b>C</b> random start, <b>Space</b> pause, <b>T</b> trail
+      </div>
+    </div>
+  </div>
+
+  <canvas id="fractal-canvas" width="200" height="200"></canvas>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+    // ----------------------------
+    // Basic setup
+    // ----------------------------
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x111122);
+
+    const camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 0.1, 100);
+    camera.position.set(0, 8, 6);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.shadowMap.enabled = true;
+    document.body.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.set(0, 0.8, 0);
+    controls.enableDamping = true;
+
+    const ambient = new THREE.AmbientLight(0x334455, 0.4);
+    scene.add(ambient);
+
+    const pointLight = new THREE.PointLight(0xffffff, 1.0);
+    pointLight.position.set(0, 10, 0);
+    pointLight.castShadow = true;
+    scene.add(pointLight);
+
+    // ----------------------------
+    // Platform
+    // ----------------------------
+    const platform = new THREE.Mesh(
+      new THREE.CylinderGeometry(4, 4, 0.12, 64),
+      new THREE.MeshStandardMaterial({ color: 0x222233, roughness: 0.9, metalness: 0.1 })
+    );
+    platform.position.y = -0.06;
+    platform.receiveShadow = true;
+    scene.add(platform);
+
+    // ----------------------------
+    // Parameters / state
+    // ----------------------------
+    const pivot = new THREE.Vector3(0, 5, 0);
+    const gravity = 9.81;
+    const bobMass = 0.1;
+    let magnetStrength = 1.0;
+    let damping = 0.10;
+    let pendulumLength = 5.0;
+    let isPaused = false;
+    let trailVisible = true;
+    let frameCount = 0;
+
+    const dt = 0.002;
+    const substepsPerFrame = 5;
+    const trailMax = 500;
+
+    // ----------------------------
+    // Magnets
+    // ----------------------------
+    const magnetData = [
+      { pos: new THREE.Vector3( 2.000, 0.05,  0.000), color: 0xff3333, name: 'Red(1)'   },
+      { pos: new THREE.Vector3(-1.000, 0.05,  1.732), color: 0x33ff33, name: 'Green(2)' },
+      { pos: new THREE.Vector3(-1.000, 0.05, -1.732), color: 0x3333ff, name: 'Blue(3)'  },
+    ];
+
+    const magnets = [];
+    for (const m of magnetData) {
+      const group = new THREE.Group();
+
+      const body = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.25, 0.25, 0.3, 32),
+        new THREE.MeshStandardMaterial({
+          color: m.color,
+          emissive: m.color,
+          emissiveIntensity: 0.6,
+          metalness: 0.4,
+          roughness: 0.35
+        })
+      );
+      body.position.copy(m.pos);
+      body.castShadow = true;
+      body.receiveShadow = true;
+      group.add(body);
+
+      const halo = new THREE.Mesh(
+        new THREE.TorusGeometry(0.4, 0.03, 12, 48),
+        new THREE.MeshStandardMaterial({
+          color: m.color,
+          emissive: m.color,
+          emissiveIntensity: 1.0,
+          transparent: true,
+          opacity: 0.95
+        })
+      );
+      halo.rotation.x = Math.PI / 2;
+      halo.position.copy(m.pos);
+      halo.position.y += 0.08;
+      group.add(halo);
+
+      scene.add(group);
+      magnets.push({ ...m, body, halo });
+    }
+
+    // ----------------------------
+    // Fractal canvas + texture plane
+    // ----------------------------
+    const fractalCanvas = document.getElementById('fractal-canvas');
+    const fractalCtx = fractalCanvas.getContext('2d', { willReadFrequently: true });
+    const fractalImage = fractalCtx.createImageData(fractalCanvas.width, fractalCanvas.height);
+    const fractalTexture = new THREE.CanvasTexture(fractalCanvas);
+    fractalTexture.colorSpace = THREE.SRGBColorSpace;
+    fractalTexture.minFilter = THREE.NearestFilter;
+    fractalTexture.magFilter = THREE.NearestFilter;
+
+    const fractalPlane = new THREE.Mesh(
+      new THREE.PlaneGeometry(4, 4),
+      new THREE.MeshBasicMaterial({
+        map: fractalTexture,
+        transparent: true,
+        opacity: 0.65,
+        side: THREE.DoubleSide
+      })
+    );
+    fractalPlane.rotation.x = -Math.PI / 2;
+    fractalPlane.position.set(0, 0.02, 0);
+    scene.add(fractalPlane);
+
+    let fractalRow = 0;
+    let fractalProgress = 0;
+    let fractalDirty = true;
+
+    function clearFractalImage() {
+      for (let i = 0; i < fractalImage.data.length; i += 4) {
+        fractalImage.data[i + 0] = 0;
+        fractalImage.data[i + 1] = 0;
+        fractalImage.data[i + 2] = 0;
+        fractalImage.data[i + 3] = 255;
+      }
+      fractalCtx.putImageData(fractalImage, 0, 0);
+      fractalTexture.needsUpdate = true;
+    }
+
+    function restartFractal() {
+      fractalRow = 0;
+      fractalProgress = 0;
+      fractalDirty = true;
+      clearFractalImage();
+    }
+
+    // ----------------------------
+    // Pendulum objects
+    // ----------------------------
+    const bobMaterial = new THREE.MeshStandardMaterial({
+      color: 0xdddddd,
+      metalness: 0.8,
+      roughness: 0.2
+    });
+
+    const bob = new THREE.Mesh(
+      new THREE.SphereGeometry(0.2, 32, 32),
+      bobMaterial
+    );
+    bob.castShadow = true;
+    bob.receiveShadow = true;
+    scene.add(bob);
+
+    const arm = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.02, 0.02, 1, 12, 1, false),
+      new THREE.MeshStandardMaterial({ color: 0xcccccc, metalness: 0.3, roughness: 0.6 })
+    );
+    arm.castShadow = true;
+    scene.add(arm);
+
+    const pivotMarker = new THREE.Object3D();
+    pivotMarker.position.copy(pivot);
+    scene.add(pivotMarker);
+
+    let state = {
+      pos: new THREE.Vector3(),
+      vel: new THREE.Vector3()
+    };
+
+    const initialXZ = new THREE.Vector2(1.5, 0.5);
+
+    function computeBobYFromXZ(x, z, L = pendulumLength) {
+      const dx = x - pivot.x;
+      const dz = z - pivot.z;
+      const inside = Math.max(L * L - dx * dx - dz * dz, 0.000001);
+      return pivot.y - Math.sqrt(inside);
+    }
+
+    function setPendulumFromXZ(x, z, zeroVelocity = true) {
+      const r2 = x * x + z * z;
+      const maxR = Math.max(0.001, pendulumLength - 0.05);
+      let nx = x, nz = z;
+      if (r2 > maxR * maxR) {
+        const s = maxR / Math.sqrt(r2);
+        nx *= s;
+        nz *= s;
+      }
+      const y = computeBobYFromXZ(nx, nz, pendulumLength);
+      state.pos.set(nx, y, nz);
+      if (zeroVelocity) state.vel.set(0, 0, 0);
+      updateBobVisual();
+      resetTrail();
+    }
+
+    function randomizePendulum() {
+      const x = THREE.MathUtils.randFloat(-2, 2);
+      const z = THREE.MathUtils.randFloat(-2, 2);
+      setPendulumFromXZ(x, z, true);
+    }
+
+    // ----------------------------
+    // Physics
+    // ----------------------------
+    function computeAcceleration(pos, vel, L = pendulumLength, mStrength = magnetStrength, damp = damping) {
+      const fxz = new THREE.Vector3();
+
+      // Gravity restoring force in projected XZ
+      fxz.x += -(bobMass * gravity / L) * pos.x;
+      fxz.z += -(bobMass * gravity / L) * pos.z;
+
+      // Magnetic forces
+      for (const m of magnets) {
+        const dx = m.pos.x - pos.x;
+        const dz = m.pos.z - pos.z;
+        const dy = m.pos.y - pos.y;
+        const dist = Math.max(Math.sqrt(dx*dx + dy*dy + dz*dz), 0.3);
+        const inv = mStrength / (dist * dist * dist);
+        fxz.x += inv * dx;
+        fxz.z += inv * dz;
+      }
+
+      // Damping
+      fxz.x += -damp * vel.x;
+      fxz.z += -damp * vel.z;
+
+      // Convert force to acceleration
+      const ax = fxz.x / bobMass;
+      const az = fxz.z / bobMass;
+
+      return new THREE.Vector3(ax, 0, az);
+    }
+
+    function constrainToSphere(s, L = pendulumLength) {
+      const rel = s.pos.clone().sub(pivot);
+      if (!Number.isFinite(rel.x) || !Number.isFinite(rel.y) || !Number.isFinite(rel.z) || rel.lengthSq() === 0) {
+        setPendulumFromXZ(initialXZ.x, initialXZ.y, true);
+        return;
+      }
+
+      rel.normalize().multiplyScalar(L);
+      s.pos.copy(pivot).add(rel);
+
+      const radial = rel.clone().normalize();
+      const vr = radial.multiplyScalar(s.vel.dot(radial));
+      s.vel.sub(vr);
+    }
+
+    function rk4Step(s, h, L = pendulumLength, mStrength = magnetStrength, damp = damping) {
+      const p1 = s.pos.clone();
+      const v1 = s.vel.clone();
+      const a1 = computeAcceleration(p1, v1, L, mStrength, damp);
+
+      const p2 = p1.clone().add(v1.clone().multiplyScalar(h * 0.5));
+      const v2 = v1.clone().add(a1.clone().multiplyScalar(h * 0.5));
+      const a2 = computeAcceleration(p2, v2, L, mStrength, damp);
+
+      const p3 = p1.clone().add(v2.clone().multiplyScalar(h * 0.5));
+      const v3 = v1.clone().add(a2.clone().multiplyScalar(h * 0.5));
+      const a3 = computeAcceleration(p3, v3, L, mStrength, damp);
+
+      const p4 = p1.clone().add(v3.clone().multiplyScalar(h));
+      const v4 = v1.clone().add(a3.clone().multiplyScalar(h));
+      const a4 = computeAcceleration(p4, v4, L, mStrength, damp);
+
+      s.pos.add(
+        v1.clone().add(v2.clone().multiplyScalar(2)).add(v3.clone().multiplyScalar(2)).add(v4).multiplyScalar(h / 6)
+      );
+      s.vel.add(
+        a1.clone().add(a2.clone().multiplyScalar(2)).add(a3.clone().multiplyScalar(2)).add(a4).multiplyScalar(h / 6)
+      );
+
+      constrainToSphere(s, L);
+    }
+
+    // ----------------------------
+    // Trail
+    // ----------------------------
+    const trailPositions = new Float32Array(trailMax * 3);
+    const trailColors = new Float32Array(trailMax * 3);
+    const trailGeometry = new THREE.BufferGeometry();
+    trailGeometry.setAttribute('position', new THREE.BufferAttribute(trailPositions, 3));
+    trailGeometry.setAttribute('color', new THREE.BufferAttribute(trailColors, 3));
+    trailGeometry.setDrawRange(0, 0);
+
+    const trailMaterial = new THREE.LineBasicMaterial({
+      vertexColors: true,
+      transparent: true,
+      opacity: 0.9
+    });
+
+    const trailLine = new THREE.Line(trailGeometry, trailMaterial);
+    scene.add(trailLine);
+
+    const trail = [];
+
+    function resetTrail() {
+      trail.length = 0;
+      addTrailPoint(state.pos.clone());
+      updateTrailGeometry();
+    }
+
+    function nearestMagnetIndexFromPosition(pos) {
+      let idx = 0;
+      let best = Infinity;
+      for (let i = 0; i < magnets.length; i++) {
+        const d2 = magnets[i].pos.distanceToSquared(pos);
+        if (d2 < best) {
+          best = d2;
+          idx = i;
+        }
+      }
+      return idx;
+    }
+
+    function addTrailPoint(pos) {
+      trail.push(pos.clone());
+      if (trail.length > trailMax) trail.shift();
+    }
+
+    function updateTrailGeometry() {
+      const count = trail.length;
+      for (let i = 0; i < count; i++) {
+        const p = trail[i];
+        trailPositions[i * 3 + 0] = p.x;
+        trailPositions[i * 3 + 1] = p.y;
+        trailPositions[i * 3 + 2] = p.z;
+
+        const nearest = nearestMagnetIndexFromPosition(p);
+        const c = new THREE.Color(magnets[nearest].color);
+        const t = count > 1 ? i / (count - 1) : 1;
+        const fade = 0.1 + 0.9 * t;
+        trailColors[i * 3 + 0] = c.r * fade;
+        trailColors[i * 3 + 1] = c.g * fade;
+        trailColors[i * 3 + 2] = c.b * fade;
+      }
+      trailGeometry.setDrawRange(0, count);
+      trailGeometry.attributes.position.needsUpdate = true;
+      trailGeometry.attributes.color.needsUpdate = true;
+      trailLine.visible = trailVisible;
+    }
+
+    // ----------------------------
+    // Visual updates
+    // ----------------------------
+    function updateBobVisual() {
+      bob.position.copy(state.pos);
+
+      const dir = new THREE.Vector3().subVectors(state.pos, pivot);
+      const len = dir.length();
+      arm.position.copy(pivot).addScaledVector(dir, 0.5);
+      arm.scale.set(1, len, 1);
+      arm.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir.clone().normalize());
+    }
+
+    // ----------------------------
+    // Fractal simulation
+    // ----------------------------
+    function classifyAttractorFromXZ(startX, startZ) {
+      const L = pendulumLength;
+      const r2 = startX * startX + startZ * startZ;
+      const maxR = Math.max(0.001, L - 0.05);
+      let x = startX, z = startZ;
+      if (r2 > maxR * maxR) {
+        const s = maxR / Math.sqrt(r2);
+        x *= s;
+        z *= s;
+      }
+
+      const sim = {
+        pos: new THREE.Vector3(x, computeBobYFromXZ(x, z, L), z),
+        vel: new THREE.Vector3(0, 0, 0)
+      };
+
+      for (let i = 0; i < 2000; i++) {
+        rk4Step(sim, dt, L, magnetStrength, damping);
+
+        for (let m = 0; m < magnets.length; m++) {
+          if (sim.pos.distanceTo(magnets[m].pos) < 0.5) return m;
+        }
+      }
+
+      return nearestMagnetIndexFromPosition(sim.pos);
+    }
+
+    function computeFractalRows(rowsPerFrame = 2) {
+      if (fractalRow >= fractalCanvas.height) {
+        fractalProgress = 100;
+        return;
+      }
+
+      const w = fractalCanvas.width;
+      const h = fractalCanvas.height;
+
+      for (let rowStep = 0; rowStep < rowsPerFrame && fractalRow < h; rowStep++, fractalRow++) {
+        const py = fractalRow;
+        const z = 3 - (py / (h - 1)) * 6;
+
+        for (let px = 0; px < w; px++) {
+          const x = -3 + (px / (w - 1)) * 6;
+          const idx = classifyAttractorFromXZ(x, z);
+          const color = new THREE.Color(magnets[idx].color);
+          const off = (py * w + px) * 4;
+          fractalImage.data[off + 0] = Math.round(color.r * 255);
+          fractalImage.data[off + 1] = Math.round(color.g * 255);
+          fractalImage.data[off + 2] = Math.round(color.b * 255);
+          fractalImage.data[off + 3] = 255;
+        }
+      }
+
+      fractalCtx.putImageData(fractalImage, 0, 0);
+      fractalTexture.needsUpdate = true;
+      fractalProgress = Math.min(100, Math.round((fractalRow / h) * 100));
+    }
+
+    // ----------------------------
+    // UI
+    // ----------------------------
+    const hudMagnet = document.getElementById('hud-magnet');
+    const hudDamping = document.getElementById('hud-damping');
+    const hudLength = document.getElementById('hud-length');
+    const hudSpeed = document.getElementById('hud-speed');
+    const hudNearest = document.getElementById('hud-nearest');
+    const hudFractal = document.getElementById('hud-fractal');
+    const hudPaused = document.getElementById('hud-paused');
+
+    const sliderMagnet = document.getElementById('slider-magnet-strength');
+    const sliderDamping = document.getElementById('slider-damping');
+    const sliderLength = document.getElementById('slider-pendulum-length');
+    const labelMagnet = document.getElementById('label-magnet-strength');
+    const labelDamping = document.getElementById('label-damping');
+    const labelLength = document.getElementById('label-pendulum-length');
+
+    sliderMagnet.addEventListener('input', () => {
+      magnetStrength = parseFloat(sliderMagnet.value);
+      labelMagnet.textContent = magnetStrength.toFixed(1);
+      restartFractal();
+    });
+
+    sliderDamping.addEventListener('input', () => {
+      damping = parseFloat(sliderDamping.value);
+      labelDamping.textContent = damping.toFixed(2);
+      restartFractal();
+    });
+
+    sliderLength.addEventListener('input', () => {
+      const oldRel = state.pos.clone().sub(pivot).normalize();
+      pendulumLength = parseFloat(sliderLength.value);
+      labelLength.textContent = pendulumLength.toFixed(1);
+      state.pos.copy(pivot).add(oldRel.multiplyScalar(pendulumLength));
+      constrainToSphere(state, pendulumLength);
+      resetTrail();
+    });
+
+    window.addEventListener('keydown', (e) => {
+      if (e.code === 'Space') {
+        e.preventDefault();
+        isPaused = !isPaused;
+      } else if (e.key === 'r' || e.key === 'R') {
+        setPendulumFromXZ(initialXZ.x, initialXZ.y, true);
+      } else if (e.key === 'c' || e.key === 'C') {
+        randomizePendulum();
+      } else if (e.key === 't' || e.key === 'T') {
+        trailVisible = !trailVisible;
+        trailLine.visible = trailVisible;
+      }
+    });
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    // ----------------------------
+    // Public state
+    // ----------------------------
+    window.__3D_STATE__ = {};
+
+    function updatePublicState() {
+      const nearest = nearestMagnetIndexFromPosition(state.pos) + 1;
+      const speed = state.vel.length();
+      const simValid = [state.pos.x, state.pos.y, state.pos.z, state.vel.x, state.vel.y, state.vel.z].every(Number.isFinite);
+
+      window.__3D_STATE__ = {
+        magnetStrength: Number(magnetStrength.toFixed(1)),
+        damping: Number(damping.toFixed(2)),
+        pendulumLength: Number(pendulumLength.toFixed(1)),
+        bobPosition: {
+          x: Number(state.pos.x.toFixed(3)),
+          y: Number(state.pos.y.toFixed(3)),
+          z: Number(state.pos.z.toFixed(3))
+        },
+        bobSpeed: Number(speed.toFixed(4)),
+        nearestMagnet: nearest,
+        fractalProgress: Math.round(fractalProgress),
+        isPaused,
+        trailVisible,
+        frameCount,
+        simValid
+      };
+    }
+
+    function updateHUD() {
+      const nearest = nearestMagnetIndexFromPosition(state.pos);
+      hudMagnet.textContent = magnetStrength.toFixed(1);
+      hudDamping.textContent = damping.toFixed(2);
+      hudLength.textContent = pendulumLength.toFixed(1);
+      hudSpeed.textContent = state.vel.length().toFixed(3);
+      hudNearest.textContent = magnets[nearest].name;
+      hudFractal.textContent = String(Math.round(fractalProgress));
+      hudPaused.textContent = isPaused ? 'Paused' : 'Playing';
+    }
+
+    // ----------------------------
+    // Init
+    // ----------------------------
+    clearFractalImage();
+    setPendulumFromXZ(initialXZ.x, initialXZ.y, true);
+    labelMagnet.textContent = magnetStrength.toFixed(1);
+    labelDamping.textContent = damping.toFixed(2);
+    labelLength.textContent = pendulumLength.toFixed(1);
+    restartFractal();
+
+    // ----------------------------
+    // Animation loop
+    // ----------------------------
+    function animate() {
+      requestAnimationFrame(animate);
+      frameCount++;
+
+      controls.update();
+
+      if (!isPaused) {
+        for (let i = 0; i < substepsPerFrame; i++) {
+          rk4Step(state, dt);
+        }
+        addTrailPoint(state.pos);
+        updateTrailGeometry();
+        updateBobVisual();
+      }
+
+      if (fractalDirty || fractalRow < fractalCanvas.height) {
+        computeFractalRows(2);
+        if (fractalRow >= fractalCanvas.height) fractalDirty = false;
+      }
+
+      updateHUD();
+      updatePublicState(); // must update before rendering
+      renderer.render(scene, camera);
+    }
+
+    animate();
+  </script>
+</body>
+</html>

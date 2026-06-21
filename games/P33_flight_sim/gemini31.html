@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Flight Simulator</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #87CEEB;
+            font-family: monospace;
+        }
+        #hud {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            color: #0f0;
+            background: rgba(0, 0, 0, 0.5);
+            padding: 15px;
+            border-radius: 8px;
+            pointer-events: none;
+            font-size: 16px;
+            line-height: 1.5;
+            text-shadow: 1px 1px 2px black;
+        }
+        #stallWarning {
+            color: red;
+            font-weight: bold;
+            font-size: 24px;
+            display: none;
+            animation: blink 0.5s infinite;
+            margin-top: 10px;
+        }
+        @keyframes blink {
+            0% { opacity: 1; }
+            50% { opacity: 0; }
+            100% { opacity: 1; }
+        }
+        #controls-help {
+            position: absolute;
+            bottom: 20px;
+            right: 20px;
+            color: white;
+            background: rgba(0, 0, 0, 0.5);
+            padding: 10px;
+            border-radius: 8px;
+            pointer-events: none;
+            font-size: 12px;
+        }
+    </style>
+    <script type="importmap">
+    { "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+    } }
+    </script>
+</head>
+<body>
+    <div id="hud">
+        <div>Airspeed: <span id="airspeed">0</span> m/s</div>
+        <div>Altitude: <span id="altitude">0</span> m</div>
+        <div>Throttle: <span id="throttle">0</span>%</div>
+        <div>Heading: <span id="heading">0</span>°</div>
+        <div>VSI: <span id="vsi">0</span> m/s</div>
+        <div id="stallWarning">STALL</div>
+    </div>
+    <div id="controls-help">
+        W/S: Pitch Down/Up<br>
+        A/D: Roll Left/Right<br>
+        Q/E: Yaw Left/Right<br>
+        Shift/Ctrl(Z): Throttle Up/Down
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+
+        // --- Scene Setup ---
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x87CEEB);
+        scene.fog = new THREE.FogExp2(0x87CEEB, 0.0002);
+
+        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 20000);
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        document.body.appendChild(renderer.domElement);
+
+        // --- Lighting ---
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+        dirLight.position.set(1000, 2000, 1000);
+        dirLight.castShadow = true;
+        dirLight.shadow.camera.top = 200;
+        dirLight.shadow.camera.bottom = -200;
+        dirLight.shadow.camera.left = -200;
+        dirLight.shadow.camera.right = 200;
+        dirLight.shadow.camera.near = 100;
+        dirLight.shadow.camera.far = 4000;
+        dirLight.shadow.mapSize.width = 2048;
+        dirLight.shadow.mapSize.height = 2048;
+        scene.add(dirLight);
+
+        // --- Terrain Generation ---
+        function getTerrainHeight(x, z) {
+            return Math.sin(x / 200) * 20 + Math.cos(z / 200) * 20 + 25;
+        }
+
+        const terrainGeo = new THREE.PlaneGeometry(20000, 20000, 100, 100);
+        terrainGeo.rotateX(-Math.PI / 2);
+        const posAttr = terrainGeo.attributes.position;
+        const colors = [];
+        const colorLow = new THREE.Color(0x2d4c1e); // Green
+        const colorHigh = new THREE.Color(0x8b5a2b); // Brown
+
+        for (let i = 0; i < posAttr.count; i++) {
+            const x = posAttr.getX(i);
+            const z = posAttr.getZ(i);
+            const y = getTerrainHeight(x, z);
+            posAttr.setY(i, y);
+            
+            const alpha = THREE.MathUtils.clamp(y / 50, 0, 1);
+            const c = colorLow.clone().lerp(colorHigh, alpha);
+            colors.push(c.r, c.g, c.b);
+        }
+        terrainGeo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+        terrainGeo.computeVertexNormals();
+
+        const terrainMat = new THREE.MeshStandardMaterial({ 
+            vertexColors: true, 
+            flatShading: true,
+            roughness: 0.8
+        });
+        const terrain = new THREE.Mesh(terrainGeo, terrainMat);
+        terrain.receiveShadow = true;
+        scene.add(terrain);
+
+        // --- Airplane Construction ---
+        const planeGroup = new THREE.Group();
+
+        const bodyMat = new THREE.MeshStandardMaterial({ color: 0xffffff });
+        const wingMat = new THREE.MeshStandardMaterial({ color: 0x888888 });
+
+        // 机身 (Cylinder, radius 0.5, length 6, along Z)
+        const bodyGeo = new THREE.CylinderGeometry(0.5, 0.5, 6, 16);
+        bodyGeo.rotateX(Math.PI / 2);
+        const body = new THREE.Mesh(bodyGeo, bodyMat);
+        planeGroup.add(body);
+
+        // 机翼 (Box, 10 x 0.15 x 2)
+        const wingGeo = new THREE.BoxGeometry(10, 0.15, 2);
+        const wing = new THREE.Mesh(wingGeo, wingMat);
+        planeGroup.add(wing);
+
+        // 尾翼 (Box, 3 x 0.1 x 1)
+        const tailGeo = new THREE.BoxGeometry(3, 0.1, 1);
+        const tail = new THREE.Mesh(tailGeo, wingMat);
+        tail.position.set(0, 0, 2.5); // Back of plane (forward is -Z)
+        planeGroup.add(tail);
+
+        // 垂直尾翼 (Box, 0.1 x 1.5 x 1)
+        const vTailGeo = new THREE.BoxGeometry(0.1, 1.5, 1);
+        const vTail = new THREE.Mesh(vTailGeo, wingMat);
+        vTail.position.set(0, 0.75, 2.5);
+        planeGroup.add(vTail);
+
+        planeGroup.traverse(child => {
+            if (child.isMesh) {
+                child.castShadow = true;
+                child.receiveShadow = true;
+            }
+        });
+
+        scene.add(planeGroup);
+
+        // --- Physics & State Variables ---
+        const mass = 1000;
+        const S = 20;
+        const maxThrust = 5000;
+        let throttle = 0.5;
+        let velocity = new THREE.Vector3(0, 0, -50); // Initial speed 50m/s forward
+        planeGroup.position.set(0, 1000, 0); // Start at 1000m altitude
+
+        // --- Input Handling ---
+        const keys = { w:false, s:false, a:false, d:false, q:false, e:false, shift:false, ctrl:false };
+        
+        window.addEventListener('keydown', (e) => {
+            const key = e.key.toLowerCase();
+            if (keys.hasOwnProperty(key)) keys[key] = true;
+            if (e.key === 'Shift') keys.shift = true;
+            if (e.key === 'Control' || key === 'z') keys.ctrl = true;
+        });
+
+        window.addEventListener('keyup', (e) => {
+            const key = e.key.toLowerCase();
+            if (keys.hasOwnProperty(key)) keys[key] = false;
+            if (e.key === 'Shift') keys.shift = false;
+            if (e.key === 'Control' || key === 'z') keys.ctrl = false;
+        });
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // --- Main Loop ---
+        const clock = new THREE.Clock();
+
+        function animate() {
+            requestAnimationFrame(animate);
+            const dt = Math.min(clock.getDelta(), 0.1); // Cap dt to prevent physics explosion
+
+            // 1. Controls (Throttle & Kinematic Rotation)
+            if (keys.shift) throttle = Math.min(1.0, throttle + 0.02);
+            if (keys.ctrl) throttle = Math.max(0.0, throttle - 0.02);
+
+            const pitchRate = 2 * dt;
+            const rollRate = 3 * dt;
+            const yawRate = 1 * dt;
+
+            if (keys.w) planeGroup.rotateX(-pitchRate); // Pitch down
+            if (keys.s) planeGroup.rotateX(pitchRate);  // Pitch up
+            if (keys.a) planeGroup.rotateZ(rollRate);   // Roll left
+            if (keys.d) planeGroup.rotateZ(-rollRate);  // Roll right
+            if (keys.q) planeGroup.rotateY(yawRate);    // Yaw left
+            if (keys.e) planeGroup.rotateY(-yawRate);   // Yaw right
+
+            // 2. Aerodynamics & Physics
+            const altitude = planeGroup.position.y;
+            const rho = 1.225 * Math.exp(-altitude / 8500);
+            const v_mag = velocity.length();
+
+            // Local axes
+            const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(planeGroup.quaternion);
+            const up = new THREE.Vector3(0, 1, 0).applyQuaternion(planeGroup.quaternion);
+            const right = new THREE.Vector3(1, 0, 0).applyQuaternion(planeGroup.quaternion);
+
+            // Local velocity to calculate Angle of Attack
+            const v_loc = velocity.clone().applyQuaternion(planeGroup.quaternion.clone().invert());
+            const v_forward = -v_loc.z;
+            const v_up = v_loc.y;
+
+            let alpha = 0;
+            if (v_forward > 0.1) {
+                alpha = Math.atan2(v_up, v_forward);
+            }
+
+            // Lift Coefficient
+            let Cl = 2 * Math.PI * alpha;
+            Cl = THREE.MathUtils.clamp(Cl, -1.5, 1.5);
+
+            // Stall logic
+            const stallSpeed = Math.sqrt((2 * mass * 9.8) / (rho * S * 1.5));
+            const isStalling = v_mag < stallSpeed;
+
+            if (isStalling) {
+                Cl *= 0.1; // Drastic loss of lift
+            }
+
+            // Forces
+            const liftMag = 0.5 * Cl * rho * v_mag * v_mag * S;
+            const F_lift = up.clone().multiplyScalar(liftMag);
+
+            let Cd = 0.02 + (Cl * Cl) / (Math.PI * 5 * 0.8);
+            if (isStalling) Cd += 0.2; // Increased drag during stall
+            const dragMag = 0.5 * Cd * rho * v_mag * v_mag * S;
+            const F_drag = v_mag > 0.1 ? velocity.clone().normalize().multiplyScalar(-dragMag) : new THREE.Vector3();
+
+            // Lateral drag to stabilize flight (prevent infinite side-slip)
+            const v_side = v_loc.x;
+            const F_lat_mag = 0.5 * 1.0 * rho * v_side * Math.abs(v_side) * 10;
+            const F_lat = right.clone().multiplyScalar(-F_lat_mag);
+
+            const F_thrust = forward.clone().multiplyScalar(throttle * maxThrust);
+            const F_grav = new THREE.Vector3(0, -mass * 9.8, 0);
+
+            // Integration
+            const F_net = new THREE.Vector3().add(F_lift).add(F_drag).add(F_lat).add(F_thrust).add(F_grav);
+            const acc = F_net.divideScalar(mass);
+
+            velocity.add(acc.multiplyScalar(dt));
+            planeGroup.position.add(velocity.clone().multiplyScalar(dt));
+
+            // Ground Collision
+            const groundY = getTerrainHeight(planeGroup.position.x, planeGroup.position.z);
+            if (planeGroup.position.y < groundY + 0.5) {
+                planeGroup.position.y = groundY + 0.5;
+                velocity.set(0, 0, 0);
+                throttle = 0;
+            }
+
+            // 3. Camera Follow
+            const idealOffset = new THREE.Vector3(0, 3, 15);
+            idealOffset.applyQuaternion(planeGroup.quaternion);
+            idealOffset.add(planeGroup.position);
+
+            // Prevent camera from going underground
+            const camGroundY = getTerrainHeight(idealOffset.x, idealOffset.z);
+            if (idealOffset.y < camGroundY + 2) idealOffset.y = camGroundY + 2;
+
+            camera.position.lerp(idealOffset, 0.1);
+
+            const lookAtTarget = new THREE.Vector3(0, 0, -50);
+            lookAtTarget.applyQuaternion(planeGroup.quaternion);
+            lookAtTarget.add(planeGroup.position);
+            camera.lookAt(lookAtTarget);
+
+            // Update Directional Light position to follow plane (for consistent shadows)
+            dirLight.position.set(planeGroup.position.x + 1000, planeGroup.position.y + 2000, planeGroup.position.z + 1000);
+            dirLight.target = planeGroup;
+
+            // 4. HUD Update
+            let heading = Math.atan2(forward.x, -forward.z) * (180 / Math.PI);
+            if (heading < 0) heading += 360;
+
+            document.getElementById('airspeed').innerText = v_mag.toFixed(1);
+            document.getElementById('altitude').innerText = altitude.toFixed(1);
+            document.getElementById('throttle').innerText = (throttle * 100).toFixed(0);
+            document.getElementById('heading').innerText = heading.toFixed(0);
+            document.getElementById('vsi').innerText = velocity.y.toFixed(1);
+            document.getElementById('stallWarning').style.display = isStalling && altitude > groundY + 5 ? 'block' : 'none';
+
+            // 5. State Exposure
+            const euler = new THREE.Euler().setFromQuaternion(planeGroup.quaternion, 'YXZ');
+            window.__3D_STATE__ = {
+                position: { x: planeGroup.position.x, y: planeGroup.position.y, z: planeGroup.position.z },
+                rotation: { pitch: euler.x, yaw: euler.y, roll: euler.z },
+                airspeed: v_mag,
+                altitude: altitude,
+                throttle: throttle,
+                heading: heading,
+                verticalSpeed: velocity.y,
+                isStalling: isStalling,
+                liftForce: liftMag
+            };
+
+            renderer.render(scene, camera);
+        }
+
+        animate();
+    </script>
+</body>
+</html>

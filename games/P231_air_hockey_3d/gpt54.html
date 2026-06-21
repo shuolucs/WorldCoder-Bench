@@ -1,0 +1,619 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>3D Air Hockey - Three.js</title>
+  <style>
+    html, body {
+      margin: 0;
+      overflow: hidden;
+      background: #000;
+      font-family: Arial, sans-serif;
+    }
+    canvas {
+      display: block;
+    }
+    #hud {
+      position: absolute;
+      top: 14px;
+      left: 50%;
+      transform: translateX(-50%);
+      color: white;
+      font-size: 24px;
+      font-weight: bold;
+      background: rgba(0,0,0,0.35);
+      padding: 8px 16px;
+      border-radius: 10px;
+      z-index: 10;
+      user-select: none;
+    }
+    #debug {
+      position: absolute;
+      bottom: 12px;
+      left: 12px;
+      color: #fff;
+      font-size: 14px;
+      background: rgba(0,0,0,0.4);
+      padding: 8px 10px;
+      border-radius: 8px;
+      z-index: 10;
+      user-select: none;
+    }
+    #newGameBtn {
+      position: absolute;
+      top: 14px;
+      right: 14px;
+      z-index: 10;
+      padding: 10px 14px;
+      border: none;
+      border-radius: 8px;
+      background: #ffffff;
+      color: #111;
+      font-weight: bold;
+      cursor: pointer;
+    }
+    #newGameBtn:hover {
+      background: #eaeaea;
+    }
+    #overlay {
+      position: absolute;
+      inset: 0;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      flex-direction: column;
+      background: rgba(0,0,0,0.6);
+      color: white;
+      z-index: 20;
+      text-align: center;
+    }
+    #overlay h1 {
+      margin: 0;
+      font-size: 56px;
+      letter-spacing: 2px;
+    }
+    #overlay p {
+      margin: 12px 0 0;
+      font-size: 28px;
+    }
+    #info {
+      position: absolute;
+      bottom: 12px;
+      right: 12px;
+      z-index: 10;
+      color: #ddd;
+      font-size: 13px;
+      background: rgba(0,0,0,0.35);
+      padding: 8px 10px;
+      border-radius: 8px;
+      user-select: none;
+    }
+  </style>
+</head>
+<body>
+  <div id="hud">Player: 0 | AI: 0</div>
+  <button id="newGameBtn">New Game</button>
+  <div id="debug">Speed: 0.000</div>
+  <div id="info">Mouse: move paddle | Space: launch puck | R: reset</div>
+  <div id="overlay">
+    <h1>GAME OVER</h1>
+    <p id="winnerText"></p>
+  </div>
+
+  <script type="module">
+    import * as THREE from "https://unpkg.com/three@0.160.0/build/three.module.js";
+    import { GLTFLoader } from "https://unpkg.com/three@0.160.0/examples/jsm/loaders/GLTFLoader.js";
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0b1020);
+
+    const camera = new THREE.PerspectiveCamera(
+      55,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      100
+    );
+    camera.position.set(0, 12, 8);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.shadowMap.enabled = false;
+    document.body.appendChild(renderer.domElement);
+
+    // Lights
+    scene.add(new THREE.AmbientLight(0xffffff, 0.4));
+    const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+    dirLight.position.set(0, 10, 0);
+    scene.add(dirLight);
+
+    // Constants
+    const TABLE_WIDTH = 10;
+    const TABLE_LENGTH = 16;
+    const TABLE_HEIGHT = 0.3;
+    const SURFACE_Y = 0.15;
+    const WALL_HEIGHT = 0.5;
+    const WALL_THICKNESS = 0.3;
+    const GOAL_WIDTH = 3;
+    const HALF_GOAL = GOAL_WIDTH / 2;
+    const MAX_PUCK_SPEED = 0.3;
+    const PUCK_RADIUS = 0.4;
+    const PADDLE_RADIUS = 0.6;
+
+    // State
+    let playerScore = 0;
+    let aiScore = 0;
+    let gameOver = false;
+    let winner = '';
+    let goalPause = false;
+    let frameCount = 0;
+    let dragonLoaded = false;
+    let dragonModel = null;
+
+    // Root group
+    const tableGroup = new THREE.Group();
+    scene.add(tableGroup);
+
+    // Table base
+    const tableBase = new THREE.Mesh(
+      new THREE.BoxGeometry(TABLE_WIDTH, TABLE_HEIGHT, TABLE_LENGTH),
+      new THREE.MeshPhongMaterial({ color: 0x1a237e })
+    );
+    tableBase.position.set(0, TABLE_HEIGHT / 2 - 0.15, 0);
+    tableGroup.add(tableBase);
+
+    // Surface lines
+    const lineMat = new THREE.LineBasicMaterial({ color: 0xffffff });
+
+    function makeLine(points) {
+      const geom = new THREE.BufferGeometry().setFromPoints(points);
+      return new THREE.Line(geom, lineMat);
+    }
+
+    const lineY = SURFACE_Y + 0.01;
+    const halfW = TABLE_WIDTH / 2;
+    const halfL = TABLE_LENGTH / 2;
+
+    // Boundary rectangle
+    tableGroup.add(makeLine([
+      new THREE.Vector3(-halfW + 0.15, lineY, -halfL + 0.15),
+      new THREE.Vector3( halfW - 0.15, lineY, -halfL + 0.15),
+      new THREE.Vector3( halfW - 0.15, lineY,  halfL - 0.15),
+      new THREE.Vector3(-halfW + 0.15, lineY,  halfL - 0.15),
+      new THREE.Vector3(-halfW + 0.15, lineY, -halfL + 0.15),
+    ]));
+
+    // Center line
+    tableGroup.add(makeLine([
+      new THREE.Vector3(-halfW + 0.15, lineY, 0),
+      new THREE.Vector3( halfW - 0.15, lineY, 0),
+    ]));
+
+    // Center circle
+    {
+      const pts = [];
+      const r = 1.4;
+      for (let i = 0; i <= 64; i++) {
+        const a = (i / 64) * Math.PI * 2;
+        pts.push(new THREE.Vector3(Math.cos(a) * r, lineY, Math.sin(a) * r));
+      }
+      tableGroup.add(makeLine(pts));
+    }
+
+    // Goal marks
+    tableGroup.add(makeLine([
+      new THREE.Vector3(-HALF_GOAL, lineY, -halfL + 0.16),
+      new THREE.Vector3( HALF_GOAL, lineY, -halfL + 0.16),
+    ]));
+    tableGroup.add(makeLine([
+      new THREE.Vector3(-HALF_GOAL, lineY, halfL - 0.16),
+      new THREE.Vector3( HALF_GOAL, lineY, halfL - 0.16),
+    ]));
+
+    // Walls
+    const wallMat = new THREE.MeshPhongMaterial({ color: 0xe0e0e0 });
+
+    function addWall(w, h, d, x, y, z) {
+      const m = new THREE.Mesh(
+        new THREE.BoxGeometry(w, h, d),
+        wallMat
+      );
+      m.position.set(x, y, z);
+      tableGroup.add(m);
+      return m;
+    }
+
+    // Side walls
+    addWall(WALL_THICKNESS, WALL_HEIGHT, TABLE_LENGTH, -halfW + WALL_THICKNESS / 2, SURFACE_Y + WALL_HEIGHT / 2, 0);
+    addWall(WALL_THICKNESS, WALL_HEIGHT, TABLE_LENGTH,  halfW - WALL_THICKNESS / 2, SURFACE_Y + WALL_HEIGHT / 2, 0);
+
+    // End walls with goal openings
+    const endSegmentLen = (TABLE_WIDTH - GOAL_WIDTH) / 2;
+    const leftSegCenterX = -(GOAL_WIDTH / 2 + endSegmentLen / 2);
+    const rightSegCenterX = (GOAL_WIDTH / 2 + endSegmentLen / 2);
+
+    addWall(endSegmentLen, WALL_HEIGHT, WALL_THICKNESS, leftSegCenterX, SURFACE_Y + WALL_HEIGHT / 2, -halfL + WALL_THICKNESS / 2);
+    addWall(endSegmentLen, WALL_HEIGHT, WALL_THICKNESS, rightSegCenterX, SURFACE_Y + WALL_HEIGHT / 2, -halfL + WALL_THICKNESS / 2);
+    addWall(endSegmentLen, WALL_HEIGHT, WALL_THICKNESS, leftSegCenterX, SURFACE_Y + WALL_HEIGHT / 2,  halfL - WALL_THICKNESS / 2);
+    addWall(endSegmentLen, WALL_HEIGHT, WALL_THICKNESS, rightSegCenterX, SURFACE_Y + WALL_HEIGHT / 2,  halfL - WALL_THICKNESS / 2);
+
+    // Puck
+    const puck = new THREE.Mesh(
+      new THREE.CylinderGeometry(PUCK_RADIUS, PUCK_RADIUS, 0.15, 32),
+      new THREE.MeshPhongMaterial({ color: 0xff3333 })
+    );
+    puck.position.set(0, 0.225, 0);
+    scene.add(puck);
+
+    // Player paddle
+    const playerPaddle = new THREE.Mesh(
+      new THREE.CylinderGeometry(PADDLE_RADIUS, PADDLE_RADIUS, 0.2, 32),
+      new THREE.MeshPhongMaterial({ color: 0x33cc66 })
+    );
+    playerPaddle.position.set(0, 0.25, 5);
+    scene.add(playerPaddle);
+
+    // AI paddle
+    const aiPaddle = new THREE.Mesh(
+      new THREE.CylinderGeometry(PADDLE_RADIUS, PADDLE_RADIUS, 0.2, 32),
+      new THREE.MeshPhongMaterial({ color: 0xffdd33 })
+    );
+    aiPaddle.position.set(0, 0.25, -5);
+    scene.add(aiPaddle);
+
+    let puckVX = 0;
+    let puckVZ = 0;
+    let prevPlayerPos = new THREE.Vector3().copy(playerPaddle.position);
+    let prevAIPos = new THREE.Vector3().copy(aiPaddle.position);
+    let playerVel = new THREE.Vector2(0, 0);
+    let aiVel = new THREE.Vector2(0, 0);
+
+    // Decorative dragon
+    const loader = new GLTFLoader();
+    loader.load(
+      'DragonAttenuation.glb',
+      (gltf) => {
+        dragonModel = gltf.scene;
+        const box = new THREE.Box3().setFromObject(dragonModel);
+        const size = new THREE.Vector3();
+        box.getSize(size);
+        const maxDim = Math.max(size.x, size.y, size.z) || 1;
+        const scale = 1.5 / maxDim;
+        dragonModel.scale.setScalar(scale);
+        dragonModel.position.set(5, 3, 0);
+        scene.add(dragonModel);
+        dragonLoaded = true;
+      },
+      undefined,
+      (err) => {
+        console.warn('Failed to load DragonAttenuation.glb:', err);
+      }
+    );
+
+    // Mouse interaction
+    const raycaster = new THREE.Raycaster();
+    const mouse = new THREE.Vector2();
+    const tablePlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -SURFACE_Y);
+    const intersectPoint = new THREE.Vector3();
+
+    function clamp(value, min, max) {
+      return Math.max(min, Math.min(max, value));
+    }
+
+    function clampPlayerPaddle() {
+      playerPaddle.position.x = clamp(playerPaddle.position.x, -4.1, 4.1);
+      playerPaddle.position.z = clamp(playerPaddle.position.z, 0.6, 7.2);
+    }
+
+    function clampAIPaddle() {
+      aiPaddle.position.x = clamp(aiPaddle.position.x, -4.1, 4.1);
+      aiPaddle.position.z = clamp(aiPaddle.position.z, -7.2, -0.6);
+    }
+
+    window.addEventListener('mousemove', (e) => {
+      mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
+      mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+
+      raycaster.setFromCamera(mouse, camera);
+      if (raycaster.ray.intersectPlane(tablePlane, intersectPoint)) {
+        playerPaddle.position.x = clamp(intersectPoint.x, -4.1, 4.1);
+        playerPaddle.position.z = clamp(intersectPoint.z, 0.6, 7.2);
+      }
+    });
+
+    // UI
+    const hud = document.getElementById('hud');
+    const debug = document.getElementById('debug');
+    const overlay = document.getElementById('overlay');
+    const winnerText = document.getElementById('winnerText');
+    const newGameBtn = document.getElementById('newGameBtn');
+
+    function updateHUD() {
+      hud.textContent = `Player: ${playerScore} | AI: ${aiScore}`;
+    }
+
+    function updateOverlay() {
+      if (gameOver) {
+        overlay.style.display = 'flex';
+        winnerText.textContent = winner === 'player' ? 'Player Wins!' : 'AI Wins!';
+      } else {
+        overlay.style.display = 'none';
+        winnerText.textContent = '';
+      }
+    }
+
+    function resetPuckAndPaddles() {
+      puck.position.set(0, 0.225, 0);
+      puckVX = 0;
+      puckVZ = 0;
+
+      playerPaddle.position.set(0, 0.25, 5);
+      aiPaddle.position.set(0, 0.25, -5);
+
+      prevPlayerPos.copy(playerPaddle.position);
+      prevAIPos.copy(aiPaddle.position);
+      playerVel.set(0, 0);
+      aiVel.set(0, 0);
+    }
+
+    function fullReset() {
+      playerScore = 0;
+      aiScore = 0;
+      gameOver = false;
+      winner = '';
+      goalPause = false;
+      resetPuckAndPaddles();
+      updateHUD();
+      updateOverlay();
+    }
+
+    function launchPuck() {
+      const speed = Math.hypot(puckVX, puckVZ);
+      if (speed < 0.01 && !gameOver && !goalPause) {
+        const angle = (Math.random() * 1.0 - 0.5); // around straight toward AI side
+        puckVX = Math.sin(angle) * 0.15;
+        puckVZ = -Math.cos(angle) * 0.15;
+      }
+    }
+
+    newGameBtn.addEventListener('click', fullReset);
+
+    window.addEventListener('keydown', (e) => {
+      if (e.code === 'KeyR') fullReset();
+      if (e.code === 'Space') {
+        e.preventDefault();
+        launchPuck();
+      }
+    });
+
+    function handlePaddleCollision(paddle, paddleVelocity) {
+      const dx = puck.position.x - paddle.position.x;
+      const dz = puck.position.z - paddle.position.z;
+      const dist = Math.hypot(dx, dz);
+      const minDist = PUCK_RADIUS + PADDLE_RADIUS;
+
+      if (dist < minDist && dist > 0.0001) {
+        const nx = dx / dist;
+        const nz = dz / dist;
+
+        // push puck out to prevent sticking
+        const overlap = minDist - dist;
+        puck.position.x += nx * overlap;
+        puck.position.z += nz * overlap;
+
+        const relDot = puckVX * nx + puckVZ * nz;
+        if (relDot < 0) {
+          puckVX -= 2 * relDot * nx;
+          puckVZ -= 2 * relDot * nz;
+        } else {
+          // If moving away but overlapping, still impart impulse
+          puckVX += nx * 0.02;
+          puckVZ += nz * 0.02;
+        }
+
+        puckVX += paddleVelocity.x * 0.35;
+        puckVZ += paddleVelocity.y * 0.35;
+
+        const speed = Math.hypot(puckVX, puckVZ);
+        if (speed > MAX_PUCK_SPEED) {
+          puckVX = (puckVX / speed) * MAX_PUCK_SPEED;
+          puckVZ = (puckVZ / speed) * MAX_PUCK_SPEED;
+        }
+      }
+    }
+
+    function scoreGoal(side) {
+      if (goalPause || gameOver) return;
+
+      if (side === 'player') playerScore++;
+      if (side === 'ai') aiScore++;
+
+      updateHUD();
+
+      if (playerScore >= 5 || aiScore >= 5) {
+        gameOver = true;
+        winner = playerScore >= 5 ? 'player' : 'ai';
+        updateOverlay();
+        puckVX = 0;
+        puckVZ = 0;
+        return;
+      }
+
+      goalPause = true;
+      puckVX = 0;
+      puckVZ = 0;
+
+      setTimeout(() => {
+        resetPuckAndPaddles();
+        goalPause = false;
+      }, 1000);
+    }
+
+    // Table visuals around play field
+    const floor = new THREE.Mesh(
+      new THREE.PlaneGeometry(40, 40),
+      new THREE.MeshPhongMaterial({ color: 0x202020, side: THREE.DoubleSide })
+    );
+    floor.rotation.x = -Math.PI / 2;
+    floor.position.y = -0.001;
+    scene.add(floor);
+
+    // Exposed state
+    window.__3D_STATE__ = {
+      playerScore: 0,
+      aiScore: 0,
+      puckX: 0,
+      puckZ: 0,
+      puckVX: 0,
+      puckVZ: 0,
+      puckSpeed: 0,
+      playerPaddleX: 0,
+      playerPaddleZ: 5,
+      aiPaddleX: 0,
+      aiPaddleZ: -5,
+      gameOver: false,
+      winner: '',
+      goalPause: false,
+      dragonLoaded: false,
+      dragonRotationY: 0,
+      frameCount: 0,
+      maxPuckSpeed: 0.3,
+      tableWidth: 10,
+      tableLength: 16
+    };
+
+    function updateState() {
+      const speed = Math.hypot(puckVX, puckVZ);
+      window.__3D_STATE__.playerScore = playerScore;
+      window.__3D_STATE__.aiScore = aiScore;
+      window.__3D_STATE__.puckX = puck.position.x;
+      window.__3D_STATE__.puckZ = puck.position.z;
+      window.__3D_STATE__.puckVX = puckVX;
+      window.__3D_STATE__.puckVZ = puckVZ;
+      window.__3D_STATE__.puckSpeed = speed;
+      window.__3D_STATE__.playerPaddleX = playerPaddle.position.x;
+      window.__3D_STATE__.playerPaddleZ = playerPaddle.position.z;
+      window.__3D_STATE__.aiPaddleX = aiPaddle.position.x;
+      window.__3D_STATE__.aiPaddleZ = aiPaddle.position.z;
+      window.__3D_STATE__.gameOver = gameOver;
+      window.__3D_STATE__.winner = winner;
+      window.__3D_STATE__.goalPause = goalPause;
+      window.__3D_STATE__.dragonLoaded = dragonLoaded;
+      window.__3D_STATE__.dragonRotationY = dragonModel ? dragonModel.rotation.y : 0;
+      window.__3D_STATE__.frameCount = frameCount;
+      window.__3D_STATE__.maxPuckSpeed = MAX_PUCK_SPEED;
+      window.__3D_STATE__.tableWidth = TABLE_WIDTH;
+      window.__3D_STATE__.tableLength = TABLE_LENGTH;
+    }
+
+    function animate() {
+      requestAnimationFrame(animate);
+      frameCount++;
+
+      // Decorative dragon
+      if (dragonModel) {
+        dragonModel.rotation.y += 0.01;
+        dragonModel.position.y = 3 + Math.sin(frameCount * 0.03) * 0.15;
+      }
+
+      // Track paddle velocities
+      playerVel.set(
+        playerPaddle.position.x - prevPlayerPos.x,
+        playerPaddle.position.z - prevPlayerPos.z
+      );
+
+      // AI logic
+      if (!gameOver) {
+        aiPaddle.position.x = THREE.MathUtils.lerp(aiPaddle.position.x, clamp(puck.position.x, -4.1, 4.1), 0.03);
+
+        const targetZ = puck.position.z < 0 ? clamp(puck.position.z, -7.2, -0.6) : -5;
+        aiPaddle.position.z = THREE.MathUtils.lerp(aiPaddle.position.z, targetZ, 0.03);
+        clampAIPaddle();
+      }
+
+      aiVel.set(
+        aiPaddle.position.x - prevAIPos.x,
+        aiPaddle.position.z - prevAIPos.z
+      );
+
+      // Physics
+      if (!goalPause && !gameOver) {
+        puck.position.x += puckVX;
+        puck.position.z += puckVZ;
+
+        puckVX *= 0.998;
+        puckVZ *= 0.998;
+
+        // Side wall bounce
+        if (puck.position.x < -4.7) {
+          puck.position.x = -4.7;
+          puckVX = Math.abs(puckVX) * 0.9;
+        } else if (puck.position.x > 4.7) {
+          puck.position.x = 4.7;
+          puckVX = -Math.abs(puckVX) * 0.9;
+        }
+
+        // End wall bounce except goal opening
+        if (puck.position.z < -7.7 && Math.abs(puck.position.x) >= 1.5) {
+          puck.position.z = -7.7;
+          puckVZ = Math.abs(puckVZ) * 0.9;
+        } else if (puck.position.z > 7.7 && Math.abs(puck.position.x) >= 1.5) {
+          puck.position.z = 7.7;
+          puckVZ = -Math.abs(puckVZ) * 0.9;
+        }
+
+        // Paddle collisions
+        handlePaddleCollision(playerPaddle, playerVel);
+        handlePaddleCollision(aiPaddle, aiVel);
+
+        // Speed cap
+        const speed = Math.hypot(puckVX, puckVZ);
+        if (speed > MAX_PUCK_SPEED) {
+          puckVX = (puckVX / speed) * MAX_PUCK_SPEED;
+          puckVZ = (puckVZ / speed) * MAX_PUCK_SPEED;
+        }
+
+        // Stop tiny drift
+        if (Math.hypot(puckVX, puckVZ) < 0.0005) {
+          puckVX = 0;
+          puckVZ = 0;
+        }
+
+        // Goals
+        if (puck.position.z < -8) {
+          scoreGoal('player');
+        } else if (puck.position.z > 8) {
+          scoreGoal('ai');
+        }
+      }
+
+      puck.position.y = 0.225;
+      playerPaddle.position.y = 0.25;
+      aiPaddle.position.y = 0.25;
+      clampPlayerPaddle();
+      clampAIPaddle();
+
+      prevPlayerPos.copy(playerPaddle.position);
+      prevAIPos.copy(aiPaddle.position);
+
+      debug.textContent = `Speed: ${Math.hypot(puckVX, puckVZ).toFixed(3)}`;
+
+      updateState();
+      renderer.render(scene, camera);
+    }
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    updateHUD();
+    updateOverlay();
+    updateState();
+    animate();
+  </script>
+</body>
+</html>

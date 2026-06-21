@@ -1,0 +1,555 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Bowling Game</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #000;
+            font-family: monospace;
+            user-select: none;
+        }
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+        }
+        #hud {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(0, 0, 0, 0.7);
+            color: white;
+            padding: 15px;
+            border-radius: 8px;
+            pointer-events: none;
+            font-size: 14px;
+            line-height: 1.5;
+            border: 1px solid #444;
+        }
+        #notification {
+            position: absolute;
+            top: 30%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            font-size: 48px;
+            font-weight: bold;
+            color: #FFD700;
+            text-shadow: 2px 2px 4px #000;
+            opacity: 0;
+            transition: opacity 0.2s;
+            pointer-events: none;
+            z-index: 10;
+        }
+        .controls-help {
+            margin-top: 10px;
+            font-size: 12px;
+            color: #aaa;
+            border-top: 1px solid #444;
+            padding-top: 10px;
+        }
+    </style>
+    <!-- Import maps polyfill -->
+    <script async src="https://unpkg.com/es-module-shims@1.8.0/dist/es-module-shims.js"></script>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+    <!-- Cannon.js -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/cannon.js/0.6.2/cannon.min.js"></script>
+</head>
+<body>
+    <div id="canvas-container"></div>
+    
+    <div id="hud">
+        <div>Frame: <span id="frameDisplay">1</span>/3</div>
+        <div>Throw: <span id="throwDisplay">1</span>/2</div>
+        <div>Pins This Frame: <span id="pinsDisplay">0</span></div>
+        <div>Total Score: <span id="scoreDisplay">0</span></div>
+        <br>
+        <div>Power: <span id="powerDisplay">15</span></div>
+        <div>Spin: <span id="spinDisplay">0</span></div>
+        <div>Time Scale: <span id="timeDisplay">1.0</span>x <span id="pauseDisplay"></span></div>
+        
+        <div class="controls-help">
+            A/D: Move Ball<br>
+            W/S: Adjust Power<br>
+            Q/E: Adjust Spin<br>
+            SPACE: Throw<br>
+            T: Toggle Time Scale<br>
+            P: Pause/Unpause<br>
+            R: Reset Frame
+        </div>
+    </div>
+
+    <div id="notification"></div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+        // --- State Management ---
+        window.__3D_STATE__ = {
+            ballPosition: { x: 0, y: 0.55, z: 4 },
+            ballThrown: false,
+            throwPower: 15,
+            spinValue: 0,
+            timeScale: 1.0,
+            paused: false,
+            pinsDown: 0,
+            currentFrame: 1,
+            currentThrow: 1,
+            totalScore: 0,
+            isStrike: false,
+            isSpare: false,
+            pinStates: Array(10).fill(true),
+            trophyLoaded: false,
+            gameOver: false,
+            gutterBall: false
+        };
+
+        const state = window.__3D_STATE__;
+        let throwStartTime = 0;
+
+        // --- DOM Elements ---
+        const els = {
+            frame: document.getElementById('frameDisplay'),
+            throw: document.getElementById('throwDisplay'),
+            pins: document.getElementById('pinsDisplay'),
+            score: document.getElementById('scoreDisplay'),
+            power: document.getElementById('powerDisplay'),
+            spin: document.getElementById('spinDisplay'),
+            time: document.getElementById('timeDisplay'),
+            pause: document.getElementById('pauseDisplay'),
+            notification: document.getElementById('notification')
+        };
+
+        // --- Three.js Setup ---
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x111111);
+
+        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+        camera.position.set(0, 8, 18);
+        camera.lookAt(0, 0, -15);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        container.appendChild(renderer.domElement);
+
+        // --- Lighting ---
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+        dirLight.position.set(5, 15, 10);
+        dirLight.castShadow = true;
+        dirLight.shadow.camera.top = 20;
+        dirLight.shadow.camera.bottom = -30;
+        dirLight.shadow.camera.left = -10;
+        dirLight.shadow.camera.right = 10;
+        dirLight.shadow.mapSize.width = 2048;
+        dirLight.shadow.mapSize.height = 2048;
+        scene.add(dirLight);
+
+        // --- Cannon.js Setup ---
+        const world = new CANNON.World();
+        world.gravity.set(0, -9.81, 0);
+        world.broadphase = new CANNON.NaiveBroadphase();
+        world.solver.iterations = 20;
+
+        const physicsMaterial = new CANNON.Material("standard");
+        const physicsContactMaterial = new CANNON.ContactMaterial(
+            physicsMaterial,
+            physicsMaterial,
+            { friction: 0.1, restitution: 0.3 }
+        );
+        world.addContactMaterial(physicsContactMaterial);
+
+        // --- Environment ---
+        // Lane
+        const laneGeo = new THREE.BoxGeometry(3.5, 0.2, 30);
+        const laneMat = new THREE.MeshStandardMaterial({ color: 0xC4A46C, roughness: 0.4 });
+        const laneMesh = new THREE.Mesh(laneGeo, laneMat);
+        laneMesh.position.set(0, 0, -10);
+        laneMesh.receiveShadow = true;
+        scene.add(laneMesh);
+
+        const laneShape = new CANNON.Box(new CANNON.Vec3(1.75, 0.1, 15));
+        const laneBody = new CANNON.Body({ mass: 0, material: physicsMaterial });
+        laneBody.addShape(laneShape);
+        laneBody.position.copy(laneMesh.position);
+        world.addBody(laneBody);
+
+        // Gutters
+        const gutterGeo = new THREE.BoxGeometry(0.5, 0.1, 30);
+        const gutterMat = new THREE.MeshStandardMaterial({ color: 0x222222 });
+        
+        const leftGutter = new THREE.Mesh(gutterGeo, gutterMat);
+        leftGutter.position.set(-2.0, -0.05, -10);
+        leftGutter.receiveShadow = true;
+        scene.add(leftGutter);
+        
+        const rightGutter = new THREE.Mesh(gutterGeo, gutterMat);
+        rightGutter.position.set(2.0, -0.05, -10);
+        rightGutter.receiveShadow = true;
+        scene.add(rightGutter);
+
+        // Floor (catch-all)
+        const floorShape = new CANNON.Plane();
+        const floorBody = new CANNON.Body({ mass: 0 });
+        floorBody.addShape(floorShape);
+        floorBody.quaternion.setFromAxisAngle(new CANNON.Vec3(1, 0, 0), -Math.PI / 2);
+        floorBody.position.set(0, -1, 0);
+        world.addBody(floorBody);
+
+        // --- Trophy ---
+        const pedestalGeo = new THREE.BoxGeometry(1, 1, 1);
+        const pedestalMat = new THREE.MeshStandardMaterial({ color: 0xFFD700, metalness: 0.8, roughness: 0.2 });
+        const pedestal = new THREE.Mesh(pedestalGeo, pedestalMat);
+        pedestal.position.set(4, 0.5, 5);
+        pedestal.castShadow = true;
+        pedestal.receiveShadow = true;
+        scene.add(pedestal);
+
+        const loader = new GLTFLoader();
+        loader.load('https://unpkg.com/three@0.160.0/examples/models/gltf/Corset/glTF/Corset.gltf', (gltf) => {
+            const model = gltf.scene;
+            
+            // Calculate bounding box to scale to ~1 unit
+            const box = new THREE.Box3().setFromObject(model);
+            const size = box.getSize(new THREE.Vector3());
+            const scale = 1 / size.y;
+            
+            model.scale.set(scale, scale, scale);
+            
+            // Center bottom of model to pedestal top
+            box.setFromObject(model);
+            const center = box.getCenter(new THREE.Vector3());
+            model.position.set(4 - center.x, 1 - box.min.y, 5 - center.z);
+            
+            model.traverse((child) => {
+                if (child.isMesh) {
+                    child.castShadow = true;
+                    child.receiveShadow = true;
+                }
+            });
+            
+            scene.add(model);
+            state.trophyLoaded = true;
+        });
+
+        // --- Pins ---
+        const pins = [];
+        const pinGeo = new THREE.CylinderGeometry(0.1, 0.15, 0.6, 16);
+        const pinMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.5 });
+        
+        // Cannon cylinder is along Z, need to rotate to Y
+        const pinShape = new CANNON.Cylinder(0.1, 0.15, 0.6, 16);
+        const pinShapeQuat = new CANNON.Quaternion();
+        pinShapeQuat.setFromAxisAngle(new CANNON.Vec3(1, 0, 0), -Math.PI / 2);
+
+        const pinSpacing = 0.4;
+        const startZ = -22;
+        let pinIdx = 0;
+
+        for (let row = 0; row < 4; row++) {
+            for (let col = 0; col <= row; col++) {
+                const x = (col - row / 2) * pinSpacing;
+                const z = startZ - row * pinSpacing * 0.866;
+                const y = 0.3 + 0.1; // half height + lane height
+
+                const mesh = new THREE.Mesh(pinGeo, pinMat);
+                mesh.castShadow = true;
+                mesh.receiveShadow = true;
+                scene.add(mesh);
+
+                const body = new CANNON.Body({ mass: 0.5, material: physicsMaterial });
+                body.addShape(pinShape, new CANNON.Vec3(0, 0, 0), pinShapeQuat);
+                body.position.set(x, y, z);
+                // Add slight damping
+                body.linearDamping = 0.1;
+                body.angularDamping = 0.1;
+                world.addBody(body);
+
+                pins.push({
+                    mesh,
+                    body,
+                    initialPos: new CANNON.Vec3(x, y, z),
+                    initialQuat: new CANNON.Quaternion(),
+                    index: pinIdx
+                });
+                pinIdx++;
+            }
+        }
+
+        // --- Ball ---
+        const ballGeo = new THREE.SphereGeometry(0.35, 32, 32);
+        const ballMat = new THREE.MeshStandardMaterial({ color: 0x222244, roughness: 0.2, metalness: 0.1 });
+        const ballMesh = new THREE.Mesh(ballGeo, ballMat);
+        ballMesh.castShadow = true;
+        ballMesh.receiveShadow = true;
+        scene.add(ballMesh);
+
+        const ballShape = new CANNON.Sphere(0.35);
+        const ballBody = new CANNON.Body({ mass: 5, material: physicsMaterial });
+        ballBody.addShape(ballShape);
+        ballBody.linearDamping = 0.1;
+        ballBody.angularDamping = 0.1;
+        world.addBody(ballBody);
+
+        function resetBall() {
+            state.ballPosition = { x: 0, y: 0.55, z: 4 };
+            ballBody.position.set(state.ballPosition.x, state.ballPosition.y, state.ballPosition.z);
+            ballBody.velocity.set(0, 0, 0);
+            ballBody.angularVelocity.set(0, 0, 0);
+            ballBody.quaternion.set(0, 0, 0, 1);
+            state.ballThrown = false;
+            state.gutterBall = false;
+        }
+        resetBall();
+
+        // --- Game Logic ---
+        function showNotification(text) {
+            els.notification.innerText = text;
+            els.notification.style.opacity = 1;
+            setTimeout(() => {
+                els.notification.style.opacity = 0;
+            }, 2000);
+        }
+
+        function resetFrame(fullReset = false) {
+            if (fullReset) {
+                state.pinsDown = 0;
+                state.pinStates.fill(true);
+            }
+            
+            pins.forEach((pin, i) => {
+                if (fullReset || state.pinStates[i]) {
+                    pin.body.position.copy(pin.initialPos);
+                    pin.body.velocity.set(0, 0, 0);
+                    pin.body.angularVelocity.set(0, 0, 0);
+                    pin.body.quaternion.copy(pin.initialQuat);
+                    pin.mesh.visible = true;
+                    // Re-add to world if removed
+                    if (pin.body.world === null) {
+                        world.addBody(pin.body);
+                    }
+                }
+            });
+            resetBall();
+        }
+
+        function removeKnockedPins() {
+            pins.forEach((pin, i) => {
+                if (!state.pinStates[i]) {
+                    pin.mesh.visible = false;
+                    if (pin.body.world !== null) {
+                        world.removeBody(pin.body);
+                    }
+                }
+            });
+        }
+
+        function processThrowEnd() {
+            if (state.gameOver) return;
+
+            let newlyKnocked = 0;
+            const upVector = new THREE.Vector3(0, 1, 0);
+
+            pins.forEach((pin, i) => {
+                if (state.pinStates[i]) {
+                    const pinUp = new THREE.Vector3(0, 1, 0).applyQuaternion(pin.mesh.quaternion);
+                    if (pinUp.dot(upVector) < 0.707 || pin.body.position.y < 0) {
+                        state.pinStates[i] = false;
+                        newlyKnocked++;
+                    }
+                }
+            });
+
+            state.pinsDown += newlyKnocked;
+
+            if (state.currentThrow === 1) {
+                if (state.pinsDown === 10) {
+                    state.isStrike = true;
+                    showNotification("STRIKE!");
+                    state.totalScore += 10;
+                    setTimeout(nextFrame, 2000);
+                } else {
+                    state.currentThrow = 2;
+                    setTimeout(() => {
+                        removeKnockedPins();
+                        resetBall();
+                    }, 1000);
+                }
+            } else {
+                if (state.pinsDown === 10) {
+                    state.isSpare = true;
+                    showNotification("SPARE!");
+                    state.totalScore += 10;
+                } else {
+                    state.totalScore += state.pinsDown;
+                }
+                setTimeout(nextFrame, 2000);
+            }
+        }
+
+        function nextFrame() {
+            state.currentFrame++;
+            if (state.currentFrame > 3) {
+                state.gameOver = true;
+                showNotification("GAME OVER");
+            } else {
+                state.currentThrow = 1;
+                state.isStrike = false;
+                state.isSpare = false;
+                resetFrame(true);
+            }
+        }
+
+        // --- Input Handling ---
+        window.addEventListener('keydown', (e) => {
+            if (state.gameOver) return;
+
+            switch (e.code) {
+                case 'KeyA':
+                case 'ArrowLeft':
+                    if (!state.ballThrown) {
+                        state.ballPosition.x = Math.max(-1.5, state.ballPosition.x - 0.1);
+                        ballBody.position.x = state.ballPosition.x;
+                    }
+                    break;
+                case 'KeyD':
+                case 'ArrowRight':
+                    if (!state.ballThrown) {
+                        state.ballPosition.x = Math.min(1.5, state.ballPosition.x + 0.1);
+                        ballBody.position.x = state.ballPosition.x;
+                    }
+                    break;
+                case 'KeyW':
+                case 'ArrowUp':
+                    if (!state.ballThrown) state.throwPower = Math.min(25, state.throwPower + 1);
+                    break;
+                case 'KeyS':
+                case 'ArrowDown':
+                    if (!state.ballThrown) state.throwPower = Math.max(5, state.throwPower - 1);
+                    break;
+                case 'KeyQ':
+                    if (!state.ballThrown) state.spinValue = Math.max(-3, state.spinValue - 1);
+                    break;
+                case 'KeyE':
+                    if (!state.ballThrown) state.spinValue = Math.min(3, state.spinValue + 1);
+                    break;
+                case 'Space':
+                    if (!state.ballThrown) {
+                        state.ballThrown = true;
+                        ballBody.velocity.set(0, 0, -state.throwPower);
+                        throwStartTime = performance.now();
+                    }
+                    break;
+                case 'KeyT':
+                    if (state.timeScale === 1.0) state.timeScale = 0.25;
+                    else if (state.timeScale === 0.25) state.timeScale = 0.1;
+                    else state.timeScale = 1.0;
+                    break;
+                case 'KeyP':
+                    state.paused = !state.paused;
+                    break;
+                case 'KeyR':
+                    // Reset current frame as requested
+                    state.pinsDown = 0;
+                    state.totalScore -= state.pinsDown; // naive rollback for simple reset
+                    resetFrame(true);
+                    break;
+            }
+        });
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // --- Animation Loop ---
+        let lastTime = performance.now();
+
+        function updateHUD() {
+            els.frame.innerText = state.currentFrame;
+            els.throw.innerText = state.currentThrow;
+            els.pins.innerText = state.pinsDown;
+            els.score.innerText = state.totalScore;
+            els.power.innerText = state.throwPower;
+            els.spin.innerText = state.spinValue;
+            els.time.innerText = state.timeScale;
+            els.pause.innerText = state.paused ? "(PAUSED)" : "";
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const now = performance.now();
+            let dt = (now - lastTime) / 1000;
+            lastTime = now;
+
+            if (!state.paused) {
+                const physicsDt = dt * state.timeScale;
+                
+                // Cap dt to prevent explosions on lag
+                if (physicsDt > 0) {
+                    world.step(1 / 60, physicsDt, 3);
+                }
+
+                // Sync meshes
+                ballMesh.position.copy(ballBody.position);
+                ballMesh.quaternion.copy(ballBody.quaternion);
+
+                pins.forEach(pin => {
+                    pin.mesh.position.copy(pin.body.position);
+                    pin.mesh.quaternion.copy(pin.body.quaternion);
+                });
+
+                // Update state ball position
+                state.ballPosition.x = ballBody.position.x;
+                state.ballPosition.y = ballBody.position.y;
+                state.ballPosition.z = ballBody.position.z;
+
+                if (state.ballThrown) {
+                    // Apply spin gradually
+                    if (!state.gutterBall) {
+                        ballBody.velocity.x += state.spinValue * 2.0 * physicsDt;
+                    }
+
+                    // Check gutter
+                    if (Math.abs(ballBody.position.x) > 1.75 && !state.gutterBall) {
+                        state.gutterBall = true;
+                    }
+
+                    // Check throw end
+                    const timeSinceThrow = (now - throwStartTime) / 1000;
+                    if (ballBody.position.z < -25 || timeSinceThrow > 5) {
+                        // Prevent multiple triggers
+                        if (ballBody.velocity.z !== 0) {
+                            ballBody.velocity.set(0,0,0);
+                            processThrowEnd();
+                        }
+                    }
+                }
+            }
+
+            updateHUD();
+            renderer.render(scene, camera);
+        }
+
+        animate();
+    </script>
+</body>
+</html>

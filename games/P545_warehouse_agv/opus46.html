@@ -1,0 +1,884 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3D Warehouse AGV Simulation</title>
+<script type="importmap">
+{ "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+} }
+</script>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { overflow: hidden; background: #2a2a3a; font-family: 'Segoe UI', Arial, sans-serif; }
+canvas { display: block; }
+#hud {
+    position: absolute; top: 10px; left: 10px;
+    background: rgba(0,0,0,0.75); color: #eee; padding: 15px 20px;
+    border-radius: 10px; font-size: 14px; line-height: 1.8;
+    min-width: 220px; backdrop-filter: blur(5px);
+    border: 1px solid rgba(255,255,255,0.1);
+}
+#hud h3 { color: #88aaff; margin-bottom: 5px; font-size: 16px; }
+#hud span { color: #ffdd66; font-weight: bold; }
+#controls {
+    position: absolute; bottom: 10px; left: 10px;
+    background: rgba(0,0,0,0.75); color: #eee; padding: 15px 20px;
+    border-radius: 10px; font-size: 13px; line-height: 2.2;
+    backdrop-filter: blur(5px); border: 1px solid rgba(255,255,255,0.1);
+}
+#controls label { display: block; }
+#controls input[type="range"] { width: 160px; vertical-align: middle; margin-left: 8px; }
+#keys {
+    position: absolute; bottom: 10px; right: 10px;
+    background: rgba(0,0,0,0.75); color: #aaa; padding: 12px 16px;
+    border-radius: 10px; font-size: 12px; line-height: 1.8;
+    backdrop-filter: blur(5px); border: 1px solid rgba(255,255,255,0.1);
+}
+#keys kbd { background: #444; padding: 2px 6px; border-radius: 3px; color: #fff; }
+</style>
+</head>
+<body>
+
+<div id="hud">
+    <h3>🏭 Warehouse AGV Sim</h3>
+    Active AGVs: <span id="hud-agvs">4</span><br>
+    Deliveries: <span id="hud-deliveries">0</span><br>
+    Cargo waiting: <span id="hud-cargo">0</span><br>
+    Collisions avoided: <span id="hud-avoided">0</span><br>
+    Status: <span id="hud-paused">Playing</span><br>
+    Model loaded: <span id="hud-model">No</span>
+</div>
+
+<div id="controls">
+    <label>AGV Speed: <input type="range" id="slider-agv-speed" min="1" max="8" step="0.5" value="3"> <span id="speed-val">3</span></label>
+    <label>Active AGVs: <input type="range" id="slider-agv-count" min="1" max="4" step="1" value="4"> <span id="count-val">4</span></label>
+</div>
+
+<div id="keys">
+    <kbd>Space</kbd> Pause/Play<br>
+    <kbd>R</kbd> Reset<br>
+    <kbd>S</kbd> Step (when paused)
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+// ============ GLOBALS ============
+const GRID_SIZE = 20;
+const CELL_SIZE = 2;
+const TOTAL_SIZE = GRID_SIZE * CELL_SIZE;
+const AGV_COLORS = [0xff4444, 0x44ff44, 0x4444ff, 0xffff44];
+
+let isPaused = false;
+let stepOnce = false;
+let totalDeliveries = 0;
+let collisionsAvoided = 0;
+let frameCount = 0;
+let modelLoaded = false;
+let cargoTemplate = null;
+let agvSpeed = 3;
+let activeAGVCount = 4;
+
+const agvs = [];
+const cargoBoxes = [];
+const shelves = [];
+const occupiedCells = new Set();
+
+// Grid: 0 = free, 1 = shelf
+const grid = Array.from({ length: GRID_SIZE }, () => Array(GRID_SIZE).fill(0));
+
+// ============ SCENE SETUP ============
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x2a2a3a);
+
+const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 200);
+camera.position.set(15, 20, 15);
+camera.lookAt(0, 0, 0);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.05;
+controls.target.set(0, 0, 0);
+
+// Lights
+const ambientLight = new THREE.AmbientLight(0x556677, 0.6);
+scene.add(ambientLight);
+
+const dirLight = new THREE.DirectionalLight(0xffffff, 0.7);
+dirLight.position.set(10, 15, 10);
+dirLight.castShadow = true;
+dirLight.shadow.mapSize.set(2048, 2048);
+dirLight.shadow.camera.left = -25;
+dirLight.shadow.camera.right = 25;
+dirLight.shadow.camera.top = 25;
+dirLight.shadow.camera.bottom = -25;
+dirLight.shadow.camera.near = 0.5;
+dirLight.shadow.camera.far = 60;
+scene.add(dirLight);
+
+// ============ HELPERS ============
+function gridToWorld(gx, gy) {
+    return new THREE.Vector3(
+        (gx - GRID_SIZE / 2 + 0.5) * CELL_SIZE,
+        0,
+        (gy - GRID_SIZE / 2 + 0.5) * CELL_SIZE
+    );
+}
+
+function worldToGrid(wx, wz) {
+    return {
+        x: Math.round(wx / CELL_SIZE + GRID_SIZE / 2 - 0.5),
+        y: Math.round(wz / CELL_SIZE + GRID_SIZE / 2 - 0.5)
+    };
+}
+
+function cellKey(gx, gy) { return `${gx},${gy}`; }
+
+// ============ FLOOR ============
+const floorGeo = new THREE.PlaneGeometry(TOTAL_SIZE, TOTAL_SIZE);
+const floorMat = new THREE.MeshStandardMaterial({ color: 0x555566 });
+const floor = new THREE.Mesh(floorGeo, floorMat);
+floor.rotation.x = -Math.PI / 2;
+floor.receiveShadow = true;
+scene.add(floor);
+
+// Grid lines
+const gridHelper = new THREE.GridHelper(TOTAL_SIZE, GRID_SIZE, 0x444455, 0x3a3a4a);
+gridHelper.position.y = 0.01;
+scene.add(gridHelper);
+
+// ============ SHELVING RACKS ============
+function createShelves() {
+    const shelfMat = new THREE.MeshStandardMaterial({ color: 0x886644 });
+    
+    // 4 rows of shelves with aisles between them
+    const shelfRows = [
+        { startX: 3, endX: 7, y: 4 },
+        { startX: 3, endX: 7, y: 8 },
+        { startX: 12, endX: 16, y: 4 },
+        { startX: 12, endX: 16, y: 8 },
+        { startX: 3, endX: 7, y: 12 },
+        { startX: 3, endX: 7, y: 15 },
+        { startX: 12, endX: 16, y: 12 },
+        { startX: 12, endX: 16, y: 15 },
+    ];
+
+    shelfRows.forEach(row => {
+        for (let gx = row.startX; gx <= row.endX; gx++) {
+            const gy = row.y;
+            if (gx >= 0 && gx < GRID_SIZE && gy >= 0 && gy < GRID_SIZE) {
+                grid[gx][gy] = 1;
+                const pos = gridToWorld(gx, gy);
+                const shelfGeo = new THREE.BoxGeometry(CELL_SIZE * 0.9, 3, CELL_SIZE * 0.9);
+                const shelf = new THREE.Mesh(shelfGeo, shelfMat);
+                shelf.position.set(pos.x, 1.5, pos.z);
+                shelf.castShadow = true;
+                shelf.receiveShadow = true;
+                scene.add(shelf);
+                shelves.push(shelf);
+            }
+        }
+    });
+}
+createShelves();
+
+// ============ STATIONS ============
+const pickupStations = [
+    { gx: 1, gy: 1 },
+    { gx: 18, gy: 1 },
+    { gx: 1, gy: 18 },
+    { gx: 18, gy: 18 }
+];
+
+const deliveryStations = [
+    { gx: 10, gy: 0 },
+    { gx: 10, gy: 19 },
+    { gx: 0, gy: 10 },
+    { gx: 19, gy: 10 }
+];
+
+function createStationMarker(gx, gy, color) {
+    const pos = gridToWorld(gx, gy);
+    const geo = new THREE.PlaneGeometry(CELL_SIZE * 0.9, CELL_SIZE * 0.9);
+    const mat = new THREE.MeshStandardMaterial({ color, emissive: color, emissiveIntensity: 0.3, side: THREE.DoubleSide });
+    const marker = new THREE.Mesh(geo, mat);
+    marker.rotation.x = -Math.PI / 2;
+    marker.position.set(pos.x, 0.02, pos.z);
+    scene.add(marker);
+    
+    // Label post
+    const postGeo = new THREE.CylinderGeometry(0.05, 0.05, 1.5);
+    const postMat = new THREE.MeshStandardMaterial({ color });
+    const post = new THREE.Mesh(postGeo, postMat);
+    post.position.set(pos.x + 0.8, 0.75, pos.z + 0.8);
+    scene.add(post);
+    
+    return marker;
+}
+
+pickupStations.forEach(s => createStationMarker(s.gx, s.gy, 0x44ff44));
+deliveryStations.forEach(s => createStationMarker(s.gx, s.gy, 0xff4444));
+
+// ============ CARGO ============
+function createCargoPrimitive() {
+    const group = new THREE.Group();
+    const boxGeo = new THREE.BoxGeometry(0.8, 0.8, 0.8);
+    const boxMat = new THREE.MeshStandardMaterial({ color: 0xddaa44 });
+    const box = new THREE.Mesh(boxGeo, boxMat);
+    box.castShadow = true;
+    group.add(box);
+    // Tape stripe
+    const stripeGeo = new THREE.BoxGeometry(0.82, 0.1, 0.82);
+    const stripeMat = new THREE.MeshStandardMaterial({ color: 0x885522 });
+    const stripe = new THREE.Mesh(stripeGeo, stripeMat);
+    stripe.position.y = 0.2;
+    group.add(stripe);
+    return group;
+}
+
+// Try loading GLTF model
+const loader = new GLTFLoader();
+loader.load(
+    'https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Models/master/2.0/BoxAnimated/glTF-Binary/BoxAnimated.glb',
+    (gltf) => {
+        cargoTemplate = gltf.scene;
+        cargoTemplate.scale.set(0.25, 0.25, 0.25);
+        cargoTemplate.traverse(child => {
+            if (child.isMesh) {
+                child.castShadow = true;
+                child.receiveShadow = true;
+            }
+        });
+        modelLoaded = true;
+        document.getElementById('hud-model').textContent = 'Yes';
+        // Replace existing cargo with model-based ones
+        refreshAllCargo();
+    },
+    undefined,
+    () => {
+        modelLoaded = false;
+        document.getElementById('hud-model').textContent = 'No';
+    }
+);
+
+function createCargoBox() {
+    if (cargoTemplate) {
+        const c = cargoTemplate.clone();
+        c.scale.set(0.25, 0.25, 0.25);
+        return c;
+    }
+    return createCargoPrimitive();
+}
+
+function spawnCargo(station) {
+    const cargo = createCargoBox();
+    const pos = gridToWorld(station.gx, station.gy);
+    cargo.position.set(pos.x, 0.4, pos.z);
+    cargo.userData.station = station;
+    cargo.userData.pickedUp = false;
+    scene.add(cargo);
+    cargoBoxes.push(cargo);
+    return cargo;
+}
+
+function initCargo() {
+    // 8 cargo boxes at random pickup stations
+    for (let i = 0; i < 8; i++) {
+        const station = pickupStations[i % pickupStations.length];
+        spawnCargo(station);
+    }
+}
+
+function refreshAllCargo() {
+    const existing = [...cargoBoxes];
+    existing.forEach(c => {
+        if (!c.userData.pickedUp) {
+            const station = c.userData.station;
+            scene.remove(c);
+            const idx = cargoBoxes.indexOf(c);
+            if (idx >= 0) cargoBoxes.splice(idx, 1);
+            spawnCargo(station);
+        }
+    });
+}
+
+// ============ A* PATHFINDING ============
+function astar(startGx, startGy, endGx, endGy, extraBlocked) {
+    if (startGx === endGx && startGy === endGy) return [{ x: endGx, y: endGy }];
+    
+    const blocked = new Set(extraBlocked || []);
+    
+    const openSet = [];
+    const closedSet = new Set();
+    const gScore = {};
+    const fScore = {};
+    const cameFrom = {};
+    
+    const key = (x, y) => `${x},${y}`;
+    const h = (x, y) => Math.abs(x - endGx) + Math.abs(y - endGy);
+    
+    const startKey = key(startGx, startGy);
+    gScore[startKey] = 0;
+    fScore[startKey] = h(startGx, startGy);
+    openSet.push({ x: startGx, y: startGy, f: fScore[startKey] });
+    
+    const dirs = [[0, 1], [0, -1], [1, 0], [-1, 0]];
+    
+    while (openSet.length > 0) {
+        openSet.sort((a, b) => a.f - b.f);
+        const current = openSet.shift();
+        const ck = key(current.x, current.y);
+        
+        if (current.x === endGx && current.y === endGy) {
+            // Reconstruct path
+            const path = [];
+            let k = ck;
+            while (k) {
+                const [px, py] = k.split(',').map(Number);
+                path.unshift({ x: px, y: py });
+                k = cameFrom[k];
+            }
+            return path;
+        }
+        
+        closedSet.add(ck);
+        
+        for (const [dx, dy] of dirs) {
+            const nx = current.x + dx;
+            const ny = current.y + dy;
+            const nk = key(nx, ny);
+            
+            if (nx < 0 || nx >= GRID_SIZE || ny < 0 || ny >= GRID_SIZE) continue;
+            if (grid[nx][ny] === 1) continue;
+            if (closedSet.has(nk)) continue;
+            if (blocked.has(nk)) continue;
+            
+            const tentG = (gScore[ck] || 0) + 1;
+            
+            if (tentG < (gScore[nk] ?? Infinity)) {
+                cameFrom[nk] = ck;
+                gScore[nk] = tentG;
+                fScore[nk] = tentG + h(nx, ny);
+                
+                if (!openSet.find(n => n.x === nx && n.y === ny)) {
+                    openSet.push({ x: nx, y: ny, f: fScore[nk] });
+                }
+            }
+        }
+    }
+    
+    return null; // No path found
+}
+
+// ============ AGV ============
+class AGV {
+    constructor(index, color, startStation) {
+        this.index = index;
+        this.color = color;
+        this.startStation = startStation;
+        
+        // Visual
+        this.mesh = new THREE.Group();
+        
+        const bodyGeo = new THREE.CylinderGeometry(0.6, 0.6, 0.3, 16);
+        const bodyMat = new THREE.MeshStandardMaterial({ color: 0x666677, metalness: 0.5, roughness: 0.3 });
+        const body = new THREE.Mesh(bodyGeo, bodyMat);
+        body.position.y = 0.15;
+        body.castShadow = true;
+        this.mesh.add(body);
+        
+        // Color indicator on top
+        const indicatorGeo = new THREE.CylinderGeometry(0.3, 0.3, 0.1, 16);
+        const indicatorMat = new THREE.MeshStandardMaterial({ color, emissive: color, emissiveIntensity: 0.5 });
+        const indicator = new THREE.Mesh(indicatorGeo, indicatorMat);
+        indicator.position.y = 0.35;
+        this.mesh.add(indicator);
+        this.indicator = indicator;
+        
+        // Wheels
+        const wheelGeo = new THREE.CylinderGeometry(0.15, 0.15, 0.08, 8);
+        const wheelMat = new THREE.MeshStandardMaterial({ color: 0x222222 });
+        for (let i = 0; i < 4; i++) {
+            const wheel = new THREE.Mesh(wheelGeo, wheelMat);
+            const angle = (i / 4) * Math.PI * 2;
+            wheel.position.set(Math.cos(angle) * 0.4, 0.04, Math.sin(angle) * 0.4);
+            wheel.rotation.z = Math.PI / 2;
+            this.mesh.add(wheel);
+        }
+        
+        // Point light
+        const light = new THREE.PointLight(color, 0.3, 3);
+        light.position.y = 0.5;
+        this.mesh.add(light);
+        
+        scene.add(this.mesh);
+        
+        // State
+        this.carrying = false;
+        this.cargo = null;
+        this.path = [];
+        this.pathIndex = 0;
+        this.currentTarget = null;
+        this.state = 'idle'; // idle, goPickup, picking, goDeliver, delivering
+        this.waiting = false;
+        this.waitTimer = 0;
+        this.assignedDelivery = null;
+        this.active = true;
+        
+        // Position
+        const pos = gridToWorld(startStation.gx, startStation.gy);
+        this.mesh.position.set(pos.x, 0, pos.z);
+        this.gridPos = { x: startStation.gx, y: startStation.gy };
+        this.targetWorldPos = null;
+        this.moving = false;
+    }
+    
+    reset() {
+        const pos = gridToWorld(this.startStation.gx, this.startStation.gy);
+        this.mesh.position.set(pos.x, 0, pos.z);
+        this.gridPos = { x: this.startStation.gx, y: this.startStation.gy };
+        this.carrying = false;
+        if (this.cargo) {
+            scene.remove(this.cargo);
+            const idx = cargoBoxes.indexOf(this.cargo);
+            if (idx >= 0) cargoBoxes.splice(idx, 1);
+            this.cargo = null;
+        }
+        this.path = [];
+        this.pathIndex = 0;
+        this.state = 'idle';
+        this.waiting = false;
+        this.waitTimer = 0;
+        this.currentTarget = null;
+        this.targetWorldPos = null;
+        this.moving = false;
+        this.assignedDelivery = null;
+        this.mesh.visible = this.active;
+    }
+    
+    findNearestCargoStation() {
+        let best = null;
+        let bestDist = Infinity;
+        
+        for (const cargo of cargoBoxes) {
+            if (cargo.userData.pickedUp) continue;
+            // Check if another AGV is already targeting this cargo
+            let taken = false;
+            for (const other of agvs) {
+                if (other === this || !other.active) continue;
+                if (other.state === 'goPickup' && other.targetCargo === cargo) {
+                    taken = true;
+                    break;
+                }
+            }
+            if (taken) continue;
+            
+            const station = cargo.userData.station;
+            const dist = Math.abs(this.gridPos.x - station.gx) + Math.abs(this.gridPos.y - station.gy);
+            if (dist < bestDist) {
+                bestDist = dist;
+                best = cargo;
+            }
+        }
+        return best;
+    }
+    
+    planPath(targetGx, targetGy) {
+        // Build blocked set from other AGV positions
+        const blocked = [];
+        for (const other of agvs) {
+            if (other === this || !other.active) continue;
+            // Don't block the target cell
+            if (other.gridPos.x === targetGx && other.gridPos.y === targetGy) continue;
+            blocked.push(cellKey(other.gridPos.x, other.gridPos.y));
+        }
+        
+        const path = astar(this.gridPos.x, this.gridPos.y, targetGx, targetGy, blocked);
+        if (!path) {
+            // Try without blocking
+            return astar(this.gridPos.x, this.gridPos.y, targetGx, targetGy, []);
+        }
+        return path;
+    }
+    
+    update(dt) {
+        if (!this.active) return;
+        
+        // State machine
+        switch (this.state) {
+            case 'idle':
+                this.findTask();
+                break;
+            case 'goPickup':
+                this.followPath(dt);
+                if (!this.moving && this.path.length === 0) {
+                    // Check if cargo still exists at this station
+                    if (this.targetCargo && !this.targetCargo.userData.pickedUp) {
+                        this.state = 'picking';
+                        this.waitTimer = 0.5;
+                    } else {
+                        this.state = 'idle';
+                    }
+                }
+                break;
+            case 'picking':
+                this.waitTimer -= dt;
+                if (this.waitTimer <= 0) {
+                    this.pickUpCargo();
+                }
+                break;
+            case 'goDeliver':
+                this.followPath(dt);
+                if (!this.moving && this.path.length === 0) {
+                    this.state = 'delivering';
+                    this.waitTimer = 0.5;
+                }
+                break;
+            case 'delivering':
+                this.waitTimer -= dt;
+                if (this.waitTimer <= 0) {
+                    this.deliverCargo();
+                }
+                break;
+        }
+        
+        // Update cargo position if carrying
+        if (this.carrying && this.cargo) {
+            this.cargo.position.set(
+                this.mesh.position.x,
+                0.7,
+                this.mesh.position.z
+            );
+        }
+        
+        // Pulse indicator
+        const t = performance.now() * 0.003;
+        if (this.indicator) {
+            this.indicator.material.emissiveIntensity = 0.3 + 0.3 * Math.sin(t + this.index);
+        }
+    }
+    
+    findTask() {
+        const cargo = this.findNearestCargoStation();
+        if (cargo) {
+            this.targetCargo = cargo;
+            const station = cargo.userData.station;
+            const path = this.planPath(station.gx, station.gy);
+            if (path && path.length > 0) {
+                this.path = path.slice(1); // Remove current position
+                this.pathIndex = 0;
+                this.state = 'goPickup';
+                this.moving = false;
+            }
+        }
+    }
+    
+    followPath(dt) {
+        if (this.waiting) {
+            this.waitTimer -= dt;
+            if (this.waitTimer <= 0) {
+                this.waiting = false;
+                // Replan
+                if (this.state === 'goPickup' && this.targetCargo) {
+                    const station = this.targetCargo.userData.station;
+                    const path = this.planPath(station.gx, station.gy);
+                    if (path && path.length > 0) {
+                        this.path = path.slice(1);
+                        this.pathIndex = 0;
+                        this.moving = false;
+                    }
+                } else if (this.state === 'goDeliver' && this.assignedDelivery) {
+                    const path = this.planPath(this.assignedDelivery.gx, this.assignedDelivery.gy);
+                    if (path && path.length > 0) {
+                        this.path = path.slice(1);
+                        this.pathIndex = 0;
+                        this.moving = false;
+                    }
+                }
+            }
+            return;
+        }
+        
+        if (!this.moving && this.path.length > 0) {
+            const next = this.path[0];
+            
+            // Collision check: is another AGV at or heading to this cell?
+            let blocked = false;
+            for (const other of agvs) {
+                if (other === this || !other.active) continue;
+                if (other.gridPos.x === next.x && other.gridPos.y === next.y) {
+                    blocked = true;
+                    break;
+                }
+                // Check if other is moving to same cell
+                if (other.moving && other.path.length > 0) {
+                    const otherNext = other.path[0];
+                    if (otherNext && otherNext.x === next.x && otherNext.y === next.y) {
+                        if (this.index > other.index) {
+                            blocked = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            
+            // Proximity collision avoidance
+            if (!blocked) {
+                const nextWorld = gridToWorld(next.x, next.y);
+                for (const other of agvs) {
+                    if (other === this || !other.active) continue;
+                    const dist = this.mesh.position.distanceTo(other.mesh.position);
+                    if (dist < 2.0) {
+                        // Check if heading toward each other
+                        const myDir = new THREE.Vector3().subVectors(nextWorld, this.mesh.position).normalize();
+                        const toOther = new THREE.Vector3().subVectors(other.mesh.position, this.mesh.position).normalize();
+                        if (myDir.dot(toOther) > 0.5 && this.index > other.index) {
+                            blocked = true;
+                            collisionsAvoided++;
+                            break;
+                        }
+                    }
+                }
+            }
+            
+            if (blocked) {
+                this.waiting = true;
+                this.waitTimer = 0.3 + Math.random() * 0.3;
+                return;
+            }
+            
+            this.targetWorldPos = gridToWorld(next.x, next.y);
+            this.gridPos = { x: next.x, y: next.y };
+            this.moving = true;
+        }
+        
+        if (this.moving && this.targetWorldPos) {
+            const dir = new THREE.Vector3().subVectors(this.targetWorldPos, this.mesh.position);
+            dir.y = 0;
+            const dist = dir.length();
+            
+            if (dist < 0.05) {
+                this.mesh.position.set(this.targetWorldPos.x, 0, this.targetWorldPos.z);
+                this.moving = false;
+                this.path.shift();
+            } else {
+                dir.normalize();
+                const step = Math.min(agvSpeed * dt, dist);
+                this.mesh.position.add(dir.multiplyScalar(step));
+                
+                // Rotate to face direction
+                const angle = Math.atan2(dir.x, dir.z);
+                this.mesh.rotation.y = angle;
+            }
+        }
+    }
+    
+    pickUpCargo() {
+        if (this.targetCargo && !this.targetCargo.userData.pickedUp) {
+            this.carrying = true;
+            this.cargo = this.targetCargo;
+            this.cargo.userData.pickedUp = true;
+            
+            // Assign delivery station
+            this.assignedDelivery = deliveryStations[this.index % deliveryStations.length];
+            
+            const path = this.planPath(this.assignedDelivery.gx, this.assignedDelivery.gy);
+            if (path && path.length > 0) {
+                this.path = path.slice(1);
+                this.pathIndex = 0;
+                this.state = 'goDeliver';
+                this.moving = false;
+            } else {
+                this.state = 'idle';
+            }
+        } else {
+            this.state = 'idle';
+        }
+    }
+    
+    deliverCargo() {
+        if (this.carrying && this.cargo) {
+            scene.remove(this.cargo);
+            const idx = cargoBoxes.indexOf(this.cargo);
+            if (idx >= 0) cargoBoxes.splice(idx, 1);
+            this.cargo = null;
+            this.carrying = false;
+            totalDeliveries++;
+            
+            // Spawn new cargo after 2 seconds
+            setTimeout(() => {
+                const station = pickupStations[Math.floor(Math.random() * pickupStations.length)];
+                spawnCargo(station);
+            }, 2000);
+        }
+        this.state = 'idle';
+        this.targetCargo = null;
+        this.assignedDelivery = null;
+    }
+    
+    getRemainingPathLength() {
+        return this.path ? this.path.length : 0;
+    }
+}
+
+// ============ INIT AGVs ============
+function initAGVs() {
+    for (let i = 0; i < 4; i++) {
+        const agv = new AGV(i, AGV_COLORS[i], pickupStations[i]);
+        agvs.push(agv);
+    }
+}
+
+initAGVs();
+initCargo();
+
+// ============ CONTROLS ============
+const speedSlider = document.getElementById('slider-agv-speed');
+const countSlider = document.getElementById('slider-agv-count');
+const speedVal = document.getElementById('speed-val');
+const countVal = document.getElementById('count-val');
+
+speedSlider.addEventListener('input', () => {
+    agvSpeed = parseFloat(speedSlider.value);
+    speedVal.textContent = agvSpeed;
+});
+
+countSlider.addEventListener('input', () => {
+    activeAGVCount = parseInt(countSlider.value);
+    countVal.textContent = activeAGVCount;
+    for (let i = 0; i < 4; i++) {
+        agvs[i].active = i < activeAGVCount;
+        agvs[i].mesh.visible = i < activeAGVCount;
+    }
+});
+
+document.addEventListener('keydown', (e) => {
+    if (e.code === 'Space') {
+        e.preventDefault();
+        isPaused = !isPaused;
+    } else if (e.code === 'KeyR') {
+        resetSimulation();
+    } else if (e.code === 'KeyS' && isPaused) {
+        stepOnce = true;
+    }
+});
+
+function resetSimulation() {
+    totalDeliveries = 0;
+    collisionsAvoided = 0;
+    
+    // Remove all cargo
+    for (const c of [...cargoBoxes]) {
+        scene.remove(c);
+    }
+    cargoBoxes.length = 0;
+    
+    // Reset AGVs
+    for (const agv of agvs) {
+        agv.reset();
+    }
+    
+    // Respawn cargo
+    initCargo();
+}
+
+// ============ STATE ============
+window.__3D_STATE__ = {
+    activeAGVs: 4,
+    totalDeliveries: 0,
+    cargoWaiting: 0,
+    collisionsAvoided: 0,
+    isPaused: false,
+    agvSpeed: 3,
+    modelLoaded: false,
+    frameCount: 0,
+    agvsValid: true,
+    avgPathLength: 0
+};
+
+function updateState() {
+    const cargoWaiting = cargoBoxes.filter(c => !c.userData.pickedUp).length;
+    
+    let agvsValid = true;
+    let totalPath = 0;
+    let activeCount = 0;
+    for (const agv of agvs) {
+        if (!agv.active) continue;
+        activeCount++;
+        const p = agv.mesh.position;
+        if (isNaN(p.x) || isNaN(p.y) || isNaN(p.z)) {
+            agvsValid = false;
+        }
+        totalPath += agv.getRemainingPathLength();
+    }
+    const avgPath = activeCount > 0 ? Math.round((totalPath / activeCount) * 10) / 10 : 0;
+    
+    window.__3D_STATE__ = {
+        activeAGVs: activeAGVCount,
+        totalDeliveries,
+        cargoWaiting,
+        collisionsAvoided,
+        isPaused,
+        agvSpeed,
+        modelLoaded,
+        frameCount,
+        agvsValid,
+        avgPathLength: avgPath
+    };
+    
+    // Update HUD
+    document.getElementById('hud-agvs').textContent = activeAGVCount;
+    document.getElementById('hud-deliveries').textContent = totalDeliveries;
+    document.getElementById('hud-cargo').textContent = cargoWaiting;
+    document.getElementById('hud-avoided').textContent = collisionsAvoided;
+    document.getElementById('hud-paused').textContent = isPaused ? 'Paused' : 'Playing';
+    document.getElementById('hud-model').textContent = modelLoaded ? 'Yes' : 'No';
+}
+
+// ============ ANIMATION LOOP ============
+const clock = new THREE.Clock();
+
+function animate() {
+    requestAnimationFrame(animate);
+    
+    const dt = Math.min(clock.getDelta(), 0.05);
+    
+    if (!isPaused || stepOnce) {
+        for (const agv of agvs) {
+            if (agv.active) {
+                agv.update(stepOnce ? 0.016 : dt);
+            }
+        }
+        stepOnce = false;
+    }
+    
+    frameCount++;
+    updateState();
+    
+    controls.update();
+    renderer.render(scene, camera);
+}
+
+// ============ RESIZE ============
+window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+animate();
+</script>
+</body>
+</html>

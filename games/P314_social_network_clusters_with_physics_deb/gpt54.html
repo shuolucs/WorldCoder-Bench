@@ -1,0 +1,793 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Three.js Social Network Graph</title>
+  <style>
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #000;
+      font-family: Arial, sans-serif;
+      color: #fff;
+    }
+
+    #app {
+      width: 100%;
+      height: 100%;
+      position: relative;
+    }
+
+    canvas {
+      display: block;
+    }
+
+    #hud {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      z-index: 10;
+      background: rgba(0, 0, 0, 0.65);
+      border: 1px solid rgba(255,255,255,0.2);
+      padding: 10px 12px;
+      border-radius: 8px;
+      min-width: 250px;
+      line-height: 1.5;
+      font-size: 14px;
+      user-select: none;
+    }
+
+    #hud .row {
+      margin: 2px 0;
+    }
+
+    #controls {
+      margin-top: 8px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      align-items: center;
+    }
+
+    button, select {
+      background: #1e1e1e;
+      color: #fff;
+      border: 1px solid rgba(255,255,255,0.25);
+      border-radius: 4px;
+      padding: 6px 8px;
+      font-size: 13px;
+      cursor: pointer;
+    }
+
+    button:hover, select:hover {
+      background: #2a2a2a;
+    }
+
+    .hint {
+      margin-top: 8px;
+      color: #bbb;
+      font-size: 12px;
+    }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <div id="hud">
+      <div class="row" id="hud-nodes">Nodes: 30</div>
+      <div class="row" id="hud-edges">Edges: 0</div>
+      <div class="row" id="hud-iter">Iteration: 0</div>
+      <div class="row" id="hud-ke">Kinetic Energy: 0.00</div>
+      <div class="row" id="hud-debug">Debug: OFF</div>
+      <div class="row" id="hud-sim">Simulation: RUNNING</div>
+
+      <div id="controls">
+        <button id="btn-pause">Pause/Resume</button>
+        <button id="btn-reset">Reset</button>
+        <select id="select-highlight">
+          <option value="0">None</option>
+          <option value="1">Cluster 1</option>
+          <option value="2">Cluster 2</option>
+          <option value="3">Cluster 3</option>
+        </select>
+      </div>
+
+      <div class="hint">
+        Keys: SPACE pause/resume, D debug, R reset
+      </div>
+    </div>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js';
+    import { OrbitControls } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js';
+    import { GLTFLoader } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/GLTFLoader.js';
+
+    const app = document.getElementById('app');
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x000000);
+
+    const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+    camera.position.set(0, 0, 50);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    app.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.target.set(0, 0, 0);
+
+    const ambientLight = new THREE.AmbientLight(0x404040);
+    scene.add(ambientLight);
+
+    const dirLight = new THREE.DirectionalLight(0xffffff, 1);
+    dirLight.position.set(10, 10, 10);
+    scene.add(dirLight);
+
+    const NODE_COUNT = 30;
+    const CLUSTER_SIZE = 10;
+    const CLUSTER_COLORS = [0xff4444, 0x44ff44, 0x4444ff];
+    const CLUSTER_BIASES = [
+      new THREE.Vector3(-10, 10, 0),
+      new THREE.Vector3(10, 10, 0),
+      new THREE.Vector3(0, -10, 0)
+    ];
+
+    const REGULAR_RADIUS = 0.5;
+    const nodes = [];
+    const edges = [];
+    const edgeSet = new Set();
+    const clusterGroups = [[], [], []];
+    const clusterCentroids = [
+      new THREE.Vector3(),
+      new THREE.Vector3(),
+      new THREE.Vector3()
+    ];
+
+    const nodeGroup = new THREE.Group();
+    scene.add(nodeGroup);
+
+    const edgeGroup = new THREE.Group();
+    scene.add(edgeGroup);
+
+    const debugGroup = new THREE.Group();
+    debugGroup.name = 'debugGroup';
+    debugGroup.visible = false;
+    scene.add(debugGroup);
+
+    let debugPlane = null;
+    let boxHelpers = [];
+    let velocityArrows = [];
+
+    let simulationRunning = true;
+    let iterationCount = 0;
+    let kineticEnergy = 0;
+    let selectedNodeIndex = -1;
+    let highlightedCluster = 0;
+    let storkLoaded = false;
+    let storkObject = null;
+
+    const raycaster = new THREE.Raycaster();
+    const mouse = new THREE.Vector2();
+
+    const sphereGeo = new THREE.SphereGeometry(REGULAR_RADIUS, 16, 16);
+
+    function randRange(min, max) {
+      return min + Math.random() * (max - min);
+    }
+
+    function edgeKey(a, b) {
+      return a < b ? `${a}-${b}` : `${b}-${a}`;
+    }
+
+    function createNodeMaterial(color) {
+      return new THREE.MeshStandardMaterial({
+        color,
+        emissive: 0x000000,
+        emissiveIntensity: 0,
+        transparent: true,
+        opacity: 1
+      });
+    }
+
+    function randomBiasedPosition(clusterIndex) {
+      const bias = CLUSTER_BIASES[clusterIndex];
+      return new THREE.Vector3(
+        randRange(-20, 20) * 0.35 + bias.x,
+        randRange(-20, 20) * 0.35 + bias.y,
+        randRange(-20, 20) * 0.35 + bias.z
+      );
+    }
+
+    function clearGraph() {
+      while (nodeGroup.children.length) nodeGroup.remove(nodeGroup.children[0]);
+      while (edgeGroup.children.length) edgeGroup.remove(edgeGroup.children[0]);
+
+      nodes.length = 0;
+      edges.length = 0;
+      edgeSet.clear();
+      clusterGroups[0] = [];
+      clusterGroups[1] = [];
+      clusterGroups[2] = [];
+      selectedNodeIndex = -1;
+    }
+
+    function createSelectionRing(node) {
+      const geo = new THREE.SphereGeometry(0.75, 16, 16);
+      const mat = new THREE.MeshBasicMaterial({
+        color: 0xffff00,
+        wireframe: true
+      });
+      const ring = new THREE.Mesh(geo, mat);
+      ring.visible = false;
+      node.mesh.add(ring);
+      node.selectionRing = ring;
+    }
+
+    function createRegularNode(index, clusterIndex) {
+      const color = CLUSTER_COLORS[clusterIndex];
+      const material = createNodeMaterial(color);
+      const mesh = new THREE.Mesh(sphereGeo, material);
+      const pos = randomBiasedPosition(clusterIndex);
+      mesh.position.copy(pos);
+      mesh.userData.nodeIndex = index;
+
+      const node = {
+        index,
+        cluster: clusterIndex,
+        mesh,
+        position: pos.clone(),
+        velocity: new THREE.Vector3(),
+        force: new THREE.Vector3(),
+        isInfluencer: false,
+        selectionRing: null,
+        baseColor: color
+      };
+
+      createSelectionRing(node);
+      nodeGroup.add(mesh);
+      nodes.push(node);
+      clusterGroups[clusterIndex].push(node);
+    }
+
+    function createNodes() {
+      for (let i = 0; i < NODE_COUNT; i++) {
+        const clusterIndex = Math.floor(i / CLUSTER_SIZE);
+        createRegularNode(i, clusterIndex);
+      }
+    }
+
+    function addEdge(a, b) {
+      if (a === b) return;
+      const key = edgeKey(a, b);
+      if (edgeSet.has(key)) return;
+
+      edgeSet.add(key);
+
+      const positions = new Float32Array(6);
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+
+      const material = new THREE.LineBasicMaterial({
+        color: 0x888888,
+        transparent: true,
+        opacity: 0.9
+      });
+
+      const line = new THREE.Line(geometry, material);
+      edgeGroup.add(line);
+
+      const edge = { a, b, line };
+      edges.push(edge);
+      updateEdgeGeometry(edge);
+    }
+
+    function updateEdgeGeometry(edge) {
+      const pa = nodes[edge.a].mesh.position;
+      const pb = nodes[edge.b].mesh.position;
+      const attr = edge.line.geometry.attributes.position;
+      attr.setXYZ(0, pa.x, pa.y, pa.z);
+      attr.setXYZ(1, pb.x, pb.y, pb.z);
+      attr.needsUpdate = true;
+      edge.line.geometry.computeBoundingSphere();
+    }
+
+    function createEdges() {
+      for (let c = 0; c < 3; c++) {
+        const start = c * CLUSTER_SIZE;
+        const end = start + CLUSTER_SIZE;
+
+        for (let i = start; i < end; i++) {
+          const targetCount = 3 + Math.floor(Math.random() * 2);
+          let attempts = 0;
+          while (attempts < 20) {
+            attempts++;
+            if (countNodeEdgesInCluster(i, c) >= targetCount) break;
+            const j = start + Math.floor(Math.random() * CLUSTER_SIZE);
+            if (j !== i) addEdge(i, j);
+          }
+        }
+      }
+
+      let cross = 0;
+      let tries = 0;
+      while (cross < 5 && tries < 100) {
+        tries++;
+        const c1 = Math.floor(Math.random() * 3);
+        let c2 = Math.floor(Math.random() * 3);
+        if (c2 === c1) continue;
+
+        const i = c1 * CLUSTER_SIZE + Math.floor(Math.random() * CLUSTER_SIZE);
+        const j = c2 * CLUSTER_SIZE + Math.floor(Math.random() * CLUSTER_SIZE);
+        const before = edgeSet.size;
+        addEdge(i, j);
+        if (edgeSet.size > before) cross++;
+      }
+    }
+
+    function countNodeEdgesInCluster(nodeIndex, clusterIndex) {
+      const start = clusterIndex * CLUSTER_SIZE;
+      const end = start + CLUSTER_SIZE - 1;
+      let count = 0;
+      for (const e of edges) {
+        if (e.a === nodeIndex && e.b >= start && e.b <= end) count++;
+        if (e.b === nodeIndex && e.a >= start && e.a <= end) count++;
+      }
+      return count;
+    }
+
+    function computeClusterCentroids() {
+      for (let c = 0; c < 3; c++) {
+        clusterCentroids[c].set(0, 0, 0);
+        for (const node of clusterGroups[c]) {
+          clusterCentroids[c].add(node.mesh.position);
+        }
+        clusterCentroids[c].multiplyScalar(1 / clusterGroups[c].length);
+      }
+    }
+
+    function resetNodePositions() {
+      for (const node of nodes) {
+        const p = randomBiasedPosition(node.cluster);
+        node.mesh.position.copy(p);
+        node.position.copy(p);
+        node.velocity.set(0, 0, 0);
+        node.force.set(0, 0, 0);
+      }
+      iterationCount = 0;
+      kineticEnergy = 0;
+      computeClusterCentroids();
+      updateAllEdges();
+      updateSelectionVisuals();
+      rebuildDebugOverlay();
+      updateHighlighting();
+      updateState();
+      updateHUD();
+    }
+
+    function updateAllEdges() {
+      for (const edge of edges) updateEdgeGeometry(edge);
+    }
+
+    function applyForces() {
+      const repulsionCoeff = 50;
+      const springK = 0.05;
+      const restLength = 5;
+      const clusterGravity = 0.01;
+      const damping = 0.95;
+
+      for (const node of nodes) {
+        node.force.set(0, 0, 0);
+      }
+
+      for (let i = 0; i < nodes.length; i++) {
+        for (let j = i + 1; j < nodes.length; j++) {
+          const ni = nodes[i];
+          const nj = nodes[j];
+          const delta = new THREE.Vector3().subVectors(ni.mesh.position, nj.mesh.position);
+          let distSq = delta.lengthSq();
+          if (distSq < 0.01) distSq = 0.01;
+          const dist = Math.sqrt(distSq);
+          delta.normalize();
+
+          const forceMag = repulsionCoeff / distSq;
+          const force = delta.clone().multiplyScalar(forceMag);
+
+          ni.force.add(force);
+          nj.force.sub(force);
+        }
+      }
+
+      for (const edge of edges) {
+        const na = nodes[edge.a];
+        const nb = nodes[edge.b];
+        const delta = new THREE.Vector3().subVectors(nb.mesh.position, na.mesh.position);
+        let dist = delta.length();
+        if (dist < 0.001) dist = 0.001;
+        const dir = delta.clone().multiplyScalar(1 / dist);
+        const extension = dist - restLength;
+        const force = dir.multiplyScalar(springK * extension);
+
+        na.force.add(force);
+        nb.force.sub(force);
+      }
+
+      computeClusterCentroids();
+
+      for (const node of nodes) {
+        const centroid = clusterCentroids[node.cluster];
+        const toward = new THREE.Vector3().subVectors(centroid, node.mesh.position).multiplyScalar(clusterGravity);
+        node.force.add(toward);
+      }
+
+      kineticEnergy = 0;
+      for (const node of nodes) {
+        node.velocity.add(node.force);
+        node.velocity.multiplyScalar(damping);
+        node.mesh.position.add(node.velocity);
+        node.position.copy(node.mesh.position);
+        kineticEnergy += 0.5 * node.velocity.lengthSq();
+      }
+
+      iterationCount++;
+    }
+
+    function createDebugPlane() {
+      const geo = new THREE.PlaneGeometry(80, 80, 20, 20);
+      const mat = new THREE.MeshBasicMaterial({
+        color: 0x44aaff,
+        transparent: true,
+        opacity: 0.08,
+        side: THREE.DoubleSide,
+        wireframe: true
+      });
+      const plane = new THREE.Mesh(geo, mat);
+      plane.rotation.x = -Math.PI / 2;
+      plane.position.y = 0;
+      return plane;
+    }
+
+    function rebuildDebugOverlay() {
+      while (debugGroup.children.length) {
+        debugGroup.remove(debugGroup.children[0]);
+      }
+      boxHelpers = [];
+      velocityArrows = [];
+
+      debugPlane = createDebugPlane();
+      debugGroup.add(debugPlane);
+
+      for (let c = 0; c < 3; c++) {
+        const aabbMesh = createClusterAABBMesh(c);
+        const helper = new THREE.BoxHelper(aabbMesh, 0xffffff);
+        helper.material.transparent = true;
+        helper.material.opacity = 0.7;
+        boxHelpers.push({ helper, source: aabbMesh, cluster: c });
+        debugGroup.add(helper);
+      }
+
+      for (const node of nodes) {
+        const dir = node.velocity.clone();
+        const len = Math.max(0.001, dir.length());
+        if (len > 0) dir.normalize();
+        else dir.set(1, 0, 0);
+
+        const arrow = new THREE.ArrowHelper(
+          dir,
+          node.mesh.position.clone(),
+          Math.min(len * 2, 3),
+          0xffff00,
+          0.4,
+          0.2
+        );
+        velocityArrows.push(arrow);
+        debugGroup.add(arrow);
+      }
+    }
+
+    function createClusterAABBMesh(clusterIndex) {
+      const box = new THREE.Box3();
+      for (const node of clusterGroups[clusterIndex]) {
+        box.expandByPoint(node.mesh.position);
+      }
+
+      const size = new THREE.Vector3();
+      const center = new THREE.Vector3();
+      box.getSize(size);
+      box.getCenter(center);
+
+      size.x = Math.max(size.x, 1);
+      size.y = Math.max(size.y, 1);
+      size.z = Math.max(size.z, 1);
+
+      const geo = new THREE.BoxGeometry(size.x, size.y, size.z);
+      const mat = new THREE.MeshBasicMaterial({ visible: false });
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.position.copy(center);
+      return mesh;
+    }
+
+    function updateDebugOverlay() {
+      if (!debugGroup.visible) return;
+
+      for (let i = 0; i < boxHelpers.length; i++) {
+        const item = boxHelpers[i];
+        const box = new THREE.Box3();
+        for (const node of clusterGroups[item.cluster]) {
+          box.expandByPoint(node.mesh.position);
+        }
+
+        const size = new THREE.Vector3();
+        const center = new THREE.Vector3();
+        box.getSize(size);
+        box.getCenter(center);
+
+        size.x = Math.max(size.x, 1);
+        size.y = Math.max(size.y, 1);
+        size.z = Math.max(size.z, 1);
+
+        item.source.geometry.dispose();
+        item.source.geometry = new THREE.BoxGeometry(size.x, size.y, size.z);
+        item.source.position.copy(center);
+        item.helper.update();
+      }
+
+      for (let i = 0; i < nodes.length; i++) {
+        const node = nodes[i];
+        const arrow = velocityArrows[i];
+        const vel = node.velocity.clone();
+        const len = vel.length();
+        const dir = len > 0.0001 ? vel.clone().normalize() : new THREE.Vector3(1, 0, 0);
+        arrow.position.copy(node.mesh.position);
+        arrow.setDirection(dir);
+        arrow.setLength(Math.min(Math.max(len * 2, 0.2), 3), 0.35, 0.2);
+      }
+    }
+
+    function updateSelectionVisuals() {
+      for (const node of nodes) {
+        if (node.selectionRing) {
+          node.selectionRing.visible = node.index === selectedNodeIndex;
+          if (node.isInfluencer) {
+            node.selectionRing.scale.setScalar(2.5);
+          } else {
+            node.selectionRing.scale.setScalar(1);
+          }
+        }
+      }
+    }
+
+    function updateHighlighting() {
+      for (const node of nodes) {
+        const selectedCluster = highlightedCluster - 1;
+        const isHighlighted = highlightedCluster === 0 || node.cluster === selectedCluster;
+
+        if (node.mesh.material) {
+          node.mesh.material.opacity = isHighlighted ? 1.0 : 0.5;
+          node.mesh.material.transparent = true;
+          node.mesh.material.emissive.setHex(isHighlighted && highlightedCluster !== 0 ? node.baseColor : 0x000000);
+          node.mesh.material.emissiveIntensity = isHighlighted && highlightedCluster !== 0 ? 0.5 : 0.0;
+        }
+
+        if (node.isInfluencer && storkObject) {
+          storkObject.traverse((child) => {
+            if (child.isMesh && child.material) {
+              child.material.transparent = true;
+              child.material.opacity = isHighlighted ? 1.0 : 0.5;
+              if ('emissive' in child.material) {
+                child.material.emissive = new THREE.Color(isHighlighted && highlightedCluster !== 0 ? 0x552222 : 0x000000);
+                child.material.emissiveIntensity = isHighlighted && highlightedCluster !== 0 ? 0.4 : 0.0;
+              }
+            }
+          });
+        }
+      }
+    }
+
+    function updateHUD() {
+      document.getElementById('hud-nodes').textContent = `Nodes: ${NODE_COUNT}`;
+      document.getElementById('hud-edges').textContent = `Edges: ${edges.length}`;
+      document.getElementById('hud-iter').textContent = `Iteration: ${iterationCount}`;
+      document.getElementById('hud-ke').textContent = `Kinetic Energy: ${kineticEnergy.toFixed(2)}`;
+      document.getElementById('hud-debug').textContent = `Debug: ${debugGroup.visible ? 'ON' : 'OFF'}`;
+      document.getElementById('hud-sim').textContent = `Simulation: ${simulationRunning ? 'RUNNING' : 'PAUSED'}`;
+    }
+
+    function hasNaNPositions() {
+      for (const node of nodes) {
+        const p = node.mesh.position;
+        if (Number.isNaN(p.x) || Number.isNaN(p.y) || Number.isNaN(p.z)) return true;
+      }
+      return false;
+    }
+
+    function averageVelocityMagnitude() {
+      let sum = 0;
+      for (const node of nodes) sum += node.velocity.length();
+      return sum / nodes.length;
+    }
+
+    function updateState() {
+      computeClusterCentroids();
+      window.__3D_STATE__ = {
+        nodeCount: NODE_COUNT,
+        edgeCount: edges.length,
+        simulationRunning,
+        iterationCount,
+        kineticEnergy,
+        debugOverlayVisible: debugGroup.visible,
+        selectedNodeIndex,
+        highlightedCluster,
+        storkLoaded,
+        clusterCentroids: clusterCentroids.map(v => ({ x: v.x, y: v.y, z: v.z })),
+        nodesHaveNaN: hasNaNPositions(),
+        averageVelocity: averageVelocityMagnitude()
+      };
+    }
+
+    function toggleSimulation() {
+      simulationRunning = !simulationRunning;
+      updateHUD();
+      updateState();
+    }
+
+    function toggleDebug() {
+      debugGroup.visible = !debugGroup.visible;
+      if (debugGroup.visible) rebuildDebugOverlay();
+      updateHUD();
+      updateState();
+    }
+
+    function resetGraph() {
+      resetNodePositions();
+      simulationRunning = true;
+      updateHUD();
+      updateState();
+    }
+
+    function onPointerDown(event) {
+      const rect = renderer.domElement.getBoundingClientRect();
+      mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+      mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+
+      raycaster.setFromCamera(mouse, camera);
+      const meshes = nodes.map(n => n.mesh);
+      const intersects = raycaster.intersectObjects(meshes, true);
+
+      if (intersects.length > 0) {
+        let obj = intersects[0].object;
+        while (obj && obj.userData.nodeIndex === undefined && obj.parent) obj = obj.parent;
+        if (obj && obj.userData.nodeIndex !== undefined) {
+          selectedNodeIndex = obj.userData.nodeIndex;
+        } else {
+          selectedNodeIndex = -1;
+        }
+      } else {
+        selectedNodeIndex = -1;
+      }
+
+      updateSelectionVisuals();
+      updateState();
+    }
+
+    function onKeyDown(e) {
+      const key = e.key.toLowerCase();
+      if (e.code === 'Space') {
+        e.preventDefault();
+        toggleSimulation();
+      } else if (key === 'd') {
+        toggleDebug();
+      } else if (key === 'r') {
+        resetGraph();
+      }
+    }
+
+    function loadStork() {
+      const loader = new GLTFLoader();
+      const url = 'https://rawcdn.githack.com/KhronosGroup/glTF-Sample-Models/master/2.0/Stork/glTF-Binary/Stork.glb';
+
+      loader.load(
+        url,
+        (gltf) => {
+          storkObject = gltf.scene;
+          storkObject.userData.nodeIndex = 0;
+
+          const box = new THREE.Box3().setFromObject(storkObject);
+          const size = new THREE.Vector3();
+          box.getSize(size);
+          const maxDim = Math.max(size.x, size.y, size.z) || 1;
+          const scale = 2 / maxDim;
+          storkObject.scale.setScalar(scale);
+
+          const influencerNode = nodes[0];
+          influencerNode.isInfluencer = true;
+
+          nodeGroup.remove(influencerNode.mesh);
+          influencerNode.mesh = storkObject;
+          influencerNode.mesh.position.copy(influencerNode.position);
+          influencerNode.mesh.userData.nodeIndex = 0;
+
+          nodeGroup.add(influencerNode.mesh);
+          createSelectionRing(influencerNode);
+
+          storkObject.traverse((child) => {
+            if (child.isMesh) {
+              child.castShadow = false;
+              child.receiveShadow = false;
+              if (child.material) child.material = child.material.clone();
+            }
+          });
+
+          storkLoaded = true;
+          updateSelectionVisuals();
+          updateHighlighting();
+          updateState();
+        },
+        undefined,
+        (err) => {
+          console.warn('Failed to load stork.glb:', err);
+          storkLoaded = false;
+          updateState();
+        }
+      );
+    }
+
+    function initGraph() {
+      clearGraph();
+      createNodes();
+      createEdges();
+      computeClusterCentroids();
+      updateAllEdges();
+      rebuildDebugOverlay();
+      updateSelectionVisuals();
+      updateHighlighting();
+      updateHUD();
+      updateState();
+      loadStork();
+    }
+
+    document.getElementById('btn-pause').addEventListener('click', toggleSimulation);
+    document.getElementById('btn-reset').addEventListener('click', resetGraph);
+    document.getElementById('select-highlight').addEventListener('change', (e) => {
+      highlightedCluster = parseInt(e.target.value, 10);
+      updateHighlighting();
+      updateHUD();
+      updateState();
+    });
+
+    renderer.domElement.addEventListener('pointerdown', onPointerDown);
+    window.addEventListener('keydown', onKeyDown);
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      if (simulationRunning) {
+        applyForces();
+        updateAllEdges();
+      }
+
+      updateSelectionVisuals();
+      updateDebugOverlay();
+      controls.update();
+      updateHUD();
+      updateState();
+      renderer.render(scene, camera);
+    }
+
+    initGraph();
+    animate();
+  </script>
+</body>
+</html>

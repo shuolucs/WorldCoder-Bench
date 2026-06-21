@@ -1,0 +1,513 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Three.js A* Pathfinding with Fox</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #f0f0f0;
+            font-family: sans-serif;
+        }
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+        }
+        #hud {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(255, 255, 255, 0.8);
+            padding: 15px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            pointer-events: none;
+            font-size: 14px;
+            line-height: 1.5;
+        }
+        .hud-item {
+            margin-bottom: 5px;
+        }
+        .hud-label {
+            font-weight: bold;
+            color: #333;
+        }
+    </style>
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+            "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+        }
+    }
+    </script>
+</head>
+<body>
+    <div id="hud">
+        <div class="hud-item"><span class="hud-label">狐狸位置:</span> <span id="foxPos">0, 0</span></div>
+        <div class="hud-item"><span class="hud-label">目标位置:</span> <span id="targetPos">无</span></div>
+        <div class="hud-item"><span class="hud-label">路径长度:</span> <span id="pathLength">0</span></div>
+        <div class="hud-item"><span class="hud-label">动画状态:</span> <span id="animState">idle</span></div>
+        <div class="hud-item"><span class="hud-label">障碍物数:</span> <span id="obstacleCount">15</span></div>
+    </div>
+    <div id="canvas-container"></div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        // --- Global State ---
+        window.__3D_STATE__ = {
+            modelLoaded: false,
+            foxPosition: { col: 0, row: 0 },
+            targetPosition: null,
+            pathLength: 0,
+            animState: 'idle',
+            obstacleCount: 15,
+            isMoving: false,
+            gridSize: 10
+        };
+
+        // --- Constants ---
+        const GRID_SIZE = 10;
+        const CELL_SIZE = 1;
+        const CELL_SPACING = 0.05;
+        const STEP_SIZE = CELL_SIZE + CELL_SPACING;
+        const MOVE_DURATION = 0.5; // seconds per cell
+        
+        const COLOR_GROUND = 0x4CAF50;
+        const COLOR_OBSTACLE = 0xf44336;
+        const COLOR_PATH = 0x2196F3;
+        const COLOR_TARGET = 0xFFEB3B;
+
+        // --- Scene Setup ---
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0xf0f0f0);
+
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
+        // Top-down default view
+        camera.position.set(0, 15, 10);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        container.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.target.set(0, 0, 0);
+        controls.update();
+
+        // --- Lights ---
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 1.2);
+        dirLight.position.set(10, 20, 10);
+        dirLight.castShadow = true;
+        dirLight.shadow.camera.top = 10;
+        dirLight.shadow.camera.bottom = -10;
+        dirLight.shadow.camera.left = -10;
+        dirLight.shadow.camera.right = 10;
+        dirLight.shadow.mapSize.width = 2048;
+        dirLight.shadow.mapSize.height = 2048;
+        scene.add(dirLight);
+
+        // --- Grid & Terrain ---
+        const gridData = [];
+        const cellMeshes = [];
+        const groundGroup = new THREE.Group();
+        scene.add(groundGroup);
+
+        const offset = (GRID_SIZE * STEP_SIZE) / 2 - STEP_SIZE / 2;
+
+        function getGridWorldPos(col, row) {
+            return new THREE.Vector3(
+                col * STEP_SIZE - offset,
+                0,
+                row * STEP_SIZE - offset
+            );
+        }
+
+        const boxGeo = new THREE.BoxGeometry(CELL_SIZE, 0.1, CELL_SIZE);
+        const groundMat = new THREE.MeshStandardMaterial({ color: COLOR_GROUND });
+
+        for (let col = 0; col < GRID_SIZE; col++) {
+            gridData[col] = [];
+            cellMeshes[col] = [];
+            for (let row = 0; row < GRID_SIZE; row++) {
+                gridData[col][row] = { walkable: true, col, row };
+                
+                const mesh = new THREE.Mesh(boxGeo, groundMat.clone());
+                const pos = getGridWorldPos(col, row);
+                mesh.position.set(pos.x, -0.05, pos.z);
+                mesh.receiveShadow = true;
+                mesh.userData = { col, row, isGround: true };
+                
+                groundGroup.add(mesh);
+                cellMeshes[col][row] = mesh;
+            }
+        }
+
+        // --- Obstacles ---
+        const obstacleGeo = new THREE.BoxGeometry(0.8, 0.8, 0.8);
+        const obstacleMat = new THREE.MeshStandardMaterial({ color: COLOR_OBSTACLE });
+        let obstaclesPlaced = 0;
+
+        while (obstaclesPlaced < window.__3D_STATE__.obstacleCount) {
+            const c = Math.floor(Math.random() * GRID_SIZE);
+            const r = Math.floor(Math.random() * GRID_SIZE);
+            
+            // Protect start and end corners
+            if ((c === 0 && r === 0) || (c === GRID_SIZE - 1 && r === GRID_SIZE - 1)) continue;
+            
+            if (gridData[c][r].walkable) {
+                gridData[c][r].walkable = false;
+                
+                const obsMesh = new THREE.Mesh(obstacleGeo, obstacleMat);
+                const pos = getGridWorldPos(c, r);
+                obsMesh.position.set(pos.x, 0.4, pos.z);
+                obsMesh.castShadow = true;
+                obsMesh.receiveShadow = true;
+                scene.add(obsMesh);
+                
+                obstaclesPlaced++;
+            }
+        }
+
+        // --- Fox Model ---
+        let foxModel, mixer;
+        let animActions = {};
+        let currentAction = null;
+
+        const loader = new GLTFLoader();
+        loader.load('assets/Fox.glb', (gltf) => {
+            foxModel = gltf.scene;
+            foxModel.scale.set(0.02, 0.02, 0.02);
+            
+            // Enable shadows for fox
+            foxModel.traverse((child) => {
+                if (child.isMesh) {
+                    child.castShadow = true;
+                    child.receiveShadow = true;
+                }
+            });
+
+            const startPos = getGridWorldPos(0, 0);
+            foxModel.position.copy(startPos);
+            scene.add(foxModel);
+
+            // Animations
+            mixer = new THREE.AnimationMixer(foxModel);
+            gltf.animations.forEach((clip) => {
+                const name = clip.name.toLowerCase();
+                if (name.includes('survey') || name.includes('idle')) {
+                    animActions['idle'] = mixer.clipAction(clip);
+                } else if (name.includes('walk')) {
+                    animActions['walk'] = mixer.clipAction(clip);
+                } else if (name.includes('run')) {
+                    animActions['run'] = mixer.clipAction(clip);
+                }
+            });
+
+            // Fallback if specific names not found
+            if (!animActions['idle'] && gltf.animations.length > 0) animActions['idle'] = mixer.clipAction(gltf.animations[0]);
+            if (!animActions['walk'] && gltf.animations.length > 1) animActions['walk'] = mixer.clipAction(gltf.animations[1]);
+
+            playAnimation('idle');
+            
+            window.__3D_STATE__.modelLoaded = true;
+        });
+
+        function playAnimation(name) {
+            if (!animActions[name] || currentAction === animActions[name]) return;
+            
+            const action = animActions[name];
+            if (currentAction) {
+                currentAction.fadeOut(0.2);
+            }
+            action.reset().fadeIn(0.2).play();
+            currentAction = action;
+            window.__3D_STATE__.animState = name;
+        }
+
+        // --- A* Pathfinding ---
+        class AStarNode {
+            constructor(col, row) {
+                this.col = col;
+                this.row = row;
+                this.g = 0;
+                this.h = 0;
+                this.f = 0;
+                this.parent = null;
+            }
+        }
+
+        function heuristic(node, target) {
+            return Math.abs(node.col - target.col) + Math.abs(node.row - target.row);
+        }
+
+        function getNeighbors(node) {
+            const neighbors = [];
+            const dirs = [[0, 1], [1, 0], [0, -1], [-1, 0]]; // Up, Right, Down, Left
+            
+            for (let dir of dirs) {
+                const nc = node.col + dir[0];
+                const nr = node.row + dir[1];
+                
+                if (nc >= 0 && nc < GRID_SIZE && nr >= 0 && nr < GRID_SIZE && gridData[nc][nr].walkable) {
+                    neighbors.push(new AStarNode(nc, nr));
+                }
+            }
+            return neighbors;
+        }
+
+        function findPath(startCol, startRow, targetCol, targetRow) {
+            let openList = [];
+            let closedList = [];
+            
+            const startNode = new AStarNode(startCol, startRow);
+            const targetNode = new AStarNode(targetCol, targetRow);
+            
+            openList.push(startNode);
+            
+            while (openList.length > 0) {
+                // Get node with lowest f
+                let lowestIndex = 0;
+                for (let i = 0; i < openList.length; i++) {
+                    if (openList[i].f < openList[lowestIndex].f) {
+                        lowestIndex = i;
+                    }
+                }
+                let currentNode = openList[lowestIndex];
+                
+                // Reached target
+                if (currentNode.col === targetNode.col && currentNode.row === targetNode.row) {
+                    let path = [];
+                    let curr = currentNode;
+                    while (curr.parent) {
+                        path.push({ col: curr.col, row: curr.row });
+                        curr = curr.parent;
+                    }
+                    return path.reverse();
+                }
+                
+                openList.splice(lowestIndex, 1);
+                closedList.push(currentNode);
+                
+                let neighbors = getNeighbors(currentNode);
+                for (let neighbor of neighbors) {
+                    if (closedList.find(n => n.col === neighbor.col && n.row === neighbor.row)) {
+                        continue;
+                    }
+                    
+                    let gScore = currentNode.g + 1;
+                    let gScoreIsBest = false;
+                    
+                    let existingNode = openList.find(n => n.col === neighbor.col && n.row === neighbor.row);
+                    
+                    if (!existingNode) {
+                        gScoreIsBest = true;
+                        neighbor.h = heuristic(neighbor, targetNode);
+                        openList.push(neighbor);
+                    } else if (gScore < existingNode.g) {
+                        gScoreIsBest = true;
+                        neighbor = existingNode;
+                    }
+                    
+                    if (gScoreIsBest) {
+                        neighbor.parent = currentNode;
+                        neighbor.g = gScore;
+                        neighbor.f = neighbor.g + neighbor.h;
+                    }
+                }
+            }
+            return []; // No path found
+        }
+
+        // --- Movement Logic ---
+        let currentPath = [];
+        let isMoving = false;
+        let moveTimer = 0;
+        let currentCell = { col: 0, row: 0 };
+        let nextCell = null;
+        let startPosVec = new THREE.Vector3();
+        let targetPosVec = new THREE.Vector3();
+
+        function resetPathColors() {
+            for (let c = 0; c < GRID_SIZE; c++) {
+                for (let r = 0; r < GRID_SIZE; r++) {
+                    cellMeshes[c][r].material.color.setHex(COLOR_GROUND);
+                }
+            }
+        }
+
+        function highlightPath(path, target) {
+            resetPathColors();
+            path.forEach(p => {
+                cellMeshes[p.col][p.row].material.color.setHex(COLOR_PATH);
+            });
+            if (target) {
+                cellMeshes[target.col][target.row].material.color.setHex(COLOR_TARGET);
+            }
+        }
+
+        function startMovement(path) {
+            currentPath = path;
+            window.__3D_STATE__.pathLength = currentPath.length;
+            
+            if (currentPath.length > 0 && !isMoving) {
+                isMoving = true;
+                window.__3D_STATE__.isMoving = true;
+                playAnimation('walk');
+                prepareNextStep();
+            }
+        }
+
+        function prepareNextStep() {
+            if (currentPath.length === 0) {
+                isMoving = false;
+                window.__3D_STATE__.isMoving = false;
+                window.__3D_STATE__.targetPosition = null;
+                window.__3D_STATE__.pathLength = 0;
+                nextCell = null;
+                playAnimation('idle');
+                resetPathColors();
+                return;
+            }
+
+            nextCell = currentPath.shift();
+            window.__3D_STATE__.pathLength = currentPath.length + 1;
+            
+            startPosVec.copy(foxModel.position);
+            targetPosVec.copy(getGridWorldPos(nextCell.col, nextCell.row));
+            
+            // Face direction
+            foxModel.lookAt(targetPosVec);
+            
+            moveTimer = 0;
+        }
+
+        // --- Interaction ---
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+
+        window.addEventListener('pointerdown', (event) => {
+            if (!window.__3D_STATE__.modelLoaded) return;
+
+            mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+            raycaster.setFromCamera(mouse, camera);
+            const intersects = raycaster.intersectObjects(groundGroup.children);
+
+            if (intersects.length > 0) {
+                const userData = intersects[0].object.userData;
+                if (userData.isGround) {
+                    const targetCol = userData.col;
+                    const targetRow = userData.row;
+
+                    if (!gridData[targetCol][targetRow].walkable) return;
+
+                    window.__3D_STATE__.targetPosition = { col: targetCol, row: targetRow };
+
+                    // Determine start point for pathfinding
+                    let startCol = currentCell.col;
+                    let startRow = currentCell.row;
+                    
+                    // If currently moving, calculate path from the cell we are heading to
+                    if (isMoving && nextCell) {
+                        startCol = nextCell.col;
+                        startRow = nextCell.row;
+                    }
+
+                    const path = findPath(startCol, startRow, targetCol, targetRow);
+
+                    if (path.length > 0) {
+                        highlightPath(path, window.__3D_STATE__.targetPosition);
+                        
+                        if (isMoving) {
+                            // Replace remaining path
+                            currentPath = path;
+                            window.__3D_STATE__.pathLength = currentPath.length + 1; // +1 for current step
+                        } else {
+                            startMovement(path);
+                        }
+                    } else {
+                        // Check if already at target or heading there
+                        if (startCol === targetCol && startRow === targetRow) {
+                            highlightPath([], window.__3D_STATE__.targetPosition);
+                        } else {
+                            alert("无法到达目标位置！");
+                            window.__3D_STATE__.targetPosition = null;
+                        }
+                    }
+                }
+            }
+        });
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // --- HUD Update ---
+        const elFoxPos = document.getElementById('foxPos');
+        const elTargetPos = document.getElementById('targetPos');
+        const elPathLength = document.getElementById('pathLength');
+        const elAnimState = document.getElementById('animState');
+        const elObstacleCount = document.getElementById('obstacleCount');
+
+        function updateHUD() {
+            const state = window.__3D_STATE__;
+            elFoxPos.innerText = `${state.foxPosition.col}, ${state.foxPosition.row}`;
+            elTargetPos.innerText = state.targetPosition ? `${state.targetPosition.col}, ${state.targetPosition.row}` : '无';
+            elPathLength.innerText = state.pathLength;
+            elAnimState.innerText = state.animState;
+            elObstacleCount.innerText = state.obstacleCount;
+        }
+
+        // --- Animation Loop ---
+        const clock = new THREE.Clock();
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const delta = clock.getDelta();
+
+            if (mixer) mixer.update(delta);
+
+            if (isMoving && foxModel && nextCell) {
+                moveTimer += delta;
+                let progress = moveTimer / MOVE_DURATION;
+
+                if (progress >= 1) {
+                    progress = 1;
+                    foxModel.position.copy(targetPosVec);
+                    currentCell = { col: nextCell.col, row: nextCell.row };
+                    window.__3D_STATE__.foxPosition = { ...currentCell };
+                    
+                    // Remove highlight from the cell we just reached
+                    cellMeshes[currentCell.col][currentCell.row].material.color.setHex(COLOR_GROUND);
+                    
+                    prepareNextStep();
+                } else {
+                    foxModel.position.lerpVectors(startPosVec, targetPosVec, progress);
+                }
+            }
+
+            controls.update();
+            updateHUD();
+            renderer.render(scene, camera);
+        }
+
+        animate();
+    </script>
+</body>
+</html>

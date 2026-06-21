@@ -1,0 +1,469 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Fox Projectile Motion Simulator</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            font-family: monospace;
+            background-color: #000;
+        }
+        #controlPanel {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(0, 0, 0, 0.7);
+            color: white;
+            padding: 15px;
+            border-radius: 8px;
+            z-index: 100;
+            width: 250px;
+        }
+        #hud {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            background: rgba(0, 0, 0, 0.7);
+            color: #00ff00;
+            padding: 15px;
+            border-radius: 8px;
+            z-index: 100;
+            width: 200px;
+        }
+        .control-group {
+            margin-bottom: 10px;
+        }
+        label {
+            display: inline-block;
+            width: 120px;
+        }
+        input[type="range"] {
+            width: 100%;
+        }
+        button {
+            background: #444;
+            color: white;
+            border: 1px solid #666;
+            padding: 5px 10px;
+            margin: 2px;
+            cursor: pointer;
+            border-radius: 4px;
+        }
+        button:hover {
+            background: #666;
+        }
+        .hud-line {
+            margin: 5px 0;
+        }
+    </style>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+
+    <div id="controlPanel">
+        <div class="control-group">
+            <label>Speed: <span id="speedLabel">30</span> m/s</label>
+            <input type="range" id="speedSlider" min="10" max="60" step="1" value="30">
+        </div>
+        <div class="control-group">
+            <label>Angle: <span id="angleLabel">45</span>°</label>
+            <input type="range" id="angleSlider" min="5" max="85" step="1" value="45">
+        </div>
+        <div class="control-group">
+            <button id="fireBtn">Fire (F)</button>
+            <button id="resetBtn">Reset (R)</button>
+        </div>
+        <div class="control-group">
+            <button id="undoBtn">Undo (Ctrl+Z)</button>
+            <button id="redoBtn">Redo (Ctrl+Y)</button>
+        </div>
+    </div>
+
+    <div id="hud">
+        <div class="hud-line" id="posDisplay">Pos: (0.00, 0.00, 0.00)</div>
+        <div class="hud-line" id="velDisplay">Vel: 0.00 m/s</div>
+        <div class="hud-line" id="maxHeightDisplay">Max H: 0.00 m</div>
+        <div class="hud-line" id="rangeDisplay">Range: 0.00 m</div>
+        <div class="hud-line" id="shotCountDisplay">Shots: 0</div>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+        // --- State Management ---
+        window.__3D_STATE__ = {
+            foxPosition: { x: -30, y: 1, z: 0 },
+            foxVelocity: { x: 0, y: 0, z: 0 },
+            launchSpeed: 30,
+            launchAngle: 45,
+            isFlying: false,
+            maxHeight: 0,
+            range: 0,
+            shotCount: 0,
+            undoStackSize: 0,
+            redoStackSize: 0,
+            dragEnabled: true,
+            landed: false,
+            trajectoryCount: 0,
+            mass: 2.0,
+            dragCoefficient: 0.47,
+            timeOfFlight: 0
+        };
+
+        // --- Physics Constants ---
+        const g = 9.81;
+        const Cd = 0.47;
+        const rho = 1.225;
+        const A = 0.1;
+        const mass = 2.0;
+        const dt = 1 / 60;
+        const launchPos = new THREE.Vector3(-30, 1, 0);
+
+        // --- Scene Setup ---
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color('#87CEEB'); // Light blue sky
+
+        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.set(0, 15, 40);
+        camera.lookAt(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        document.body.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+
+        // Lighting
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+        dirLight.position.set(10, 20, 10);
+        scene.add(dirLight);
+
+        // Ground
+        const groundGeo = new THREE.PlaneGeometry(200, 200);
+        const groundMat = new THREE.MeshLambertMaterial({ color: 0x4a7c3f });
+        const ground = new THREE.Mesh(groundGeo, groundMat);
+        ground.rotation.x = -Math.PI / 2;
+        ground.position.y = 0;
+        scene.add(ground);
+
+        const gridHelper = new THREE.GridHelper(200, 40, 0x000000, 0x000000);
+        gridHelper.material.opacity = 0.2;
+        gridHelper.material.transparent = true;
+        scene.add(gridHelper);
+
+        // Launch Pad
+        const padGeo = new THREE.CylinderGeometry(1, 1, 0.5, 32);
+        const padMat = new THREE.MeshLambertMaterial({ color: 0xff0000 });
+        const pad = new THREE.Mesh(padGeo, padMat);
+        pad.position.set(-30, 0.25, 0);
+        scene.add(pad);
+
+        // Fox Model
+        let fox = new THREE.Group(); // Placeholder until loaded
+        scene.add(fox);
+        
+        const loader = new GLTFLoader();
+        loader.load('https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Models/master/2.0/Fox/glTF-Binary/Fox.glb', (gltf) => {
+            scene.remove(fox);
+            fox = gltf.scene;
+            fox.scale.set(0.02, 0.02, 0.02);
+            fox.position.copy(launchPos);
+            fox.lookAt(launchPos.x + 1, launchPos.y, launchPos.z);
+            scene.add(fox);
+        });
+
+        // --- Variables ---
+        let position = new THREE.Vector3().copy(launchPos);
+        let velocity = new THREE.Vector3();
+        let activeTrajectory = null;
+        let flightTime = 0;
+        let currentMaxHeight = 0;
+
+        const historyStack = [];
+        const redoStack = [];
+        const allTrajectories = [];
+
+        // --- DOM Elements ---
+        const speedSlider = document.getElementById('speedSlider');
+        const angleSlider = document.getElementById('angleSlider');
+        const speedLabel = document.getElementById('speedLabel');
+        const angleLabel = document.getElementById('angleLabel');
+        const posDisplay = document.getElementById('posDisplay');
+        const velDisplay = document.getElementById('velDisplay');
+        const maxHeightDisplay = document.getElementById('maxHeightDisplay');
+        const rangeDisplay = document.getElementById('rangeDisplay');
+        const shotCountDisplay = document.getElementById('shotCountDisplay');
+
+        // --- Functions ---
+        function createTrajectoryLine(color) {
+            const maxPoints = 3000;
+            const geometry = new THREE.BufferGeometry();
+            const positions = new Float32Array(maxPoints * 3);
+            geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+            geometry.setDrawRange(0, 0);
+            const material = new THREE.LineBasicMaterial({ color: color, linewidth: 2 });
+            const line = new THREE.Line(geometry, material);
+            scene.add(line);
+            allTrajectories.push(line);
+            return { line, positions, index: 0 };
+        }
+
+        function fire() {
+            if (window.__3D_STATE__.isFlying) reset();
+
+            const speed = parseFloat(speedSlider.value);
+            const angleDeg = parseFloat(angleSlider.value);
+            const angleRad = THREE.MathUtils.degToRad(angleDeg);
+
+            position.copy(launchPos);
+            velocity.set(
+                speed * Math.cos(angleRad),
+                speed * Math.sin(angleRad),
+                0
+            );
+
+            if (activeTrajectory) {
+                scene.remove(activeTrajectory.line);
+                const idx = allTrajectories.indexOf(activeTrajectory.line);
+                if (idx > -1) allTrajectories.splice(idx, 1);
+            }
+
+            activeTrajectory = createTrajectoryLine(0xFFD700); // Yellow
+            activeTrajectory.positions[0] = position.x;
+            activeTrajectory.positions[1] = position.y;
+            activeTrajectory.positions[2] = position.z;
+            activeTrajectory.index = 1;
+            activeTrajectory.line.geometry.setDrawRange(0, 1);
+
+            flightTime = 0;
+            currentMaxHeight = position.y;
+            
+            window.__3D_STATE__.isFlying = true;
+            window.__3D_STATE__.landed = false;
+            window.__3D_STATE__.launchSpeed = speed;
+            window.__3D_STATE__.launchAngle = angleDeg;
+            
+            // Clear redo stack on new fire
+            redoStack.forEach(shot => {
+                scene.remove(shot.line);
+                const idx = allTrajectories.indexOf(shot.line);
+                if (idx > -1) allTrajectories.splice(idx, 1);
+            });
+            redoStack.length = 0;
+        }
+
+        function reset() {
+            window.__3D_STATE__.isFlying = false;
+            window.__3D_STATE__.landed = false;
+            position.copy(launchPos);
+            velocity.set(0, 0, 0);
+            fox.position.copy(position);
+            fox.lookAt(position.x + 1, position.y, position.z);
+            
+            if (activeTrajectory) {
+                scene.remove(activeTrajectory.line);
+                const idx = allTrajectories.indexOf(activeTrajectory.line);
+                if (idx > -1) allTrajectories.splice(idx, 1);
+                activeTrajectory = null;
+            }
+        }
+
+        function handleLanding() {
+            window.__3D_STATE__.isFlying = false;
+            window.__3D_STATE__.landed = true;
+            position.y = 0;
+            fox.position.copy(position);
+            
+            const range = position.x - launchPos.x;
+            window.__3D_STATE__.range = range;
+            window.__3D_STATE__.maxHeight = currentMaxHeight;
+            window.__3D_STATE__.timeOfFlight = flightTime;
+            window.__3D_STATE__.shotCount++;
+
+            if (activeTrajectory) {
+                activeTrajectory.line.material.color.setHex(0x888888); // Gray
+                
+                const shotData = {
+                    line: activeTrajectory.line,
+                    range: range,
+                    maxHeight: currentMaxHeight,
+                    timeOfFlight: flightTime,
+                    landingPos: position.clone()
+                };
+                historyStack.push(shotData);
+                activeTrajectory = null;
+            }
+        }
+
+        function undo() {
+            if (window.__3D_STATE__.isFlying) reset();
+            if (historyStack.length === 0) return;
+
+            const shot = historyStack.pop();
+            redoStack.push(shot);
+            scene.remove(shot.line);
+            
+            window.__3D_STATE__.shotCount--;
+            reset();
+            
+            // Restore stats to previous if available
+            if (historyStack.length > 0) {
+                const prev = historyStack[historyStack.length - 1];
+                window.__3D_STATE__.range = prev.range;
+                window.__3D_STATE__.maxHeight = prev.maxHeight;
+            } else {
+                window.__3D_STATE__.range = 0;
+                window.__3D_STATE__.maxHeight = 0;
+            }
+        }
+
+        function redo() {
+            if (window.__3D_STATE__.isFlying) reset();
+            if (redoStack.length === 0) return;
+
+            const shot = redoStack.pop();
+            historyStack.push(shot);
+            scene.add(shot.line);
+            
+            window.__3D_STATE__.shotCount++;
+            window.__3D_STATE__.range = shot.range;
+            window.__3D_STATE__.maxHeight = shot.maxHeight;
+            
+            // Move fox to landing pos of redone shot
+            position.copy(shot.landingPos);
+            fox.position.copy(position);
+            fox.lookAt(position.x + 1, position.y, position.z);
+        }
+
+        function updatePhysics() {
+            if (!window.__3D_STATE__.isFlying) return;
+
+            const speed = velocity.length();
+            
+            // F_drag = -0.5 * Cd * rho * A * |v| * v
+            const dragMag = 0.5 * Cd * rho * A * speed;
+            const dragForce = velocity.clone().multiplyScalar(-dragMag);
+            
+            const gravityForce = new THREE.Vector3(0, -mass * g, 0);
+            
+            const totalForce = new THREE.Vector3().addVectors(dragForce, gravityForce);
+            const acceleration = totalForce.divideScalar(mass);
+
+            // Semi-implicit Euler
+            velocity.add(acceleration.multiplyScalar(dt));
+            
+            // Prevent NaN
+            if (isNaN(velocity.x)) velocity.set(0,0,0);
+
+            position.add(velocity.clone().multiplyScalar(dt));
+            flightTime += dt;
+
+            if (position.y > currentMaxHeight) {
+                currentMaxHeight = position.y;
+            }
+
+            // Update Fox
+            fox.position.copy(position);
+            if (velocity.lengthSq() > 0.1) {
+                fox.lookAt(position.clone().add(velocity));
+            }
+
+            // Update Trajectory Line
+            if (activeTrajectory && activeTrajectory.index < 3000) {
+                const idx = activeTrajectory.index;
+                activeTrajectory.positions[idx * 3] = position.x;
+                activeTrajectory.positions[idx * 3 + 1] = position.y;
+                activeTrajectory.positions[idx * 3 + 2] = position.z;
+                activeTrajectory.index++;
+                activeTrajectory.line.geometry.setDrawRange(0, activeTrajectory.index);
+                activeTrajectory.line.geometry.attributes.position.needsUpdate = true;
+            }
+
+            // Check Landing
+            if (position.y <= 0) {
+                handleLanding();
+            }
+        }
+
+        function updateUI() {
+            // Update State Object
+            window.__3D_STATE__.foxPosition = { x: fox.position.x, y: fox.position.y, z: fox.position.z };
+            window.__3D_STATE__.foxVelocity = { x: velocity.x, y: velocity.y, z: velocity.z };
+            window.__3D_STATE__.launchSpeed = parseFloat(speedSlider.value);
+            window.__3D_STATE__.launchAngle = parseFloat(angleSlider.value);
+            window.__3D_STATE__.undoStackSize = historyStack.length;
+            window.__3D_STATE__.redoStackSize = redoStack.length;
+            
+            let visibleLines = 0;
+            allTrajectories.forEach(l => { if(l.parent === scene) visibleLines++; });
+            window.__3D_STATE__.trajectoryCount = visibleLines;
+
+            // Update DOM
+            speedLabel.innerText = speedSlider.value;
+            angleLabel.innerText = angleSlider.value;
+
+            posDisplay.innerText = `Pos: (${fox.position.x.toFixed(2)}, ${fox.position.y.toFixed(2)}, ${fox.position.z.toFixed(2)})`;
+            velDisplay.innerText = `Vel: ${velocity.length().toFixed(2)} m/s`;
+            
+            if (window.__3D_STATE__.isFlying) {
+                maxHeightDisplay.innerText = `Max H: ${currentMaxHeight.toFixed(2)} m`;
+                rangeDisplay.innerText = `Range: ${(fox.position.x - launchPos.x).toFixed(2)} m`;
+            } else {
+                maxHeightDisplay.innerText = `Max H: ${window.__3D_STATE__.maxHeight.toFixed(2)} m`;
+                rangeDisplay.innerText = `Range: ${window.__3D_STATE__.range.toFixed(2)} m`;
+            }
+            
+            shotCountDisplay.innerText = `Shots: ${window.__3D_STATE__.shotCount}`;
+        }
+
+        // --- Event Listeners ---
+        document.getElementById('fireBtn').addEventListener('click', fire);
+        document.getElementById('resetBtn').addEventListener('click', reset);
+        document.getElementById('undoBtn').addEventListener('click', undo);
+        document.getElementById('redoBtn').addEventListener('click', redo);
+
+        speedSlider.addEventListener('input', updateUI);
+        angleSlider.addEventListener('input', updateUI);
+
+        window.addEventListener('keydown', (e) => {
+            if (e.key.toLowerCase() === 'f') fire();
+            if (e.key.toLowerCase() === 'r') reset();
+            if (e.ctrlKey && e.key.toLowerCase() === 'z') undo();
+            if (e.ctrlKey && e.key.toLowerCase() === 'y') redo();
+        });
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // --- Animation Loop ---
+        function animate() {
+            requestAnimationFrame(animate);
+            updatePhysics();
+            controls.update();
+            updateUI();
+            renderer.render(scene, camera);
+        }
+
+        animate();
+    </script>
+</body>
+</html>

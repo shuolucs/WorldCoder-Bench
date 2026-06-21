@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Soft Body Simulation</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #111; font-family: sans-serif; }
+        #ui { position: absolute; top: 10px; left: 10px; z-index: 10; }
+        button {
+            padding: 10px 20px;
+            font-size: 16px;
+            background-color: #4CAF50;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.3);
+        }
+        button:hover { background-color: #45a049; }
+        button.active { background-color: #f44336; }
+    </style>
+    <script type="importmap">
+    { "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+    } }
+    </script>
+</head>
+<body>
+    <div id="ui">
+        <button id="windBtn">Wind: OFF</button>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        // --- Configuration ---
+        const GRID_SIZE = 10;
+        const NUM_PARTICLES = GRID_SIZE * GRID_SIZE * GRID_SIZE;
+        const REST_LENGTH = 1.0;
+        const MASS = 1.0;
+        const STIFFNESS = 500.0;
+        const DAMPING = 5.0;
+        const GRAVITY = -9.81;
+        const RESTITUTION = 0.6;
+        const FRICTION = 0.8;
+        const DT = 0.002;
+        const SUBSTEPS = 8;
+
+        // --- State Variables ---
+        let simTime = 0;
+        let windEnabled = false;
+        let currentMaxStretch = 0;
+        let currentGroundContacts = 0;
+
+        // --- Data Arrays ---
+        const pos = new Float32Array(NUM_PARTICLES * 3);
+        const prevPos = new Float32Array(NUM_PARTICLES * 3);
+        const force = new Float32Array(NUM_PARTICLES * 3);
+        const pinned = new Uint8Array(NUM_PARTICLES);
+        const springs = [];
+
+        // --- Initialization ---
+        function getIndex(i, j, k) {
+            return i * GRID_SIZE * GRID_SIZE + j * GRID_SIZE + k;
+        }
+
+        function initPhysics() {
+            let idx = 0;
+            const offset = (GRID_SIZE - 1) * REST_LENGTH / 2;
+            const startY = 5.0; // Bottom of the cube at y=5
+
+            for (let i = 0; i < GRID_SIZE; i++) {
+                for (let j = 0; j < GRID_SIZE; j++) {
+                    for (let k = 0; k < GRID_SIZE; k++) {
+                        const x = i * REST_LENGTH - offset;
+                        const y = j * REST_LENGTH + startY;
+                        const z = k * REST_LENGTH - offset;
+
+                        const pIdx = getIndex(i, j, k) * 3;
+                        pos[pIdx] = x; pos[pIdx + 1] = y; pos[pIdx + 2] = z;
+                        prevPos[pIdx] = x; prevPos[pIdx + 1] = y; prevPos[pIdx + 2] = z;
+
+                        // Pin top 4 corners (j=9 is the top face)
+                        if ((i === 0 || i === GRID_SIZE - 1) && j === GRID_SIZE - 1 && (k === 0 || k === GRID_SIZE - 1)) {
+                            pinned[getIndex(i, j, k)] = 1;
+                        }
+                    }
+                }
+            }
+
+            // Generate Springs
+            const addSpring = (i1, j1, k1, i2, j2, k2) => {
+                const a = getIndex(i1, j1, k1);
+                const b = getIndex(i2, j2, k2);
+                const dx = pos[a * 3] - pos[b * 3];
+                const dy = pos[a * 3 + 1] - pos[b * 3 + 1];
+                const dz = pos[a * 3 + 2] - pos[b * 3 + 2];
+                const restLen = Math.sqrt(dx * dx + dy * dy + dz * dz);
+                springs.push({ a, b, restLen });
+            };
+
+            for (let i = 0; i < GRID_SIZE; i++) {
+                for (let j = 0; j < GRID_SIZE; j++) {
+                    for (let k = 0; k < GRID_SIZE; k++) {
+                        // Structural (6-way)
+                        if (i < GRID_SIZE - 1) addSpring(i, j, k, i + 1, j, k);
+                        if (j < GRID_SIZE - 1) addSpring(i, j, k, i, j + 1, k);
+                        if (k < GRID_SIZE - 1) addSpring(i, j, k, i, j, k + 1);
+
+                        // Face Diagonals (Shear)
+                        if (i < GRID_SIZE - 1 && j < GRID_SIZE - 1) {
+                            addSpring(i, j, k, i + 1, j + 1, k);
+                            addSpring(i + 1, j, k, i, j + 1, k);
+                        }
+                        if (j < GRID_SIZE - 1 && k < GRID_SIZE - 1) {
+                            addSpring(i, j, k, i, j + 1, k + 1);
+                            addSpring(i, j + 1, k, i, j, k + 1);
+                        }
+                        if (i < GRID_SIZE - 1 && k < GRID_SIZE - 1) {
+                            addSpring(i, j, k, i + 1, j, k + 1);
+                            addSpring(i + 1, j, k, i, j, k + 1);
+                        }
+
+                        // Body Diagonals (Volume)
+                        if (i < GRID_SIZE - 1 && j < GRID_SIZE - 1 && k < GRID_SIZE - 1) {
+                            addSpring(i, j, k, i + 1, j + 1, k + 1);
+                            addSpring(i + 1, j, k, i, j + 1, k + 1);
+                            addSpring(i, j + 1, k, i + 1, j, k + 1);
+                            addSpring(i, j, k + 1, i + 1, j + 1, k);
+                        }
+                    }
+                }
+            }
+        }
+
+        // --- Simulation Step ---
+        function simulate() {
+            let stepMaxStretch = 0;
+            let stepContacts = 0;
+
+            for (let s = 0; s < SUBSTEPS; s++) {
+                force.fill(0);
+
+                // External Forces (Gravity & Wind)
+                for (let i = 0; i < NUM_PARTICLES; i++) {
+                    const i3 = i * 3;
+                    force[i3 + 1] += GRAVITY * MASS;
+                    if (windEnabled) {
+                        force[i3 + 2] += 15.0; // Constant wind in +Z
+                    }
+                }
+
+                // Spring Forces (Hooke's Law + Damping)
+                for (let i = 0; i < springs.length; i++) {
+                    const sp = springs[i];
+                    const a3 = sp.a * 3;
+                    const b3 = sp.b * 3;
+
+                    const dx = pos[b3] - pos[a3];
+                    const dy = pos[b3 + 1] - pos[a3 + 1];
+                    const dz = pos[b3 + 2] - pos[a3 + 2];
+                    const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+
+                    if (dist > 0.0001) {
+                        const nx = dx / dist;
+                        const ny = dy / dist;
+                        const nz = dz / dist;
+
+                        const vx = (pos[b3] - prevPos[b3] - (pos[a3] - prevPos[a3])) / DT;
+                        const vy = (pos[b3 + 1] - prevPos[b3 + 1] - (pos[a3 + 1] - prevPos[a3 + 1])) / DT;
+                        const vz = (pos[b3 + 2] - prevPos[b3 + 2] - (pos[a3 + 2] - prevPos[a3 + 2])) / DT;
+
+                        const vRelDot = vx * nx + vy * ny + vz * nz;
+                        const f = STIFFNESS * (dist - sp.restLen) + DAMPING * vRelDot;
+
+                        const fx = f * nx;
+                        const fy = f * ny;
+                        const fz = f * nz;
+
+                        force[a3] += fx; force[a3 + 1] += fy; force[a3 + 2] += fz;
+                        force[b3] -= fx; force[b3 + 1] -= fy; force[b3 + 2] -= fz;
+
+                        if (s === SUBSTEPS - 1) {
+                            const stretch = dist / sp.restLen;
+                            if (stretch > stepMaxStretch) stepMaxStretch = stretch;
+                        }
+                    }
+                }
+
+                // Verlet Integration & Collision
+                stepContacts = 0;
+                for (let i = 0; i < NUM_PARTICLES; i++) {
+                    if (pinned[i]) continue;
+
+                    const i3 = i * 3;
+                    const x = pos[i3], y = pos[i3 + 1], z = pos[i3 + 2];
+                    const px = prevPos[i3], py = prevPos[i3 + 1], pz = prevPos[i3 + 2];
+
+                    let nx = 2 * x - px + force[i3] * DT * DT / MASS;
+                    let ny = 2 * y - py + force[i3 + 1] * DT * DT / MASS;
+                    let nz = 2 * z - pz + force[i3 + 2] * DT * DT / MASS;
+
+                    // Ground Collision (y=0)
+                    if (ny < 0) {
+                        const vy_unconstrained = ny - y;
+                        ny = 0;
+                        
+                        // Bounce
+                        const npy = ny + RESTITUTION * vy_unconstrained;
+                        
+                        // Friction
+                        const vx = nx - x;
+                        const vz = nz - z;
+                        const npx = nx - vx * FRICTION;
+                        const npz = nz - vz * FRICTION;
+
+                        prevPos[i3] = npx;
+                        prevPos[i3 + 1] = npy;
+                        prevPos[i3 + 2] = npz;
+                        stepContacts++;
+                    } else {
+                        prevPos[i3] = x;
+                        prevPos[i3 + 1] = y;
+                        prevPos[i3 + 2] = z;
+                    }
+
+                    pos[i3] = nx;
+                    pos[i3 + 1] = ny;
+                    pos[i3 + 2] = nz;
+                }
+            }
+
+            simTime += DT * SUBSTEPS;
+            currentMaxStretch = stepMaxStretch;
+            currentGroundContacts = stepContacts;
+        }
+
+        // --- Three.js Setup ---
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x222222);
+
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.set(20, 15, 30);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        document.body.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.target.set(0, 5, 0);
+        controls.update();
+
+        // Lights
+        const ambientLight = new THREE.AmbientLight(0x404040, 2.0);
+        scene.add(ambientLight);
+        const dirLight = new THREE.DirectionalLight(0xffffff, 2.0);
+        dirLight.position.set(10, 20, 10);
+        scene.add(dirLight);
+
+        // Ground Grid
+        const gridHelper = new THREE.GridHelper(50, 50, 0x888888, 0x444444);
+        scene.add(gridHelper);
+
+        initPhysics();
+
+        // --- Rendering Objects ---
+        // Particles (InstancedMesh)
+        const sphereGeo = new THREE.SphereGeometry(0.15, 16, 16);
+        const sphereMat = new THREE.MeshStandardMaterial({ color: 0x3498db, roughness: 0.4 });
+        const instancedMesh = new THREE.InstancedMesh(sphereGeo, sphereMat, NUM_PARTICLES);
+        
+        // Color pinned nodes differently
+        const colorPinned = new THREE.Color(0xe74c3c);
+        const colorNormal = new THREE.Color(0x3498db);
+        for(let i=0; i<NUM_PARTICLES; i++) {
+            instancedMesh.setColorAt(i, pinned[i] ? colorPinned : colorNormal);
+        }
+        scene.add(instancedMesh);
+
+        // Springs (LineSegments)
+        const lineGeo = new THREE.BufferGeometry();
+        const linePositions = new Float32Array(springs.length * 6);
+        lineGeo.setAttribute('position', new THREE.BufferAttribute(linePositions, 3));
+        const lineMat = new THREE.LineBasicMaterial({ color: 0xaaaaaa, transparent: true, opacity: 0.3 });
+        const lines = new THREE.LineSegments(lineGeo, lineMat);
+        scene.add(lines);
+
+        const dummy = new THREE.Object3D();
+
+        // --- UI & Events ---
+        const windBtn = document.getElementById('windBtn');
+        windBtn.addEventListener('click', () => {
+            windEnabled = !windEnabled;
+            windBtn.innerText = windEnabled ? 'Wind: ON' : 'Wind: OFF';
+            windBtn.className = windEnabled ? 'active' : '';
+        });
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // --- Main Loop ---
+        function animate() {
+            requestAnimationFrame(animate);
+
+            simulate();
+
+            // Update InstancedMesh
+            let cx = 0, cy = 0, cz = 0;
+            for (let i = 0; i < NUM_PARTICLES; i++) {
+                const i3 = i * 3;
+                dummy.position.set(pos[i3], pos[i3 + 1], pos[i3 + 2]);
+                dummy.updateMatrix();
+                instancedMesh.setMatrixAt(i, dummy.matrix);
+                
+                cx += pos[i3];
+                cy += pos[i3 + 1];
+                cz += pos[i3 + 2];
+            }
+            instancedMesh.instanceMatrix.needsUpdate = true;
+
+            // Update Lines
+            for (let i = 0; i < springs.length; i++) {
+                const sp = springs[i];
+                const a3 = sp.a * 3;
+                const b3 = sp.b * 3;
+                const i6 = i * 6;
+                linePositions[i6]     = pos[a3];
+                linePositions[i6 + 1] = pos[a3 + 1];
+                linePositions[i6 + 2] = pos[a3 + 2];
+                linePositions[i6 + 3] = pos[b3];
+                linePositions[i6 + 4] = pos[b3 + 1];
+                linePositions[i6 + 5] = pos[b3 + 2];
+            }
+            lineGeo.attributes.position.needsUpdate = true;
+
+            renderer.render(scene, camera);
+
+            // Expose State
+            window.__3D_STATE__ = {
+                nodeCount: NUM_PARTICLES,
+                springCount: springs.length,
+                centerOfMass: { 
+                    x: cx / NUM_PARTICLES, 
+                    y: cy / NUM_PARTICLES, 
+                    z: cz / NUM_PARTICLES 
+                },
+                maxStretch: currentMaxStretch,
+                groundContacts: currentGroundContacts,
+                windEnabled: windEnabled,
+                simTime: simTime
+            };
+        }
+
+        animate();
+    </script>
+</body>
+</html>

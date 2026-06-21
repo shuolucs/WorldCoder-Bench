@@ -1,0 +1,399 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Crystal Growth Lab</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #0a0a1a;
+            font-family: monospace;
+            user-select: none;
+        }
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+        }
+        #hud {
+            position: absolute;
+            top: 15px;
+            left: 15px;
+            background: rgba(10, 10, 26, 0.75);
+            color: white;
+            padding: 15px;
+            border-radius: 8px;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            pointer-events: none;
+            min-width: 250px;
+            backdrop-filter: blur(4px);
+        }
+        #hud h1 {
+            margin: 0 0 10px 0;
+            font-size: 18px;
+            color: #44aaff;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            border-bottom: 1px solid rgba(255,255,255,0.2);
+            padding-bottom: 5px;
+        }
+        .stat-row {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 5px;
+            font-size: 14px;
+        }
+        .stat-label {
+            color: #aaa;
+        }
+        .stat-value {
+            font-weight: bold;
+        }
+        #controls-help {
+            margin-top: 15px;
+            font-size: 11px;
+            color: #888;
+            border-top: 1px solid rgba(255,255,255,0.2);
+            padding-top: 10px;
+            line-height: 1.4;
+        }
+    </style>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="hud">
+        <h1>Crystal Growth Lab</h1>
+        <div class="stat-row"><span class="stat-label">Crystals:</span> <span class="stat-value" id="val-count">0 / 50</span></div>
+        <div class="stat-row"><span class="stat-label">Clusters:</span> <span class="stat-value" id="val-clusters">0</span></div>
+        <div class="stat-row"><span class="stat-label">Avg Height:</span> <span class="stat-value" id="val-height">0.00</span></div>
+        <div class="stat-row"><span class="stat-label">Speed:</span> <span class="stat-value" id="val-speed">1.00x</span></div>
+        <div class="stat-row"><span class="stat-label">Palette:</span> <span class="stat-value" id="val-palette">vibrant</span></div>
+        <div class="stat-row"><span class="stat-label">Status:</span> <span class="stat-value" id="val-status">Running</span></div>
+        <div class="stat-row"><span class="stat-label">Glow:</span> <span class="stat-value" id="val-glow">Off</span></div>
+        
+        <div id="controls-help">
+            Click Ground: Plant Seed<br>
+            Space: Pause/Resume<br>
+            R: Reset Simulation<br>
+            C: Cycle Palette<br>
+            Up/Down: Adjust Speed<br>
+            G: Toggle Glow
+        </div>
+    </div>
+    <div id="canvas-container"></div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+        // State Management
+        window.__3D_STATE__ = {
+            crystalCount: 0,
+            clusterCount: 0,
+            averageHeight: 0,
+            speedMultiplier: 1.0,
+            paused: false,
+            paletteMode: 'vibrant',
+            glowEnabled: false,
+            maxGeneration: 0,
+            modelLoaded: false,
+            growthComplete: 0
+        };
+
+        const palettes = {
+            vibrant: [0xff44aa, 0x44ffaa, 0xaa44ff, 0x44aaff, 0xffaa44, 0xff4444],
+            ice: [0x88ccff, 0xaaeeff, 0xccffff, 0x6699cc, 0x99bbdd, 0xbbddff],
+            fire: [0xff2200, 0xff6600, 0xffaa00, 0xff4400, 0xcc3300, 0xff8800]
+        };
+        const paletteNames = Object.keys(palettes);
+        let currentPaletteIndex = 0;
+
+        let crystals = [];
+        const MAX_CRYSTALS = 50;
+
+        // Scene Setup
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x0a0a1a);
+
+        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.set(0, 15, 25);
+        camera.lookAt(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        document.getElementById('canvas-container').appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.05;
+        controls.maxPolarAngle = Math.PI / 2 - 0.05; // Don't go below ground
+
+        // Lighting
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.3);
+        scene.add(ambientLight);
+
+        const warmLight = new THREE.DirectionalLight(0xffd700, 0.8);
+        warmLight.position.set(10, 20, 10);
+        scene.add(warmLight);
+
+        const coolLight = new THREE.DirectionalLight(0x4488ff, 0.5);
+        coolLight.position.set(-10, 15, -10);
+        scene.add(coolLight);
+
+        // Invisible Ground Plane for Raycasting
+        const groundGeo = new THREE.PlaneGeometry(100, 100);
+        groundGeo.rotateX(-Math.PI / 2);
+        const groundMat = new THREE.MeshBasicMaterial({ visible: false });
+        const groundPlane = new THREE.Mesh(groundGeo, groundMat);
+        scene.add(groundPlane);
+
+        // Load Environment Model
+        const loader = new GLTFLoader();
+        loader.load('collision-world.glb', (gltf) => {
+            const model = gltf.scene;
+            model.position.set(0, -2, 0);
+            model.scale.set(0.05, 0.05, 0.05);
+            
+            // Enhance model materials slightly for better look
+            model.traverse((child) => {
+                if (child.isMesh && child.material) {
+                    child.material.roughness = 0.8;
+                    child.material.metalness = 0.2;
+                }
+            });
+
+            scene.add(model);
+            window.__3D_STATE__.modelLoaded = true;
+        }, undefined, (error) => {
+            console.error('Error loading model:', error);
+            // Fallback if model fails to load so simulation still works
+            window.__3D_STATE__.modelLoaded = true; 
+        });
+
+        // Crystal Geometry (reused)
+        const crystalGeometry = new THREE.CylinderGeometry(0.15, 0.4, 1, 6);
+        crystalGeometry.translate(0, 0.5, 0); // Move origin to bottom
+
+        function createCrystal(position, generation, parentRotation = null) {
+            if (crystals.length >= MAX_CRYSTALS) return;
+
+            const palette = palettes[window.__3D_STATE__.paletteMode];
+            const colorHex = palette[Math.floor(Math.random() * palette.length)];
+            const targetHeight = 1.5 + Math.random() * 3.5;
+
+            const material = new THREE.MeshPhysicalMaterial({
+                color: colorHex,
+                transmission: 0.6,
+                roughness: 0.1,
+                metalness: 0.1,
+                transparent: true,
+                opacity: 0.85,
+                side: THREE.DoubleSide
+            });
+
+            const mesh = new THREE.Mesh(crystalGeometry, material);
+            mesh.position.copy(position);
+
+            if (parentRotation) {
+                mesh.rotation.copy(parentRotation);
+                // Tilt up to 25 degrees (0.436 rad)
+                const tiltX = (Math.random() - 0.5) * 0.87;
+                const tiltZ = (Math.random() - 0.5) * 0.87;
+                mesh.rotateX(tiltX);
+                mesh.rotateZ(tiltZ);
+            }
+            // Random Y rotation
+            mesh.rotateY(Math.random() * Math.PI * 2);
+
+            mesh.scale.set(1, 0.01, 1);
+            scene.add(mesh);
+
+            let glowLight = null;
+            if (window.__3D_STATE__.glowEnabled) {
+                glowLight = new THREE.PointLight(colorHex, 0.3, 3);
+                glowLight.position.set(0, 1, 0);
+                mesh.add(glowLight);
+            }
+
+            crystals.push({
+                mesh,
+                targetHeight,
+                currentHeight: 0.01,
+                generation,
+                hasSpawned: false,
+                color: colorHex,
+                glowLight,
+                isComplete: false
+            });
+
+            if (generation === 0) {
+                window.__3D_STATE__.clusterCount++;
+            }
+        }
+
+        // Interaction
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+
+        window.addEventListener('click', (event) => {
+            mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+            raycaster.setFromCamera(mouse, camera);
+            const intersects = raycaster.intersectObject(groundPlane);
+
+            if (intersects.length > 0) {
+                createCrystal(intersects[0].point, 0);
+            }
+        });
+
+        window.addEventListener('keydown', (event) => {
+            const state = window.__3D_STATE__;
+            switch(event.key.toLowerCase()) {
+                case ' ':
+                    state.paused = !state.paused;
+                    break;
+                case 'r':
+                    crystals.forEach(c => {
+                        scene.remove(c.mesh);
+                        c.mesh.material.dispose();
+                        if (c.glowLight) c.glowLight.dispose();
+                    });
+                    crystals = [];
+                    state.clusterCount = 0;
+                    break;
+                case 'c':
+                    currentPaletteIndex = (currentPaletteIndex + 1) % paletteNames.length;
+                    state.paletteMode = paletteNames[currentPaletteIndex];
+                    break;
+                case 'g':
+                    state.glowEnabled = !state.glowEnabled;
+                    crystals.forEach(c => {
+                        if (state.glowEnabled && !c.glowLight) {
+                            c.glowLight = new THREE.PointLight(c.color, 0.3, 3);
+                            c.glowLight.position.set(0, 1, 0);
+                            c.mesh.add(c.glowLight);
+                        } else if (!state.glowEnabled && c.glowLight) {
+                            c.mesh.remove(c.glowLight);
+                            c.glowLight.dispose();
+                            c.glowLight = null;
+                        }
+                    });
+                    break;
+                case 'arrowup':
+                    state.speedMultiplier = Math.min(4.0, state.speedMultiplier + 0.25);
+                    break;
+                case 'arrowdown':
+                    state.speedMultiplier = Math.max(0.25, state.speedMultiplier - 0.25);
+                    break;
+            }
+        });
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // Update HUD
+        function updateHUD() {
+            const state = window.__3D_STATE__;
+            document.getElementById('val-count').innerText = `${state.crystalCount} / ${MAX_CRYSTALS}`;
+            document.getElementById('val-clusters').innerText = state.clusterCount;
+            document.getElementById('val-height').innerText = state.averageHeight.toFixed(2);
+            document.getElementById('val-speed').innerText = state.speedMultiplier.toFixed(2) + 'x';
+            document.getElementById('val-palette').innerText = state.paletteMode;
+            
+            const statusEl = document.getElementById('val-status');
+            statusEl.innerText = state.paused ? 'Paused' : 'Running';
+            statusEl.style.color = state.paused ? '#ff4444' : '#44ffaa';
+            
+            document.getElementById('val-glow').innerText = state.glowEnabled ? 'On' : 'Off';
+        }
+
+        // Animation Loop
+        const clock = new THREE.Clock();
+
+        function animate() {
+            requestAnimationFrame(animate);
+            
+            const delta = clock.getDelta();
+            const state = window.__3D_STATE__;
+
+            controls.update();
+
+            let totalHeight = 0;
+            let maxGen = 0;
+            let completed = 0;
+
+            if (!state.paused) {
+                const growthAmount = 0.02 * state.speedMultiplier; // Base speed per frame approx
+
+                // Create a copy of array length to avoid infinite loop if spawning adds to array during iteration
+                const currentLen = crystals.length; 
+                
+                for (let i = 0; i < currentLen; i++) {
+                    const c = crystals[i];
+                    
+                    // Growth
+                    if (c.currentHeight < c.targetHeight) {
+                        c.currentHeight = Math.min(c.targetHeight, c.currentHeight + growthAmount);
+                        c.mesh.scale.y = c.currentHeight;
+                    } else if (!c.isComplete) {
+                        c.isComplete = true;
+                    }
+
+                    // Shimmer rotation
+                    c.mesh.rotateY(0.005);
+
+                    // Spawning
+                    if (!c.hasSpawned && c.currentHeight >= c.targetHeight * 0.5 && c.generation < 3) {
+                        c.hasSpawned = true;
+                        const numChildren = Math.floor(Math.random() * 3) + 1; // 1 to 3
+                        
+                        for (let j = 0; j < numChildren; j++) {
+                            if (crystals.length >= MAX_CRYSTALS) break;
+                            
+                            const angle = Math.random() * Math.PI * 2;
+                            const radius = 0.5 + Math.random() * 1.0; // within 1.5
+                            const offset = new THREE.Vector3(Math.cos(angle) * radius, 0, Math.sin(angle) * radius);
+                            const childPos = c.mesh.position.clone().add(offset);
+                            childPos.y = 0; // Keep on ground plane
+                            
+                            createCrystal(childPos, c.generation + 1, c.mesh.rotation);
+                        }
+                    }
+                }
+            }
+
+            // Calculate stats
+            crystals.forEach(c => {
+                totalHeight += c.currentHeight;
+                if (c.generation > maxGen) maxGen = c.generation;
+                if (c.isComplete) completed++;
+            });
+
+            state.crystalCount = crystals.length;
+            state.averageHeight = crystals.length > 0 ? totalHeight / crystals.length : 0;
+            state.maxGeneration = maxGen;
+            state.growthComplete = completed;
+
+            updateHUD();
+            renderer.render(scene, camera);
+        }
+
+        animate();
+    </script>
+</body>
+</html>

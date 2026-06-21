@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Top-Down Space Shooter</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #000;
+            font-family: 'Courier New', Courier, monospace;
+            user-select: none;
+        }
+        #ui-container {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            color: #fff;
+            font-size: 20px;
+            pointer-events: none;
+            text-shadow: 1px 1px 2px #000;
+            z-index: 10;
+        }
+        .ui-item {
+            margin-bottom: 5px;
+        }
+        #gameover {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: #ff0000;
+            font-size: 48px;
+            font-weight: bold;
+            display: none;
+            text-shadow: 2px 2px 4px #000;
+            z-index: 20;
+        }
+        #controls-hint {
+            position: absolute;
+            bottom: 10px;
+            left: 10px;
+            color: #aaa;
+            font-size: 14px;
+            pointer-events: none;
+        }
+    </style>
+    <script type="importmap">
+    { "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+    } }
+    </script>
+</head>
+<body>
+    <div id="ui-container">
+        <div class="ui-item">Score: <span id="score">0</span></div>
+        <div class="ui-item">Lives: <span id="lives">3</span></div>
+        <div class="ui-item">Wave: <span id="wave">1</span></div>
+    </div>
+    <div id="gameover">GAME OVER</div>
+    <div id="controls-hint">A/D or Left/Right to move | Space to shoot</div>
+
+    <script type="module">
+        import * as THREE from 'three';
+
+        // --- Game State ---
+        let score = 0;
+        let lives = 3;
+        let waveNum = 1;
+        let shotsFired = 0;
+        let isGameOver = false;
+        const enemiesPerWave = 10;
+
+        // --- Scene Setup ---
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x050510);
+        scene.fog = new THREE.FogExp2(0x050510, 0.015);
+
+        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+        // Top-down view, looking at XZ plane
+        camera.position.set(0, 50, 10);
+        camera.lookAt(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        document.body.appendChild(renderer.domElement);
+
+        // --- Lighting ---
+        const ambientLight = new THREE.AmbientLight(0x404040);
+        scene.add(ambientLight);
+        const dirLight = new THREE.DirectionalLight(0xffffff, 1.5);
+        dirLight.position.set(10, 50, 20);
+        scene.add(dirLight);
+
+        // --- Background Stars ---
+        const starGeo = new THREE.BufferGeometry();
+        const starPos = [];
+        for(let i = 0; i < 800; i++) {
+            starPos.push((Math.random() - 0.5) * 200, -20, (Math.random() - 0.5) * 200);
+        }
+        starGeo.setAttribute('position', new THREE.Float32BufferAttribute(starPos, 3));
+        const starMat = new THREE.PointsMaterial({ color: 0xffffff, size: 0.3, transparent: true, opacity: 0.8 });
+        const stars = new THREE.Points(starGeo, starMat);
+        scene.add(stars);
+
+        // --- Game Objects ---
+        const boundsX = 25;
+        const shipZ = 15;
+        const spawnZ = -40;
+        const despawnZ = 20;
+
+        // Player Ship
+        const shipGroup = new THREE.Group();
+        const hullGeo = new THREE.ConeGeometry(1.2, 3, 8);
+        hullGeo.rotateX(-Math.PI / 2);
+        const hullMat = new THREE.MeshPhongMaterial({ color: 0x00aaff, shininess: 100 });
+        const hull = new THREE.Mesh(hullGeo, hullMat);
+        const wingGeo = new THREE.BoxGeometry(4, 0.5, 1);
+        const wingMat = new THREE.MeshPhongMaterial({ color: 0x0055aa });
+        const wings = new THREE.Mesh(wingGeo, wingMat);
+        wings.position.z = 0.5;
+        shipGroup.add(hull);
+        shipGroup.add(wings);
+        shipGroup.position.set(0, 0, shipZ);
+        scene.add(shipGroup);
+
+        // Arrays for dynamic objects
+        const lasers = [];
+        const enemies = [];
+        const particles = [];
+
+        // --- Input Handling ---
+        const keys = { a: false, d: false, space: false };
+        window.addEventListener('keydown', (e) => {
+            if (e.code === 'KeyA' || e.code === 'ArrowLeft') keys.a = true;
+            if (e.code === 'KeyD' || e.code === 'ArrowRight') keys.d = true;
+            if (e.code === 'Space') keys.space = true;
+        });
+        window.addEventListener('keyup', (e) => {
+            if (e.code === 'KeyA' || e.code === 'ArrowLeft') keys.a = false;
+            if (e.code === 'KeyD' || e.code === 'ArrowRight') keys.d = false;
+            if (e.code === 'Space') keys.space = false;
+        });
+
+        // --- Game Logic Functions ---
+        let lastShootTime = 0;
+        const shootCooldown = 150;
+
+        function shoot() {
+            const now = Date.now();
+            if (now - lastShootTime > shootCooldown) {
+                const geo = new THREE.CylinderGeometry(0.15, 0.15, 2.5, 8);
+                geo.rotateX(Math.PI / 2);
+                const mat = new THREE.MeshBasicMaterial({ color: 0x00ff00 });
+                const laser = new THREE.Mesh(geo, mat);
+                laser.position.copy(shipGroup.position);
+                laser.position.z -= 1.5;
+                scene.add(laser);
+                lasers.push(laser);
+                shotsFired++;
+                lastShootTime = now;
+            }
+        }
+
+        function spawnWave() {
+            for (let i = 0; i < enemiesPerWave; i++) {
+                const geo = new THREE.BoxGeometry(2, 1.5, 2);
+                const mat = new THREE.MeshPhongMaterial({ color: 0xff3333, shininess: 50 });
+                const enemy = new THREE.Mesh(geo, mat);
+                
+                // Randomize X position within bounds, stagger Z position
+                const xPos = (Math.random() - 0.5) * boundsX * 2;
+                const zPos = spawnZ - Math.random() * 30;
+                enemy.position.set(xPos, 0, zPos);
+                
+                // Add a simple rotation animation property
+                enemy.userData = { rotSpeed: (Math.random() - 0.5) * 0.1 };
+                
+                scene.add(enemy);
+                enemies.push(enemy);
+            }
+        }
+
+        function createExplosion(pos, color) {
+            const particleCount = 30;
+            const geo = new THREE.BufferGeometry();
+            const positions = new Float32Array(particleCount * 3);
+            const velocities = [];
+
+            for (let i = 0; i < particleCount; i++) {
+                positions[i * 3] = pos.x;
+                positions[i * 3 + 1] = pos.y;
+                positions[i * 3 + 2] = pos.z;
+                
+                const vx = (Math.random() - 0.5) * 1.5;
+                const vy = (Math.random() - 0.5) * 1.5;
+                const vz = (Math.random() - 0.5) * 1.5;
+                velocities.push(new THREE.Vector3(vx, vy, vz));
+            }
+
+            geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+            const mat = new THREE.PointsMaterial({ 
+                color: color, 
+                size: 0.6, 
+                transparent: true, 
+                blending: THREE.AdditiveBlending 
+            });
+            
+            const points = new THREE.Points(geo, mat);
+            scene.add(points);
+            particles.push({ mesh: points, velocities: velocities, life: 1.0 });
+        }
+
+        function loseLife() {
+            if (isGameOver) return;
+            lives--;
+            createExplosion(shipGroup.position, 0x00aaff); // Player damage effect
+            
+            // Flash ship red
+            hullMat.color.setHex(0xff0000);
+            setTimeout(() => { if(!isGameOver) hullMat.color.setHex(0x00aaff); }, 200);
+
+            if (lives <= 0) {
+                lives = 0;
+                isGameOver = true;
+                scene.remove(shipGroup);
+                createExplosion(shipGroup.position, 0xffffff);
+                document.getElementById('gameover').style.display = 'block';
+            }
+        }
+
+        // --- Testing Helpers ---
+        window.__ICG_destroyOneEnemy__ = () => {
+            if (enemies.length > 0) {
+                const enemy = enemies[0];
+                createExplosion(enemy.position, 0xffaa00);
+                scene.remove(enemy);
+                enemies.splice(0, 1);
+                score += 10 * waveNum;
+            }
+        };
+
+        window.__ICG_damagePlayer__ = () => {
+            loseLife();
+        };
+
+        // --- Initial Setup ---
+        spawnWave();
+
+        // --- Main Loop ---
+        const clock = new THREE.Clock();
+
+        function animate() {
+            requestAnimationFrame(animate);
+            const delta = clock.getDelta();
+
+            if (!isGameOver) {
+                // Player Movement
+                const speed = 25 * delta;
+                if (keys.a) shipGroup.position.x -= speed;
+                if (keys.d) shipGroup.position.x += speed;
+                
+                // Clamp position
+                shipGroup.position.x = Math.max(-boundsX, Math.min(boundsX, shipGroup.position.x));
+                
+                // Tilt ship based on movement
+                shipGroup.rotation.z = THREE.MathUtils.lerp(shipGroup.rotation.z, (keys.a ? 0.3 : (keys.d ? -0.3 : 0)), 0.1);
+
+                // Shooting
+                if (keys.space) shoot();
+            }
+
+            // Update Lasers
+            const laserSpeed = 60 * delta;
+            for (let i = lasers.length - 1; i >= 0; i--) {
+                const laser = lasers[i];
+                laser.position.z -= laserSpeed;
+                if (laser.position.z < spawnZ - 10) {
+                    scene.remove(laser);
+                    laser.geometry.dispose();
+                    laser.material.dispose();
+                    lasers.splice(i, 1);
+                }
+            }
+
+            // Update Enemies
+            const baseEnemySpeed = 10;
+            const enemySpeed = (baseEnemySpeed + waveNum * 2) * delta;
+            
+            for (let i = enemies.length - 1; i >= 0; i--) {
+                const enemy = enemies[i];
+                enemy.position.z += enemySpeed;
+                enemy.rotation.x += enemy.userData.rotSpeed;
+                enemy.rotation.y += enemy.userData.rotSpeed;
+
+                let destroyed = false;
+
+                // Collision: Laser vs Enemy
+                for (let j = lasers.length - 1; j >= 0; j--) {
+                    const laser = lasers[j];
+                    // Simple distance check
+                    if (enemy.position.distanceTo(laser.position) < 2.0) {
+                        createExplosion(enemy.position, 0xffaa00);
+                        scene.remove(enemy);
+                        enemy.geometry.dispose();
+                        enemy.material.dispose();
+                        enemies.splice(i, 1);
+                        
+                        scene.remove(laser);
+                        laser.geometry.dispose();
+                        laser.material.dispose();
+                        lasers.splice(j, 1);
+                        
+                        score += 10 * waveNum;
+                        destroyed = true;
+                        break;
+                    }
+                }
+                if (destroyed) continue;
+
+                // Collision: Enemy vs Ship
+                if (!isGameOver && enemy.position.distanceTo(shipGroup.position) < 2.5) {
+                    createExplosion(enemy.position, 0xff3333);
+                    scene.remove(enemy);
+                    enemy.geometry.dispose();
+                    enemy.material.dispose();
+                    enemies.splice(i, 1);
+                    loseLife();
+                    continue;
+                }
+
+                // Enemy reaches bottom
+                if (enemy.position.z > despawnZ) {
+                    scene.remove(enemy);
+                    enemy.geometry.dispose();
+                    enemy.material.dispose();
+                    enemies.splice(i, 1);
+                    loseLife(); // Rule: lose life if enemy reaches bottom
+                }
+            }
+
+            // Wave Management
+            if (enemies.length === 0 && !isGameOver) {
+                waveNum++;
+                spawnWave();
+            }
+
+            // Update Particles
+            for (let i = particles.length - 1; i >= 0; i--) {
+                const p = particles[i];
+                p.life -= delta * 1.5;
+                
+                if (p.life <= 0) {
+                    scene.remove(p.mesh);
+                    p.mesh.geometry.dispose();
+                    p.mesh.material.dispose();
+                    particles.splice(i, 1);
+                } else {
+                    const positions = p.mesh.geometry.attributes.position.array;
+                    for (let j = 0; j < p.velocities.length; j++) {
+                        positions[j * 3] += p.velocities[j].x;
+                        positions[j * 3 + 1] += p.velocities[j].y;
+                        positions[j * 3 + 2] += p.velocities[j].z;
+                    }
+                    p.mesh.geometry.attributes.position.needsUpdate = true;
+                    p.mesh.material.opacity = p.life;
+                }
+            }
+
+            // Background animation
+            stars.position.z += 2 * delta;
+            if(stars.position.z > 50) stars.position.z = 0;
+
+            // Update UI
+            document.getElementById('score').innerText = score;
+            document.getElementById('lives').innerText = lives;
+            document.getElementById('wave').innerText = waveNum;
+
+            // Expose State
+            window.__3D_STATE__ = {
+                score: score,
+                lives: lives,
+                waveNum: waveNum,
+                enemiesAlive: enemies.length,
+                shipPos: { x: shipGroup.position.x, y: shipGroup.position.y, z: shipGroup.position.z },
+                shotsFired: shotsFired
+            };
+
+            renderer.render(scene, camera);
+        }
+
+        // Handle Resize
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        animate();
+    </script>
+</body>
+</html>

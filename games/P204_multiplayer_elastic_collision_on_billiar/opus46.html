@@ -1,0 +1,659 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3D Billiard Table</title>
+<style>
+body { margin: 0; overflow: hidden; font-family: Arial, sans-serif; }
+canvas { display: block; }
+#hud {
+position: absolute;
+top: 10px;
+left: 10px;
+color: white;
+background: rgba(0,0,0,0.7);
+padding: 15px;
+border-radius: 8px;
+font-size: 14px;
+z-index: 10;
+min-width: 200px;
+}
+#hud div { margin: 5px 0; }
+#btn-slowmo {
+margin-top: 10px;
+padding: 8px 16px;
+background: #4CAF50;
+color: white;
+border: none;
+border-radius: 4px;
+cursor: pointer;
+font-size: 14px;
+}
+#btn-slowmo:hover { background: #45a049; }
+#btn-slowmo.active { background: #f44336; }
+#shot-indicator {
+position: absolute;
+bottom: 20px;
+left: 50%;
+transform: translateX(-50%);
+color: white;
+background: rgba(0,0,0,0.7);
+padding: 10px 20px;
+border-radius: 8px;
+font-size: 14px;
+display: none;
+z-index: 10;
+}
+</style>
+</head>
+<body>
+<div id="hud">
+<div>Player: <span id="hud-player">1</span></div>
+<div>Collisions: <span id="hud-collisions">0</span></div>
+<div>Status: <span id="hud-moving">Stopped</span></div>
+<button id="btn-slowmo">Slow Motion</button>
+</div>
+<div id="shot-indicator">Click and drag on cue ball to shoot</div>
+
+<script type="importmap">
+{
+"imports": {
+"three": "https://cdn.jsdelivr.net/npm/three@0.163.0/build/three.module.js",
+"three/addons/": "https://cdn.jsdelivr.net/npm/three@0.163.0/examples/jsm/"
+}
+}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+// State
+const state = {
+ballPositions: [{x:-4, z:0}, {x:2, z:0}, {x:3, z:1}, {x:3, z:-1}],
+ballVelocities: [{vx:0, vz:0}, {vx:0, vz:0}, {vx:0, vz:0}, {vx:0, vz:0}],
+totalCollisions: 0,
+wallBounces: 0,
+activePlayer: 1,
+ballsMoving: false,
+slowMotion: false,
+resetCount: 0,
+robotLoaded: false,
+totalKineticEnergy: 0,
+robotRotating: false
+};
+window.__3D_STATE__ = state;
+
+const initialPositions = [
+{x: -4, z: 0},
+{x: 2, z: 0},
+{x: 3, z: 1},
+{x: 3, z: -1}
+];
+
+const BALL_RADIUS = 0.3;
+const BALL_Y = 0.3;
+const TABLE_HALF_X = 5.7;
+const TABLE_HALF_Z = 2.7;
+const FRICTION = 0.995;
+const STOP_THRESHOLD = 0.01;
+const MAX_POWER = 8.0;
+
+// Scene setup
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x1a1a2e);
+
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+camera.position.set(0, 12, 10);
+camera.lookAt(0, 0, 0);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+
+// Lights
+const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+scene.add(ambientLight);
+
+const pointLight = new THREE.PointLight(0xffffff, 1.0, 50);
+pointLight.position.set(0, 8, 0);
+pointLight.castShadow = true;
+pointLight.shadow.mapSize.width = 2048;
+pointLight.shadow.mapSize.height = 2048;
+scene.add(pointLight);
+
+// Add a subtle hemisphere light for better ambiance
+const hemiLight = new THREE.HemisphereLight(0xffffff, 0x444444, 0.2);
+scene.add(hemiLight);
+
+// Floor under table
+const floorGeo = new THREE.PlaneGeometry(20, 20);
+const floorMat = new THREE.MeshStandardMaterial({ color: 0x2c2c2c });
+const floor = new THREE.Mesh(floorGeo, floorMat);
+floor.rotation.x = -Math.PI / 2;
+floor.position.y = -0.5;
+floor.receiveShadow = true;
+scene.add(floor);
+
+// Table surface
+const tableGeo = new THREE.BoxGeometry(12, 0.2, 6);
+const tableMat = new THREE.MeshStandardMaterial({ color: 0x0a6e0a, roughness: 0.8, metalness: 0.1 });
+const table = new THREE.Mesh(tableGeo, tableMat);
+table.position.y = -0.1;
+table.receiveShadow = true;
+scene.add(table);
+
+// Table felt (thin layer on top)
+const feltGeo = new THREE.PlaneGeometry(11.4, 5.4);
+const feltMat = new THREE.MeshStandardMaterial({ color: 0x0d8c0d, roughness: 0.9, metalness: 0.0 });
+const felt = new THREE.Mesh(feltGeo, feltMat);
+felt.rotation.x = -Math.PI / 2;
+felt.position.y = 0.01;
+felt.receiveShadow = true;
+scene.add(felt);
+
+// Rails
+const railMat = new THREE.MeshStandardMaterial({ color: 0x5c3317, roughness: 0.6, metalness: 0.2 });
+const railHeight = 0.3;
+const railThickness = 0.3;
+
+// Top rail (positive z)
+const topRailGeo = new THREE.BoxGeometry(12 + railThickness * 2, railHeight, railThickness);
+const topRail = new THREE.Mesh(topRailGeo, railMat);
+topRail.position.set(0, railHeight / 2, 3 + railThickness / 2);
+topRail.castShadow = true;
+topRail.receiveShadow = true;
+scene.add(topRail);
+
+// Bottom rail (negative z)
+const bottomRail = new THREE.Mesh(topRailGeo, railMat);
+bottomRail.position.set(0, railHeight / 2, -3 - railThickness / 2);
+bottomRail.castShadow = true;
+bottomRail.receiveShadow = true;
+scene.add(bottomRail);
+
+// Left rail (negative x)
+const sideRailGeo = new THREE.BoxGeometry(railThickness, railHeight, 6);
+const leftRail = new THREE.Mesh(sideRailGeo, railMat);
+leftRail.position.set(-6 - railThickness / 2, railHeight / 2, 0);
+leftRail.castShadow = true;
+leftRail.receiveShadow = true;
+scene.add(leftRail);
+
+// Right rail (positive x)
+const rightRail = new THREE.Mesh(sideRailGeo, railMat);
+rightRail.position.set(6 + railThickness / 2, railHeight / 2, 0);
+rightRail.castShadow = true;
+rightRail.receiveShadow = true;
+scene.add(rightRail);
+
+// Table legs
+const legGeo = new THREE.CylinderGeometry(0.15, 0.15, 0.5, 8);
+const legMat = new THREE.MeshStandardMaterial({ color: 0x3e1f0a, roughness: 0.7 });
+const legPositions = [[-5.5, -0.45, -2.5], [5.5, -0.45, -2.5], [-5.5, -0.45, 2.5], [5.5, -0.45, 2.5]];
+legPositions.forEach(pos => {
+    const leg = new THREE.Mesh(legGeo, legMat);
+    leg.position.set(...pos);
+    leg.castShadow = true;
+    scene.add(leg);
+});
+
+// Balls
+const ballColors = [0xffffff, 0xcc0000, 0x0044cc, 0xcccc00];
+const ballMeshes = [];
+const ballVelocities = [{vx:0, vz:0}, {vx:0, vz:0}, {vx:0, vz:0}, {vx:0, vz:0}];
+
+const ballGeo = new THREE.SphereGeometry(BALL_RADIUS, 32, 32);
+for (let i = 0; i < 4; i++) {
+    const mat = new THREE.MeshStandardMaterial({
+        color: ballColors[i],
+        metalness: 0.3,
+        roughness: 0.4
+    });
+    const ball = new THREE.Mesh(ballGeo, mat);
+    ball.position.set(initialPositions[i].x, BALL_Y, initialPositions[i].z);
+    ball.castShadow = true;
+    ball.receiveShadow = true;
+    ball.userData.index = i;
+    scene.add(ball);
+    ballMeshes.push(ball);
+}
+
+// Add number indicators on balls (small text sprites)
+function createBallLabel(text, color) {
+    const canvas = document.createElement('canvas');
+    canvas.width = 64;
+    canvas.height = 64;
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.arc(32, 32, 16, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = 'white';
+    ctx.font = 'bold 20px Arial';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(text, 32, 32);
+    const texture = new THREE.CanvasTexture(canvas);
+    const spriteMat = new THREE.SpriteMaterial({ map: texture, transparent: true });
+    const sprite = new THREE.Sprite(spriteMat);
+    sprite.scale.set(0.25, 0.25, 1);
+    return sprite;
+}
+
+// Robot referee (placeholder if GLB fails)
+let robotModel = null;
+let robotMixer = null;
+
+const loader = new GLTFLoader();
+loader.load('robot.glb',
+    (gltf) => {
+        robotModel = gltf.scene;
+        robotModel.position.set(0, 0, -4);
+        robotModel.scale.set(0.5, 0.5, 0.5);
+        robotModel.traverse((child) => {
+            if (child.isMesh) {
+                child.castShadow = true;
+                child.receiveShadow = true;
+            }
+        });
+        scene.add(robotModel);
+        state.robotLoaded = true;
+
+        if (gltf.animations && gltf.animations.length > 0) {
+            robotMixer = new THREE.AnimationMixer(robotModel);
+            const action = robotMixer.clipAction(gltf.animations[0]);
+            action.play();
+        }
+    },
+    undefined,
+    (error) => {
+        console.log('Robot GLB not found, creating placeholder robot');
+        createPlaceholderRobot();
+        state.robotLoaded = true;
+    }
+);
+
+function createPlaceholderRobot() {
+    const robotGroup = new THREE.Group();
+
+    // Body
+    const bodyGeo = new THREE.BoxGeometry(0.6, 0.8, 0.4);
+    const bodyMat = new THREE.MeshStandardMaterial({ color: 0x888888, metalness: 0.6, roughness: 0.3 });
+    const body = new THREE.Mesh(bodyGeo, bodyMat);
+    body.position.y = 1.0;
+    body.castShadow = true;
+    robotGroup.add(body);
+
+    // Head
+    const headGeo = new THREE.BoxGeometry(0.4, 0.4, 0.35);
+    const headMat = new THREE.MeshStandardMaterial({ color: 0xaaaaaa, metalness: 0.6, roughness: 0.3 });
+    const head = new THREE.Mesh(headGeo, headMat);
+    head.position.y = 1.65;
+    head.castShadow = true;
+    robotGroup.add(head);
+
+    // Eyes
+    const eyeGeo = new THREE.SphereGeometry(0.06, 8, 8);
+    const eyeMat = new THREE.MeshStandardMaterial({ color: 0x00ff00, emissive: 0x00ff00, emissiveIntensity: 0.5 });
+    const leftEye = new THREE.Mesh(eyeGeo, eyeMat);
+    leftEye.position.set(-0.1, 1.7, 0.18);
+    robotGroup.add(leftEye);
+    const rightEye = new THREE.Mesh(eyeGeo, eyeMat);
+    rightEye.position.set(0.1, 1.7, 0.18);
+    robotGroup.add(rightEye);
+
+    // Antenna
+    const antennaGeo = new THREE.CylinderGeometry(0.02, 0.02, 0.3, 8);
+    const antennaMat = new THREE.MeshStandardMaterial({ color: 0x666666 });
+    const antenna = new THREE.Mesh(antennaGeo, antennaMat);
+    antenna.position.y = 2.0;
+    robotGroup.add(antenna);
+
+    const antennaTipGeo = new THREE.SphereGeometry(0.05, 8, 8);
+    const antennaTipMat = new THREE.MeshStandardMaterial({ color: 0xff0000, emissive: 0xff0000, emissiveIntensity: 0.5 });
+    const antennaTip = new THREE.Mesh(antennaTipGeo, antennaTipMat);
+    antennaTip.position.y = 2.15;
+    robotGroup.add(antennaTip);
+
+    // Arms
+    const armGeo = new THREE.BoxGeometry(0.15, 0.6, 0.15);
+    const armMat = new THREE.MeshStandardMaterial({ color: 0x777777, metalness: 0.5 });
+    const leftArm = new THREE.Mesh(armGeo, armMat);
+    leftArm.position.set(-0.45, 0.9, 0);
+    leftArm.castShadow = true;
+    robotGroup.add(leftArm);
+    const rightArm = new THREE.Mesh(armGeo, armMat);
+    rightArm.position.set(0.45, 0.9, 0);
+    rightArm.castShadow = true;
+    robotGroup.add(rightArm);
+
+    // Legs
+    const legGeoR = new THREE.BoxGeometry(0.18, 0.5, 0.18);
+    const legMatR = new THREE.MeshStandardMaterial({ color: 0x666666, metalness: 0.5 });
+    const leftLeg = new THREE.Mesh(legGeoR, legMatR);
+    leftLeg.position.set(-0.15, 0.35, 0);
+    leftLeg.castShadow = true;
+    robotGroup.add(leftLeg);
+    const rightLeg = new THREE.Mesh(legGeoR, legMatR);
+    rightLeg.position.set(0.15, 0.35, 0);
+    rightLeg.castShadow = true;
+    robotGroup.add(rightLeg);
+
+    // Whistle (referee detail)
+    const whistleGeo = new THREE.CylinderGeometry(0.03, 0.03, 0.15, 8);
+    const whistleMat = new THREE.MeshStandardMaterial({ color: 0xffcc00, metalness: 0.8 });
+    const whistle = new THREE.Mesh(whistleGeo, whistleMat);
+    whistle.position.set(0.35, 1.2, 0.15);
+    whistle.rotation.z = Math.PI / 4;
+    robotGroup.add(whistle);
+
+    robotGroup.position.set(0, 0, -4);
+    robotGroup.scale.set(0.5, 0.5, 0.5);
+    scene.add(robotGroup);
+    robotModel = robotGroup;
+}
+
+// Aiming line
+let aimLine = null;
+const aimLineMat = new THREE.LineBasicMaterial({ color: 0xff6600, linewidth: 2 });
+
+// Raycaster for ball picking
+const raycaster = new THREE.Raycaster();
+const mouse = new THREE.Vector2();
+let isDragging = false;
+let dragStart = new THREE.Vector2();
+let dragStartWorld = new THREE.Vector3();
+const shotIndicator = document.getElementById('shot-indicator');
+
+function getMouseWorldOnTable(event) {
+    mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+    mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+    raycaster.setFromCamera(mouse, camera);
+    const plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -BALL_Y);
+    const intersection = new THREE.Vector3();
+    raycaster.ray.intersectPlane(plane, intersection);
+    return intersection;
+}
+
+renderer.domElement.addEventListener('mousedown', (event) => {
+    if (event.button !== 0) return;
+
+    mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+    mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+    raycaster.setFromCamera(mouse, camera);
+    const intersects = raycaster.intersectObject(ballMeshes[0]);
+
+    if (intersects.length > 0) {
+        // Check if cue ball is stopped
+        const speed = Math.sqrt(ballVelocities[0].vx ** 2 + ballVelocities[0].vz ** 2);
+        if (speed < STOP_THRESHOLD) {
+            isDragging = true;
+            dragStart.set(event.clientX, event.clientY);
+            dragStartWorld = getMouseWorldOnTable(event);
+            shotIndicator.style.display = 'block';
+            shotIndicator.textContent = 'Drag to aim and set power...';
+        }
+    }
+});
+
+renderer.domElement.addEventListener('mousemove', (event) => {
+    if (!isDragging) return;
+
+    const currentWorld = getMouseWorldOnTable(event);
+    const cueBallPos = ballMeshes[0].position;
+
+    // Direction from current mouse to cue ball (shot goes opposite of drag)
+    const dx = cueBallPos.x - currentWorld.x;
+    const dz = cueBallPos.z - currentWorld.z;
+    const dist = Math.sqrt(dx * dx + dz * dz);
+    const power = Math.min(dist, MAX_POWER);
+
+    shotIndicator.textContent = `Power: ${power.toFixed(1)} / ${MAX_POWER.toFixed(1)}`;
+
+    // Update aim line
+    if (aimLine) scene.remove(aimLine);
+
+    const points = [
+        new THREE.Vector3(cueBallPos.x, BALL_Y, cueBallPos.z),
+        new THREE.Vector3(cueBallPos.x + (dx / dist) * power * 0.5, BALL_Y, cueBallPos.z + (dz / dist) * power * 0.5)
+    ];
+    const aimGeo = new THREE.BufferGeometry().setFromPoints(points);
+    aimLine = new THREE.Line(aimGeo, aimLineMat);
+    scene.add(aimLine);
+});
+
+renderer.domElement.addEventListener('mouseup', (event) => {
+    if (!isDragging) return;
+    isDragging = false;
+    shotIndicator.style.display = 'none';
+
+    if (aimLine) {
+        scene.remove(aimLine);
+        aimLine = null;
+    }
+
+    const releaseWorld = getMouseWorldOnTable(event);
+    const cueBallPos = ballMeshes[0].position;
+
+    // Direction from release point to cue ball
+    const dx = cueBallPos.x - releaseWorld.x;
+    const dz = cueBallPos.z - releaseWorld.z;
+    const dist = Math.sqrt(dx * dx + dz * dz);
+
+    if (dist < 0.1) return; // Too small, ignore
+
+    const power = Math.min(dist, MAX_POWER);
+    const dirX = dx / dist;
+    const dirZ = dz / dist;
+
+    ballVelocities[0].vx = dirX * power;
+    ballVelocities[0].vz = dirZ * power;
+});
+
+// Keyboard
+document.addEventListener('keydown', (event) => {
+    if (event.key === 'r' || event.key === 'R') {
+        resetBalls();
+    } else if (event.key === '1') {
+        state.activePlayer = 1;
+        document.getElementById('hud-player').textContent = '1';
+    } else if (event.key === '2') {
+        state.activePlayer = 2;
+        document.getElementById('hud-player').textContent = '2';
+    }
+});
+
+function resetBalls() {
+    for (let i = 0; i < 4; i++) {
+        ballMeshes[i].position.set(initialPositions[i].x, BALL_Y, initialPositions[i].z);
+        ballVelocities[i].vx = 0;
+        ballVelocities[i].vz = 0;
+    }
+    state.resetCount++;
+}
+
+// Slow motion button
+const btnSlowmo = document.getElementById('btn-slowmo');
+btnSlowmo.addEventListener('click', () => {
+    state.slowMotion = !state.slowMotion;
+    btnSlowmo.classList.toggle('active', state.slowMotion);
+    btnSlowmo.textContent = state.slowMotion ? 'Normal Speed' : 'Slow Motion';
+});
+
+// Physics
+function updatePhysics(dt) {
+    const timeScale = state.slowMotion ? 0.25 : 1.0;
+    const effectiveDt = dt * timeScale;
+
+    // Move balls
+    for (let i = 0; i < 4; i++) {
+        ballMeshes[i].position.x += ballVelocities[i].vx * effectiveDt;
+        ballMeshes[i].position.z += ballVelocities[i].vz * effectiveDt;
+
+        // Apply friction
+        const frictionFactor = Math.pow(FRICTION, effectiveDt * 60); // normalize to ~60fps
+        ballVelocities[i].vx *= frictionFactor;
+        ballVelocities[i].vz *= frictionFactor;
+
+        // Stop if very slow
+        const speed = Math.sqrt(ballVelocities[i].vx ** 2 + ballVelocities[i].vz ** 2);
+        if (speed < STOP_THRESHOLD) {
+            ballVelocities[i].vx = 0;
+            ballVelocities[i].vz = 0;
+        }
+    }
+
+    // Ball-wall collisions
+    for (let i = 0; i < 4; i++) {
+        const pos = ballMeshes[i].position;
+
+        if (pos.x - BALL_RADIUS < -TABLE_HALF_X) {
+            pos.x = -TABLE_HALF_X + BALL_RADIUS;
+            ballVelocities[i].vx = Math.abs(ballVelocities[i].vx);
+            state.wallBounces++;
+        }
+        if (pos.x + BALL_RADIUS > TABLE_HALF_X) {
+            pos.x = TABLE_HALF_X - BALL_RADIUS;
+            ballVelocities[i].vx = -Math.abs(ballVelocities[i].vx);
+            state.wallBounces++;
+        }
+        if (pos.z - BALL_RADIUS < -TABLE_HALF_Z) {
+            pos.z = -TABLE_HALF_Z + BALL_RADIUS;
+            ballVelocities[i].vz = Math.abs(ballVelocities[i].vz);
+            state.wallBounces++;
+        }
+        if (pos.z + BALL_RADIUS > TABLE_HALF_Z) {
+            pos.z = TABLE_HALF_Z - BALL_RADIUS;
+            ballVelocities[i].vz = -Math.abs(ballVelocities[i].vz);
+            state.wallBounces++;
+        }
+    }
+
+    // Ball-ball collisions (elastic, equal mass)
+    for (let i = 0; i < 4; i++) {
+        for (let j = i + 1; j < 4; j++) {
+            const p1 = ballMeshes[i].position;
+            const p2 = ballMeshes[j].position;
+
+            const dx = p2.x - p1.x;
+            const dz = p2.z - p1.z;
+            const dist = Math.sqrt(dx * dx + dz * dz);
+            const minDist = BALL_RADIUS * 2;
+
+            if (dist < minDist && dist > 0) {
+                // Normal vector
+                const nx = dx / dist;
+                const nz = dz / dist;
+
+                // Relative velocity
+                const dvx = ballVelocities[i].vx - ballVelocities[j].vx;
+                const dvz = ballVelocities[i].vz - ballVelocities[j].vz;
+
+                // Relative velocity along normal
+                const dvn = dvx * nx + dvz * nz;
+
+                // Only resolve if balls are approaching
+                if (dvn > 0) {
+                    // For equal mass elastic collision, swap velocity components along normal
+                    ballVelocities[i].vx -= dvn * nx;
+                    ballVelocities[i].vz -= dvn * nz;
+                    ballVelocities[j].vx += dvn * nx;
+                    ballVelocities[j].vz += dvn * nz;
+
+                    state.totalCollisions++;
+                }
+
+                // Separate overlapping balls
+                const overlap = minDist - dist;
+                const sepX = (overlap / 2) * nx;
+                const sepZ = (overlap / 2) * nz;
+                p1.x -= sepX;
+                p1.z -= sepZ;
+                p2.x += sepX;
+                p2.z += sepZ;
+            }
+        }
+    }
+
+    // Ball rotation visual
+    for (let i = 0; i < 4; i++) {
+        const speed = Math.sqrt(ballVelocities[i].vx ** 2 + ballVelocities[i].vz ** 2);
+        if (speed > STOP_THRESHOLD) {
+            const rotSpeed = speed / BALL_RADIUS * effectiveDt;
+            // Rotate around axis perpendicular to velocity direction
+            const axis = new THREE.Vector3(-ballVelocities[i].vz, 0, ballVelocities[i].vx).normalize();
+            ballMeshes[i].rotateOnWorldAxis(axis, rotSpeed);
+        }
+    }
+}
+
+function updateState() {
+    let anyMoving = false;
+    let totalKE = 0;
+
+    for (let i = 0; i < 4; i++) {
+        state.ballPositions[i] = { x: ballMeshes[i].position.x, z: ballMeshes[i].position.z };
+        state.ballVelocities[i] = { vx: ballVelocities[i].vx, vz: ballVelocities[i].vz };
+
+        const speed2 = ballVelocities[i].vx ** 2 + ballVelocities[i].vz ** 2;
+        totalKE += 0.5 * 1.0 * speed2;
+
+        if (Math.sqrt(speed2) >= STOP_THRESHOLD) {
+            anyMoving = true;
+        }
+    }
+
+    state.ballsMoving = anyMoving;
+    state.totalKineticEnergy = totalKE;
+    state.robotRotating = anyMoving;
+
+    // Update HUD
+    document.getElementById('hud-collisions').textContent = state.totalCollisions;
+    document.getElementById('hud-moving').textContent = anyMoving ? 'Moving' : 'Stopped';
+    document.getElementById('hud-moving').style.color = anyMoving ? '#ff6600' : '#00ff00';
+    document.getElementById('hud-player').textContent = state.activePlayer;
+}
+
+// Animation loop
+const clock = new THREE.Clock();
+let lastTime = 0;
+
+function animate() {
+    requestAnimationFrame(animate);
+
+    const dt = Math.min(clock.getDelta(), 0.05); // Cap delta time
+
+    updatePhysics(dt);
+    updateState();
+
+    // Robot rotation
+    if (robotModel && state.ballsMoving) {
+        const timeScale = state.slowMotion ? 0.25 : 1.0;
+        robotModel.rotation.y += 0.5 * dt * timeScale;
+    }
+
+    if (robotMixer) {
+        robotMixer.update(dt);
+    }
+
+    renderer.render(scene, camera);
+}
+
+// Handle resize
+window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+animate();
+</script>
+</body>
+</html>

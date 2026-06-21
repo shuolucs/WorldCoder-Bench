@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Audio Spectrum Visualizer</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #000;
+            font-family: monospace;
+        }
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+        }
+        #hud {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(0, 0, 0, 0.7);
+            color: #fff;
+            padding: 15px;
+            border-radius: 5px;
+            border: 1px solid #444;
+            pointer-events: none;
+            user-select: none;
+            min-width: 200px;
+        }
+        #hud div {
+            margin-bottom: 5px;
+        }
+        #btn-reset {
+            margin-top: 10px;
+            padding: 5px 10px;
+            background: #333;
+            color: #fff;
+            border: 1px solid #666;
+            cursor: pointer;
+            pointer-events: auto;
+            font-family: monospace;
+        }
+        #btn-reset:hover {
+            background: #555;
+        }
+        .controls-help {
+            margin-top: 15px;
+            font-size: 0.8em;
+            color: #aaa;
+            border-top: 1px solid #444;
+            padding-top: 10px;
+        }
+    </style>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="canvas-container"></div>
+    <div id="hud">
+        <div>Mode: <span id="hud-mode">circular</span></div>
+        <div>Status: <span id="hud-playing">Paused</span></div>
+        <div>Gain: <span id="hud-gain">0.3</span></div>
+        <div>Freq: <span id="hud-freq">220</span> Hz</div>
+        <div>Auto-Rotate: <span id="hud-rotate">ON</span></div>
+        <div>Bars: <span id="hud-barcount">64</span></div>
+        <button id="btn-reset">Reset</button>
+        
+        <div class="controls-help">
+            [Space] Play/Pause<br>
+            [1, 2, 3] Change Mode<br>
+            [R] Toggle Rotation<br>
+            [Up/Down] Gain<br>
+            [Left/Right] Frequency
+        </div>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        // --- State Management ---
+        window.__3D_STATE__ = {
+            mode: 'circular',
+            isPlaying: false,
+            gain: 0.3,
+            frequency: 220,
+            autoRotate: true,
+            barCount: 64,
+            groupRotationY: 0,
+            maxBarHeight: 0.5,
+            minBarHeight: 0.5,
+            avgBarHeight: 0.5,
+            cameraDistance: 0,
+            frameCount: 0,
+            barsValid: true,
+            analyserFFTSize: 256
+        };
+
+        // --- DOM Elements ---
+        const elMode = document.getElementById('hud-mode');
+        const elPlaying = document.getElementById('hud-playing');
+        const elGain = document.getElementById('hud-gain');
+        const elFreq = document.getElementById('hud-freq');
+        const elRotate = document.getElementById('hud-rotate');
+        const elBarCount = document.getElementById('hud-barcount');
+        const btnReset = document.getElementById('btn-reset');
+
+        // --- Scene Setup ---
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x000000);
+
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.set(0, 30, 60);
+        camera.lookAt(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        container.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+
+        const ambientLight = new THREE.AmbientLight(0x404040);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+        dirLight.position.set(10, 40, 20);
+        scene.add(dirLight);
+
+        const gridHelper = new THREE.GridHelper(80, 40);
+        gridHelper.position.y = 0;
+        scene.add(gridHelper);
+
+        // --- Audio System ---
+        let audioCtx, analyser, gainNode, oscillator;
+        const dataArray = new Uint8Array(128);
+
+        function initAudio() {
+            if (audioCtx) return;
+            audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            analyser = audioCtx.createAnalyser();
+            analyser.fftSize = window.__3D_STATE__.analyserFFTSize;
+            
+            gainNode = audioCtx.createGain();
+            gainNode.gain.value = window.__3D_STATE__.gain;
+            
+            gainNode.connect(analyser);
+            analyser.connect(audioCtx.destination);
+        }
+
+        function togglePlay() {
+            initAudio();
+            if (window.__3D_STATE__.isPlaying) {
+                if (oscillator) {
+                    oscillator.stop();
+                    oscillator.disconnect();
+                    oscillator = null;
+                }
+                window.__3D_STATE__.isPlaying = false;
+            } else {
+                if (audioCtx.state === 'suspended') audioCtx.resume();
+                oscillator = audioCtx.createOscillator();
+                oscillator.type = 'sawtooth';
+                oscillator.frequency.value = window.__3D_STATE__.frequency;
+                oscillator.connect(gainNode);
+                oscillator.start();
+                window.__3D_STATE__.isPlaying = true;
+            }
+            updateHUD();
+        }
+
+        // --- 3D Spectrum Bars ---
+        const barGroup = new THREE.Group();
+        scene.add(barGroup);
+        const bars = [];
+        const geometry = new THREE.BoxGeometry(1, 1, 1);
+
+        for (let i = 0; i < window.__3D_STATE__.barCount; i++) {
+            const material = new THREE.MeshStandardMaterial({
+                color: new THREE.Color().setHSL(i / window.__3D_STATE__.barCount, 1.0, 0.5)
+            });
+            const mesh = new THREE.Mesh(geometry, material);
+            mesh.scale.y = 0.5;
+            mesh.position.y = 0.25;
+            bars.push(mesh);
+            barGroup.add(mesh);
+        }
+
+        function setLayout(mode) {
+            window.__3D_STATE__.mode = mode;
+            for (let i = 0; i < window.__3D_STATE__.barCount; i++) {
+                const bar = bars[i];
+                if (mode === 'circular') {
+                    const angle = i * (Math.PI * 2 / window.__3D_STATE__.barCount);
+                    bar.position.x = 20 * Math.cos(angle);
+                    bar.position.z = 20 * Math.sin(angle);
+                } else if (mode === 'linear') {
+                    bar.position.x = i - 32;
+                    bar.position.z = 0;
+                } else if (mode === 'wave') {
+                    const x = i - 32;
+                    bar.position.x = x;
+                    bar.position.z = 10 * Math.sin(x * Math.PI / 32);
+                }
+            }
+            updateHUD();
+        }
+
+        // Initialize default layout
+        setLayout('circular');
+
+        // --- Input Handling ---
+        window.addEventListener('keydown', (e) => {
+            switch(e.key) {
+                case '1': setLayout('circular'); break;
+                case '2': setLayout('linear'); break;
+                case '3': setLayout('wave'); break;
+                case 'r': 
+                case 'R':
+                    window.__3D_STATE__.autoRotate = !window.__3D_STATE__.autoRotate;
+                    break;
+                case ' ':
+                    e.preventDefault();
+                    togglePlay();
+                    break;
+                case 'ArrowUp':
+                    e.preventDefault();
+                    window.__3D_STATE__.gain = Math.min(1.0, window.__3D_STATE__.gain + 0.1);
+                    if (gainNode) gainNode.gain.value = window.__3D_STATE__.gain;
+                    break;
+                case 'ArrowDown':
+                    e.preventDefault();
+                    window.__3D_STATE__.gain = Math.max(0.0, window.__3D_STATE__.gain - 0.1);
+                    if (gainNode) gainNode.gain.value = window.__3D_STATE__.gain;
+                    break;
+                case 'ArrowRight':
+                    e.preventDefault();
+                    window.__3D_STATE__.frequency = Math.min(2000, window.__3D_STATE__.frequency + 50);
+                    if (oscillator) oscillator.frequency.value = window.__3D_STATE__.frequency;
+                    break;
+                case 'ArrowLeft':
+                    e.preventDefault();
+                    window.__3D_STATE__.frequency = Math.max(50, window.__3D_STATE__.frequency - 50);
+                    if (oscillator) oscillator.frequency.value = window.__3D_STATE__.frequency;
+                    break;
+            }
+            updateHUD();
+        });
+
+        btnReset.addEventListener('click', () => {
+            setLayout('circular');
+            window.__3D_STATE__.gain = 0.3;
+            if (gainNode) gainNode.gain.value = 0.3;
+            window.__3D_STATE__.frequency = 220;
+            if (oscillator) oscillator.frequency.value = 220;
+            window.__3D_STATE__.autoRotate = true;
+            if (window.__3D_STATE__.isPlaying) {
+                togglePlay();
+            }
+            barGroup.rotation.y = 0;
+            camera.position.set(0, 30, 60);
+            camera.lookAt(0, 0, 0);
+            controls.target.set(0, 0, 0);
+            updateHUD();
+        });
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // --- HUD Update ---
+        function updateHUD() {
+            elMode.textContent = window.__3D_STATE__.mode;
+            elPlaying.textContent = window.__3D_STATE__.isPlaying ? 'Playing' : 'Paused';
+            elGain.textContent = window.__3D_STATE__.gain.toFixed(1);
+            elFreq.textContent = window.__3D_STATE__.frequency;
+            elRotate.textContent = window.__3D_STATE__.autoRotate ? 'ON' : 'OFF';
+            elBarCount.textContent = window.__3D_STATE__.barCount;
+        }
+
+        // --- Animation Loop ---
+        function animate() {
+            requestAnimationFrame(animate);
+            
+            window.__3D_STATE__.frameCount++;
+
+            if (window.__3D_STATE__.autoRotate) {
+                barGroup.rotation.y += 0.005;
+            }
+            window.__3D_STATE__.groupRotationY = barGroup.rotation.y;
+
+            if (analyser && window.__3D_STATE__.isPlaying) {
+                analyser.getByteFrequencyData(dataArray);
+            }
+
+            let maxH = -Infinity;
+            let minH = Infinity;
+            let sumH = 0;
+            let valid = true;
+
+            for (let i = 0; i < window.__3D_STATE__.barCount; i++) {
+                const bar = bars[i];
+                let targetHeight = 0.5;
+
+                if (window.__3D_STATE__.isPlaying) {
+                    const val = dataArray[i];
+                    targetHeight = 0.5 + (val / 255) * 29.5;
+                }
+
+                // Lerp for smooth movement and decay
+                bar.scale.y += (targetHeight - bar.scale.y) * 0.2;
+                
+                // Snap to 0.5 if close to avoid floating point jitter when paused
+                if (!window.__3D_STATE__.isPlaying && Math.abs(bar.scale.y - 0.5) < 0.001) {
+                    bar.scale.y = 0.5;
+                }
+
+                bar.position.y = bar.scale.y / 2;
+
+                const h = bar.scale.y;
+                if (h > maxH) maxH = h;
+                if (h < minH) minH = h;
+                sumH += h;
+
+                if (isNaN(bar.position.x) || isNaN(bar.scale.y)) valid = false;
+            }
+
+            // Update State
+            window.__3D_STATE__.maxBarHeight = Number(maxH.toFixed(2));
+            window.__3D_STATE__.minBarHeight = Number(minH.toFixed(2));
+            window.__3D_STATE__.avgBarHeight = Number((sumH / window.__3D_STATE__.barCount).toFixed(2));
+            window.__3D_STATE__.barsValid = valid;
+            window.__3D_STATE__.cameraDistance = Number(camera.position.distanceTo(new THREE.Vector3(0,0,0)).toFixed(1));
+
+            controls.update();
+            renderer.render(scene, camera);
+        }
+
+        updateHUD();
+        animate();
+    </script>
+</body>
+</html>

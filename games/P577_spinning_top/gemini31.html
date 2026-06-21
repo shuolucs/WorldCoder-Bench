@@ -1,0 +1,615 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Spinning Top Simulation</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #f5f0e8;
+            font-family: sans-serif;
+        }
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+        }
+        #hud {
+            position: fixed;
+            top: 10px;
+            left: 10px;
+            background: rgba(0, 0, 0, 0.6);
+            color: #0f0;
+            font-family: monospace;
+            padding: 10px;
+            border-radius: 6px;
+            z-index: 100;
+            pointer-events: none;
+            font-size: 14px;
+            line-height: 1.5;
+            min-width: 200px;
+        }
+        #controls {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            background: rgba(0, 0, 0, 0.7);
+            color: white;
+            padding: 14px;
+            border-radius: 8px;
+            z-index: 100;
+            min-width: 240px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+        }
+        .control-group {
+            margin-bottom: 12px;
+        }
+        .control-group:last-child {
+            margin-bottom: 0;
+        }
+        .control-group label {
+            display: flex;
+            justify-content: space-between;
+            font-size: 12px;
+            margin-bottom: 4px;
+        }
+        .control-group input[type="range"] {
+            width: 100%;
+            cursor: pointer;
+        }
+        .instructions {
+            margin-top: 10px;
+            font-size: 11px;
+            color: #aaa;
+            text-align: center;
+            border-top: 1px solid #555;
+            padding-top: 8px;
+        }
+    </style>
+    <script type="importmap">
+    { "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+    } }
+    </script>
+</head>
+<body>
+
+    <div id="hud">
+        <div>Spin Rate: <span id="hud-spinrate">0.00</span> rad/s</div>
+        <div>Precession: <span id="hud-precession">0.00</span> rad/s</div>
+        <div>Tilt Angle: <span id="hud-tilt">0.00</span>&deg;</div>
+        <div>Status: <span id="hud-status">Ready</span></div>
+        <div>Time: <span id="hud-time">0.00</span> s</div>
+        <div>Frame: <span id="hud-framecount">0</span></div>
+        <div>Paused: <span id="hud-paused">No</span></div>
+    </div>
+
+    <div id="controls">
+        <div class="control-group">
+            <label><span>Initial Spin (rad/s)</span> <span id="val-spinspeed">40</span></label>
+            <input type="range" id="slider-spinspeed" min="5" max="100" value="40" step="1">
+        </div>
+        <div class="control-group">
+            <label><span>Initial Tilt (&deg;)</span> <span id="val-tilt">10</span></label>
+            <input type="range" id="slider-tilt" min="1" max="45" value="10" step="1">
+        </div>
+        <div class="control-group">
+            <label><span>Friction</span> <span id="val-friction">0.05</span></label>
+            <input type="range" id="slider-friction" min="0.01" max="0.3" value="0.05" step="0.01">
+        </div>
+        <div class="control-group">
+            <label><span>Gravity Scale</span> <span id="val-gravity">1.0</span></label>
+            <input type="range" id="slider-gravity" min="0.1" max="3.0" value="1.0" step="0.1">
+        </div>
+        <div class="instructions">
+            Space: Launch/Reset | P: Pause | R: Reset
+        </div>
+    </div>
+
+    <div id="canvas-container"></div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        // --- Global State ---
+        window.__3D_STATE__ = {
+            frameCount: 0,
+            isPaused: false,
+            spinRate: 0,
+            precessionRate: 0,
+            tiltAngle: 0,
+            azimuthAngle: 0,
+            status: 'Ready',
+            friction: 0.05,
+            gravityScale: 1.0,
+            initialSpinSpeed: 40,
+            initialTilt: 10,
+            elapsedTime: 0,
+            kineticEnergy: 0,
+            isValid: true
+        };
+
+        // --- Physics Constants ---
+        const m = 0.5; // kg
+        const R = 1.0; // cone radius
+        const h = 1.5; // cone height
+        const d = 0.75 * h; // 1.125, distance from tip to CoM
+        const g = 9.81; // m/s^2
+        
+        const I_s = 0.4 * m * R * R; // 0.2
+        const I_t = 0.6 * m * (R * R / 4 + h * h / 12); // 0.13125
+        
+        const I_local_inv = new THREE.Vector3(1 / I_t, 1 / I_s, 1 / I_t);
+
+        // --- Physics State Variables ---
+        let q = new THREE.Quaternion(); // Orientation
+        let L = new THREE.Vector3();    // Angular momentum in world space
+        let omega = new THREE.Vector3(); // Angular velocity in world space
+        let currentOmegaS = 0;
+        let isToppled = false;
+
+        // --- Scene Setup ---
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0xf5f0e8);
+
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+        camera.position.set(5, 6, 8);
+        camera.lookAt(0, 1, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        container.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.05;
+        controls.target.set(0, 1, 0);
+
+        // --- Lights ---
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.3);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+        dirLight.position.set(5, 10, 5);
+        dirLight.castShadow = true;
+        dirLight.shadow.mapSize.width = 2048;
+        dirLight.shadow.mapSize.height = 2048;
+        dirLight.shadow.camera.near = 0.5;
+        dirLight.shadow.camera.far = 25;
+        dirLight.shadow.camera.left = -10;
+        dirLight.shadow.camera.right = 10;
+        dirLight.shadow.camera.top = 10;
+        dirLight.shadow.camera.bottom = -10;
+        dirLight.shadow.bias = -0.001;
+        scene.add(dirLight);
+
+        const pointLight = new THREE.PointLight(0xffffff, 0.3);
+        pointLight.position.set(-3, 5, -3);
+        scene.add(pointLight);
+
+        // --- Table ---
+        const tableGeo = new THREE.BoxGeometry(20, 0.3, 20);
+        const textureLoader = new THREE.TextureLoader();
+        const tableTex = textureLoader.load('https://raw.githubusercontent.com/nicobailon/CodingWithVision/main/shared_assets/textures/hardwood2_diffuse.jpg');
+        tableTex.wrapS = THREE.RepeatWrapping;
+        tableTex.wrapT = THREE.RepeatWrapping;
+        tableTex.repeat.set(4, 4);
+        tableTex.colorSpace = THREE.SRGBColorSpace;
+
+        const tableMat = new THREE.MeshPhongMaterial({ 
+            map: tableTex,
+            shininess: 10
+        });
+        const table = new THREE.Mesh(tableGeo, tableMat);
+        table.position.y = -0.15; // Top surface at y=0
+        table.receiveShadow = true;
+        scene.add(table);
+
+        // --- Top Geometry ---
+        const topGroup = new THREE.Group();
+        scene.add(topGroup);
+
+        // Body (Inverted Cone)
+        const bodyGeo = new THREE.ConeGeometry(R, h, 32);
+        bodyGeo.translate(0, h/2, 0); // Base at y=1.5, tip at y=0
+        const bodyMat = new THREE.MeshPhongMaterial({ 
+            color: 0xc62828, 
+            shininess: 80,
+            specular: 0x555555
+        });
+        const body = new THREE.Mesh(bodyGeo, bodyMat);
+        body.castShadow = true;
+        body.receiveShadow = true;
+        // Rotate to invert (tip down)
+        body.rotation.x = Math.PI;
+        body.position.y = h; // Move up so tip is at 0
+        topGroup.add(body);
+
+        // Stem
+        const stemHeight = 0.8;
+        const stemGeo = new THREE.CylinderGeometry(0.08, 0.08, stemHeight, 16);
+        stemGeo.translate(0, stemHeight/2, 0);
+        const stemMat = new THREE.MeshPhongMaterial({ color: 0x424242 });
+        const stem = new THREE.Mesh(stemGeo, stemMat);
+        stem.position.y = h;
+        stem.castShadow = true;
+        topGroup.add(stem);
+
+        // Decorative Bands
+        const band1Geo = new THREE.TorusGeometry(R * (0.5/1.5) + 0.02, 0.03, 16, 32);
+        band1Geo.rotateX(Math.PI/2);
+        const band1Mat = new THREE.MeshPhongMaterial({ color: 0xffd700 });
+        const band1 = new THREE.Mesh(band1Geo, band1Mat);
+        band1.position.y = 0.5;
+        topGroup.add(band1);
+
+        const band2Geo = new THREE.TorusGeometry(R * (1.0/1.5) + 0.02, 0.03, 16, 32);
+        band2Geo.rotateX(Math.PI/2);
+        const band2Mat = new THREE.MeshPhongMaterial({ color: 0x1565c0 });
+        const band2 = new THREE.Mesh(band2Geo, band2Mat);
+        band2.position.y = 1.0;
+        topGroup.add(band2);
+
+        // Motion Blur Ring
+        const blurGeo = new THREE.TorusGeometry(R + 0.1, 0.05, 16, 64);
+        blurGeo.rotateX(Math.PI/2);
+        const blurMat = new THREE.MeshBasicMaterial({ 
+            color: 0xc62828, 
+            transparent: true, 
+            opacity: 0,
+            side: THREE.DoubleSide,
+            depthWrite: false
+        });
+        const blurRing = new THREE.Mesh(blurGeo, blurMat);
+        blurRing.position.y = h;
+        topGroup.add(blurRing);
+
+        // --- Trail ---
+        const MAX_TRAIL = 150;
+        const trailPositions = new Float32Array(MAX_TRAIL * 3);
+        const trailColors = new Float32Array(MAX_TRAIL * 3);
+        const trailGeo = new THREE.BufferGeometry();
+        trailGeo.setAttribute('position', new THREE.BufferAttribute(trailPositions, 3));
+        trailGeo.setAttribute('color', new THREE.BufferAttribute(trailColors, 3));
+        
+        const trailMat = new THREE.LineBasicMaterial({ 
+            vertexColors: true,
+            transparent: true,
+            opacity: 0.6
+        });
+        const trailLine = new THREE.Line(trailGeo, trailMat);
+        scene.add(trailLine);
+        
+        let trailIndex = 0;
+        let trailCount = 0;
+
+        function updateTrail() {
+            if (isToppled) return;
+            
+            // Track the top of the stem
+            const trackPoint = new THREE.Vector3(0, h + stemHeight, 0);
+            trackPoint.applyMatrix4(topGroup.matrixWorld);
+            
+            // Project onto table
+            trackPoint.y = 0.01; 
+
+            const idx = trailIndex * 3;
+            trailPositions[idx] = trackPoint.x;
+            trailPositions[idx+1] = trackPoint.y;
+            trailPositions[idx+2] = trackPoint.z;
+
+            trailIndex = (trailIndex + 1) % MAX_TRAIL;
+            if (trailCount < MAX_TRAIL) trailCount++;
+
+            // Update colors for fade effect
+            for (let i = 0; i < trailCount; i++) {
+                const actualIdx = (trailIndex - 1 - i + MAX_TRAIL) % MAX_TRAIL;
+                const alpha = 1.0 - (i / MAX_TRAIL);
+                // Base color: faint blue/gray
+                trailColors[actualIdx * 3] = 0.5 * alpha;
+                trailColors[actualIdx * 3 + 1] = 0.7 * alpha;
+                trailColors[actualIdx * 3 + 2] = 0.9 * alpha;
+            }
+
+            trailGeo.attributes.position.needsUpdate = true;
+            trailGeo.attributes.color.needsUpdate = true;
+            trailGeo.setDrawRange(0, MAX_TRAIL);
+        }
+
+        function clearTrail() {
+            trailPositions.fill(0);
+            trailColors.fill(0);
+            trailIndex = 0;
+            trailCount = 0;
+            trailGeo.attributes.position.needsUpdate = true;
+            trailGeo.attributes.color.needsUpdate = true;
+            trailGeo.setDrawRange(0, 0);
+        }
+
+        // --- DOM Elements ---
+        const sliderSpin = document.getElementById('slider-spinspeed');
+        const sliderTilt = document.getElementById('slider-tilt');
+        const sliderFriction = document.getElementById('slider-friction');
+        const sliderGravity = document.getElementById('slider-gravity');
+        
+        const valSpin = document.getElementById('val-spinspeed');
+        const valTilt = document.getElementById('val-tilt');
+        const valFriction = document.getElementById('val-friction');
+        const valGravity = document.getElementById('val-gravity');
+
+        const hudSpin = document.getElementById('hud-spinrate');
+        const hudPrec = document.getElementById('hud-precession');
+        const hudTilt = document.getElementById('hud-tilt');
+        const hudStatus = document.getElementById('hud-status');
+        const hudTime = document.getElementById('hud-time');
+        const hudFrame = document.getElementById('hud-framecount');
+        const hudPaused = document.getElementById('hud-paused');
+
+        // --- Event Listeners ---
+        sliderSpin.addEventListener('input', (e) => {
+            valSpin.textContent = e.target.value;
+            window.__3D_STATE__.initialSpinSpeed = parseFloat(e.target.value);
+        });
+        sliderTilt.addEventListener('input', (e) => {
+            valTilt.textContent = e.target.value;
+            window.__3D_STATE__.initialTilt = parseFloat(e.target.value);
+        });
+        sliderFriction.addEventListener('input', (e) => {
+            valFriction.textContent = e.target.value;
+            window.__3D_STATE__.friction = parseFloat(e.target.value);
+        });
+        sliderGravity.addEventListener('input', (e) => {
+            valGravity.textContent = e.target.value;
+            window.__3D_STATE__.gravityScale = parseFloat(e.target.value);
+        });
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        window.addEventListener('keydown', (e) => {
+            if (e.code === 'Space') {
+                resetSimulation();
+            } else if (e.code === 'KeyP') {
+                window.__3D_STATE__.isPaused = !window.__3D_STATE__.isPaused;
+                hudPaused.textContent = window.__3D_STATE__.isPaused ? 'Yes' : 'No';
+            } else if (e.code === 'KeyR') {
+                resetSimulation();
+            }
+        });
+
+        // --- Physics Engine ---
+
+        function getDerivatives(q_in, L_in) {
+            // 1. Rotation matrix from quaternion
+            const R_mat = new THREE.Matrix4().makeRotationFromQuaternion(q_in);
+            
+            // 2. Local angular momentum
+            const L_local = L_in.clone().applyMatrix4(R_mat.clone().transpose());
+            
+            // 3. Local angular velocity
+            const omega_local = new THREE.Vector3(
+                L_local.x * I_local_inv.x,
+                L_local.y * I_local_inv.y,
+                L_local.z * I_local_inv.z
+            );
+            
+            // 4. World angular velocity
+            const w = omega_local.clone().applyMatrix4(R_mat);
+            
+            // 5. Symmetry axis in world space (local Y axis)
+            const u = new THREE.Vector3(0, 1, 0).applyMatrix4(R_mat);
+            
+            // 6. Spin rate
+            const w_s = w.dot(u);
+            
+            // 7. Torques
+            const r_com = u.clone().multiplyScalar(d);
+            const gravityForce = new THREE.Vector3(0, -m * g * window.__3D_STATE__.gravityScale, 0);
+            const tau_g = new THREE.Vector3().crossVectors(r_com, gravityForce);
+            
+            const frictionMag = window.__3D_STATE__.friction * w_s;
+            const tau_f = u.clone().multiplyScalar(-frictionMag);
+            
+            // Small damping on transverse rotation to simulate air resistance and stabilize nutation
+            const w_transverse = w.clone().sub(u.clone().multiplyScalar(w_s));
+            const tau_damp = w_transverse.multiplyScalar(-0.02);
+            
+            const tau_total = new THREE.Vector3().add(tau_g).add(tau_f).add(tau_damp);
+            
+            // 8. Quaternion derivative: dq = 0.5 * w * q
+            const wQuat = new THREE.Quaternion(w.x, w.y, w.z, 0);
+            const dq = wQuat.multiply(q_in).multiplyScalar(0.5);
+            
+            return { dL: tau_total, dq: dq, w: w, w_s: w_s };
+        }
+
+        function stepPhysics(dt) {
+            if (isToppled) {
+                // Kinematic toppling animation
+                currentOmegaS *= 0.95; // Spin down quickly
+                
+                // Target resting angle: side of cone flat on floor
+                // Cone angle alpha = atan(R/h) = atan(1/1.5) = 33.69 deg
+                // Tilt angle = 90 - 33.69 = 56.31 deg
+                const targetTilt = (90 - Math.atan2(R, h) * 180 / Math.PI) * Math.PI / 180;
+                
+                const u = new THREE.Vector3(0, 1, 0).applyQuaternion(q);
+                const yAxis = new THREE.Vector3(0, 1, 0);
+                
+                // Axis perpendicular to tilt direction and vertical
+                const tiltAxis = new THREE.Vector3().crossVectors(yAxis, u).normalize();
+                
+                if (tiltAxis.lengthSq() > 0.001) {
+                    const targetQ = new THREE.Quaternion().setFromAxisAngle(tiltAxis, targetTilt);
+                    q.slerp(targetQ, 0.08); // Smoothly fall
+                }
+                
+                topGroup.quaternion.copy(q);
+                return;
+            }
+
+            // RK2 Integration (Midpoint Method)
+            const dt_sub = dt / 4;
+            for (let i = 0; i < 4; i++) {
+                const deriv1 = getDerivatives(q, L);
+                
+                const q_mid = new THREE.Quaternion(
+                    q.x + deriv1.dq.x * dt_sub / 2,
+                    q.y + deriv1.dq.y * dt_sub / 2,
+                    q.z + deriv1.dq.z * dt_sub / 2,
+                    q.w + deriv1.dq.w * dt_sub / 2
+                ).normalize();
+                
+                const L_mid = L.clone().addScaledVector(deriv1.dL, dt_sub / 2);
+                
+                const deriv2 = getDerivatives(q_mid, L_mid);
+                
+                q.set(
+                    q.x + deriv2.dq.x * dt_sub,
+                    q.y + deriv2.dq.y * dt_sub,
+                    q.z + deriv2.dq.z * dt_sub,
+                    q.w + deriv2.dq.w * dt_sub
+                ).normalize();
+                
+                L.addScaledVector(deriv2.dL, dt_sub);
+                
+                omega.copy(deriv2.w);
+                currentOmegaS = deriv2.w_s;
+            }
+
+            topGroup.quaternion.copy(q);
+
+            // Check Toppling Condition
+            const u = new THREE.Vector3(0, 1, 0).applyQuaternion(q);
+            const theta = Math.acos(u.y) * 180 / Math.PI;
+            
+            if (Math.abs(currentOmegaS) < 1.0 || theta > 80) {
+                isToppled = true;
+                window.__3D_STATE__.status = 'Toppled';
+                hudStatus.textContent = 'Toppled';
+                hudStatus.style.color = '#f00';
+            } else if (theta > window.__3D_STATE__.initialTilt + 5) {
+                window.__3D_STATE__.status = 'Wobbling';
+                hudStatus.textContent = 'Wobbling';
+                hudStatus.style.color = '#ff0';
+            } else {
+                window.__3D_STATE__.status = 'Spinning';
+                hudStatus.textContent = 'Spinning';
+                hudStatus.style.color = '#0f0';
+            }
+        }
+
+        function resetSimulation() {
+            const initialTiltRad = window.__3D_STATE__.initialTilt * Math.PI / 180;
+            const initialSpin = window.__3D_STATE__.initialSpinSpeed;
+
+            // Set initial orientation (tilt around Z axis)
+            q.setFromAxisAngle(new THREE.Vector3(0, 0, 1), initialTiltRad);
+            topGroup.quaternion.copy(q);
+
+            // Set initial angular momentum
+            // Start with pure spin along local Y axis
+            const omega_local = new THREE.Vector3(0, initialSpin, 0);
+            const L_local = new THREE.Vector3(
+                omega_local.x * I_t,
+                omega_local.y * I_s,
+                omega_local.z * I_t
+            );
+            
+            // Transform to world space
+            L.copy(L_local).applyQuaternion(q);
+
+            currentOmegaS = initialSpin;
+            isToppled = false;
+            window.__3D_STATE__.elapsedTime = 0;
+            window.__3D_STATE__.frameCount = 0;
+            window.__3D_STATE__.status = 'Spinning';
+            hudStatus.textContent = 'Spinning';
+            hudStatus.style.color = '#0f0';
+            
+            clearTrail();
+        }
+
+        // --- Main Loop ---
+        const clock = new THREE.Clock();
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const dt = Math.min(clock.getDelta(), 0.1); // Cap dt to prevent explosions
+
+            if (!window.__3D_STATE__.isPaused) {
+                stepPhysics(1/60); // Fixed time step for physics stability
+                window.__3D_STATE__.elapsedTime += 1/60;
+                window.__3D_STATE__.frameCount++;
+                updateTrail();
+            }
+
+            controls.update();
+
+            // --- Visual Updates ---
+            
+            // Motion Blur
+            const spinMag = Math.abs(currentOmegaS);
+            if (!isToppled && spinMag > 10) {
+                blurMat.opacity = Math.min(0.5, (spinMag - 10) / 30);
+                // Blend bands into blur
+                band1Mat.opacity = 1.0 - blurMat.opacity;
+                band1Mat.transparent = true;
+                band2Mat.opacity = 1.0 - blurMat.opacity;
+                band2Mat.transparent = true;
+            } else {
+                blurMat.opacity = 0;
+                band1Mat.opacity = 1.0;
+                band1Mat.transparent = false;
+                band2Mat.opacity = 1.0;
+                band2Mat.transparent = false;
+            }
+
+            // --- State Extraction & HUD ---
+            const u = new THREE.Vector3(0, 1, 0).applyQuaternion(q);
+            const theta = Math.acos(u.y) * 180 / Math.PI;
+            const phi = Math.atan2(u.z, u.x) * 180 / Math.PI;
+            
+            // Theoretical precession rate
+            const omega_p = (spinMag > 0.1) ? (m * g * d * window.__3D_STATE__.gravityScale) / (I_s * spinMag) : 0;
+            const ke = 0.5 * I_s * currentOmegaS * currentOmegaS;
+
+            // Update HUD
+            if (window.__3D_STATE__.frameCount % 5 === 0) {
+                hudSpin.textContent = currentOmegaS.toFixed(2);
+                hudPrec.textContent = omega_p.toFixed(2);
+                hudTilt.textContent = theta.toFixed(1);
+                hudTime.textContent = window.__3D_STATE__.elapsedTime.toFixed(2);
+                hudFrame.textContent = window.__3D_STATE__.frameCount;
+            }
+
+            // Update Global State
+            window.__3D_STATE__.spinRate = currentOmegaS;
+            window.__3D_STATE__.precessionRate = omega_p;
+            window.__3D_STATE__.tiltAngle = theta;
+            window.__3D_STATE__.azimuthAngle = phi;
+            window.__3D_STATE__.kineticEnergy = ke;
+            window.__3D_STATE__.isValid = !isNaN(q.x) && !isNaN(L.x);
+
+            renderer.render(scene, camera);
+        }
+
+        // Initialize
+        resetSimulation();
+        animate();
+
+    </script>
+</body>
+</html>

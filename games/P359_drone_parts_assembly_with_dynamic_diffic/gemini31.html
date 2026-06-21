@@ -1,0 +1,641 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Drone Assembly</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #222;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            user-select: none;
+        }
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+        }
+        #hud-panel {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            background: rgba(20, 20, 20, 0.85);
+            border: 1px solid #444;
+            border-radius: 8px;
+            padding: 15px;
+            color: #fff;
+            width: 280px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+            pointer-events: none;
+            z-index: 10;
+        }
+        .hud-row {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 8px;
+            font-size: 14px;
+        }
+        .hud-value {
+            font-weight: bold;
+            color: #00aaff;
+        }
+        #error-count { color: #ff4444; }
+        #progress-container {
+            width: 100%;
+            height: 10px;
+            background: #333;
+            border-radius: 5px;
+            margin-top: 10px;
+            overflow: hidden;
+        }
+        #progress-bar {
+            height: 100%;
+            width: 0%;
+            background: linear-gradient(90deg, #00aaff, #00ffaa);
+            transition: width 0.3s ease;
+        }
+        .controls {
+            position: absolute;
+            bottom: 30px;
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            gap: 15px;
+            z-index: 10;
+        }
+        button {
+            background: #333;
+            color: #fff;
+            border: 1px solid #555;
+            padding: 10px 20px;
+            font-size: 16px;
+            border-radius: 5px;
+            cursor: pointer;
+            transition: all 0.2s;
+            pointer-events: auto;
+            text-transform: uppercase;
+            font-weight: bold;
+        }
+        button:hover { background: #444; border-color: #777; }
+        button:disabled {
+            background: #222;
+            color: #555;
+            border-color: #333;
+            cursor: not-allowed;
+        }
+        #test-flight-btn {
+            background: #006600;
+            border-color: #009900;
+        }
+        #test-flight-btn:hover:not(:disabled) {
+            background: #008800;
+            box-shadow: 0 0 10px #00ff00;
+        }
+        #loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: white;
+            font-size: 24px;
+            pointer-events: none;
+            z-index: 20;
+        }
+    </style>
+</head>
+<body>
+    <div id="loading">Loading 3D Engine...</div>
+    <div id="hud-panel">
+        <div class="hud-row"><span>Difficulty:</span> <span id="difficulty-display" class="hud-value">1 (Easy)</span></div>
+        <div class="hud-row"><span>Parts Placed:</span> <span id="parts-placed" class="hud-value">0 / 8</span></div>
+        <div class="hud-row"><span>Errors:</span> <span id="error-count" class="hud-value">0</span></div>
+        <div class="hud-row"><span>Selected:</span> <span id="selected-part" class="hud-value">None</span></div>
+        <div id="progress-container"><div id="progress-bar"></div></div>
+    </div>
+    
+    <div class="controls">
+        <button id="reset-btn">Reset Assembly</button>
+        <button id="test-flight-btn" disabled>Test Flight</button>
+    </div>
+
+    <div id="canvas-container"></div>
+
+    <!-- Three.js and Dependencies -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/GLTFLoader.js"></script>
+
+    <script>
+        // --- STATE MANAGEMENT ---
+        window.__3D_STATE__ = {
+            partsPlaced: 0,
+            difficulty: 1,
+            errorCount: 0,
+            selectedPart: null,
+            assemblyComplete: false,
+            testFlightActive: false,
+            droneY: 0.5,
+            foxLoaded: false,
+            partStates: {},
+            progressPercent: 0,
+            snapTolerance: 999
+        };
+
+        // --- SCENE SETUP ---
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x222222);
+        scene.fog = new THREE.Fog(0x222222, 10, 30);
+
+        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+        camera.position.set(0, 5, 10);
+        camera.lookAt(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        container.appendChild(renderer.domElement);
+
+        const controls = new THREE.OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.05;
+        controls.maxPolarAngle = Math.PI / 2 - 0.05; // Don't go below ground
+        controls.minDistance = 3;
+        controls.maxDistance = 20;
+
+        // Lights
+        const ambientLight = new THREE.AmbientLight(0x404040, 0.6);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+        dirLight.position.set(5, 10, 5);
+        dirLight.castShadow = true;
+        dirLight.shadow.mapSize.width = 2048;
+        dirLight.shadow.mapSize.height = 2048;
+        scene.add(dirLight);
+
+        const pointLight = new THREE.PointLight(0x00aaff, 0.5, 10);
+        pointLight.position.set(-3, 4, -3);
+        scene.add(pointLight);
+
+        // Ground
+        const groundGeo = new THREE.PlaneGeometry(20, 20);
+        const groundMat = new THREE.MeshStandardMaterial({ color: 0x444444, roughness: 0.8, metalness: 0.2 });
+        const ground = new THREE.Mesh(groundGeo, groundMat);
+        ground.rotation.x = -Math.PI / 2;
+        ground.receiveShadow = true;
+        scene.add(ground);
+
+        // Assembly Zone
+        const zoneGeo = new THREE.CircleGeometry(2, 32);
+        const zoneMat = new THREE.MeshStandardMaterial({ 
+            color: 0x111111, 
+            emissive: 0x004400,
+            roughness: 0.5,
+            metalness: 0.8
+        });
+        const zone = new THREE.Mesh(zoneGeo, zoneMat);
+        zone.rotation.x = -Math.PI / 2;
+        zone.position.y = 0.01;
+        zone.receiveShadow = true;
+        scene.add(zone);
+
+        // Zone Edge Glow
+        const edgeGeo = new THREE.RingGeometry(1.9, 2, 32);
+        const edgeMat = new THREE.MeshBasicMaterial({ color: 0x00ff00, side: THREE.DoubleSide, transparent: true, opacity: 0.5 });
+        const zoneEdge = new THREE.Mesh(edgeGeo, edgeMat);
+        zoneEdge.rotation.x = -Math.PI / 2;
+        zoneEdge.position.y = 0.015;
+        scene.add(zoneEdge);
+
+        // Invisible placement plane for raycasting
+        const placementPlaneGeo = new THREE.PlaneGeometry(10, 10);
+        const placementPlaneMat = new THREE.MeshBasicMaterial({ visible: false });
+        const placementPlane = new THREE.Mesh(placementPlaneGeo, placementPlaneMat);
+        placementPlane.rotation.x = -Math.PI / 2;
+        placementPlane.position.y = 0.5;
+        scene.add(placementPlane);
+
+        // Drone Group (holds assembled parts)
+        const droneGroup = new THREE.Group();
+        scene.add(droneGroup);
+
+        // --- LOAD FOX MODEL ---
+        let foxMixer, foxIdleAction, foxRunAction;
+        const gltfLoader = new THREE.GLTFLoader();
+        
+        // Using a reliable CDN for the Khronos sample model
+        gltfLoader.load('https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Models/master/2.0/Fox/glTF-Binary/Fox.glb', (gltf) => {
+            const fox = gltf.scene;
+            fox.scale.set(0.02, 0.02, 0.02);
+            fox.position.set(5, 0, 5);
+            
+            fox.traverse((child) => {
+                if (child.isMesh) {
+                    child.castShadow = true;
+                    child.receiveShadow = true;
+                }
+            });
+
+            scene.add(fox);
+            window.__3D_STATE__.foxLoaded = true;
+
+            if (gltf.animations && gltf.animations.length > 0) {
+                foxMixer = new THREE.AnimationMixer(fox);
+                // Fox animations: 0: Survey, 1: Walk, 2: Run
+                foxIdleAction = foxMixer.clipAction(gltf.animations[0]);
+                foxRunAction = foxMixer.clipAction(gltf.animations[2] || gltf.animations[1] || gltf.animations[0]);
+                
+                foxIdleAction.play();
+            }
+            document.getElementById('loading').style.display = 'none';
+        }, undefined, (error) => {
+            console.error("Error loading Fox:", error);
+            document.getElementById('loading').style.display = 'none';
+        });
+
+        // --- DRONE PARTS ---
+        const partsConfig = [
+            { id: 'frame', name: 'Frame', geo: new THREE.BoxGeometry(1.5, 0.15, 1.5), color: 0x333333, spawn: [-4, 0.5, 0], target: [0, 0.5, 0], orderGroup: 1 },
+            { id: 'motorA', name: 'Motor A', geo: new THREE.CylinderGeometry(0.15, 0.15, 0.3, 16), color: 0xcc0000, spawn: [-4, 0.5, 2], target: [-0.6, 0.65, -0.6], orderGroup: 2 },
+            { id: 'motorB', name: 'Motor B', geo: new THREE.CylinderGeometry(0.15, 0.15, 0.3, 16), color: 0x00cc00, spawn: [-2, 0.5, 2], target: [0.6, 0.65, -0.6], orderGroup: 2 },
+            { id: 'motorC', name: 'Motor C', geo: new THREE.CylinderGeometry(0.15, 0.15, 0.3, 16), color: 0x0000cc, spawn: [-4, 0.5, 4], target: [-0.6, 0.65, 0.6], orderGroup: 2 },
+            { id: 'motorD', name: 'Motor D', geo: new THREE.CylinderGeometry(0.15, 0.15, 0.3, 16), color: 0xcccc00, spawn: [-2, 0.5, 4], target: [0.6, 0.65, 0.6], orderGroup: 2 },
+            { id: 'battery', name: 'Battery', geo: new THREE.BoxGeometry(0.4, 0.15, 0.6), color: 0xff8800, spawn: [0, 0.5, 3], target: [0, 0.58, 0], orderGroup: 3 },
+            { id: 'camera', name: 'Camera Module', geo: new THREE.SphereGeometry(0.15, 16, 16), color: 0xffffff, spawn: [0, 0.5, 5], target: [0, 0.35, -0.75], orderGroup: 4 },
+            { id: 'props', name: 'Propeller Pack', geo: new THREE.BoxGeometry(0.8, 0.02, 0.2), color: 0x88ffff, spawn: [2, 0.5, 3], target: [0, 0.75, 0], orderGroup: 5 }
+        ];
+
+        const parts = [];
+        const partMeshes = [];
+        const spawnedProps = []; // For the small propellers
+
+        partsConfig.forEach(config => {
+            const mat = new THREE.MeshStandardMaterial({ color: config.color, roughness: 0.4, metalness: 0.3 });
+            const mesh = new THREE.Mesh(config.geo, mat);
+            mesh.position.set(...config.spawn);
+            mesh.castShadow = true;
+            mesh.receiveShadow = true;
+            
+            mesh.userData = {
+                id: config.id,
+                name: config.name,
+                spawnPos: new THREE.Vector3(...config.spawn),
+                targetPos: new THREE.Vector3(...config.target),
+                orderGroup: config.orderGroup,
+                state: 'unplaced', // unplaced, placing, placed, error
+                originalColor: config.color,
+                animStartPos: new THREE.Vector3(),
+                animStartTime: 0,
+                errorStartTime: 0
+            };
+
+            scene.add(mesh);
+            parts.push(mesh);
+            partMeshes.push(mesh);
+            window.__3D_STATE__.partStates[config.name] = 'unplaced';
+        });
+
+        // Create small propellers (hidden initially)
+        const propGeo = new THREE.BoxGeometry(0.6, 0.02, 0.05);
+        const propMat = new THREE.MeshStandardMaterial({ color: 0xdddddd });
+        const motorTargets = [
+            [-0.6, 0.8, -0.6], [0.6, 0.8, -0.6], [-0.6, 0.8, 0.6], [0.6, 0.8, 0.6]
+        ];
+        motorTargets.forEach(pos => {
+            const p = new THREE.Mesh(propGeo, propMat);
+            p.position.set(...pos);
+            p.visible = false;
+            droneGroup.add(p);
+            spawnedProps.push(p);
+        });
+
+        // --- INTERACTION LOGIC ---
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+        let selectedMesh = null;
+
+        window.addEventListener('pointerdown', (event) => {
+            if (window.__3D_STATE__.testFlightActive) return;
+
+            mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+            raycaster.setFromCamera(mouse, camera);
+
+            // Check parts first
+            const partIntersects = raycaster.intersectObjects(partMeshes);
+            if (partIntersects.length > 0) {
+                const clickedPart = partIntersects[0].object;
+                if (clickedPart.userData.state === 'unplaced' || clickedPart.userData.state === 'error') {
+                    selectPart(clickedPart);
+                    return;
+                }
+            }
+
+            // Check placement zone if a part is selected
+            if (selectedMesh) {
+                const zoneIntersects = raycaster.intersectObject(placementPlane);
+                if (zoneIntersects.length > 0) {
+                    const point = zoneIntersects[0].point;
+                    // Check if click is roughly within the assembly zone radius
+                    if (point.length() < 3) {
+                        attemptPlacement(selectedMesh, point);
+                    }
+                }
+            }
+        });
+
+        function selectPart(mesh) {
+            if (selectedMesh) {
+                selectedMesh.material.emissive.setHex(0x000000);
+            }
+            selectedMesh = mesh;
+            selectedMesh.material.emissive.setHex(0x444444);
+            
+            window.__3D_STATE__.selectedPart = mesh.userData.name;
+            updateHUD();
+        }
+
+        function deselectPart() {
+            if (selectedMesh) {
+                selectedMesh.material.emissive.setHex(0x000000);
+                selectedMesh = null;
+                window.__3D_STATE__.selectedPart = null;
+                updateHUD();
+            }
+        }
+
+        function attemptPlacement(mesh, clickPoint) {
+            const state = window.__3D_STATE__;
+            const data = mesh.userData;
+            let isValid = true;
+
+            // 1. Check Order (Medium & Hard)
+            if (state.difficulty > 1) {
+                const requiredGroup = getRequiredOrderGroup();
+                if (data.orderGroup > requiredGroup) {
+                    isValid = false;
+                }
+            }
+
+            // 2. Check Tolerance (Medium & Hard)
+            if (isValid && state.difficulty > 1) {
+                // Distance from click point to target XZ
+                const targetXZ = new THREE.Vector2(data.targetPos.x, data.targetPos.z);
+                const clickXZ = new THREE.Vector2(clickPoint.x, clickPoint.z);
+                const dist = clickXZ.distanceTo(targetXZ);
+                
+                if (dist > state.snapTolerance) {
+                    isValid = false;
+                }
+            }
+
+            if (isValid) {
+                placePart(mesh);
+            } else {
+                triggerError(mesh);
+            }
+        }
+
+        function getRequiredOrderGroup() {
+            // 1: Frame, 2: Motors, 3: Battery, 4: Camera, 5: Props
+            const states = window.__3D_STATE__.partStates;
+            if (states['Frame'] !== 'placed') return 1;
+            if (states['Motor A'] !== 'placed' || states['Motor B'] !== 'placed' || 
+                states['Motor C'] !== 'placed' || states['Motor D'] !== 'placed') return 2;
+            if (states['Battery'] !== 'placed') return 3;
+            if (states['Camera Module'] !== 'placed') return 4;
+            return 5;
+        }
+
+        function placePart(mesh) {
+            const state = window.__3D_STATE__;
+            mesh.userData.state = 'placing';
+            mesh.userData.animStartPos.copy(mesh.position);
+            mesh.userData.animStartTime = clock.getElapsedTime();
+            
+            state.partStates[mesh.userData.name] = 'placed';
+            state.partsPlaced++;
+            state.progressPercent = (state.partsPlaced / 8) * 100;
+            
+            deselectPart();
+            updateDifficulty();
+            updateHUD();
+
+            // Special logic for Propeller Pack
+            if (mesh.userData.id === 'props') {
+                mesh.visible = false; // Hide the pack box
+                spawnedProps.forEach(p => p.visible = true); // Show actual props
+            }
+
+            checkCompletion();
+        }
+
+        function triggerError(mesh) {
+            const state = window.__3D_STATE__;
+            mesh.userData.state = 'error';
+            mesh.userData.errorStartTime = clock.getElapsedTime();
+            mesh.material.color.setHex(0xff0000);
+            
+            state.errorCount++;
+            state.partStates[mesh.userData.name] = 'error';
+            updateHUD();
+        }
+
+        function updateDifficulty() {
+            const state = window.__3D_STATE__;
+            if (state.partsPlaced >= 6) {
+                state.difficulty = 3;
+                state.snapTolerance = 0.8;
+            } else if (state.partsPlaced >= 3) {
+                state.difficulty = 2;
+                state.snapTolerance = 1.5;
+            } else {
+                state.difficulty = 1;
+                state.snapTolerance = 999;
+            }
+        }
+
+        function checkCompletion() {
+            const state = window.__3D_STATE__;
+            if (state.partsPlaced === 8) {
+                state.assemblyComplete = true;
+                document.getElementById('test-flight-btn').disabled = false;
+                zoneEdge.material.color.setHex(0x00ffff);
+            }
+        }
+
+        // --- DOM / HUD UPDATES ---
+        function updateHUD() {
+            const state = window.__3D_STATE__;
+            
+            let diffText = "1 (Easy)";
+            if (state.difficulty === 2) diffText = "2 (Medium)";
+            if (state.difficulty === 3) diffText = "3 (Hard)";
+            
+            document.getElementById('difficulty-display').innerText = diffText;
+            document.getElementById('parts-placed').innerText = `${state.partsPlaced} / 8`;
+            document.getElementById('error-count').innerText = state.errorCount;
+            document.getElementById('selected-part').innerText = state.selectedPart || "None";
+            document.getElementById('progress-bar').style.width = `${state.progressPercent}%`;
+        }
+
+        // --- BUTTON ACTIONS ---
+        document.getElementById('reset-btn').addEventListener('click', () => {
+            const state = window.__3D_STATE__;
+            state.partsPlaced = 0;
+            state.difficulty = 1;
+            state.errorCount = 0;
+            state.selectedPart = null;
+            state.assemblyComplete = false;
+            state.testFlightActive = false;
+            state.droneY = 0.5;
+            state.progressPercent = 0;
+            state.snapTolerance = 999;
+
+            droneGroup.position.set(0, 0, 0);
+            droneGroup.rotation.set(0, 0, 0);
+
+            parts.forEach(mesh => {
+                scene.add(mesh); // Move back to scene if in droneGroup
+                mesh.position.copy(mesh.userData.spawnPos);
+                mesh.rotation.set(0, 0, 0);
+                mesh.material.color.setHex(mesh.userData.originalColor);
+                mesh.material.emissive.setHex(0x000000);
+                mesh.userData.state = 'unplaced';
+                mesh.visible = true;
+                state.partStates[mesh.userData.name] = 'unplaced';
+            });
+
+            spawnedProps.forEach(p => p.visible = false);
+            selectedMesh = null;
+            
+            document.getElementById('test-flight-btn').disabled = true;
+            zoneEdge.material.color.setHex(0x00ff00);
+            
+            if (foxMixer && foxIdleAction) {
+                foxMixer.stopAllAction();
+                foxIdleAction.play();
+            }
+
+            updateHUD();
+        });
+
+        document.getElementById('test-flight-btn').addEventListener('click', () => {
+            if (!window.__3D_STATE__.assemblyComplete) return;
+            
+            window.__3D_STATE__.testFlightActive = true;
+            document.getElementById('test-flight-btn').disabled = true;
+            document.getElementById('reset-btn').disabled = true;
+
+            // Group all placed parts into droneGroup for easy animation
+            parts.forEach(mesh => {
+                if (mesh.userData.state === 'placed') {
+                    droneGroup.add(mesh);
+                    // Adjust position relative to group origin (0,0,0)
+                    mesh.position.copy(mesh.userData.targetPos);
+                }
+            });
+
+            if (foxMixer && foxRunAction) {
+                foxMixer.stopAllAction();
+                foxRunAction.play();
+            }
+
+            // Re-enable reset after flight animation (approx 3s)
+            setTimeout(() => {
+                document.getElementById('reset-btn').disabled = false;
+            }, 3000);
+        });
+
+        // --- ANIMATION LOOP ---
+        const clock = new THREE.Clock();
+
+        function animate() {
+            requestAnimationFrame(animate);
+            
+            const delta = clock.getDelta();
+            const time = clock.getElapsedTime();
+            const state = window.__3D_STATE__;
+
+            controls.update();
+
+            if (foxMixer) foxMixer.update(delta);
+
+            // Fallback Fox bobbing if no animation loaded
+            if (state.foxLoaded && !foxMixer) {
+                const fox = scene.children.find(c => c.position && c.position.x === 5 && c.position.z === 5);
+                if (fox) fox.position.y = Math.sin(time * 2) * 0.05;
+            }
+
+            // Part Animations
+            parts.forEach(mesh => {
+                const data = mesh.userData;
+
+                if (data.state === 'unplaced') {
+                    // Hover effect
+                    mesh.position.y = data.spawnPos.y + Math.sin(time * 3 + mesh.position.x) * 0.05;
+                } 
+                else if (data.state === 'placing') {
+                    // Lerp to target
+                    const t = Math.min((time - data.animStartTime) / 0.3, 1);
+                    mesh.position.lerpVectors(data.animStartPos, data.targetPos, t);
+                    
+                    if (t >= 1) {
+                        data.state = 'placed';
+                        mesh.position.copy(data.targetPos);
+                        // If test flight is active, it will be moved to droneGroup
+                    }
+                }
+                else if (data.state === 'error') {
+                    // Wobble
+                    const elapsed = time - data.errorStartTime;
+                    if (elapsed < 0.5) {
+                        mesh.position.x = data.spawnPos.x + Math.sin(elapsed * 30) * 0.1;
+                    } else {
+                        data.state = 'unplaced';
+                        mesh.position.x = data.spawnPos.x;
+                        mesh.material.color.setHex(data.originalColor);
+                        state.partStates[data.name] = 'unplaced';
+                        if (selectedMesh === mesh) deselectPart();
+                    }
+                }
+            });
+
+            // Test Flight Animation
+            if (state.testFlightActive) {
+                // Ascend
+                if (droneGroup.position.y < 3.5) {
+                    droneGroup.position.y += delta * 1.5;
+                }
+                // Rotate
+                droneGroup.rotation.y += delta * 1.0;
+                
+                // Spin props
+                spawnedProps.forEach(p => {
+                    if (p.visible) p.rotation.y += delta * 20;
+                });
+
+                state.droneY = droneGroup.position.y + 0.5; // +0.5 to account for base frame height
+            }
+
+            renderer.render(scene, camera);
+        }
+
+        // Handle Resize
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // Start
+        updateHUD();
+        animate();
+    </script>
+</body>
+</html>

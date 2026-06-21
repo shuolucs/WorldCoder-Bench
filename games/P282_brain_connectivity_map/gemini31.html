@@ -1,0 +1,379 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Brain Connectivity Map</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #0a0a1a;
+        }
+        canvas {
+            display: block;
+        }
+        .hud {
+            position: absolute;
+            background: rgba(10, 10, 26, 0.85);
+            color: #ffffff;
+            font-family: monospace;
+            font-size: 14px;
+            padding: 12px;
+            pointer-events: none;
+            border: 1px solid #334466;
+            border-radius: 4px;
+            text-shadow: 1px 1px 2px #000;
+        }
+        #hud-top {
+            top: 15px;
+            left: 15px;
+        }
+        #hud-bottom {
+            bottom: 15px;
+            left: 50%;
+            transform: translateX(-50%);
+            text-align: center;
+            line-height: 1.5;
+            white-space: nowrap;
+        }
+        .key {
+            color: #ffcc33;
+            font-weight: bold;
+        }
+    </style>
+</head>
+<body>
+    <div id="hud-top"></div>
+    <div id="hud-bottom">
+        Controls: <span class="key">Click</span> Node to Select | <span class="key">G</span> Cycle Group | <span class="key">R</span> Toggle Rotation | <span class="key">W</span> Toggle Weights | <span class="key">P</span> Toggle Pulse | <span class="key">+/-</span> Zoom | <span class="key">T</span> Toggle Model
+    </div>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+        // State Management
+        window.__3D_STATE__ = {
+            modelLoaded: false,
+            nodeCount: 20,
+            edgeCount: 30,
+            selectedNode: -1,
+            hoveredNode: -1,
+            activeGroup: -1,
+            connectionStrengthMode: 'uniform',
+            rotationEnabled: true,
+            rotationSpeed: 0.002,
+            currentRotationY: 0,
+            visibleNodes: 20,
+            visibleEdges: 30,
+            highlightedEdges: 0,
+            pulseActive: false,
+            modelOpacity: 0.3,
+            zoomLevel: 1.0
+        };
+
+        const state = window.__3D_STATE__;
+
+        // Scene Setup
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x0a0a1a);
+
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+        camera.position.set(0, 3, 8);
+        camera.lookAt(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        document.body.appendChild(renderer.domElement);
+
+        // Lights
+        const ambientLight = new THREE.AmbientLight(0x334466, 0.4);
+        scene.add(ambientLight);
+
+        const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
+        directionalLight.position.set(5, 10, 5);
+        scene.add(directionalLight);
+
+        // Container for rotation
+        const networkGroup = new THREE.Group();
+        scene.add(networkGroup);
+
+        let loadedModel = null;
+
+        // Load Model
+        const loader = new GLTFLoader();
+        loader.load(
+            'https://raw.githubusercontent.com/mrdoob/three.js/master/examples/models/gltf/LittlestTokyo.glb',
+            (gltf) => {
+                loadedModel = gltf.scene;
+                
+                // Calculate bounding sphere to scale
+                const box = new THREE.Box3().setFromObject(loadedModel);
+                const sphere = box.getBoundingSphere(new THREE.Sphere());
+                const scale = 3 / sphere.radius;
+                
+                loadedModel.scale.setScalar(scale);
+                loadedModel.position.sub(sphere.center.clone().multiplyScalar(scale));
+
+                // Make materials transparent
+                loadedModel.traverse((child) => {
+                    if (child.isMesh && child.material) {
+                        child.material.transparent = true;
+                        child.material.opacity = state.modelOpacity;
+                        child.material.depthWrite = false;
+                    }
+                });
+
+                networkGroup.add(loadedModel);
+                state.modelLoaded = true;
+                updateHUD();
+            }
+        );
+
+        // Nodes Setup
+        const nodes = [];
+        const nodeColors = [0xff3333, 0x3366ff, 0x33ff66, 0xffcc33];
+        const nodeGeometry = new THREE.SphereGeometry(0.15, 16, 16);
+
+        for (let i = 0; i < state.nodeCount; i++) {
+            const groupIdx = Math.floor(i / 5);
+            const color = nodeColors[groupIdx];
+            
+            const material = new THREE.MeshBasicMaterial({ color: color });
+            const node = new THREE.Mesh(nodeGeometry, material);
+            
+            const x = 2.5 * Math.cos(i * 0.314) * Math.sin(i * 0.5);
+            const y = 1.5 * Math.sin(i * 0.628);
+            const z = 2.0 * Math.cos(i * 0.5) * Math.cos(i * 0.314);
+            
+            node.position.set(x, y, z);
+            node.userData = { index: i, group: groupIdx, baseColor: color };
+            
+            nodes.push(node);
+            networkGroup.add(node);
+        }
+
+        // Edges Setup
+        const edges = [];
+        let maxEdgeDistance = 0;
+
+        // Create exactly 30 connections by looping 0 to 9
+        for (let i = 0; i < 10; i++) {
+            const connections = [
+                [i, (i + 3) % 20],
+                [i, (i + 7) % 20],
+                [i, i + 10]
+            ];
+
+            connections.forEach(([n1, n2]) => {
+                const pos1 = nodes[n1].position;
+                const pos2 = nodes[n2].position;
+                
+                const dist = pos1.distanceTo(pos2);
+                if (dist > maxEdgeDistance) maxEdgeDistance = dist;
+
+                const geometry = new THREE.BufferGeometry().setFromPoints([pos1, pos2]);
+                
+                const c1 = new THREE.Color(nodes[n1].userData.baseColor);
+                const c2 = new THREE.Color(nodes[n2].userData.baseColor);
+                const colors = new Float32Array([c1.r, c1.g, c1.b, c2.r, c2.g, c2.b]);
+                geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+                const material = new THREE.LineBasicMaterial({ 
+                    vertexColors: true, 
+                    transparent: true, 
+                    opacity: 0.3,
+                    linewidth: 1
+                });
+
+                const line = new THREE.Line(geometry, material);
+                line.userData = { n1, n2, distance: dist };
+                
+                edges.push(line);
+                networkGroup.add(line);
+            });
+        }
+
+        // Interaction Setup
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+
+        function updateVisibilityAndAppearance() {
+            let visNodes = 0;
+            let visEdges = 0;
+            let highEdges = 0;
+
+            // Update Nodes
+            nodes.forEach(node => {
+                const inGroup = state.activeGroup === -1 || node.userData.group === state.activeGroup;
+                node.visible = inGroup;
+                if (inGroup) visNodes++;
+            });
+
+            // Update Edges
+            edges.forEach(edge => {
+                const n1 = edge.userData.n1;
+                const n2 = edge.userData.n2;
+                const g1 = nodes[n1].userData.group;
+                const g2 = nodes[n2].userData.group;
+
+                const isVisible = state.activeGroup === -1 || g1 === state.activeGroup || g2 === state.activeGroup;
+                edge.visible = isVisible;
+
+                if (isVisible) {
+                    visEdges++;
+                    let opacity = 0.3;
+
+                    if (state.connectionStrengthMode === 'weighted') {
+                        opacity = 0.1 + 0.9 * (1 - edge.userData.distance / maxEdgeDistance);
+                    }
+
+                    const isConnectedToSelected = (n1 === state.selectedNode || n2 === state.selectedNode);
+                    
+                    if (state.selectedNode !== -1) {
+                        if (isConnectedToSelected) {
+                            opacity = 1.0;
+                            highEdges++;
+                        } else {
+                            opacity *= 0.15; // Dim non-connected
+                        }
+                    }
+
+                    edge.material.opacity = opacity;
+                }
+            });
+
+            state.visibleNodes = visNodes;
+            state.visibleEdges = visEdges;
+            state.highlightedEdges = highEdges;
+            updateHUD();
+        }
+
+        function updateHUD() {
+            const hud = document.getElementById('hud-top');
+            hud.innerHTML = `Nodes: ${state.visibleNodes}/20 | Edges: ${state.visibleEdges}/30 | Selected: ${state.selectedNode !== -1 ? state.selectedNode : 'None'} | Group: ${state.activeGroup !== -1 ? state.activeGroup : 'All'}<br>Mode: ${state.connectionStrengthMode} | Pulse: ${state.pulseActive ? 'On' : 'Off'} | Zoom: ${state.zoomLevel.toFixed(1)}`;
+        }
+
+        // Event Listeners
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        window.addEventListener('pointermove', (event) => {
+            mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+            raycaster.setFromCamera(mouse, camera);
+            const intersects = raycaster.intersectObjects(nodes);
+
+            if (intersects.length > 0) {
+                const node = intersects[0].object;
+                if (node.visible) {
+                    state.hoveredNode = node.userData.index;
+                    document.body.style.cursor = 'pointer';
+                    return;
+                }
+            }
+            state.hoveredNode = -1;
+            document.body.style.cursor = 'default';
+        });
+
+        window.addEventListener('pointerdown', (event) => {
+            raycaster.setFromCamera(mouse, camera);
+            const intersects = raycaster.intersectObjects(nodes);
+
+            if (intersects.length > 0 && intersects[0].object.visible) {
+                state.selectedNode = intersects[0].object.userData.index;
+            } else {
+                state.selectedNode = -1;
+            }
+            updateVisibilityAndAppearance();
+        });
+
+        window.addEventListener('keydown', (event) => {
+            const key = event.key.toLowerCase();
+            let needsUpdate = false;
+
+            if (key === 'g') {
+                state.activeGroup = state.activeGroup >= 3 ? -1 : state.activeGroup + 1;
+                needsUpdate = true;
+            } else if (key === 'r') {
+                state.rotationEnabled = !state.rotationEnabled;
+            } else if (key === 'w') {
+                state.connectionStrengthMode = state.connectionStrengthMode === 'uniform' ? 'weighted' : 'uniform';
+                needsUpdate = true;
+            } else if (key === 'p') {
+                state.pulseActive = !state.pulseActive;
+                updateHUD();
+            } else if (key === '+' || key === '=') {
+                state.zoomLevel = Math.min(3.0, state.zoomLevel + 0.2);
+                camera.position.z = 8 / state.zoomLevel;
+                updateHUD();
+            } else if (key === '-' || key === '_') {
+                state.zoomLevel = Math.max(0.4, state.zoomLevel - 0.2);
+                camera.position.z = 8 / state.zoomLevel;
+                updateHUD();
+            } else if (key === 't') {
+                state.modelOpacity = state.modelOpacity > 0.1 ? 0.0 : 0.3;
+                if (loadedModel) {
+                    loadedModel.traverse((child) => {
+                        if (child.isMesh && child.material) {
+                            child.material.opacity = state.modelOpacity;
+                            child.visible = state.modelOpacity > 0;
+                        }
+                    });
+                }
+            }
+
+            if (needsUpdate) updateVisibilityAndAppearance();
+        });
+
+        // Initial setup
+        updateVisibilityAndAppearance();
+
+        // Animation Loop
+        const clock = new THREE.Clock();
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const time = clock.getElapsedTime();
+
+            if (state.rotationEnabled) {
+                networkGroup.rotation.y += state.rotationSpeed;
+                state.currentRotationY = networkGroup.rotation.y;
+            }
+
+            // Handle Node Scaling (Hover & Pulse)
+            nodes.forEach((node, i) => {
+                let targetScale = 1.0;
+                if (state.hoveredNode === i) {
+                    targetScale = 1.5;
+                } else if (state.pulseActive) {
+                    targetScale = 1.0 + 0.2 * Math.sin(time * 3 + i);
+                }
+                
+                // Smooth scaling
+                node.scale.lerp(new THREE.Vector3(targetScale, targetScale, targetScale), 0.1);
+            });
+
+            renderer.render(scene, camera);
+        }
+
+        animate();
+    </script>
+</body>
+</html>

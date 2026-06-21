@@ -1,0 +1,497 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Car Suspension Simulation</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #000;
+            font-family: sans-serif;
+        }
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+        }
+        #ui-panel {
+            position: absolute;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: rgba(255, 255, 255, 0.9);
+            padding: 15px 25px;
+            border-radius: 8px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+            display: flex;
+            gap: 20px;
+            align-items: center;
+            z-index: 10;
+        }
+        .control-group {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        .control-group label {
+            font-size: 12px;
+            margin-bottom: 5px;
+            font-weight: bold;
+        }
+        #hud {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            background: rgba(0, 0, 0, 0.6);
+            color: white;
+            padding: 12px;
+            font-family: monospace;
+            font-size: 14px;
+            border-radius: 5px;
+            pointer-events: none;
+            z-index: 10;
+            line-height: 1.5;
+        }
+        button, select {
+            padding: 5px 10px;
+            cursor: pointer;
+        }
+    </style>
+    <script type="importmap">
+    { "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+    } }
+    </script>
+</head>
+<body>
+
+<div id="canvas-container"></div>
+
+<div id="hud">
+    <div>Speed: <span id="hud-speed">0.0</span> m/s</div>
+    <div>FL Comp: <span id="hud-fl">0.0</span> cm</div>
+    <div>FR Comp: <span id="hud-fr">0.0</span> cm</div>
+    <div>RL Comp: <span id="hud-rl">0.0</span> cm</div>
+    <div>RR Comp: <span id="hud-rr">0.0</span> cm</div>
+    <div>Pitch: <span id="hud-pitch">0.0</span>&deg;</div>
+    <div>Roll: <span id="hud-roll">0.0</span>&deg;</div>
+    <div style="margin-top: 5px; color: #aaa; font-size: 12px;">Press 'P' to Pause</div>
+</div>
+
+<div id="ui-panel">
+    <div class="control-group">
+        <label for="slider-speed">Speed (m/s): <span id="val-speed">5</span></label>
+        <input type="range" id="slider-speed" min="0" max="20" step="0.5" value="5">
+    </div>
+    <div class="control-group">
+        <label for="slider-stiffness">Stiffness k (N/m): <span id="val-stiffness">30000</span></label>
+        <input type="range" id="slider-stiffness" min="5000" max="100000" step="1000" value="30000">
+    </div>
+    <div class="control-group">
+        <label for="slider-damping">Damping c (Ns/m): <span id="val-damping">3000</span></label>
+        <input type="range" id="slider-damping" min="500" max="10000" step="100" value="3000">
+    </div>
+    <div class="control-group">
+        <label for="select-terrain">Terrain</label>
+        <select id="select-terrain">
+            <option value="sine">Sine Wave</option>
+            <option value="step">Step Bump</option>
+            <option value="random">Random Bumps</option>
+        </select>
+    </div>
+    <div class="control-group">
+        <button id="btn-reset">Reset</button>
+    </div>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+// --- Global State ---
+window.__3D_STATE__ = {
+    frameCount: 0,
+    carZ: -20,
+    carBodyY: 0.8,
+    speed: 5,
+    stiffness: 30000,
+    damping: 3000,
+    compressionFL: 0,
+    compressionFR: 0,
+    compressionRL: 0,
+    compressionRR: 0,
+    pitchAngle: 0,
+    rollAngle: 0,
+    terrainType: 'sine',
+    suspensionValid: true,
+    isPaused: false
+};
+
+// --- Physics Constants & Variables ---
+const MASS = 1200;
+const I_PITCH = 2000;
+const I_ROLL = 500;
+const G = 9.81;
+const L0 = 0.5;
+const WHEEL_RADIUS = 0.25;
+const DT = 1 / 60;
+
+// Local wheel positions [FL, FR, RL, RR]
+const localX = [-0.8, 0.8, -0.8, 0.8];
+const localZ = [1.4, 1.4, -1.4, -1.4];
+
+let vy = 0, vPitch = 0, vRoll = 0;
+let prevL = [L0, L0, L0, L0];
+
+// --- Three.js Setup ---
+const container = document.getElementById('canvas-container');
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x87CEEB);
+
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+camera.position.set(8, 6, 12);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+container.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 1, 0);
+controls.update();
+
+// Lights
+const dirLight = new THREE.DirectionalLight(0xffffff, 1.5);
+dirLight.position.set(5, 10, 5);
+dirLight.castShadow = true;
+dirLight.shadow.camera.top = 20;
+dirLight.shadow.camera.bottom = -20;
+dirLight.shadow.camera.left = -20;
+dirLight.shadow.camera.right = 20;
+dirLight.shadow.mapSize.width = 2048;
+dirLight.shadow.mapSize.height = 2048;
+scene.add(dirLight);
+
+const ambLight = new THREE.AmbientLight(0xffffff, 0.4);
+scene.add(ambLight);
+
+// --- Environment ---
+// Ground
+const groundGeo = new THREE.PlaneGeometry(100, 100);
+const groundMat = new THREE.MeshStandardMaterial({ color: 0x556B2F });
+const ground = new THREE.Mesh(groundGeo, groundMat);
+ground.rotation.x = -Math.PI / 2;
+ground.receiveShadow = true;
+scene.add(ground);
+
+// Terrain Strip
+const terrainGeo = new THREE.PlaneGeometry(4, 100, 10, 200);
+terrainGeo.rotateX(-Math.PI / 2); // Now Y is up, Z is along length
+const terrainMat = new THREE.MeshStandardMaterial({ color: 0x6B8E23, wireframe: false });
+const terrainMesh = new THREE.Mesh(terrainGeo, terrainMat);
+terrainMesh.receiveShadow = true;
+terrainMesh.castShadow = true;
+scene.add(terrainMesh);
+
+function getTerrainHeight(z, type) {
+    if (type === 'sine') {
+        return 0.3 * Math.sin(2 * Math.PI * z / 4);
+    } else if (type === 'step') {
+        return (z > -1 && z < 1) ? 0.4 : 0;
+    } else if (type === 'random') {
+        return 0.15 * Math.sin(z) + 0.1 * Math.sin(2.3 * z) + 0.05 * Math.sin(5.1 * z);
+    }
+    return 0;
+}
+
+function updateTerrainGeometry() {
+    const pos = terrainGeo.attributes.position;
+    for (let i = 0; i < pos.count; i++) {
+        // In the rotated geometry, local Z is world Z
+        let z = pos.getZ(i); 
+        let h = getTerrainHeight(z, window.__3D_STATE__.terrainType);
+        pos.setY(i, h);
+    }
+    terrainGeo.computeVertexNormals();
+    pos.needsUpdate = true;
+}
+updateTerrainGeometry();
+
+// --- Car & Suspension Objects ---
+const carGroup = new THREE.Group();
+scene.add(carGroup);
+
+// Fallback Car Body
+const boxGeo = new THREE.BoxGeometry(1.6, 0.6, 4);
+const boxMat = new THREE.MeshStandardMaterial({ color: 0xcc0000 });
+const fallbackCar = new THREE.Mesh(boxGeo, boxMat);
+fallbackCar.position.y = 0.3; // Center above attachment plane
+fallbackCar.castShadow = true;
+carGroup.add(fallbackCar);
+
+// Load GLTF
+const loader = new GLTFLoader();
+loader.load('./ferrari.glb', (gltf) => {
+    const model = gltf.scene;
+    
+    // Scale to ~4m length
+    const box = new THREE.Box3().setFromObject(model);
+    const length = box.max.z - box.min.z;
+    const scale = 4 / length;
+    model.scale.set(scale, scale, scale);
+    
+    // Center model
+    const center = box.getCenter(new THREE.Vector3());
+    model.position.set(-center.x * scale, -box.min.y * scale, -center.z * scale);
+    
+    model.traverse((child) => {
+        if (child.isMesh) {
+            child.castShadow = true;
+            child.receiveShadow = true;
+        }
+    });
+
+    carGroup.remove(fallbackCar);
+    carGroup.add(model);
+}, undefined, (err) => {
+    console.log("GLTF load failed, using fallback box.", err);
+});
+
+// Wheels and Springs
+const wheels = [];
+const springs = [];
+
+const wheelGeo = new THREE.CylinderGeometry(WHEEL_RADIUS, WHEEL_RADIUS, 0.2, 32);
+wheelGeo.rotateZ(Math.PI / 2);
+const wheelMat = new THREE.MeshStandardMaterial({ color: 0x222222 });
+
+function createSpringGeometry() {
+    const pts = [];
+    const segments = 10;
+    const radius = 0.1;
+    for (let i = 0; i <= segments; i++) {
+        let y = i / segments;
+        let x = (i % 2 === 0) ? radius : -radius;
+        if (i === 0 || i === segments) x = 0;
+        pts.push(new THREE.Vector3(x, y, 0));
+    }
+    return new THREE.BufferGeometry().setFromPoints(pts);
+}
+const springGeo = createSpringGeometry();
+const springMat = new THREE.LineBasicMaterial({ color: 0xffff00, linewidth: 2 });
+
+for (let i = 0; i < 4; i++) {
+    const wheel = new THREE.Mesh(wheelGeo, wheelMat);
+    wheel.castShadow = true;
+    scene.add(wheel);
+    wheels.push(wheel);
+
+    const spring = new THREE.Line(springGeo, springMat);
+    scene.add(spring);
+    springs.push(spring);
+}
+
+// --- UI & Controls ---
+const uiSpeed = document.getElementById('slider-speed');
+const uiStiffness = document.getElementById('slider-stiffness');
+const uiDamping = document.getElementById('slider-damping');
+const uiTerrain = document.getElementById('select-terrain');
+const btnReset = document.getElementById('btn-reset');
+
+const valSpeed = document.getElementById('val-speed');
+const valStiffness = document.getElementById('val-stiffness');
+const valDamping = document.getElementById('val-damping');
+
+uiSpeed.addEventListener('input', (e) => {
+    window.__3D_STATE__.speed = parseFloat(e.target.value);
+    valSpeed.textContent = e.target.value;
+});
+uiStiffness.addEventListener('input', (e) => {
+    window.__3D_STATE__.stiffness = parseFloat(e.target.value);
+    valStiffness.textContent = e.target.value;
+});
+uiDamping.addEventListener('input', (e) => {
+    window.__3D_STATE__.damping = parseFloat(e.target.value);
+    valDamping.textContent = e.target.value;
+});
+uiTerrain.addEventListener('change', (e) => {
+    window.__3D_STATE__.terrainType = e.target.value;
+    updateTerrainGeometry();
+});
+
+function resetCar() {
+    window.__3D_STATE__.carZ = -20;
+    window.__3D_STATE__.carBodyY = 0.65; // Approx rest height
+    window.__3D_STATE__.pitchAngle = 0;
+    window.__3D_STATE__.rollAngle = 0;
+    vy = 0;
+    vPitch = 0;
+    vRoll = 0;
+    prevL = [L0, L0, L0, L0];
+    
+    // Reset camera relative position
+    camera.position.set(8, window.__3D_STATE__.carBodyY + 6, window.__3D_STATE__.carZ + 12);
+    controls.target.set(0, window.__3D_STATE__.carBodyY, window.__3D_STATE__.carZ);
+    controls.update();
+}
+btnReset.addEventListener('click', resetCar);
+
+window.addEventListener('keydown', (e) => {
+    if (e.key.toLowerCase() === 'p') {
+        window.__3D_STATE__.isPaused = !window.__3D_STATE__.isPaused;
+    }
+});
+
+window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// --- Physics Step ---
+function updatePhysics() {
+    const state = window.__3D_STATE__;
+    
+    // Move forward
+    let prevZ = state.carZ;
+    state.carZ += state.speed * DT;
+    
+    // Loop track
+    if (state.carZ > 50) {
+        state.carZ -= 100;
+        camera.position.z -= 100;
+        controls.target.z -= 100;
+    }
+
+    let F_total_y = -MASS * G;
+    let Torque_x = 0;
+    let Torque_z = 0;
+    
+    let compressions = [0, 0, 0, 0];
+
+    for (let i = 0; i < 4; i++) {
+        let wheel_z = state.carZ + localZ[i];
+        let h = getTerrainHeight(wheel_z, state.terrainType);
+        
+        // Attachment point Y on car body
+        // Pitch (rot X): positive means nose down. So +z goes down.
+        // Roll (rot Z): positive means right up. So +x goes up.
+        let y_attach = state.carBodyY - localZ[i] * Math.sin(state.pitchAngle) + localX[i] * Math.sin(state.rollAngle);
+        
+        // Current spring length
+        let L = y_attach - h - WHEEL_RADIUS;
+        
+        // Compression (positive means compressed)
+        let compression = L0 - L;
+        compressions[i] = compression;
+        
+        // Velocity of compression
+        let v_comp = (prevL[i] - L) / DT;
+        prevL[i] = L;
+        
+        // Upward force from suspension
+        let F_y = state.stiffness * compression + state.damping * v_comp;
+        
+        // Prevent extreme pulling if wheels leave ground (simple limit)
+        if (F_y < -5000) F_y = -5000; 
+
+        F_total_y += F_y;
+        
+        // Torque X (Pitch): Upward force at front (+z) causes nose up (negative pitch)
+        Torque_x += -localZ[i] * F_y;
+        
+        // Torque Z (Roll): Upward force at right (+x) causes right up (positive roll)
+        Torque_z += localX[i] * F_y;
+        
+        // Update Visuals
+        wheels[i].position.set(localX[i], h + WHEEL_RADIUS, wheel_z);
+        
+        springs[i].position.set(localX[i], h + WHEEL_RADIUS, wheel_z);
+        springs[i].scale.y = Math.max(0.01, L); // Prevent negative scale
+    }
+
+    // Integrate
+    let ay = F_total_y / MASS;
+    let alpha_pitch = Torque_x / I_PITCH;
+    let alpha_roll = Torque_z / I_ROLL;
+
+    vy += ay * DT;
+    vPitch += alpha_pitch * DT;
+    vRoll += alpha_roll * DT;
+
+    // Apply slight artificial damping to body to prevent numerical explosion
+    vy *= 0.99;
+    vPitch *= 0.98;
+    vRoll *= 0.98;
+
+    state.carBodyY += vy * DT;
+    state.pitchAngle += vPitch * DT;
+    state.rollAngle += vRoll * DT;
+
+    // Update State Compressions
+    state.compressionFL = compressions[0];
+    state.compressionFR = compressions[1];
+    state.compressionRL = compressions[2];
+    state.compressionRR = compressions[3];
+
+    // Validate state
+    state.suspensionValid = compressions.every(c => Number.isFinite(c) && c >= -0.5 && c <= 0.5);
+
+    // Apply to Car Mesh
+    carGroup.position.set(0, state.carBodyY, state.carZ);
+    carGroup.rotation.set(state.pitchAngle, 0, state.rollAngle);
+
+    // Camera follow
+    let deltaZ = state.carZ - prevZ;
+    camera.position.z += deltaZ;
+    controls.target.set(0, state.carBodyY, state.carZ);
+    controls.update();
+}
+
+// --- HUD Update ---
+const hudSpeed = document.getElementById('hud-speed');
+const hudFL = document.getElementById('hud-fl');
+const hudFR = document.getElementById('hud-fr');
+const hudRL = document.getElementById('hud-rl');
+const hudRR = document.getElementById('hud-rr');
+const hudPitch = document.getElementById('hud-pitch');
+const hudRoll = document.getElementById('hud-roll');
+
+function updateHUD() {
+    const s = window.__3D_STATE__;
+    hudSpeed.textContent = s.speed.toFixed(1);
+    hudFL.textContent = (s.compressionFL * 100).toFixed(1);
+    hudFR.textContent = (s.compressionFR * 100).toFixed(1);
+    hudRL.textContent = (s.compressionRL * 100).toFixed(1);
+    hudRR.textContent = (s.compressionRR * 100).toFixed(1);
+    hudPitch.textContent = (s.pitchAngle * 180 / Math.PI).toFixed(1);
+    hudRoll.textContent = (s.rollAngle * 180 / Math.PI).toFixed(1);
+}
+
+// --- Main Loop ---
+resetCar();
+
+function animate() {
+    requestAnimationFrame(animate);
+
+    if (!window.__3D_STATE__.isPaused) {
+        updatePhysics();
+    }
+
+    updateHUD();
+    
+    window.__3D_STATE__.frameCount++;
+    
+    renderer.render(scene, camera);
+}
+
+animate();
+
+</script>
+</body>
+</html>

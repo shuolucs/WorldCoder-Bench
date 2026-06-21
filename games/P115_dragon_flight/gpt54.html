@@ -1,0 +1,595 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>飞龙飞行模拟器</title>
+  <style>
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #87b8ff;
+      font-family: Arial, Helvetica, sans-serif;
+    }
+    canvas {
+      display: block;
+    }
+    #hud {
+      position: fixed;
+      top: 12px;
+      left: 12px;
+      padding: 12px 14px;
+      color: #fff;
+      background: rgba(0, 0, 0, 0.35);
+      border: 1px solid rgba(255,255,255,0.18);
+      border-radius: 10px;
+      backdrop-filter: blur(6px);
+      z-index: 10;
+      line-height: 1.7;
+      font-size: 14px;
+      min-width: 180px;
+      user-select: none;
+    }
+    #hud b {
+      color: #ffd76a;
+      display: inline-block;
+      width: 72px;
+    }
+    #help {
+      position: fixed;
+      right: 12px;
+      top: 12px;
+      padding: 10px 12px;
+      color: #eef7ff;
+      background: rgba(0,0,0,0.3);
+      border: 1px solid rgba(255,255,255,0.15);
+      border-radius: 10px;
+      font-size: 13px;
+      line-height: 1.6;
+      z-index: 10;
+      user-select: none;
+    }
+    #loading {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: white;
+      background:
+        radial-gradient(circle at center, rgba(255,255,255,0.1), rgba(0,0,0,0.35)),
+        linear-gradient(180deg, #6ea7ff, #a6d3ff 45%, #d5f1ff);
+      z-index: 20;
+      font-size: 20px;
+      letter-spacing: 1px;
+    }
+  </style>
+
+  <script type="importmap">
+  { "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+  } }
+  </script>
+</head>
+<body>
+  <div id="loading">正在加载飞龙模型...</div>
+
+  <div id="hud">
+    <div><b>速度</b><span id="speed">0.0</span> m/s</div>
+    <div><b>高度</b><span id="altitude">0.0</span> m</div>
+    <div><b>得分</b><span id="score">0</span></div>
+    <div><b>通过环</b><span id="ringsHit">0</span></div>
+    <div><b>时间</b><span id="time">0.0</span> s</div>
+  </div>
+
+  <div id="help">
+    <div><strong>操作</strong></div>
+    <div>W / S：俯冲 / 拉起</div>
+    <div>A / D：左转 / 右转</div>
+    <div>Space：加速上升</div>
+    <div>Shift：俯冲加速</div>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x9fd0ff);
+    scene.fog = new THREE.Fog(0x9fd0ff, 120, 420);
+
+    const camera = new THREE.PerspectiveCamera(65, window.innerWidth / window.innerHeight, 0.1, 1200);
+    camera.position.set(0, 18, -25);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    document.body.appendChild(renderer.domElement);
+
+    const clock = new THREE.Clock();
+
+    const hemi = new THREE.HemisphereLight(0xdff4ff, 0x4b7a2f, 1.2);
+    scene.add(hemi);
+
+    const dirLight = new THREE.DirectionalLight(0xffffff, 1.3);
+    dirLight.position.set(40, 80, 20);
+    dirLight.castShadow = true;
+    dirLight.shadow.mapSize.set(2048, 2048);
+    dirLight.shadow.camera.left = -120;
+    dirLight.shadow.camera.right = 120;
+    dirLight.shadow.camera.top = 120;
+    dirLight.shadow.camera.bottom = -120;
+    dirLight.shadow.camera.near = 1;
+    dirLight.shadow.camera.far = 250;
+    scene.add(dirLight);
+
+    const ambient = new THREE.AmbientLight(0xffffff, 0.35);
+    scene.add(ambient);
+
+    const dragonRoot = new THREE.Group();
+    dragonRoot.position.set(0, 20, 0);
+    scene.add(dragonRoot);
+
+    let dragonModel = null;
+    let mixer = null;
+    let modelLoaded = false;
+
+    const initialPosition = new THREE.Vector3(0, 20, 0);
+    const initialQuaternion = new THREE.Quaternion();
+
+    const keys = {
+      KeyW: false,
+      KeyA: false,
+      KeyS: false,
+      KeyD: false,
+      Space: false,
+      ShiftLeft: false,
+      ShiftRight: false
+    };
+
+    const BASE_SPEED = 8;
+    const PITCH_SPEED = 1.5;
+    const YAW_SPEED = 1.5;
+    const EXTRA_UP_SPEED = 5;
+    const EXTRA_DIVE_SPEED = 5;
+
+    let currentSpeed = BASE_SPEED;
+    let score = 0;
+    let ringsHit = 0;
+    let elapsed = 0;
+    let crashed = false;
+    let crashFlashTime = 0;
+
+    const rings = [];
+    const effects = [];
+
+    const ringGeometry = new THREE.TorusGeometry(3, 0.3, 16, 48);
+    const ringMaterialBase = new THREE.MeshStandardMaterial({
+      color: 0xffaa00,
+      emissive: 0xff8800,
+      emissiveIntensity: 1.8,
+      metalness: 0.15,
+      roughness: 0.3
+    });
+
+    const effectGeometry = new THREE.TorusGeometry(3, 0.14, 12, 48);
+    const ringTargetCount = 5;
+
+    function createGround() {
+      const size = 500;
+      const segments = 120;
+      const geometry = new THREE.PlaneGeometry(size, size, segments, segments);
+      geometry.rotateX(-Math.PI / 2);
+
+      const pos = geometry.attributes.position;
+      for (let i = 0; i < pos.count; i++) {
+        const x = pos.getX(i);
+        const z = pos.getZ(i);
+        const y =
+          Math.sin(x * 0.035) * 1.5 +
+          Math.cos(z * 0.03) * 1.2 +
+          Math.sin((x + z) * 0.02) * 2.0;
+        pos.setY(i, y);
+      }
+      geometry.computeVertexNormals();
+
+      const material = new THREE.MeshStandardMaterial({
+        color: 0x4f9a43,
+        roughness: 1.0,
+        metalness: 0.0
+      });
+
+      const ground = new THREE.Mesh(geometry, material);
+      ground.receiveShadow = true;
+      ground.position.y = 0;
+      scene.add(ground);
+    }
+
+    function createSkyDecor() {
+      const cloudGroup = new THREE.Group();
+      scene.add(cloudGroup);
+
+      const cloudMat = new THREE.MeshStandardMaterial({
+        color: 0xffffff,
+        transparent: true,
+        opacity: 0.65,
+        roughness: 1
+      });
+
+      for (let i = 0; i < 24; i++) {
+        const cloud = new THREE.Group();
+        const puffCount = 3 + Math.floor(Math.random() * 4);
+        for (let j = 0; j < puffCount; j++) {
+          const geo = new THREE.SphereGeometry(3 + Math.random() * 3, 12, 12);
+          const mesh = new THREE.Mesh(geo, cloudMat);
+          mesh.position.set(
+            (Math.random() - 0.5) * 8,
+            (Math.random() - 0.5) * 2,
+            (Math.random() - 0.5) * 5
+          );
+          cloud.add(mesh);
+        }
+        cloud.position.set(
+          (Math.random() - 0.5) * 420,
+          55 + Math.random() * 45,
+          (Math.random() - 0.5) * 420
+        );
+        cloud.scale.setScalar(0.8 + Math.random() * 1.5);
+        cloudGroup.add(cloud);
+      }
+    }
+
+    function randomRange(min, max) {
+      return min + Math.random() * (max - min);
+    }
+
+    function getDragonForward() {
+      const forward = new THREE.Vector3(0, 0, 1);
+      forward.applyQuaternion(dragonRoot.quaternion).normalize();
+      return forward;
+    }
+
+    function spawnRing() {
+      const forward = getDragonForward();
+      const distance = randomRange(50, 150);
+      const basePos = dragonRoot.position.clone().add(forward.multiplyScalar(distance));
+
+      const ring = new THREE.Mesh(ringGeometry, ringMaterialBase.clone());
+      ring.castShadow = true;
+      ring.receiveShadow = false;
+      ring.position.set(
+        basePos.x + randomRange(-30, 30),
+        randomRange(10, 40),
+        basePos.z + randomRange(-20, 20)
+      );
+
+      const lookDir = ring.position.clone().sub(dragonRoot.position).normalize();
+      const q = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 0, 1), lookDir);
+      ring.quaternion.copy(q);
+      ring.userData.hit = false;
+      ring.userData.pulse = Math.random() * Math.PI * 2;
+
+      scene.add(ring);
+      rings.push(ring);
+    }
+
+    function ensureRingCount() {
+      while (rings.length < ringTargetCount) spawnRing();
+    }
+
+    function createHitEffect(position, quaternion) {
+      const mat = new THREE.MeshBasicMaterial({
+        color: 0xffdd66,
+        transparent: true,
+        opacity: 0.95
+      });
+      const mesh = new THREE.Mesh(effectGeometry, mat);
+      mesh.position.copy(position);
+      mesh.quaternion.copy(quaternion);
+      mesh.scale.setScalar(1);
+      scene.add(mesh);
+      effects.push({
+        mesh,
+        life: 0.55,
+        maxLife: 0.55
+      });
+    }
+
+    function removeRing(ring) {
+      const idx = rings.indexOf(ring);
+      if (idx >= 0) rings.splice(idx, 1);
+      scene.remove(ring);
+      ring.geometry.dispose();
+      ring.material.dispose();
+    }
+
+    function checkRingCollisions() {
+      for (let i = rings.length - 1; i >= 0; i--) {
+        const ring = rings[i];
+        if (ring.userData.hit) continue;
+
+        const dist = dragonRoot.position.distanceTo(ring.position);
+        if (dist < 3.5) {
+          ring.userData.hit = true;
+          score += 10;
+          ringsHit += 1;
+          createHitEffect(ring.position, ring.quaternion);
+          removeRing(ring);
+          spawnRing();
+        }
+      }
+    }
+
+    function updateEffects(dt) {
+      for (let i = effects.length - 1; i >= 0; i--) {
+        const fx = effects[i];
+        fx.life -= dt;
+        const t = 1 - Math.max(fx.life, 0) / fx.maxLife;
+        const s = 1 + t * 2.2;
+        fx.mesh.scale.setScalar(s);
+        fx.mesh.material.opacity = 0.95 * (1 - t);
+        fx.mesh.material.color.setHSL(0.12, 1.0, 0.6 + t * 0.15);
+
+        if (fx.life <= 0) {
+          scene.remove(fx.mesh);
+          fx.mesh.geometry.dispose();
+          fx.mesh.material.dispose();
+          effects.splice(i, 1);
+        }
+      }
+    }
+
+    function updateRingVisuals(time) {
+      for (const ring of rings) {
+        const pulse = 1.4 + Math.sin(time * 3 + ring.userData.pulse) * 0.5;
+        ring.material.emissiveIntensity = pulse;
+      }
+    }
+
+    function resetDragon() {
+      dragonRoot.position.copy(initialPosition);
+      dragonRoot.quaternion.copy(initialQuaternion);
+      crashed = true;
+      crashFlashTime = 0.25;
+    }
+
+    function updateFlight(dt) {
+      if (keys.KeyW) dragonRoot.rotateX(-PITCH_SPEED * dt);
+      if (keys.KeyS) dragonRoot.rotateX(PITCH_SPEED * dt);
+      if (keys.KeyA) dragonRoot.rotateY(PITCH_SPEED * dt);
+      if (keys.KeyD) dragonRoot.rotateY(-PITCH_SPEED * dt);
+
+      const forward = getDragonForward();
+      const velocity = forward.multiplyScalar(BASE_SPEED);
+
+      if (keys.Space) {
+        velocity.y += EXTRA_UP_SPEED;
+      }
+      if (keys.ShiftLeft || keys.ShiftRight) {
+        const dive = getDragonForward().multiplyScalar(EXTRA_DIVE_SPEED);
+        dive.y -= EXTRA_DIVE_SPEED * 0.7;
+        velocity.add(dive);
+      }
+
+      currentSpeed = velocity.length();
+      dragonRoot.position.addScaledVector(velocity, dt);
+
+      if (dragonRoot.position.y < 1) {
+        score -= 5;
+        resetDragon();
+      }
+    }
+
+    function updateCamera(dt) {
+      const offset = new THREE.Vector3(0, 5, -15).applyQuaternion(dragonRoot.quaternion);
+      const desiredPos = dragonRoot.position.clone().add(offset);
+      camera.position.lerp(desiredPos, 1 - Math.exp(-4 * dt));
+
+      const target = dragonRoot.position.clone().add(
+        new THREE.Vector3(0, 2, 8).applyQuaternion(dragonRoot.quaternion)
+      );
+      const currentLook = new THREE.Vector3();
+      camera.getWorldDirection(currentLook);
+      const lookTarget = target.clone();
+      const tempTarget = new THREE.Vector3().lerpVectors(
+        camera.position.clone().add(currentLook),
+        lookTarget,
+        1 - Math.exp(-5 * dt)
+      );
+      camera.lookAt(tempTarget);
+    }
+
+    function updateHUD() {
+      document.getElementById('speed').textContent = currentSpeed.toFixed(1);
+      document.getElementById('altitude').textContent = dragonRoot.position.y.toFixed(1);
+      document.getElementById('score').textContent = String(score);
+      document.getElementById('ringsHit').textContent = String(ringsHit);
+      document.getElementById('time').textContent = elapsed.toFixed(1);
+    }
+
+    function updateState() {
+      window.__3D_STATE__ = {
+        modelLoaded,
+        speed: Number(currentSpeed.toFixed(3)),
+        altitude: Number(dragonRoot.position.y.toFixed(3)),
+        score,
+        ringsHit,
+        activeRings: rings.length,
+        time: Number(elapsed.toFixed(3)),
+        dragonPos: {
+          x: Number(dragonRoot.position.x.toFixed(3)),
+          y: Number(dragonRoot.position.y.toFixed(3)),
+          z: Number(dragonRoot.position.z.toFixed(3))
+        },
+        crashed
+      };
+    }
+
+    function createFallbackDragon() {
+      const g = new THREE.Group();
+
+      const bodyMat = new THREE.MeshStandardMaterial({ color: 0x6c3428, roughness: 0.65, metalness: 0.05 });
+      const wingMat = new THREE.MeshStandardMaterial({ color: 0x8f4f39, roughness: 0.8, metalness: 0.02 });
+      const hornMat = new THREE.MeshStandardMaterial({ color: 0xdcc6a1, roughness: 0.7 });
+
+      const body = new THREE.Mesh(new THREE.CapsuleGeometry(1.2, 4.2, 8, 16), bodyMat);
+      body.rotation.z = Math.PI / 2;
+      body.castShadow = true;
+      g.add(body);
+
+      const neck = new THREE.Mesh(new THREE.CapsuleGeometry(0.55, 2.2, 6, 12), bodyMat);
+      neck.position.set(0, 0.9, 2.8);
+      neck.rotation.x = Math.PI / 4;
+      neck.castShadow = true;
+      g.add(neck);
+
+      const head = new THREE.Mesh(new THREE.BoxGeometry(1.3, 0.9, 1.6), bodyMat);
+      head.position.set(0, 1.8, 4.1);
+      head.castShadow = true;
+      g.add(head);
+
+      const horn1 = new THREE.Mesh(new THREE.ConeGeometry(0.12, 0.7, 8), hornMat);
+      horn1.position.set(0.25, 2.3, 4.35);
+      horn1.rotation.x = -0.3;
+      const horn2 = horn1.clone();
+      horn2.position.x = -0.25;
+      g.add(horn1, horn2);
+
+      const tail = new THREE.Mesh(new THREE.CapsuleGeometry(0.35, 3.5, 6, 10), bodyMat);
+      tail.position.set(0, -0.2, -3.2);
+      tail.rotation.x = Math.PI / 2.8;
+      tail.castShadow = true;
+      g.add(tail);
+
+      const wingGeo = new THREE.BufferGeometry();
+      const wingVerts = new Float32Array([
+         0, 0, 0,
+         6, 0.25, -1.2,
+         1.5, -0.2, 2.6,
+         0, 0, 0,
+         5, -0.15, 1.4,
+         1.5, -0.2, 2.6
+      ]);
+      wingGeo.setAttribute('position', new THREE.BufferAttribute(wingVerts, 3));
+      wingGeo.computeVertexNormals();
+
+      const leftWing = new THREE.Mesh(wingGeo, wingMat);
+      leftWing.position.set(0.6, 0.5, 0.2);
+      leftWing.rotation.z = 0.12;
+      leftWing.castShadow = true;
+
+      const rightWing = new THREE.Mesh(wingGeo, wingMat);
+      rightWing.position.set(-0.6, 0.5, 0.2);
+      rightWing.rotation.y = Math.PI;
+      rightWing.rotation.z = -0.12;
+      rightWing.castShadow = true;
+
+      g.add(leftWing, rightWing);
+      g.scale.setScalar(1.2);
+      return g;
+    }
+
+    function loadDragon() {
+      const loader = new GLTFLoader();
+      loader.load(
+        'assets/DragonAttenuation.glb',
+        (gltf) => {
+          dragonModel = gltf.scene;
+          dragonModel.scale.setScalar(0.5);
+          dragonModel.position.set(0, 0, 0);
+
+          const box = new THREE.Box3().setFromObject(dragonModel);
+          const size = box.getSize(new THREE.Vector3());
+          const center = box.getCenter(new THREE.Vector3());
+          dragonModel.position.sub(center);
+          dragonModel.position.y += size.y * 0.35;
+
+          dragonModel.traverse((obj) => {
+            if (obj.isMesh) {
+              obj.castShadow = true;
+              obj.receiveShadow = true;
+            }
+          });
+
+          dragonRoot.add(dragonModel);
+
+          if (gltf.animations && gltf.animations.length > 0) {
+            mixer = new THREE.AnimationMixer(dragonModel);
+            const clip = gltf.animations[0];
+            const action = mixer.clipAction(clip);
+            action.setLoop(THREE.LoopRepeat);
+            action.play();
+          }
+
+          modelLoaded = true;
+          document.getElementById('loading').style.display = 'none';
+        },
+        undefined,
+        () => {
+          dragonModel = createFallbackDragon();
+          dragonRoot.add(dragonModel);
+          modelLoaded = true;
+          document.getElementById('loading').textContent = '模型加载失败，已使用备用飞龙';
+          setTimeout(() => {
+            document.getElementById('loading').style.display = 'none';
+          }, 1000);
+        }
+      );
+    }
+
+    document.addEventListener('keydown', (e) => {
+      if (e.code in keys) keys[e.code] = true;
+      if (e.code === 'Space') e.preventDefault();
+    }, { passive: false });
+
+    document.addEventListener('keyup', (e) => {
+      if (e.code in keys) keys[e.code] = false;
+    });
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    createGround();
+    createSkyDecor();
+    ensureRingCount();
+    loadDragon();
+
+    updateState();
+    updateHUD();
+
+    function animate() {
+      requestAnimationFrame(animate);
+      const dt = Math.min(clock.getDelta(), 0.05);
+      elapsed += dt;
+
+      if (mixer) mixer.update(dt);
+
+      updateFlight(dt);
+      checkRingCollisions();
+      updateEffects(dt);
+      updateRingVisuals(elapsed);
+      updateCamera(dt);
+
+      if (crashFlashTime > 0) {
+        crashFlashTime -= dt;
+      } else {
+        crashed = false;
+      }
+
+      renderer.render(scene, camera);
+      updateHUD();
+      updateState();
+    }
+
+    animate();
+  </script>
+</body>
+</html>

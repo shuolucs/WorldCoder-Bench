@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Kaleidoscope</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #0a0a1a;
+            font-family: 'Courier New', Courier, monospace;
+            user-select: none;
+            transition: background-color 0.1s;
+        }
+        body.snapshot-flash {
+            background-color: #ffffff;
+        }
+        #hud-panel {
+            position: absolute;
+            top: 15px;
+            left: 15px;
+            background: rgba(10, 10, 26, 0.75);
+            color: #ffffff;
+            padding: 15px 20px;
+            border-radius: 8px;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            pointer-events: none;
+            z-index: 10;
+            min-width: 200px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+        }
+        #hud-panel div {
+            margin-bottom: 8px;
+            font-size: 14px;
+            text-shadow: 1px 1px 2px black;
+        }
+        #hud-panel div:last-child {
+            margin-bottom: 0;
+        }
+        #hud-pause {
+            color: #ff5555;
+            font-weight: bold;
+            height: 16px;
+        }
+        #instructions {
+            position: absolute;
+            bottom: 0;
+            width: 100%;
+            background: rgba(0, 0, 0, 0.85);
+            color: #cccccc;
+            text-align: center;
+            padding: 12px;
+            box-sizing: border-box;
+            font-size: 13px;
+            z-index: 10;
+            border-top: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        .key {
+            color: #ffffff;
+            background: #333;
+            padding: 2px 6px;
+            border-radius: 4px;
+            border: 1px solid #555;
+            font-weight: bold;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="hud-panel">
+        <div id="hud-speed">Speed: 1.00x</div>
+        <div id="hud-time">Time: 0.00s</div>
+        <div id="hud-symmetry">Symmetry: 6-fold</div>
+        <div id="hud-color-mode">Mode: rainbow</div>
+        <div id="hud-snapshots">Snapshots: 0</div>
+        <div id="hud-pause"></div>
+    </div>
+
+    <div id="instructions">
+        <span class="key">↑</span>/<span class="key">↓</span> Speed | 
+        <span class="key">Space</span> Pause | 
+        <span class="key">R</span> Reset | 
+        <span class="key">S</span> Snapshot | 
+        <span class="key">4</span>/<span class="key">6</span>/<span class="key">8</span> Symmetry | 
+        <span class="key">C</span> Color Mode
+    </div>
+
+    <script type="module">
+        import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
+
+        // --- STATE MANAGEMENT ---
+        window.__3D_STATE__ = {
+            timeSpeed: 1.0,
+            elapsedTime: 0.0,
+            isPaused: false,
+            symmetryFold: 6,
+            colorMode: 'rainbow',
+            snapshotCount: 0,
+            shapeCount: 0,
+            shapesPositionsValid: true,
+            prePauseSpeed: 1.0
+        };
+
+        // --- SCENE SETUP ---
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x0a0a1a);
+
+        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+        camera.position.set(0, 0, 12);
+        camera.lookAt(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        // Tone mapping to enhance emissive glow
+        renderer.toneMapping = THREE.ACESFilmicToneMapping;
+        renderer.toneMappingExposure = 1.2;
+        document.body.appendChild(renderer.domElement);
+
+        // --- LIGHTS ---
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+        scene.add(ambientLight);
+
+        const pointLight = new THREE.PointLight(0xffffff, 1.0);
+        pointLight.position.set(5, 5, 5);
+        scene.add(pointLight);
+
+        // --- KALEIDOSCOPE CONFIGURATION ---
+        const kaleidoscopeGroup = new THREE.Group();
+        scene.add(kaleidoscopeGroup);
+
+        // Define the 5 base shapes
+        const baseConfigs = [
+            { geom: new THREE.TorusKnotGeometry(0.35, 0.12, 100, 16), r: 1.5, orbitSpeed: 1.2, rotSpeed: [1.5, 0.5, 0], offset: 0 },
+            { geom: new THREE.IcosahedronGeometry(0.45), r: 2.5, orbitSpeed: -0.8, rotSpeed: [0.5, 1.2, 0.2], offset: 1.5 },
+            { geom: new THREE.OctahedronGeometry(0.55), r: 3.5, orbitSpeed: 0.5, rotSpeed: [0.2, 0.3, 1.5], offset: 3.0 },
+            { geom: new THREE.TorusKnotGeometry(0.4, 0.15, 100, 16), r: 4.5, orbitSpeed: -0.4, rotSpeed: [1.0, 1.0, 0.8], offset: 4.5 },
+            { geom: new THREE.IcosahedronGeometry(0.65), r: 5.5, orbitSpeed: 0.7, rotSpeed: [0.4, 0.8, 0.6], offset: 6.0 }
+        ];
+
+        // Shared materials for each base shape type to optimize and easily update colors
+        const sharedMaterials = baseConfigs.map(() => new THREE.MeshStandardMaterial({
+            roughness: 0.2,
+            metalness: 0.8,
+            emissiveIntensity: 0.8
+        }));
+
+        let activeMeshes = [];
+
+        function buildKaleidoscope(folds) {
+            // Clear existing
+            while(kaleidoscopeGroup.children.length > 0){ 
+                kaleidoscopeGroup.remove(kaleidoscopeGroup.children[0]); 
+            }
+            activeMeshes = [];
+            window.__3D_STATE__.shapeCount = baseConfigs.length * folds;
+
+            for (let i = 0; i < folds; i++) {
+                const symmetryAngle = i * ((2 * Math.PI) / folds);
+                
+                baseConfigs.forEach((config, configIndex) => {
+                    const mesh = new THREE.Mesh(config.geom, sharedMaterials[configIndex]);
+                    kaleidoscopeGroup.add(mesh);
+                    activeMeshes.push({
+                        mesh: mesh,
+                        configIndex: configIndex,
+                        symmetryAngle: symmetryAngle
+                    });
+                });
+            }
+        }
+
+        // Initial build
+        buildKaleidoscope(window.__3D_STATE__.symmetryFold);
+
+        // --- COLOR LOGIC ---
+        const tempColor = new THREE.Color();
+        function updateColors(time, mode) {
+            baseConfigs.forEach((_, i) => {
+                let h, s, l;
+                if (mode === 'rainbow') {
+                    h = (time * 0.05 + i * 0.2) % 1.0;
+                    if (h < 0) h += 1.0;
+                    s = 0.9;
+                    l = 0.6;
+                } else if (mode === 'monochrome') {
+                    h = 0.6; // Blue hue
+                    s = 0.8;
+                    // Pulse lightness
+                    l = 0.3 + 0.4 * (Math.sin(time * 1.5 + i) * 0.5 + 0.5);
+                } else if (mode === 'fire') {
+                    // Hue from red (0.0) to yellow (0.15)
+                    h = (0.0 + 0.15 * (Math.sin(time * 2.0 + i) * 0.5 + 0.5)) % 1.0;
+                    if (h < 0) h += 1.0;
+                    s = 1.0;
+                    l = 0.5;
+                }
+                
+                tempColor.setHSL(h, s, l);
+                sharedMaterials[i].color.copy(tempColor);
+                sharedMaterials[i].emissive.copy(tempColor).multiplyScalar(0.6);
+            });
+        }
+
+        // --- HUD UPDATE ---
+        const hudSpeed = document.getElementById('hud-speed');
+        const hudTime = document.getElementById('hud-time');
+        const hudSymmetry = document.getElementById('hud-symmetry');
+        const hudColorMode = document.getElementById('hud-color-mode');
+        const hudSnapshots = document.getElementById('hud-snapshots');
+        const hudPause = document.getElementById('hud-pause');
+
+        function updateHUD() {
+            const state = window.__3D_STATE__;
+            hudSpeed.innerText = `Speed: ${state.timeSpeed.toFixed(2)}x`;
+            hudTime.innerText = `Time: ${state.elapsedTime.toFixed(2)}s`;
+            hudSymmetry.innerText = `Symmetry: ${state.symmetryFold}-fold`;
+            hudColorMode.innerText = `Mode: ${state.colorMode}`;
+            hudSnapshots.innerText = `Snapshots: ${state.snapshotCount}`;
+            hudPause.innerText = state.isPaused ? 'PAUSED' : '';
+        }
+
+        // --- INPUT HANDLING ---
+        window.addEventListener('keydown', (e) => {
+            const state = window.__3D_STATE__;
+            
+            switch(e.code) {
+                case 'ArrowUp':
+                    if (state.isPaused) {
+                        state.prePauseSpeed = Math.min(3.0, state.prePauseSpeed + 0.25);
+                    } else {
+                        state.timeSpeed = Math.min(3.0, state.timeSpeed + 0.25);
+                    }
+                    break;
+                case 'ArrowDown':
+                    if (state.isPaused) {
+                        state.prePauseSpeed = Math.max(-2.0, state.prePauseSpeed - 0.25);
+                    } else {
+                        state.timeSpeed = Math.max(-2.0, state.timeSpeed - 0.25);
+                    }
+                    break;
+                case 'Space':
+                    if (state.isPaused) {
+                        state.isPaused = false;
+                        state.timeSpeed = state.prePauseSpeed;
+                    } else {
+                        state.isPaused = true;
+                        state.prePauseSpeed = state.timeSpeed;
+                        state.timeSpeed = 0;
+                    }
+                    break;
+                case 'KeyR':
+                    state.elapsedTime = 0;
+                    state.timeSpeed = 1.0;
+                    state.isPaused = false;
+                    state.prePauseSpeed = 1.0;
+                    break;
+                case 'KeyS':
+                    state.snapshotCount++;
+                    // Visual flash effect
+                    document.body.classList.add('snapshot-flash');
+                    setTimeout(() => document.body.classList.remove('snapshot-flash'), 50);
+                    break;
+                case 'Digit4':
+                    if (state.symmetryFold !== 4) {
+                        state.symmetryFold = 4;
+                        buildKaleidoscope(4);
+                    }
+                    break;
+                case 'Digit6':
+                    if (state.symmetryFold !== 6) {
+                        state.symmetryFold = 6;
+                        buildKaleidoscope(6);
+                    }
+                    break;
+                case 'Digit8':
+                    if (state.symmetryFold !== 8) {
+                        state.symmetryFold = 8;
+                        buildKaleidoscope(8);
+                    }
+                    break;
+                case 'KeyC':
+                    const modes = ['rainbow', 'monochrome', 'fire'];
+                    const currentIndex = modes.indexOf(state.colorMode);
+                    state.colorMode = modes[(currentIndex + 1) % modes.length];
+                    break;
+            }
+        });
+
+        // --- RESIZE HANDLING ---
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // --- ANIMATION LOOP ---
+        const clock = new THREE.Clock();
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const delta = clock.getDelta();
+            const state = window.__3D_STATE__;
+
+            if (!state.isPaused) {
+                state.elapsedTime += delta * state.timeSpeed;
+            }
+
+            const t = state.elapsedTime;
+            const speedMult = state.timeSpeed;
+            let positionsValid = true;
+
+            updateColors(t, state.colorMode);
+
+            activeMeshes.forEach(item => {
+                const config = baseConfigs[item.configIndex];
+                
+                // Calculate orbit position
+                const baseAngle = t * config.orbitSpeed + config.offset;
+                const finalAngle = baseAngle + item.symmetryAngle;
+
+                item.mesh.position.x = config.r * Math.cos(finalAngle);
+                item.mesh.position.y = config.r * Math.sin(finalAngle);
+
+                // Local rotation
+                if (!state.isPaused) {
+                    item.mesh.rotation.x += config.rotSpeed[0] * delta * speedMult;
+                    item.mesh.rotation.y += config.rotSpeed[1] * delta * speedMult;
+                    item.mesh.rotation.z += config.rotSpeed[2] * delta * speedMult;
+                }
+
+                // Validation check
+                if (isNaN(item.mesh.position.x) || isNaN(item.mesh.position.y)) {
+                    positionsValid = false;
+                }
+            });
+
+            state.shapesPositionsValid = positionsValid;
+
+            // Slow global rotation of the entire kaleidoscope
+            kaleidoscopeGroup.rotation.z = t * 0.05;
+
+            updateHUD();
+            renderer.render(scene, camera);
+        }
+
+        animate();
+    </script>
+</body>
+</html>

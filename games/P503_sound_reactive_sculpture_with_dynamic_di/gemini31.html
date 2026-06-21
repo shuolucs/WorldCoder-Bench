@@ -1,0 +1,440 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Interactive 3D Sound-Reactive Sculpture</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #000;
+            font-family: monospace;
+            user-select: none;
+        }
+        canvas {
+            display: block;
+        }
+        .hud {
+            position: absolute;
+            color: white;
+            background-color: rgba(0, 0, 0, 0.6);
+            padding: 8px;
+            border-radius: 4px;
+            pointer-events: none;
+        }
+        #hud-difficulty { top: 10px; left: 10px; }
+        #hud-particles { top: 10px; right: 10px; }
+        #hud-fps { bottom: 10px; left: 10px; }
+        #hud-status { bottom: 10px; left: 50%; transform: translateX(-50%); }
+    </style>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="hud-difficulty" class="hud">Difficulty: 1</div>
+    <div id="hud-particles" class="hud">Particles: 0</div>
+    <div id="hud-fps" class="hud">FPS: 0</div>
+    <div id="hud-status" class="hud">Status: PLAYING</div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+        // State Management
+        window.__3D_STATE__ = {
+            difficultyLevel: 1,
+            isPaused: false,
+            autoRotate: false,
+            fishCount: 8,
+            selectedFishIndex: -1,
+            frequencyBands: new Array(8).fill(0),
+            averageFrequency: 0,
+            fishPositions: new Array(8).fill({x: 0, y: 0, z: 0}),
+            activeParticles: 0,
+            performanceMode: false,
+            elapsedTime: 0,
+            modelLoaded: false,
+            fishScales: new Array(8).fill(1),
+            totalResets: 0
+        };
+
+        // Scene Setup
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x000000);
+        scene.fog = new THREE.Fog(0x000000, 1, 50);
+
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 100);
+        camera.position.set(0, 3, 8);
+        camera.lookAt(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        document.body.appendChild(renderer.domElement);
+
+        // Lights
+        const dirLight = new THREE.DirectionalLight(0xffffff, 1.5);
+        dirLight.position.set(5, 10, 5);
+        scene.add(dirLight);
+
+        const ambLight = new THREE.AmbientLight(0x331155, 0.4);
+        scene.add(ambLight);
+
+        // Ground
+        const groundGeo = new THREE.CircleGeometry(6, 64);
+        const groundMat = new THREE.MeshStandardMaterial({
+            color: 0x1a0033,
+            metalness: 0.9,
+            roughness: 0.1
+        });
+        const ground = new THREE.Mesh(groundGeo, groundMat);
+        ground.rotation.x = -Math.PI / 2;
+        scene.add(ground);
+
+        // Controls
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.autoRotate = false;
+        controls.maxPolarAngle = Math.PI / 2 - 0.05;
+
+        // Fish Sculpture Setup
+        const fishes = [];
+        const numFishes = 8;
+        const radius = 3;
+        const baseY = 1.0;
+        const baseScale = 2.0; // Adjust based on model size
+
+        const loader = new GLTFLoader();
+        // Using a reliable public URL for the Barramundi GLB
+        const modelUrl = 'https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Models/master/2.0/BarramundiFish/glTF-Binary/BarramundiFish.glb';
+
+        loader.load(modelUrl, (gltf) => {
+            const baseModel = gltf.scene;
+            
+            for (let i = 0; i < numFishes; i++) {
+                const fish = baseModel.clone();
+                
+                // Clone materials to allow independent emissive colors
+                fish.traverse((child) => {
+                    if (child.isMesh) {
+                        child.material = child.material.clone();
+                        if (!child.material.emissive) {
+                            child.material.emissive = new THREE.Color(0x000000);
+                        }
+                    }
+                });
+
+                const angle = (i / numFishes) * Math.PI * 2;
+                const x = Math.cos(angle) * radius;
+                const z = Math.sin(angle) * radius;
+
+                fish.position.set(x, baseY, z);
+                
+                // Face outward
+                const target = new THREE.Vector3(x * 2, baseY, z * 2);
+                fish.lookAt(target);
+
+                // Store base properties
+                fish.userData = {
+                    index: i,
+                    basePos: new THREE.Vector3(x, baseY, z),
+                    baseRot: fish.rotation.clone(),
+                    baseScale: new THREE.Vector3(baseScale, baseScale, baseScale)
+                };
+
+                fish.scale.copy(fish.userData.baseScale);
+                
+                scene.add(fish);
+                fishes.push(fish);
+            }
+            window.__3D_STATE__.modelLoaded = true;
+        });
+
+        // Particle System
+        const maxParticles = 500;
+        const particleGeo = new THREE.BufferGeometry();
+        const particlePos = new Float32Array(maxParticles * 3);
+        const particleColors = new Float32Array(maxParticles * 4);
+        
+        particleGeo.setAttribute('position', new THREE.BufferAttribute(particlePos, 3));
+        particleGeo.setAttribute('color', new THREE.BufferAttribute(particleColors, 4));
+        
+        const particleMat = new THREE.PointsMaterial({
+            size: 0.15,
+            vertexColors: true,
+            transparent: true,
+            depthWrite: false,
+            blending: THREE.AdditiveBlending
+        });
+        
+        const particleSystem = new THREE.Points(particleGeo, particleMat);
+        scene.add(particleSystem);
+
+        const particles = [];
+        for (let i = 0; i < maxParticles; i++) {
+            particles.push({
+                active: false,
+                life: 0,
+                maxLife: 2.0,
+                pos: new THREE.Vector3(),
+                vel: new THREE.Vector3()
+            });
+        }
+
+        function spawnParticle(origin) {
+            const p = particles.find(p => !p.active);
+            if (p) {
+                p.active = true;
+                p.life = p.maxLife;
+                p.pos.copy(origin);
+                // Add random offset so they don't spawn exactly at center
+                p.pos.x += (Math.random() - 0.5) * 0.5;
+                p.pos.y += (Math.random() - 0.5) * 0.5;
+                p.pos.z += (Math.random() - 0.5) * 0.5;
+                p.vel.set(
+                    (Math.random() - 0.5) * 0.5,
+                    Math.random() * 1.5 + 0.5, // Upward drift
+                    (Math.random() - 0.5) * 0.5
+                );
+            }
+        }
+
+        // Interaction & Raycasting
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+
+        window.addEventListener('pointerdown', (event) => {
+            mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+            raycaster.setFromCamera(mouse, camera);
+            const intersects = raycaster.intersectObjects(fishes, true);
+
+            if (intersects.length > 0) {
+                // Find root fish object
+                let obj = intersects[0].object;
+                while (obj.parent && !fishes.includes(obj)) {
+                    obj = obj.parent;
+                }
+                if (fishes.includes(obj)) {
+                    window.__3D_STATE__.selectedFishIndex = obj.userData.index;
+                }
+            } else {
+                window.__3D_STATE__.selectedFishIndex = -1;
+            }
+        });
+
+        window.addEventListener('keydown', (e) => {
+            const state = window.__3D_STATE__;
+            if (e.key >= '1' && e.key <= '5') {
+                state.difficultyLevel = parseInt(e.key);
+            } else if (e.code === 'Space') {
+                state.isPaused = !state.isPaused;
+            } else if (e.key.toLowerCase() === 'r') {
+                state.difficultyLevel = 1;
+                state.isPaused = false;
+                state.autoRotate = false;
+                controls.autoRotate = false;
+                state.performanceMode = false;
+                state.selectedFishIndex = -1;
+                state.totalResets++;
+                
+                fishes.forEach(fish => {
+                    fish.position.copy(fish.userData.basePos);
+                    fish.rotation.copy(fish.userData.baseRot);
+                    fish.scale.copy(fish.userData.baseScale);
+                    fish.traverse(child => {
+                        if (child.isMesh && child.material.emissive) {
+                            child.material.emissive.setHex(0x000000);
+                        }
+                    });
+                });
+            } else if (e.key.toLowerCase() === 'a') {
+                state.autoRotate = !state.autoRotate;
+                controls.autoRotate = state.autoRotate;
+            } else if (e.key.toLowerCase() === 'p') {
+                state.performanceMode = !state.performanceMode;
+            }
+        });
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // HUD Elements
+        const hudDiff = document.getElementById('hud-difficulty');
+        const hudPart = document.getElementById('hud-particles');
+        const hudFps = document.getElementById('hud-fps');
+        const hudStat = document.getElementById('hud-status');
+
+        // Animation Loop
+        const clock = new THREE.Clock();
+        let audioTime = 0;
+        let frames = 0;
+        let lastFpsTime = 0;
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const delta = clock.getDelta();
+            const state = window.__3D_STATE__;
+
+            // FPS Calculation
+            frames++;
+            if (clock.elapsedTime - lastFpsTime >= 1) {
+                hudFps.textContent = `FPS: ${frames}`;
+                frames = 0;
+                lastFpsTime = clock.elapsedTime;
+            }
+
+            if (!state.isPaused) {
+                audioTime += delta;
+                state.elapsedTime += delta;
+            }
+
+            let totalFreq = 0;
+            let activeFishCount = 0;
+
+            // Update Fishes
+            if (state.modelLoaded) {
+                for (let i = 0; i < numFishes; i++) {
+                    const fish = fishes[i];
+                    
+                    // Performance Mode
+                    if (state.performanceMode && i % 2 !== 0) {
+                        fish.visible = false;
+                        continue;
+                    } else {
+                        fish.visible = true;
+                        activeFishCount++;
+                    }
+
+                    // Simulated Audio Frequency
+                    let freq = 0.5 + 0.5 * Math.sin(audioTime * (1.0 + i * 0.3) + i * Math.PI / 4);
+                    
+                    if (state.selectedFishIndex === i) {
+                        freq = Math.min(1.0, freq * 2.0);
+                    }
+
+                    state.frequencyBands[i] = freq;
+                    totalFreq += freq;
+
+                    const diff = state.difficultyLevel;
+                    const baseP = fish.userData.basePos;
+                    const baseR = fish.userData.baseRot;
+                    const baseS = fish.userData.baseScale;
+
+                    // Reset transformations before applying new ones based on level
+                    fish.position.copy(baseP);
+                    fish.rotation.copy(baseR);
+                    fish.scale.copy(baseS);
+                    let emissiveColor = 0x000000;
+
+                    // Level 1: Bob up/down
+                    if (diff >= 1) {
+                        fish.position.y = baseP.y + freq * 0.5;
+                    }
+                    
+                    // Level 2: Scale
+                    if (diff >= 2) {
+                        const s = 1.0 + freq * 0.3;
+                        fish.scale.set(baseS.x * s, baseS.y * s, baseS.z * s);
+                        state.fishScales[i] = s;
+                    } else {
+                        state.fishScales[i] = 1.0;
+                    }
+
+                    // Level 3: Rotate
+                    if (diff >= 3) {
+                        fish.rotation.y = baseR.y + freq * Math.PI;
+                    }
+
+                    // Level 4: Emissive
+                    if (diff >= 4) {
+                        const color = new THREE.Color(0x3366ff).multiplyScalar(freq);
+                        emissiveColor = color.getHex();
+                    }
+                    
+                    fish.traverse(child => {
+                        if (child.isMesh && child.material.emissive) {
+                            child.material.emissive.setHex(emissiveColor);
+                        }
+                    });
+
+                    // Level 5: Particles
+                    if (diff >= 5 && !state.isPaused) {
+                        // Spawn chance based on frequency
+                        if (Math.random() < freq * 0.2) {
+                            spawnParticle(fish.position);
+                        }
+                    }
+
+                    // Update state positions
+                    state.fishPositions[i] = { x: fish.position.x, y: fish.position.y, z: fish.position.z };
+                }
+            }
+
+            state.fishCount = activeFishCount;
+            state.averageFrequency = activeFishCount > 0 ? totalFreq / activeFishCount : 0;
+
+            // Update Particles
+            let activeParts = 0;
+            const posAttr = particleGeo.attributes.position.array;
+            const colAttr = particleGeo.attributes.color.array;
+
+            for (let i = 0; i < maxParticles; i++) {
+                const p = particles[i];
+                if (p.active) {
+                    if (!state.isPaused) {
+                        p.life -= delta;
+                        p.pos.addScaledVector(p.vel, delta);
+                    }
+
+                    if (p.life <= 0) {
+                        p.active = false;
+                        colAttr[i * 4 + 3] = 0; // Alpha 0
+                    } else {
+                        activeParts++;
+                        posAttr[i * 3] = p.pos.x;
+                        posAttr[i * 3 + 1] = p.pos.y;
+                        posAttr[i * 3 + 2] = p.pos.z;
+                        
+                        // Color based on life
+                        const lifeRatio = p.life / p.maxLife;
+                        colAttr[i * 4] = 0.2 + lifeRatio * 0.8;     // R
+                        colAttr[i * 4 + 1] = 0.4 + lifeRatio * 0.6; // G
+                        colAttr[i * 4 + 2] = 1.0;                   // B
+                        colAttr[i * 4 + 3] = lifeRatio;             // A
+                    }
+                } else {
+                    colAttr[i * 4 + 3] = 0;
+                }
+            }
+            
+            particleGeo.attributes.position.needsUpdate = true;
+            particleGeo.attributes.color.needsUpdate = true;
+            state.activeParticles = activeParts;
+
+            // Update HUD
+            hudDiff.textContent = `Difficulty: ${state.difficultyLevel}`;
+            hudPart.textContent = `Particles: ${state.activeParticles}`;
+            hudStat.textContent = `Status: ${state.isPaused ? 'PAUSED' : 'PLAYING'}`;
+
+            controls.update();
+            renderer.render(scene, camera);
+        }
+
+        animate();
+    </script>
+</body>
+</html>

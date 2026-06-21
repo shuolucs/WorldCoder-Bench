@@ -1,0 +1,489 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Three.js Double Spring System with Undo/Redo</title>
+  <style>
+    html, body {
+      margin: 0;
+      overflow: hidden;
+      background: #111;
+      font-family: Arial, sans-serif;
+    }
+
+    #hud {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      color: #fff;
+      background: rgba(0,0,0,0.6);
+      padding: 12px;
+      border-radius: 8px;
+      font-size: 14px;
+      line-height: 1.5;
+      z-index: 10;
+      min-width: 220px;
+      white-space: pre-line;
+    }
+
+    #controls {
+      position: absolute;
+      top: 10px;
+      right: 10px;
+      z-index: 10;
+      display: flex;
+      gap: 8px;
+    }
+
+    button {
+      padding: 8px 14px;
+      font-size: 14px;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      background: #2d2d2d;
+      color: white;
+    }
+
+    button:hover {
+      background: #444;
+    }
+  </style>
+</head>
+<body>
+  <div id="hud"></div>
+  <div id="controls">
+    <button id="undoBtn">Undo</button>
+    <button id="redoBtn">Redo</button>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js';
+    import { GLTFLoader } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/GLTFLoader.js';
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x111111);
+
+    const camera = new THREE.PerspectiveCamera(
+      60,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      1000
+    );
+    camera.position.set(0, 2, 8);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    document.body.appendChild(renderer.domElement);
+
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
+    scene.add(ambientLight);
+
+    const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+    dirLight.position.set(5, 10, 5);
+    scene.add(dirLight);
+
+    const ground = new THREE.Mesh(
+      new THREE.PlaneGeometry(50, 50),
+      new THREE.MeshStandardMaterial({ color: 0x777777, side: THREE.DoubleSide })
+    );
+    ground.rotation.x = -Math.PI / 2;
+    ground.position.y = 0;
+    scene.add(ground);
+
+    const grid = new THREE.GridHelper(50, 50, 0xffffff, 0x666666);
+    grid.position.y = 0.001;
+    scene.add(grid);
+
+    window.__3D_STATE__ = {
+      simRunning: false,
+      massA_pos: { x: 0, y: 3.5, z: 0 },
+      massB_pos: { x: 0, y: 2.0, z: 0 },
+      massA_vel: { x: 0, y: 0, z: 0 },
+      massB_vel: { x: 0, y: 0, z: 0 },
+      k1: 20,
+      k2: 15,
+      totalEnergy: 0,
+      historyIndex: 0,
+      historyLength: 1,
+      dragMode: false,
+      brainStemLoaded: false,
+      stepCount: 0,
+      massA_grounded: false,
+      massB_grounded: false
+    };
+
+    const loader = new GLTFLoader();
+    loader.load(
+      '._BrainStem.glb',
+      (gltf) => {
+        const model = gltf.scene;
+        model.position.set(0, 3, -3);
+        model.scale.set(0.5, 0.5, 0.5);
+        scene.add(model);
+        window.__3D_STATE__.brainStemLoaded = true;
+      },
+      undefined,
+      (err) => {
+        console.warn('Failed to load ._BrainStem.glb', err);
+      }
+    );
+
+    const massRadius = 0.3;
+    const anchorPos = new THREE.Vector3(0, 5, 0);
+
+    const anchor = new THREE.Mesh(
+      new THREE.SphereGeometry(0.15, 24, 24),
+      new THREE.MeshStandardMaterial({ color: 0xff0000 })
+    );
+    anchor.position.copy(anchorPos);
+    scene.add(anchor);
+
+    const massAGeo = new THREE.SphereGeometry(massRadius, 32, 32);
+    const massBGeo = new THREE.SphereGeometry(massRadius, 32, 32);
+
+    const massA = new THREE.Mesh(
+      massAGeo,
+      new THREE.MeshStandardMaterial({ color: 0x3366ff })
+    );
+    const massB = new THREE.Mesh(
+      massBGeo,
+      new THREE.MeshStandardMaterial({ color: 0x33cc66 })
+    );
+
+    massA.position.set(0, 3.5, 0);
+    massB.position.set(0, 2.0, 0);
+
+    scene.add(massA, massB);
+
+    const springMat = new THREE.LineBasicMaterial({ color: 0xffffff });
+
+    function makeSpringLine() {
+      const geom = new THREE.BufferGeometry().setFromPoints([
+        new THREE.Vector3(),
+        new THREE.Vector3()
+      ]);
+      return new THREE.Line(geom, springMat);
+    }
+
+    const spring1Line = makeSpringLine();
+    const spring2Line = makeSpringLine();
+    scene.add(spring1Line, spring2Line);
+
+    const state = {
+      dt: 0.016,
+      mass: 1.0,
+      g: 9.81,
+      damping: 0.5,
+      rest1: 1.0,
+      rest2: 1.0,
+      k1: 20,
+      k2: 15,
+      simRunning: false,
+      dragMode: false,
+      velA: new THREE.Vector3(0, 0, 0),
+      velB: new THREE.Vector3(0, 0, 0),
+      stepCount: 0
+    };
+
+    const history = [];
+    let historyIndex = -1;
+
+    function cloneVec(v) {
+      return { x: v.x, y: v.y, z: v.z };
+    }
+
+    function applySnapshot(snap) {
+      massA.position.set(snap.massA_pos.x, snap.massA_pos.y, snap.massA_pos.z);
+      massB.position.set(snap.massB_pos.x, snap.massB_pos.y, snap.massB_pos.z);
+      state.velA.set(snap.massA_vel.x, snap.massA_vel.y, snap.massA_vel.z);
+      state.velB.set(snap.massB_vel.x, snap.massB_vel.y, snap.massB_vel.z);
+      state.k1 = snap.k1;
+      state.k2 = snap.k2;
+      updateSpringLines();
+    }
+
+    function createSnapshot() {
+      return {
+        massA_pos: cloneVec(massA.position),
+        massB_pos: cloneVec(massB.position),
+        massA_vel: cloneVec(state.velA),
+        massB_vel: cloneVec(state.velB),
+        k1: state.k1,
+        k2: state.k2
+      };
+    }
+
+    function pushHistorySnapshot() {
+      if (historyIndex < history.length - 1) {
+        history.splice(historyIndex + 1);
+      }
+      history.push(createSnapshot());
+      if (history.length > 50) {
+        history.shift();
+      }
+      historyIndex = history.length - 1;
+    }
+
+    function undo() {
+      if (historyIndex > 0) {
+        historyIndex--;
+        applySnapshot(history[historyIndex]);
+      }
+    }
+
+    function redo() {
+      if (historyIndex < history.length - 1) {
+        historyIndex++;
+        applySnapshot(history[historyIndex]);
+      }
+    }
+
+    function resetSimulation(record = true) {
+      massA.position.set(0, 3.5, 0);
+      massB.position.set(0, 2.0, 0);
+      state.velA.set(0, 0, 0);
+      state.velB.set(0, 0, 0);
+      state.k1 = 20;
+      state.k2 = 15;
+      state.simRunning = false;
+      state.stepCount = 0;
+      updateSpringLines();
+      if (record) pushHistorySnapshot();
+    }
+
+    pushHistorySnapshot();
+
+    function updateSpringLines() {
+      spring1Line.geometry.setFromPoints([anchor.position.clone(), massA.position.clone()]);
+      spring2Line.geometry.setFromPoints([massA.position.clone(), massB.position.clone()]);
+    }
+
+    function springForce(pos1, pos2, vel, k, restLen) {
+      const delta = pos2.clone().sub(pos1);
+      const len = delta.length();
+      if (len === 0) return new THREE.Vector3();
+      const dir = delta.clone().normalize();
+      const stretch = len - restLen;
+      return dir.multiplyScalar(-k * stretch).sub(vel.clone().multiplyScalar(state.damping));
+    }
+
+    function physicsStep() {
+      const gravityA = new THREE.Vector3(0, -state.mass * state.g, 0);
+      const gravityB = new THREE.Vector3(0, -state.mass * state.g, 0);
+
+      const fAnchorOnA = springForce(anchor.position, massA.position, state.velA, state.k1, state.rest1);
+
+      const deltaAB = massB.position.clone().sub(massA.position);
+      const lenAB = deltaAB.length();
+      let fAFromB = new THREE.Vector3();
+      let fBFromA = new THREE.Vector3();
+
+      if (lenAB > 0) {
+        const dirAB = deltaAB.clone().normalize();
+        const stretch = lenAB - state.rest2;
+        const relVel = state.velB.clone().sub(state.velA);
+        const springPart = dirAB.clone().multiplyScalar(-state.k2 * stretch);
+        const dampingPart = relVel.clone().multiplyScalar(-state.damping);
+        fAFromB = springPart.clone().add(dampingPart);
+        fBFromA = fAFromB.clone().multiplyScalar(-1);
+      }
+
+      const forceA = gravityA.clone().add(fAnchorOnA).sub(fAFromB);
+      const forceB = gravityB.clone().add(fBFromA);
+
+      const accA = forceA.clone().divideScalar(state.mass);
+      const accB = forceB.clone().divideScalar(state.mass);
+
+      state.velA.add(accA.multiplyScalar(state.dt));
+      state.velB.add(accB.multiplyScalar(state.dt));
+
+      massA.position.add(state.velA.clone().multiplyScalar(state.dt));
+      massB.position.add(state.velB.clone().multiplyScalar(state.dt));
+
+      if (massA.position.y < massRadius) {
+        massA.position.y = massRadius;
+        if (state.velA.y < 0) state.velA.y = 0;
+      }
+
+      if (massB.position.y < massRadius) {
+        massB.position.y = massRadius;
+        if (state.velB.y < 0) state.velB.y = 0;
+      }
+
+      state.stepCount++;
+      updateSpringLines();
+    }
+
+    function computeTotalEnergy() {
+      const keA = 0.5 * state.mass * state.velA.lengthSq();
+      const keB = 0.5 * state.mass * state.velB.lengthSq();
+
+      const peGA = state.mass * state.g * Math.max(massA.position.y, 0);
+      const peGB = state.mass * state.g * Math.max(massB.position.y, 0);
+
+      const s1Len = massA.position.distanceTo(anchor.position);
+      const s2Len = massB.position.distanceTo(massA.position);
+
+      const stretch1 = s1Len - state.rest1;
+      const stretch2 = s2Len - state.rest2;
+
+      const peS1 = 0.5 * state.k1 * stretch1 * stretch1;
+      const peS2 = 0.5 * state.k2 * stretch2 * stretch2;
+
+      return keA + keB + peGA + peGB + peS1 + peS2;
+    }
+
+    const hud = document.getElementById('hud');
+    const undoBtn = document.getElementById('undoBtn');
+    const redoBtn = document.getElementById('redoBtn');
+
+    undoBtn.addEventListener('click', undo);
+    redoBtn.addEventListener('click', redo);
+
+    const raycaster = new THREE.Raycaster();
+    const mouse = new THREE.Vector2();
+    const dragPlane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0);
+    let draggedObject = null;
+
+    function setMouseFromEvent(event) {
+      mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+      mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+    }
+
+    renderer.domElement.addEventListener('pointerdown', (event) => {
+      if (!state.dragMode || state.simRunning) return;
+
+      setMouseFromEvent(event);
+      raycaster.setFromCamera(mouse, camera);
+      const hits = raycaster.intersectObjects([massA, massB], false);
+
+      if (hits.length > 0) {
+        draggedObject = hits[0].object;
+      }
+    });
+
+    renderer.domElement.addEventListener('pointermove', (event) => {
+      if (!draggedObject || !state.dragMode || state.simRunning) return;
+
+      setMouseFromEvent(event);
+      raycaster.setFromCamera(mouse, camera);
+      const point = new THREE.Vector3();
+      if (raycaster.ray.intersectPlane(dragPlane, point)) {
+        draggedObject.position.x = point.x;
+        draggedObject.position.y = Math.max(massRadius, point.y);
+        draggedObject.position.z = 0;
+
+        if (draggedObject === massA) state.velA.set(0, 0, 0);
+        if (draggedObject === massB) state.velB.set(0, 0, 0);
+
+        updateSpringLines();
+      }
+    });
+
+    renderer.domElement.addEventListener('pointerup', () => {
+      if (draggedObject) {
+        if (draggedObject === massA) state.velA.set(0, 0, 0);
+        if (draggedObject === massB) state.velB.set(0, 0, 0);
+        pushHistorySnapshot();
+      }
+      draggedObject = null;
+    });
+
+    window.addEventListener('keydown', (event) => {
+      if (event.ctrlKey && event.key.toLowerCase() === 'z') {
+        event.preventDefault();
+        undo();
+        return;
+      }
+
+      if (event.ctrlKey && event.key.toLowerCase() === 'y') {
+        event.preventDefault();
+        redo();
+        return;
+      }
+
+      switch (event.key.toLowerCase()) {
+        case ' ':
+          event.preventDefault();
+          state.simRunning = !state.simRunning;
+          break;
+        case 'r':
+          resetSimulation(true);
+          break;
+        case 'd':
+          state.dragMode = !state.dragMode;
+          break;
+        case 'g':
+          state.velB.add(new THREE.Vector3(0, -5, 0));
+          pushHistorySnapshot();
+          break;
+        case '1':
+          state.k1 = 10;
+          pushHistorySnapshot();
+          break;
+        case '2':
+          state.k1 = 30;
+          pushHistorySnapshot();
+          break;
+      }
+    });
+
+    function updateHUD(totalEnergy) {
+      hud.textContent =
+`Simulation: ${state.simRunning ? 'RUNNING' : 'PAUSED'}
+Mass A y: ${massA.position.y.toFixed(2)}
+Mass B y: ${massB.position.y.toFixed(2)}
+Total Energy: ${totalEnergy.toFixed(2)}
+History: ${historyIndex + 1} / ${history.length}
+Drag Mode: ${state.dragMode ? 'ON' : 'OFF'}
+k1: ${state.k1.toFixed(2)}
+k2: ${state.k2.toFixed(2)}`;
+    }
+
+    function updateGlobalState(totalEnergy) {
+      window.__3D_STATE__.simRunning = state.simRunning;
+      window.__3D_STATE__.massA_pos = cloneVec(massA.position);
+      window.__3D_STATE__.massB_pos = cloneVec(massB.position);
+      window.__3D_STATE__.massA_vel = cloneVec(state.velA);
+      window.__3D_STATE__.massB_vel = cloneVec(state.velB);
+      window.__3D_STATE__.k1 = state.k1;
+      window.__3D_STATE__.k2 = state.k2;
+      window.__3D_STATE__.totalEnergy = totalEnergy;
+      window.__3D_STATE__.historyIndex = historyIndex;
+      window.__3D_STATE__.historyLength = history.length;
+      window.__3D_STATE__.dragMode = state.dragMode;
+      window.__3D_STATE__.stepCount = state.stepCount;
+      window.__3D_STATE__.massA_grounded = massA.position.y <= 0.31;
+      window.__3D_STATE__.massB_grounded = massB.position.y <= 0.31;
+    }
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      if (state.simRunning) {
+        physicsStep();
+      } else {
+        updateSpringLines();
+      }
+
+      const totalEnergy = computeTotalEnergy();
+      updateHUD(totalEnergy);
+      updateGlobalState(totalEnergy);
+
+      renderer.render(scene, camera);
+    }
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    updateSpringLines();
+    animate();
+  </script>
+</body>
+</html>

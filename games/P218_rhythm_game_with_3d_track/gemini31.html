@@ -1,0 +1,407 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Rhythm Game</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #000;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            user-select: none;
+        }
+        canvas {
+            display: block;
+        }
+        #hud {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+        }
+        .hud-element {
+            position: absolute;
+            color: #fff;
+            font-size: 24px;
+            font-weight: bold;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.8);
+            padding: 20px;
+        }
+        #score-display { top: 0; left: 0; }
+        #combo-display { top: 0; right: 0; }
+        #multiplier-display { top: 0; left: 50%; transform: translateX(-50%); color: #ffd700; }
+        #status-text {
+            top: 40%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            font-size: 48px;
+            text-align: center;
+            transition: opacity 0.1s;
+            white-space: nowrap;
+        }
+        #key-hints {
+            bottom: 30px;
+            left: 50%;
+            transform: translateX(-50%);
+            font-size: 28px;
+            letter-spacing: 60px;
+            margin-left: 30px; /* Offset for letter spacing */
+            color: #aaa;
+        }
+    </style>
+</head>
+<body>
+    <div id="hud">
+        <div id="score-display" class="hud-element">Score: 0</div>
+        <div id="combo-display" class="hud-element">Combo: 0</div>
+        <div id="multiplier-display" class="hud-element">Multiplier: 1x</div>
+        <div id="status-text" class="hud-element">Press SPACE to Start</div>
+        <div id="key-hints" class="hud-element">D F J K</div>
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/GLTFLoader.js"></script>
+
+    <script>
+        // State Management
+        window.__3D_STATE__ = {
+            gameState: 'waiting', // 'waiting' | 'playing' | 'finished'
+            score: 0,
+            combo: 0,
+            maxCombo: 0,
+            multiplier: 1,
+            totalHits: 0,
+            totalMisses: 0,
+            totalNotes: 14,
+            perfectCount: 0,
+            greatCount: 0,
+            goodCount: 0,
+            elapsedTime: 0,
+            activeNotes: 0,
+            fishY: 0.5,
+            lastJudgment: '',
+            notesSpawned: 0,
+            noteSpeed: 8,
+            accuracy: 0,
+            lanePressCount: [0, 0, 0, 0]
+        };
+
+        const state = window.__3D_STATE__;
+
+        // Constants
+        const LANE_X = [-1.5, -0.5, 0.5, 1.5];
+        const COLORS = [0xff0000, 0x0000ff, 0xffff00, 0x00ff00];
+        const SPAWN_Z = -40;
+        const HIT_Z = 3;
+        const MISS_Z = 5;
+        const SPEED = state.noteSpeed;
+
+        // Chart
+        const chart = [
+            {time:1,lane:0}, {time:1.5,lane:2}, {time:2,lane:1}, {time:2.5,lane:3},
+            {time:3,lane:0}, {time:3.5,lane:1}, {time:4,lane:2}, {time:4.5,lane:3},
+            {time:5,lane:0}, {time:5.5,lane:2}, {time:6,lane:1}, {time:6.5,lane:3},
+            {time:7,lane:0}, {time:7.5,lane:1}
+        ].map(n => ({ ...n, spawned: false }));
+
+        // Three.js Setup
+        const scene = new THREE.Scene();
+        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+        camera.position.set(0, 5, 10);
+        camera.lookAt(0, 0, -5); // Looking down the track toward negative Z
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        document.body.appendChild(renderer.domElement);
+
+        // Lighting
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+        dirLight.position.set(5, 10, 5);
+        scene.add(dirLight);
+
+        // Track
+        const trackGeom = new THREE.PlaneGeometry(4, 50);
+        const trackMat = new THREE.MeshLambertMaterial({ color: 0x222222 });
+        const track = new THREE.Mesh(trackGeom, trackMat);
+        track.rotation.x = -Math.PI / 2;
+        track.position.set(0, 0, -20); // Centered between z=5 and z=-45
+        scene.add(track);
+
+        // Hit Zone Line
+        const hitZoneGeom = new THREE.BoxGeometry(4, 0.05, 0.2);
+        const hitZoneMat = new THREE.MeshBasicMaterial({ color: 0x00ff00 });
+        const hitZone = new THREE.Mesh(hitZoneGeom, hitZoneMat);
+        hitZone.position.set(0, 0.025, HIT_Z);
+        scene.add(hitZone);
+
+        // Load Avatar (Fish)
+        let fishModel = null;
+        const loader = new THREE.GLTFLoader();
+        loader.load('._BarramundiFish.glb', (gltf) => {
+            fishModel = gltf.scene;
+            fishModel.scale.set(0.8, 0.8, 0.8);
+            fishModel.position.set(0, 0.5, 5);
+            fishModel.rotation.y = Math.PI; // Face the track
+            scene.add(fishModel);
+        }, undefined, (error) => {
+            console.warn('Could not load fish model, using fallback.', error);
+            // Fallback box if model fails
+            const geom = new THREE.BoxGeometry(1, 1, 2);
+            const mat = new THREE.MeshLambertMaterial({ color: 0x00ffff });
+            fishModel = new THREE.Mesh(geom, mat);
+            fishModel.position.set(0, 0.5, 5);
+            scene.add(fishModel);
+        });
+
+        // Game Objects
+        const activeNotes = [];
+        const particles = [];
+        let lastTime = 0;
+        let judgmentTimer = 0;
+
+        // DOM Elements
+        const elScore = document.getElementById('score-display');
+        const elCombo = document.getElementById('combo-display');
+        const elMult = document.getElementById('multiplier-display');
+        const elStatus = document.getElementById('status-text');
+
+        // Input Handling
+        window.addEventListener('keydown', (e) => {
+            if (e.repeat) return;
+
+            if (e.code === 'Space' && state.gameState === 'waiting') {
+                state.gameState = 'playing';
+                elStatus.innerText = '';
+                lastTime = performance.now();
+                return;
+            }
+
+            if (state.gameState !== 'playing') return;
+
+            let laneIndex = -1;
+            switch (e.code) {
+                case 'KeyD': laneIndex = 0; break;
+                case 'KeyF': laneIndex = 1; break;
+                case 'KeyJ': laneIndex = 2; break;
+                case 'KeyK': laneIndex = 3; break;
+            }
+
+            if (laneIndex !== -1) {
+                handleInput(laneIndex);
+            }
+        });
+
+        function handleInput(laneIndex) {
+            state.lanePressCount[laneIndex]++;
+
+            let hitIndex = -1;
+            let minAbsDist = Infinity;
+
+            // Find closest hittable note in lane
+            for (let i = 0; i < activeNotes.length; i++) {
+                let note = activeNotes[i];
+                if (note.lane === laneIndex && note.mesh.position.z >= 2.0 && note.mesh.position.z <= 4.0) {
+                    let dist = Math.abs(note.mesh.position.z - HIT_Z);
+                    if (dist < minAbsDist) {
+                        minAbsDist = dist;
+                        hitIndex = i;
+                    }
+                }
+            }
+
+            if (hitIndex !== -1) {
+                // HIT
+                let note = activeNotes[hitIndex];
+                let z = note.mesh.position.z;
+                let points = 0;
+                let judgment = '';
+
+                if (z >= 2.8 && z <= 3.2) { points = 100; judgment = 'PERFECT'; state.perfectCount++; }
+                else if (z >= 2.4 && z <= 3.6) { points = 50; judgment = 'GREAT'; state.greatCount++; }
+                else { points = 25; judgment = 'GOOD'; state.goodCount++; }
+
+                state.combo++;
+                if (state.combo > state.maxCombo) state.maxCombo = state.combo;
+                updateMultiplier();
+                state.score += points * state.multiplier;
+                state.totalHits++;
+                state.lastJudgment = judgment.toLowerCase();
+
+                showJudgment(judgment);
+                createParticles(note.mesh.position);
+
+                scene.remove(note.mesh);
+                activeNotes.splice(hitIndex, 1);
+            } else {
+                // MISS (Empty press)
+                registerMiss();
+            }
+            updateAccuracy();
+            updateHUD();
+        }
+
+        function registerMiss() {
+            state.combo = 0;
+            updateMultiplier();
+            state.totalMisses++;
+            state.lastJudgment = 'miss';
+            showJudgment('MISS');
+        }
+
+        function updateMultiplier() {
+            if (state.combo >= 30) state.multiplier = 4;
+            else if (state.combo >= 20) state.multiplier = 3;
+            else if (state.combo >= 10) state.multiplier = 2;
+            else state.multiplier = 1;
+        }
+
+        function updateAccuracy() {
+            let total = state.totalHits + state.totalMisses;
+            state.accuracy = total === 0 ? 0 : (state.totalHits / total) * 100;
+        }
+
+        function showJudgment(text) {
+            elStatus.innerText = text;
+            elStatus.style.opacity = 1;
+            judgmentTimer = 1.0;
+
+            if (text === 'PERFECT') elStatus.style.color = '#ffff00';
+            else if (text === 'GREAT') elStatus.style.color = '#00ff00';
+            else if (text === 'GOOD') elStatus.style.color = '#00aaff';
+            else elStatus.style.color = '#ff0000';
+        }
+
+        function updateHUD() {
+            elScore.innerText = `Score: ${state.score}`;
+            elCombo.innerText = `Combo: ${state.combo}`;
+            elMult.innerText = `Multiplier: ${state.multiplier}x`;
+        }
+
+        function createParticles(pos) {
+            const geom = new THREE.SphereGeometry(0.1, 8, 8);
+            const mat = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true });
+            for (let i = 0; i < 5; i++) {
+                let mesh = new THREE.Mesh(geom, mat.clone());
+                mesh.position.copy(pos);
+                let vx = (Math.random() - 0.5) * 10;
+                let vy = (Math.random() - 0.5) * 10;
+                let vz = (Math.random() - 0.5) * 10;
+                scene.add(mesh);
+                particles.push({ mesh, vx, vy, vz, life: 0.3, maxLife: 0.3 });
+            }
+        }
+
+        function showResults() {
+            elStatus.innerHTML = `FINISHED!<br>Score: ${state.score}<br>Max Combo: ${state.maxCombo}<br>Accuracy: ${state.accuracy.toFixed(1)}%`;
+            elStatus.style.opacity = 1;
+            elStatus.style.color = '#ffffff';
+        }
+
+        // Resize Handler
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // Animation Loop
+        function animate(time) {
+            requestAnimationFrame(animate);
+
+            let delta = (time - lastTime) / 1000;
+            lastTime = time;
+
+            if (state.gameState === 'playing') {
+                state.elapsedTime += delta;
+
+                // Spawn Notes
+                chart.forEach(noteData => {
+                    if (!noteData.spawned) {
+                        // Calculate where the note should be right now
+                        let currentZ = HIT_Z - (noteData.time - state.elapsedTime) * SPEED;
+                        
+                        if (currentZ >= SPAWN_Z) {
+                            const geom = new THREE.BoxGeometry(0.6, 0.6, 0.6);
+                            const mat = new THREE.MeshLambertMaterial({ color: COLORS[noteData.lane] });
+                            const mesh = new THREE.Mesh(geom, mat);
+                            mesh.position.set(LANE_X[noteData.lane], 0.3, currentZ);
+                            scene.add(mesh);
+                            activeNotes.push({ mesh, lane: noteData.lane });
+                            noteData.spawned = true;
+                            state.notesSpawned++;
+                        }
+                    }
+                });
+
+                // Move Notes & Check Misses
+                for (let i = activeNotes.length - 1; i >= 0; i--) {
+                    let note = activeNotes[i];
+                    note.mesh.position.z += SPEED * delta;
+
+                    if (note.mesh.position.z > MISS_Z) {
+                        registerMiss();
+                        updateAccuracy();
+                        updateHUD();
+                        scene.remove(note.mesh);
+                        activeNotes.splice(i, 1);
+                    }
+                }
+
+                // Update Particles
+                for (let i = particles.length - 1; i >= 0; i--) {
+                    let p = particles[i];
+                    p.life -= delta;
+                    if (p.life <= 0) {
+                        scene.remove(p.mesh);
+                        particles.splice(i, 1);
+                    } else {
+                        p.mesh.position.x += p.vx * delta;
+                        p.mesh.position.y += p.vy * delta;
+                        p.mesh.position.z += p.vz * delta;
+                        let scale = p.life / p.maxLife;
+                        p.mesh.scale.set(scale, scale, scale);
+                        p.mesh.material.opacity = scale;
+                    }
+                }
+
+                // Fade Judgment Text
+                if (judgmentTimer > 0) {
+                    judgmentTimer -= delta;
+                    elStatus.style.opacity = Math.max(0, judgmentTimer);
+                }
+
+                // Check End Game
+                if (state.notesSpawned === state.totalNotes && activeNotes.length === 0) {
+                    state.gameState = 'finished';
+                    showResults();
+                }
+            }
+
+            // Animate Fish (always bobs)
+            if (fishModel) {
+                // Sine wave: amplitude 0.2, period 2s (frequency 0.5Hz -> angular freq PI)
+                let t = state.gameState === 'playing' ? state.elapsedTime : time / 1000;
+                fishModel.position.y = 0.5 + Math.sin(t * Math.PI) * 0.2;
+                state.fishY = fishModel.position.y;
+            }
+
+            // Update exposed state
+            state.activeNotes = activeNotes.length;
+
+            renderer.render(scene, camera);
+        }
+
+        // Start loop
+        lastTime = performance.now();
+        animate(lastTime);
+
+    </script>
+</body>
+</html>

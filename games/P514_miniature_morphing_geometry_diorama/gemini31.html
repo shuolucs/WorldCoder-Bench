@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Miniature Morphing Geometry Diorama</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #111;
+        }
+        #hud {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background-color: rgba(0, 0, 0, 0.6);
+            color: #fff;
+            font-family: monospace;
+            padding: 10px;
+            border-radius: 5px;
+            pointer-events: none;
+            white-space: pre;
+            line-height: 1.5;
+            z-index: 100;
+        }
+    </style>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="hud"></div>
+    <script type="module">
+        import * as THREE from 'three';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+        // --- Scene Setup ---
+        const scene = new THREE.Scene();
+        
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+        let cameraAngleDeg = 0;
+        const cameraRadius = 6;
+        camera.position.set(0, 3, 6);
+        camera.lookAt(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        document.body.appendChild(renderer.domElement);
+
+        // Lights
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+        dirLight.position.set(5, 8, 5);
+        dirLight.castShadow = true;
+        dirLight.shadow.mapSize.width = 1024;
+        dirLight.shadow.mapSize.height = 1024;
+        dirLight.shadow.camera.near = 0.5;
+        dirLight.shadow.camera.far = 20;
+        dirLight.shadow.camera.left = -5;
+        dirLight.shadow.camera.right = 5;
+        dirLight.shadow.camera.top = 5;
+        dirLight.shadow.camera.bottom = -5;
+        scene.add(dirLight);
+
+        // Platform
+        const platformGeo = new THREE.CylinderGeometry(3, 3, 0.2, 64);
+        const platformMat = new THREE.MeshStandardMaterial({ color: 0x3a2518, roughness: 0.8 });
+        const platform = new THREE.Mesh(platformGeo, platformMat);
+        platform.position.y = 0;
+        platform.receiveShadow = true;
+        scene.add(platform);
+
+        // --- State Variables ---
+        let morphMode = 0;
+        const morphModeNames = ['idle', 'pulse', 'spin'];
+        let themeIndex = 0;
+        let selectedGeometry = -1;
+        
+        let fishModel = null;
+        let fishLoaded = false;
+        let fishVisible = true;
+        let fishJumping = false;
+        let jumpStartTime = 0;
+
+        // --- Geometries Setup ---
+        const geometriesData = [];
+        const themes = [
+            [0xff4444, 0x44ff44, 0x4444ff, 0xffff44, 0xff44ff],
+            [0x1144aa, 0x2255bb, 0x3366cc, 0x4477dd, 0x5588ee],
+            [0xff6600, 0xff7711, 0xff8822, 0xff9933, 0xffaa44]
+        ];
+
+        const createGeo = [
+            () => new THREE.IcosahedronGeometry(0.3),
+            () => new THREE.OctahedronGeometry(0.3),
+            () => new THREE.DodecahedronGeometry(0.3),
+            () => new THREE.TetrahedronGeometry(0.3),
+            () => new THREE.TorusGeometry(0.2, 0.08, 16, 32)
+        ];
+
+        const radius = 1.8;
+        for (let i = 0; i < 5; i++) {
+            const angleDeg = i * 72;
+            const angleRad = angleDeg * Math.PI / 180;
+            // Angle 0 at front (+Z)
+            const x = Math.sin(angleRad) * radius;
+            const z = Math.cos(angleRad) * radius;
+
+            // Pedestal
+            const pedGeo = new THREE.CylinderGeometry(0.15, 0.15, 0.4, 32);
+            const pedMat = new THREE.MeshStandardMaterial({ color: 0x888888 });
+            const pedestal = new THREE.Mesh(pedGeo, pedMat);
+            // Platform top is 0.1. Pedestal center is 0.1 + 0.2 = 0.3
+            pedestal.position.set(x, 0.3, z);
+            pedestal.castShadow = true;
+            pedestal.receiveShadow = true;
+            scene.add(pedestal);
+
+            // Geometry
+            const geo = createGeo[i]();
+            const mat = new THREE.MeshStandardMaterial({ 
+                color: themes[0][i],
+                emissive: 0x000000,
+                emissiveIntensity: 0
+            });
+            const mesh = new THREE.Mesh(geo, mat);
+            // Pedestal top is 0.5. Float 0.15 above. Center approx 0.3 higher.
+            const baseY = 0.5 + 0.15 + 0.15; 
+            mesh.position.set(x, baseY, z);
+            mesh.castShadow = true;
+            mesh.receiveShadow = true;
+            scene.add(mesh);
+
+            geometriesData.push({
+                mesh: mesh,
+                baseX: x,
+                baseY: baseY,
+                baseZ: z
+            });
+        }
+
+        // --- Load Fish Model ---
+        const loader = new GLTFLoader();
+        loader.load(
+            'https://raw.githubusercontent.com/mrdoob/three.js/master/examples/models/gltf/BarramundiFish.glb',
+            function (gltf) {
+                fishModel = gltf.scene;
+                
+                // Scale to roughly 1.5 units
+                const box = new THREE.Box3().setFromObject(fishModel);
+                const size = box.getSize(new THREE.Vector3());
+                const maxDim = Math.max(size.x, size.y, size.z);
+                fishModel.scale.setScalar(1.5 / maxDim);
+
+                fishModel.traverse((child) => {
+                    if (child.isMesh) {
+                        child.castShadow = true;
+                        child.receiveShadow = true;
+                    }
+                });
+
+                scene.add(fishModel);
+                fishLoaded = true;
+            }
+        );
+
+        // --- Input Handling ---
+        window.addEventListener('keydown', (e) => {
+            const key = e.key;
+
+            if (key === 'm' || key === 'M') {
+                morphMode = (morphMode + 1) % 3;
+            } 
+            else if (key === 'f' || key === 'F') {
+                fishVisible = !fishVisible;
+                if (fishModel) fishModel.visible = fishVisible;
+            }
+            else if (key === 'j' || key === 'J') {
+                if (!fishJumping) {
+                    fishJumping = true;
+                    jumpStartTime = clock.getElapsedTime();
+                }
+            }
+            else if (key === 'c' || key === 'C') {
+                themeIndex = (themeIndex + 1) % 3;
+                updateColors();
+            }
+            else if (key >= '1' && key <= '5') {
+                const index = parseInt(key) - 1;
+                if (selectedGeometry === index) {
+                    selectedGeometry = -1; // Deselect
+                } else {
+                    selectedGeometry = index;
+                }
+                updateSelection();
+            }
+            else if (key === 'Delete' || key === 'Backspace') {
+                if (selectedGeometry !== -1) {
+                    geometriesData[selectedGeometry].mesh.visible = false;
+                }
+            }
+            else if (key === 'r' || key === 'R') {
+                geometriesData.forEach(g => g.mesh.visible = true);
+            }
+            else if (key === 'ArrowLeft') {
+                cameraAngleDeg -= 15;
+            }
+            else if (key === 'ArrowRight') {
+                cameraAngleDeg += 15;
+            }
+        });
+
+        function updateColors() {
+            geometriesData.forEach((data, i) => {
+                data.mesh.material.color.setHex(themes[themeIndex][i]);
+            });
+        }
+
+        function updateSelection() {
+            geometriesData.forEach((data, i) => {
+                if (i === selectedGeometry) {
+                    data.mesh.material.emissive.setHex(0xffffff);
+                    data.mesh.material.emissiveIntensity = 0.3;
+                } else {
+                    data.mesh.material.emissive.setHex(0x000000);
+                    data.mesh.material.emissiveIntensity = 0;
+                }
+            });
+        }
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // --- Global State Object ---
+        window.__3D_STATE__ = {
+            morphMode: 0,
+            morphModeName: 'idle',
+            themeIndex: 0,
+            selectedGeometry: -1,
+            fishVisible: true,
+            fishJumping: false,
+            fishPositionX: 0,
+            fishPositionY: 0,
+            fishPositionZ: 0,
+            hiddenCount: 0,
+            cameraAngleDeg: 0,
+            geometryScales: [1, 1, 1, 1, 1],
+            geometryVisible: [true, true, true, true, true],
+            platformExists: true,
+            elapsedTime: 0,
+            geometryColors: [0, 0, 0, 0, 0],
+            fishModelLoaded: false
+        };
+
+        const clock = new THREE.Clock();
+        const hudElement = document.getElementById('hud');
+
+        // --- Animation Loop ---
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const time = clock.getElapsedTime();
+
+            // Update Camera
+            const camRad = cameraAngleDeg * Math.PI / 180;
+            camera.position.x = Math.sin(camRad) * cameraRadius;
+            camera.position.z = Math.cos(camRad) * cameraRadius;
+            camera.lookAt(0, 0, 0);
+
+            // Update Fish
+            let currentFishX = 0, currentFishY = 1.5, currentFishZ = 0;
+            if (fishLoaded) {
+                const orbitPeriod = 8;
+                const orbitAngle = (time % orbitPeriod) / orbitPeriod * Math.PI * 2;
+                
+                currentFishX = Math.cos(orbitAngle) * 1.0;
+                currentFishZ = Math.sin(orbitAngle) * 1.0;
+
+                if (fishJumping) {
+                    const jt = time - jumpStartTime;
+                    if (jt <= 0.3) {
+                        currentFishY = 1.5 + (jt / 0.3) * 1.0;
+                    } else if (jt <= 0.6) {
+                        currentFishY = 1.5 + (1.0 - ((jt - 0.3) / 0.3) * 1.0);
+                    } else {
+                        fishJumping = false;
+                        currentFishY = 1.5;
+                    }
+                }
+
+                fishModel.position.set(currentFishX, currentFishY, currentFishZ);
+
+                // Face tangent
+                const nextAngle = orbitAngle + 0.05;
+                const nextX = Math.cos(nextAngle) * 1.0;
+                const nextZ = Math.sin(nextAngle) * 1.0;
+                fishModel.lookAt(nextX, currentFishY, nextZ);
+            }
+
+            // Update Geometries
+            geometriesData.forEach((data) => {
+                const mesh = data.mesh;
+                
+                // Reset
+                mesh.scale.set(1, 1, 1);
+                mesh.rotation.set(0, 0, 0);
+                mesh.position.set(data.baseX, data.baseY, data.baseZ);
+
+                if (morphMode === 0) {
+                    // Idle: bob up and down
+                    const yOffset = Math.sin(time * Math.PI) * 0.1; // period 2s -> freq 0.5 -> 2*PI*0.5 = PI
+                    mesh.position.y = data.baseY + yOffset;
+                } 
+                else if (morphMode === 1) {
+                    // Pulse: scale 0.8 to 1.4
+                    // period 1.5s -> freq 1/1.5 -> 2*PI/1.5
+                    const scale = 1.1 + Math.sin(time * Math.PI * 2 / 1.5) * 0.3;
+                    mesh.scale.setScalar(scale);
+                }
+                else if (morphMode === 2) {
+                    // Spin: local Y spin + orbit
+                    mesh.rotation.y = time * 2;
+                    
+                    // period 3s -> 2*PI/3
+                    const orbitAngle = time * Math.PI * 2 / 3;
+                    mesh.position.x = data.baseX + Math.cos(orbitAngle) * 0.1;
+                    mesh.position.z = data.baseZ + Math.sin(orbitAngle) * 0.1;
+                }
+            });
+
+            // Update State Object
+            const hiddenCount = geometriesData.filter(g => !g.mesh.visible).length;
+            
+            window.__3D_STATE__.morphMode = morphMode;
+            window.__3D_STATE__.morphModeName = morphModeNames[morphMode];
+            window.__3D_STATE__.themeIndex = themeIndex;
+            window.__3D_STATE__.selectedGeometry = selectedGeometry;
+            window.__3D_STATE__.fishVisible = fishVisible;
+            window.__3D_STATE__.fishJumping = fishJumping;
+            window.__3D_STATE__.fishPositionX = currentFishX;
+            window.__3D_STATE__.fishPositionY = currentFishY;
+            window.__3D_STATE__.fishPositionZ = currentFishZ;
+            window.__3D_STATE__.hiddenCount = hiddenCount;
+            window.__3D_STATE__.cameraAngleDeg = cameraAngleDeg;
+            window.__3D_STATE__.elapsedTime = time;
+            window.__3D_STATE__.fishModelLoaded = fishLoaded;
+
+            for(let i=0; i<5; i++) {
+                window.__3D_STATE__.geometryScales[i] = geometriesData[i].mesh.scale.x;
+                window.__3D_STATE__.geometryVisible[i] = geometriesData[i].mesh.visible;
+                window.__3D_STATE__.geometryColors[i] = geometriesData[i].mesh.material.color.getHex();
+            }
+
+            // Update HUD
+            hudElement.innerHTML = `
+Mode: ${morphModeNames[morphMode]} (Press M)
+Theme: ${themeIndex} (Press C)
+Selected: ${selectedGeometry !== -1 ? selectedGeometry : 'None'} (Press 1-5)
+Fish Visible: ${fishVisible} (Press F)
+Hidden Geos: ${hiddenCount} (Del to hide, R to restore)
+Camera Angle: ${cameraAngleDeg}° (Left/Right Arrows)
+Fish Jump: Press J
+            `.trim();
+
+            renderer.render(scene, camera);
+        }
+
+        animate();
+    </script>
+</body>
+</html>

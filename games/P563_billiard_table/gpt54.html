@@ -1,0 +1,704 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>3D Pool Table Simulation</title>
+
+  <script type="importmap">
+  { "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+  } }
+  </script>
+
+  <style>
+    html, body {
+      margin: 0;
+      overflow: hidden;
+      background: #1a1a2e;
+      font-family: Arial, sans-serif;
+      color: #fff;
+    }
+    #hud {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      background: rgba(0,0,0,0.45);
+      padding: 10px 12px;
+      border-radius: 8px;
+      font-size: 14px;
+      line-height: 1.5;
+      z-index: 10;
+      min-width: 210px;
+    }
+    #power-container {
+      position: absolute;
+      left: 50%;
+      bottom: 20px;
+      transform: translateX(-50%);
+      width: 320px;
+      height: 20px;
+      border: 2px solid #ddd;
+      border-radius: 10px;
+      overflow: hidden;
+      background: rgba(255,255,255,0.08);
+      z-index: 10;
+    }
+    #power-bar {
+      width: 0%;
+      height: 100%;
+      background: linear-gradient(90deg, #44cc44, #ffcc00, #ff4444);
+      transition: width 0.03s linear;
+    }
+    #help {
+      position: absolute;
+      right: 10px;
+      top: 10px;
+      z-index: 10;
+      background: rgba(0,0,0,0.45);
+      padding: 10px 12px;
+      border-radius: 8px;
+      font-size: 13px;
+      line-height: 1.45;
+      max-width: 260px;
+    }
+  </style>
+</head>
+<body>
+  <div id="hud">
+    <div>Balls on table: <span id="hud-balls">16</span></div>
+    <div>Pocketed: <span id="hud-pocketed">0</span></div>
+    <div>Shot count: <span id="hud-shots">0</span></div>
+    <div>Cue ball speed: <span id="hud-cue-speed">0.000</span></div>
+    <div>All stopped: <span id="hud-stopped">Yes</span></div>
+    <div>Last pocketed: <span id="hud-last-pocket">None</span></div>
+  </div>
+
+  <div id="power-container"><div id="power-bar"></div></div>
+
+  <div id="help">
+    <b>Controls</b><br>
+    Move mouse to aim<br>
+    Click + drag back to set power, release to shoot<br>
+    R = Re-rack<br>
+    C = Reset cue ball<br>
+    Space = Toggle top-down camera
+  </div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x1a1a2e);
+
+    const camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 0.1, 100);
+    camera.position.set(0, 8, 6);
+    camera.lookAt(0, 0.5, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    document.body.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.set(0, 0.75, 0);
+    controls.maxPolarAngle = Math.PI / 2.2;
+    controls.enableDamping = true;
+
+    const ambient = new THREE.AmbientLight(0x445544, 0.3);
+    scene.add(ambient);
+
+    const spot = new THREE.SpotLight(0xffeedd, 2.0, 30, Math.PI / 4, 0.35, 1.2);
+    spot.position.set(0, 6, 0);
+    spot.castShadow = true;
+    spot.shadow.mapSize.set(2048, 2048);
+    spot.target.position.set(0, 0, 0);
+    scene.add(spot);
+    scene.add(spot.target);
+
+    const TABLE_LENGTH = 3.6;
+    const TABLE_WIDTH = 1.8;
+    const TABLE_Y = 0.75;
+    const TABLE_THICKNESS = 0.1;
+    const BALL_RADIUS = 0.05;
+    const BALL_Y = TABLE_Y + TABLE_THICKNESS / 2 + BALL_RADIUS;
+    const RAIL_HEIGHT = 0.15;
+    const RAIL_WIDTH = 0.12;
+    const INNER_X = TABLE_LENGTH / 2 - RAIL_WIDTH;
+    const INNER_Z = TABLE_WIDTH / 2 - RAIL_WIDTH;
+    const FRICTION = 1.5;
+    const DT = 1 / 120;
+    const SUBSTEPS = 2;
+    const BALL_RESTITUTION = 0.95;
+    const CUSHION_RESTITUTION = 0.7;
+    const POCKET_RADIUS = 0.1;
+    const POCKET_CAPTURE = 0.08;
+
+    const topDownCamPos = new THREE.Vector3(0, 7.8, 0.001);
+    const defaultCamPos = new THREE.Vector3(0, 8, 6);
+    let topDown = false;
+
+    const hudBalls = document.getElementById('hud-balls');
+    const hudPocketed = document.getElementById('hud-pocketed');
+    const hudShots = document.getElementById('hud-shots');
+    const hudCueSpeed = document.getElementById('hud-cue-speed');
+    const hudStopped = document.getElementById('hud-stopped');
+    const hudLastPocket = document.getElementById('hud-last-pocket');
+    const powerBar = document.getElementById('power-bar');
+
+    const textureLoader = new THREE.TextureLoader();
+    const hardwoodTexture = textureLoader.load(
+      'https://threejs.org/examples/textures/hardwood2_diffuse.jpg'
+    );
+    hardwoodTexture.wrapS = hardwoodTexture.wrapT = THREE.RepeatWrapping;
+    hardwoodTexture.repeat.set(2, 1);
+
+    const tableGroup = new THREE.Group();
+    scene.add(tableGroup);
+
+    const tableSurface = new THREE.Mesh(
+      new THREE.BoxGeometry(TABLE_LENGTH, TABLE_THICKNESS, TABLE_WIDTH),
+      new THREE.MeshStandardMaterial({ color: 0x0a6e0a, roughness: 0.9, metalness: 0.0 })
+    );
+    tableSurface.position.set(0, TABLE_Y, 0);
+    tableSurface.receiveShadow = true;
+    tableSurface.castShadow = true;
+    tableGroup.add(tableSurface);
+
+    const railMaterial = new THREE.MeshStandardMaterial({
+      color: 0x664422,
+      roughness: 0.65,
+      metalness: 0.05,
+      map: hardwoodTexture
+    });
+
+    function createRail(w, h, d, x, y, z) {
+      const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), railMaterial);
+      m.position.set(x, y, z);
+      m.castShadow = true;
+      m.receiveShadow = true;
+      tableGroup.add(m);
+      return m;
+    }
+
+    const railY = TABLE_Y + TABLE_THICKNESS / 2 + RAIL_HEIGHT / 2;
+    createRail(TABLE_LENGTH, RAIL_HEIGHT, RAIL_WIDTH, 0, railY, TABLE_WIDTH / 2 - RAIL_WIDTH / 2);
+    createRail(TABLE_LENGTH, RAIL_HEIGHT, RAIL_WIDTH, 0, railY, -TABLE_WIDTH / 2 + RAIL_WIDTH / 2);
+    createRail(RAIL_WIDTH, RAIL_HEIGHT, TABLE_WIDTH - 2 * RAIL_WIDTH, TABLE_LENGTH / 2 - RAIL_WIDTH / 2, railY, 0);
+    createRail(RAIL_WIDTH, RAIL_HEIGHT, TABLE_WIDTH - 2 * RAIL_WIDTH, -TABLE_LENGTH / 2 + RAIL_WIDTH / 2, railY, 0);
+
+    const legMat = new THREE.MeshStandardMaterial({ color: 0x553311, roughness: 0.7 });
+    const legPositions = [
+      [ TABLE_LENGTH/2 - 0.2, 0.375,  TABLE_WIDTH/2 - 0.2],
+      [-TABLE_LENGTH/2 + 0.2, 0.375,  TABLE_WIDTH/2 - 0.2],
+      [ TABLE_LENGTH/2 - 0.2, 0.375, -TABLE_WIDTH/2 + 0.2],
+      [-TABLE_LENGTH/2 + 0.2, 0.375, -TABLE_WIDTH/2 + 0.2],
+    ];
+    for (const [x, y, z] of legPositions) {
+      const leg = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.06, 0.06, 0.75, 20),
+        legMat
+      );
+      leg.position.set(x, y, z);
+      leg.castShadow = true;
+      leg.receiveShadow = true;
+      tableGroup.add(leg);
+    }
+
+    const pocketCenters = [
+      new THREE.Vector2(-INNER_X, -INNER_Z),
+      new THREE.Vector2( INNER_X, -INNER_Z),
+      new THREE.Vector2(-INNER_X,  INNER_Z),
+      new THREE.Vector2( INNER_X,  INNER_Z),
+      new THREE.Vector2(0, -INNER_Z),
+      new THREE.Vector2(0,  INNER_Z),
+    ];
+
+    const pocketMat = new THREE.MeshStandardMaterial({ color: 0x050505, roughness: 1 });
+    for (const p of pocketCenters) {
+      const pocket = new THREE.Mesh(
+        new THREE.CylinderGeometry(POCKET_RADIUS, POCKET_RADIUS, 0.02, 32),
+        pocketMat
+      );
+      pocket.rotation.x = Math.PI / 2;
+      pocket.position.set(p.x, TABLE_Y + TABLE_THICKNESS / 2 + 0.001, p.y);
+      tableGroup.add(pocket);
+    }
+
+    const tray = new THREE.Group();
+    tray.position.set(TABLE_LENGTH / 2 + 0.35, BALL_Y, 0);
+    scene.add(tray);
+
+    const ballColors = {
+      0: 0xffffff,
+      1: 0xffff00,
+      2: 0x2244ff,
+      3: 0xdd2222,
+      4: 0x7722aa,
+      5: 0xff8800,
+      6: 0x119944,
+      7: 0x661122,
+      8: 0x111111,
+      9: 0xffff00,
+      10: 0x2244ff,
+      11: 0xdd2222,
+      12: 0x7722aa,
+      13: 0xff8800,
+      14: 0x119944,
+      15: 0x661122
+    };
+
+    function createBallTexture(num) {
+      const c = document.createElement('canvas');
+      c.width = 256;
+      c.height = 256;
+      const ctx = c.getContext('2d');
+
+      const color = '#' + ballColors[num].toString(16).padStart(6, '0');
+
+      ctx.fillStyle = '#ffffff';
+      ctx.beginPath();
+      ctx.arc(128, 128, 126, 0, Math.PI * 2);
+      ctx.fill();
+
+      if (num !== 0) {
+        if (num <= 8) {
+          ctx.fillStyle = color;
+          ctx.beginPath();
+          ctx.arc(128, 128, 126, 0, Math.PI * 2);
+          ctx.fill();
+        } else {
+          ctx.fillStyle = color;
+          ctx.fillRect(0, 74, 256, 108);
+        }
+
+        ctx.fillStyle = '#ffffff';
+        ctx.beginPath();
+        ctx.arc(128, 128, 42, 0, Math.PI * 2);
+        ctx.fill();
+
+        ctx.fillStyle = '#111';
+        ctx.font = 'bold 42px Arial';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(String(num), 128, 132);
+      }
+
+      const tex = new THREE.CanvasTexture(c);
+      tex.needsUpdate = true;
+      return tex;
+    }
+
+    const balls = [];
+    let cueBall = null;
+    let pocketedCount = 0;
+    let shotCount = 0;
+    let lastPocketed = -1;
+    let frameCount = 0;
+
+    function makeBall(num, x, z) {
+      const tex = createBallTexture(num);
+      const mat = new THREE.MeshStandardMaterial({
+        color: 0xffffff,
+        roughness: 0.2,
+        metalness: 0.1,
+        map: tex
+      });
+      const mesh = new THREE.Mesh(
+        new THREE.SphereGeometry(BALL_RADIUS, 40, 32),
+        mat
+      );
+      mesh.castShadow = true;
+      mesh.receiveShadow = true;
+      scene.add(mesh);
+
+      const ball = {
+        number: num,
+        mesh,
+        pos: new THREE.Vector3(x, BALL_Y, z),
+        vel: new THREE.Vector3(),
+        omega: new THREE.Vector3(),
+        pocketed: false
+      };
+      mesh.position.copy(ball.pos);
+      balls.push(ball);
+      if (num === 0) cueBall = ball;
+      return ball;
+    }
+
+    function clearBalls() {
+      for (const b of balls) {
+        scene.remove(b.mesh);
+        b.mesh.geometry.dispose();
+        if (b.mesh.material.map) b.mesh.material.map.dispose();
+        b.mesh.material.dispose();
+      }
+      balls.length = 0;
+      cueBall = null;
+    }
+
+    function rackBalls() {
+      clearBalls();
+      pocketedCount = 0;
+      lastPocketed = -1;
+
+      makeBall(0, 0, 0.6);
+
+      const startZ = -0.5;
+      const spacing = BALL_RADIUS * 2.08;
+      const rowGap = Math.sqrt(3) * BALL_RADIUS * 1.04;
+      const nums = [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15];
+      let idx = 0;
+      for (let row = 0; row < 5; row++) {
+        const count = row + 1;
+        const z = startZ - row * rowGap;
+        const x0 = -(count - 1) * spacing / 2;
+        for (let i = 0; i < count; i++) {
+          makeBall(nums[idx++], x0 + i * spacing, z);
+        }
+      }
+    }
+
+    rackBalls();
+
+    const cueStick = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.015, 0.015, 2, 20),
+      new THREE.MeshStandardMaterial({ color: 0xaa8844, roughness: 0.7 })
+    );
+    cueStick.castShadow = true;
+    scene.add(cueStick);
+
+    let aimAngle = Math.PI;
+    let aimDir = new THREE.Vector3(0, 0, -1);
+    let isDragging = false;
+    let dragStartY = 0;
+    let power = 0;
+
+    const raycaster = new THREE.Raycaster();
+    const mouse = new THREE.Vector2();
+    const tablePlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -BALL_Y);
+
+    function allBallsStopped() {
+      return balls.every(b => b.pocketed || b.vel.lengthSq() < 1e-6);
+    }
+
+    function updateAimFromMouse(event) {
+      const rect = renderer.domElement.getBoundingClientRect();
+      mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+      mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+      raycaster.setFromCamera(mouse, camera);
+      const hit = new THREE.Vector3();
+      if (raycaster.ray.intersectPlane(tablePlane, hit) && cueBall && !cueBall.pocketed) {
+        const dx = hit.x - cueBall.pos.x;
+        const dz = hit.z - cueBall.pos.z;
+        if (dx * dx + dz * dz > 1e-8) {
+          aimAngle = Math.atan2(dz, dx);
+          aimDir.set(Math.cos(aimAngle), 0, Math.sin(aimAngle)).normalize();
+        }
+      }
+    }
+
+    function updateCueStick() {
+      if (!cueBall || cueBall.pocketed || !allBallsStopped()) {
+        cueStick.visible = false;
+        return;
+      }
+      cueStick.visible = true;
+      const backOffset = 0.65 + power * 0.03;
+      const center = cueBall.pos.clone().add(aimDir.clone().multiplyScalar(-backOffset));
+      cueStick.position.copy(center);
+      cueStick.position.y = BALL_Y + 0.015;
+      cueStick.rotation.z = Math.PI / 2;
+      cueStick.rotation.y = -aimAngle + Math.PI / 2;
+    }
+
+    function shoot() {
+      if (!cueBall || cueBall.pocketed || !allBallsStopped()) return;
+      if (power <= 0.05) return;
+      cueBall.vel.copy(aimDir).multiplyScalar(power);
+      cueBall.omega.set(-aimDir.z * power / BALL_RADIUS, 0, aimDir.x * power / BALL_RADIUS);
+      shotCount++;
+      power = 0;
+      powerBar.style.width = '0%';
+    }
+
+    renderer.domElement.addEventListener('mousemove', (e) => {
+      updateAimFromMouse(e);
+      if (isDragging && allBallsStopped()) {
+        const dy = dragStartY - e.clientY;
+        power = THREE.MathUtils.clamp(Math.abs(dy) * 0.05, 0, 15);
+        powerBar.style.width = `${(power / 15) * 100}%`;
+      }
+    });
+
+    renderer.domElement.addEventListener('mousedown', (e) => {
+      if (!allBallsStopped()) return;
+      if (!cueBall || cueBall.pocketed) return;
+      updateAimFromMouse(e);
+      isDragging = true;
+      dragStartY = e.clientY;
+      power = 0;
+      powerBar.style.width = '0%';
+    });
+
+    window.addEventListener('mouseup', () => {
+      if (isDragging) {
+        isDragging = false;
+        shoot();
+      }
+    });
+
+    window.addEventListener('keydown', (e) => {
+      if (e.code === 'KeyR') {
+        shotCount = 0;
+        rackBalls();
+      } else if (e.code === 'KeyC') {
+        if (cueBall) {
+          cueBall.pocketed = false;
+          cueBall.pos.set(0, BALL_Y, 0.6);
+          cueBall.vel.set(0,0,0);
+          cueBall.omega.set(0,0,0);
+          cueBall.mesh.visible = true;
+          cueBall.mesh.position.copy(cueBall.pos);
+        }
+      } else if (e.code === 'Space') {
+        topDown = !topDown;
+        if (topDown) {
+          camera.position.copy(topDownCamPos);
+          controls.target.set(0, 0.75, 0);
+        } else {
+          camera.position.copy(defaultCamPos);
+          controls.target.set(0, 0.75, 0);
+        }
+        controls.update();
+      }
+    });
+
+    function pocketBall(ball) {
+      if (ball.pocketed) return;
+      ball.pocketed = true;
+      ball.vel.set(0,0,0);
+      ball.omega.set(0,0,0);
+      const idx = pocketedCount;
+      ball.pos.set(0, BALL_Y, 0);
+      ball.mesh.position.set(idx % 2 * 0.13, BALL_Y, Math.floor(idx / 2) * 0.13 - 0.5);
+      tray.add(ball.mesh);
+      pocketedCount++;
+      lastPocketed = ball.number;
+      if (ball.number === 0) {
+        ball.mesh.visible = false;
+      }
+    }
+
+    function resolveBallBall(a, b) {
+      if (a.pocketed || b.pocketed) return;
+      const dx = b.pos.x - a.pos.x;
+      const dz = b.pos.z - a.pos.z;
+      const distSq = dx * dx + dz * dz;
+      const minDist = BALL_RADIUS * 2;
+      if (distSq === 0 || distSq >= minDist * minDist) return;
+
+      const dist = Math.sqrt(distSq);
+      const nx = dx / dist;
+      const nz = dz / dist;
+
+      const overlap = minDist - dist;
+      a.pos.x -= nx * overlap * 0.5;
+      a.pos.z -= nz * overlap * 0.5;
+      b.pos.x += nx * overlap * 0.5;
+      b.pos.z += nz * overlap * 0.5;
+
+      const rvx = b.vel.x - a.vel.x;
+      const rvz = b.vel.z - a.vel.z;
+      const velAlongNormal = rvx * nx + rvz * nz;
+      if (velAlongNormal > 0) return;
+
+      const j = -(1 + BALL_RESTITUTION) * velAlongNormal / 2;
+      const impulseX = j * nx;
+      const impulseZ = j * nz;
+
+      a.vel.x -= impulseX;
+      a.vel.z -= impulseZ;
+      b.vel.x += impulseX;
+      b.vel.z += impulseZ;
+
+      const tangent = new THREE.Vector3(-nz, 0, nx);
+      const relTan = (b.vel.x - a.vel.x) * tangent.x + (b.vel.z - a.vel.z) * tangent.z;
+      const spinTransfer = relTan * 0.08;
+      a.omega.y -= spinTransfer;
+      b.omega.y += spinTransfer;
+    }
+
+    function resolveCushions(ball) {
+      if (ball.pocketed) return;
+
+      const x = ball.pos.x;
+      const z = ball.pos.z;
+
+      const nearPocket = pocketCenters.some(p => {
+        const dx = x - p.x;
+        const dz = z - p.y;
+        return Math.sqrt(dx * dx + dz * dz) < POCKET_RADIUS * 1.2;
+      });
+
+      if (!nearPocket) {
+        if (x > INNER_X - BALL_RADIUS) {
+          ball.pos.x = INNER_X - BALL_RADIUS;
+          ball.vel.x = -Math.abs(ball.vel.x) * CUSHION_RESTITUTION;
+          ball.vel.z += ball.omega.y * 0.02;
+          ball.omega.y *= 0.85;
+        } else if (x < -INNER_X + BALL_RADIUS) {
+          ball.pos.x = -INNER_X + BALL_RADIUS;
+          ball.vel.x = Math.abs(ball.vel.x) * CUSHION_RESTITUTION;
+          ball.vel.z -= ball.omega.y * 0.02;
+          ball.omega.y *= 0.85;
+        }
+
+        if (z > INNER_Z - BALL_RADIUS) {
+          ball.pos.z = INNER_Z - BALL_RADIUS;
+          ball.vel.z = -Math.abs(ball.vel.z) * CUSHION_RESTITUTION;
+          ball.vel.x -= ball.omega.y * 0.02;
+          ball.omega.y *= 0.85;
+        } else if (z < -INNER_Z + BALL_RADIUS) {
+          ball.pos.z = -INNER_Z + BALL_RADIUS;
+          ball.vel.z = Math.abs(ball.vel.z) * CUSHION_RESTITUTION;
+          ball.vel.x += ball.omega.y * 0.02;
+          ball.omega.y *= 0.85;
+        }
+      }
+    }
+
+    function checkPockets(ball) {
+      if (ball.pocketed) return;
+      for (const p of pocketCenters) {
+        const dx = ball.pos.x - p.x;
+        const dz = ball.pos.z - p.y;
+        if (Math.sqrt(dx * dx + dz * dz) < POCKET_CAPTURE) {
+          pocketBall(ball);
+          break;
+        }
+      }
+    }
+
+    function integrateBall(ball, dt) {
+      if (ball.pocketed) return;
+
+      ball.pos.x += ball.vel.x * dt;
+      ball.pos.z += ball.vel.z * dt;
+
+      const damping = Math.max(0, 1 - FRICTION * dt);
+      ball.vel.multiplyScalar(damping);
+
+      if (ball.vel.lengthSq() < 1e-6) ball.vel.set(0,0,0);
+
+      if (ball.vel.lengthSq() > 0) {
+        ball.omega.set(-ball.vel.z / BALL_RADIUS, 0, ball.vel.x / BALL_RADIUS);
+      } else {
+        ball.omega.multiplyScalar(0.9);
+      }
+
+      resolveCushions(ball);
+      checkPockets(ball);
+    }
+
+    function stepPhysics(dt) {
+      for (const ball of balls) integrateBall(ball, dt);
+
+      for (let i = 0; i < balls.length; i++) {
+        for (let j = i + 1; j < balls.length; j++) {
+          resolveBallBall(balls[i], balls[j]);
+        }
+      }
+
+      for (const ball of balls) {
+        if (!ball.pocketed) {
+          ball.mesh.position.copy(ball.pos);
+          const speed = ball.vel.length();
+          if (speed > 0) {
+            const axis = new THREE.Vector3(ball.vel.z, 0, -ball.vel.x).normalize();
+            const angle = speed * dt / BALL_RADIUS;
+            ball.mesh.rotateOnWorldAxis(axis, angle);
+          }
+        }
+      }
+    }
+
+    function updateHUDAndState() {
+      const ballsOnTable = balls.filter(b => !b.pocketed || b.number === 0 && b.mesh.visible).length
+        - (cueBall && cueBall.pocketed ? 1 : 0);
+      const actualBallsOnTable = balls.filter(b => !b.pocketed).length;
+      const cueSpeed = cueBall && !cueBall.pocketed ? cueBall.vel.length() : 0;
+      const stopped = allBallsStopped();
+      let valid = true;
+      let totalKE = 0;
+
+      for (const b of balls) {
+        if (!Number.isFinite(b.pos.x) || !Number.isFinite(b.pos.y) || !Number.isFinite(b.pos.z)) valid = false;
+        if (!b.pocketed) {
+          totalKE += 0.5 * b.vel.lengthSq();
+        }
+      }
+
+      hudBalls.textContent = String(actualBallsOnTable);
+      hudPocketed.textContent = String(pocketedCount);
+      hudShots.textContent = String(shotCount);
+      hudCueSpeed.textContent = cueSpeed.toFixed(3);
+      hudStopped.textContent = stopped ? 'Yes' : 'No';
+      hudLastPocket.textContent = lastPocketed === -1 ? 'None' : String(lastPocketed);
+
+      window.__3D_STATE__ = {
+        ballsOnTable: actualBallsOnTable,
+        pocketedCount,
+        shotCount,
+        cueBallSpeed: Number(cueSpeed.toFixed(4)),
+        allStopped: stopped,
+        lastPocketed,
+        aimAngle: Number(aimAngle.toFixed(3)),
+        power: Number(power.toFixed(1)),
+        frameCount,
+        ballsValid: valid,
+        totalKE: Number(totalKE.toFixed(4))
+      };
+    }
+
+    function animate() {
+      requestAnimationFrame(animate);
+      frameCount++;
+
+      for (let i = 0; i < SUBSTEPS; i++) {
+        stepPhysics(DT / SUBSTEPS);
+      }
+
+      updateCueStick();
+      updateHUDAndState();
+      controls.update();
+      renderer.render(scene, camera);
+    }
+
+    window.__3D_STATE__ = {
+      ballsOnTable: 16,
+      pocketedCount: 0,
+      shotCount: 0,
+      cueBallSpeed: 0,
+      allStopped: true,
+      lastPocketed: -1,
+      aimAngle: Number(aimAngle.toFixed(3)),
+      power: 0,
+      frameCount: 0,
+      ballsValid: true,
+      totalKE: 0
+    };
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    animate();
+  </script>
+</body>
+</html>

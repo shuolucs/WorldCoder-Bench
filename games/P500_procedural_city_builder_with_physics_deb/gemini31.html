@@ -1,0 +1,436 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Procedural City Builder</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #000;
+            font-family: monospace;
+            color: #fff;
+            user-select: none;
+        }
+        canvas {
+            display: block;
+        }
+        #stats-panel {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 15px;
+            border: 1px solid #333;
+            border-radius: 4px;
+            pointer-events: none;
+            z-index: 10;
+            line-height: 1.5;
+        }
+        #debug-panel {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 15px;
+            border: 1px solid #ff0000;
+            border-radius: 4px;
+            pointer-events: none;
+            z-index: 10;
+            display: none;
+            line-height: 1.5;
+            color: #ffaaaa;
+        }
+        .highlight { color: #4a9eff; }
+        .key { background: #333; padding: 2px 6px; border-radius: 3px; color: #fff; }
+    </style>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="stats-panel"></div>
+    <div id="debug-panel"></div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        // --- State Management ---
+        window.__3D_STATE__ = {
+            buildingCount: 0,
+            selectedTool: 'none',
+            totalMass: 0,
+            debugOverlayActive: false,
+            demolishMode: false,
+            grid: Array(10).fill(null).map(() => Array(10).fill(null)),
+            physicsStepCount: 0,
+            buildings: [],
+            averageHeight: 0,
+            lastPlacedId: 0,
+            lastDemolishedId: 0
+        };
+
+        let nextBuildingId = 1;
+        const internalBuildings = []; // Holds extra data like meshes and helpers
+
+        // --- Scene Setup ---
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color('#0d0d1a');
+
+        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.set(30, 40, 30);
+        camera.lookAt(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        document.body.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.05;
+        controls.maxPolarAngle = Math.PI / 2 - 0.05; // Don't go below ground
+
+        // Lights
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.3);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+        dirLight.position.set(10, 30, 10);
+        dirLight.castShadow = true;
+        dirLight.shadow.camera.left = -50;
+        dirLight.shadow.camera.right = 50;
+        dirLight.shadow.camera.top = 50;
+        dirLight.shadow.camera.bottom = -50;
+        dirLight.shadow.mapSize.width = 2048;
+        dirLight.shadow.mapSize.height = 2048;
+        scene.add(dirLight);
+
+        // Ground
+        const groundGeo = new THREE.PlaneGeometry(80, 80);
+        const groundMat = new THREE.MeshStandardMaterial({ color: 0x1a1a2e });
+        const ground = new THREE.Mesh(groundGeo, groundMat);
+        ground.rotation.x = -Math.PI / 2;
+        ground.receiveShadow = true;
+        scene.add(ground);
+
+        // Grid Lines
+        const gridHelper = new THREE.GridHelper(80, 10, 0x333366, 0x333366);
+        gridHelper.position.y = 0.01; // Prevent z-fighting
+        scene.add(gridHelper);
+
+        // --- Materials & Geometries Cache ---
+        const materials = {
+            residential: new THREE.MeshStandardMaterial({ color: 0x4a9eff }),
+            commercial: new THREE.MeshStandardMaterial({ color: 0xff9f43 }),
+            park: new THREE.MeshStandardMaterial({ color: 0x2ecc71 })
+        };
+
+        const previewMaterial = new THREE.MeshStandardMaterial({
+            color: 0xffffff,
+            transparent: true,
+            opacity: 0.3,
+            depthWrite: false
+        });
+
+        // --- Preview Mesh ---
+        const previewMesh = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), previewMaterial);
+        previewMesh.visible = false;
+        scene.add(previewMesh);
+
+        // --- Input & Interaction ---
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+        let currentHoverCell = null;
+
+        function getGridCell(x, z) {
+            const col = Math.floor((x + 40) / 8);
+            const row = Math.floor((z + 40) / 8);
+            if (row >= 0 && row < 10 && col >= 0 && col < 10) return { row, col };
+            return null;
+        }
+
+        function getCellCenter(row, col) {
+            return {
+                x: -40 + col * 8 + 4,
+                z: -40 + row * 8 + 4
+            };
+        }
+
+        function updatePreviewGeometry(type) {
+            previewMesh.geometry.dispose();
+            if (type === 'residential') {
+                previewMesh.geometry = new THREE.BoxGeometry(5, 14, 5);
+                previewMaterial.color.setHex(0x4a9eff);
+            } else if (type === 'commercial') {
+                previewMesh.geometry = new THREE.BoxGeometry(6, 21, 6);
+                previewMaterial.color.setHex(0xff9f43);
+            } else if (type === 'park') {
+                previewMesh.geometry = new THREE.CylinderGeometry(3, 3, 0.5, 16);
+                previewMaterial.color.setHex(0x2ecc71);
+            }
+        }
+
+        window.addEventListener('mousemove', (e) => {
+            mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+
+            if (window.__3D_STATE__.demolishMode || window.__3D_STATE__.selectedTool === 'none') {
+                previewMesh.visible = false;
+                currentHoverCell = null;
+                return;
+            }
+
+            raycaster.setFromCamera(mouse, camera);
+            const intersects = raycaster.intersectObject(ground);
+
+            if (intersects.length > 0) {
+                const cell = getGridCell(intersects[0].point.x, intersects[0].point.z);
+                if (cell) {
+                    currentHoverCell = cell;
+                    const center = getCellCenter(cell.row, cell.col);
+                    previewMesh.position.set(center.x, 0, center.z);
+                    
+                    // Adjust Y so it sits on ground
+                    previewMesh.geometry.computeBoundingBox();
+                    const height = previewMesh.geometry.boundingBox.max.y - previewMesh.geometry.boundingBox.min.y;
+                    previewMesh.position.y = height / 2;
+                    
+                    previewMesh.visible = true;
+                } else {
+                    currentHoverCell = null;
+                    previewMesh.visible = false;
+                }
+            }
+        });
+
+        window.addEventListener('keydown', (e) => {
+            const key = e.key.toLowerCase();
+            const state = window.__3D_STATE__;
+
+            if (key === '1') { state.selectedTool = 'residential'; state.demolishMode = false; updatePreviewGeometry('residential'); }
+            if (key === '2') { state.selectedTool = 'commercial'; state.demolishMode = false; updatePreviewGeometry('commercial'); }
+            if (key === '3') { state.selectedTool = 'park'; state.demolishMode = false; updatePreviewGeometry('park'); }
+            if (key === 'x') {
+                state.demolishMode = !state.demolishMode;
+                state.selectedTool = state.demolishMode ? 'demolish' : 'none';
+                previewMesh.visible = false;
+            }
+            if (key === 'd') {
+                state.debugOverlayActive = !state.debugOverlayActive;
+            }
+        });
+
+        window.addEventListener('mousedown', (e) => {
+            if (e.button !== 0) return; // Left click only
+            const state = window.__3D_STATE__;
+
+            if (state.demolishMode) {
+                raycaster.setFromCamera(mouse, camera);
+                const meshes = internalBuildings.filter(b => !b.demolishing).map(b => b.mesh);
+                const intersects = raycaster.intersectObjects(meshes);
+                
+                if (intersects.length > 0) {
+                    const hitMesh = intersects[0].object;
+                    const bldg = internalBuildings.find(b => b.mesh === hitMesh);
+                    if (bldg) {
+                        bldg.demolishing = true;
+                        state.lastDemolishedId = bldg.id;
+                    }
+                }
+            } else if (['residential', 'commercial', 'park'].includes(state.selectedTool) && currentHoverCell) {
+                const { row, col } = currentHoverCell;
+                
+                // Check if empty
+                if (state.grid[row][col] === null) {
+                    placeBuilding(state.selectedTool, row, col);
+                }
+            }
+        });
+
+        function placeBuilding(type, row, col) {
+            const center = getCellCenter(row, col);
+            let width, height, depth, mass, geometry;
+
+            if (type === 'residential') {
+                width = 4 + Math.random() * 2;
+                height = 8 + Math.random() * 12;
+                depth = 4 + Math.random() * 2;
+                mass = height * 2;
+                geometry = new THREE.BoxGeometry(width, height, depth);
+            } else if (type === 'commercial') {
+                width = 5 + Math.random() * 2;
+                height = 12 + Math.random() * 18;
+                depth = 5 + Math.random() * 2;
+                mass = height * 3;
+                geometry = new THREE.BoxGeometry(width, height, depth);
+            } else if (type === 'park') {
+                width = 6; depth = 6; height = 0.5;
+                mass = 0;
+                geometry = new THREE.CylinderGeometry(3, 3, height, 16);
+            }
+
+            const mesh = new THREE.Mesh(geometry, materials[type]);
+            mesh.position.set(center.x, 50, center.z); // Drop from y=50
+            mesh.castShadow = true;
+            mesh.receiveShadow = true;
+            scene.add(mesh);
+
+            // Debug Helpers
+            const boxHelper = new THREE.BoxHelper(mesh, 0xff0000);
+            boxHelper.visible = false;
+            scene.add(boxHelper);
+
+            const arrowHelper = new THREE.ArrowHelper(new THREE.Vector3(0, -1, 0), mesh.position, 1, 0x00ff00);
+            arrowHelper.visible = false;
+            scene.add(arrowHelper);
+
+            const id = nextBuildingId++;
+            
+            const bldgData = {
+                id, type, row, col, x: center.x, z: center.z, height, mass,
+                velocity: 0, grounded: false,
+                mesh, boxHelper, arrowHelper, demolishing: false
+            };
+
+            internalBuildings.push(bldgData);
+            
+            window.__3D_STATE__.grid[row][col] = { id, type, height, mass };
+            window.__3D_STATE__.lastPlacedId = id;
+        }
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // --- Animation Loop ---
+        const clock = new THREE.Clock();
+        const gravity = -20;
+
+        function animate() {
+            requestAnimationFrame(animate);
+            const dt = Math.min(clock.getDelta(), 0.1); // Cap dt
+            const state = window.__3D_STATE__;
+
+            state.physicsStepCount++;
+
+            let resCount = 0, comCount = 0, parkCount = 0;
+            let totalMass = 0, totalHeight = 0, activeCount = 0;
+
+            // Process Buildings
+            for (let i = internalBuildings.length - 1; i >= 0; i--) {
+                const b = internalBuildings[i];
+
+                if (b.demolishing) {
+                    // Demolition Animation
+                    b.mesh.scale.subScalar(dt * 2);
+                    if (b.mesh.scale.x <= 0) {
+                        scene.remove(b.mesh);
+                        scene.remove(b.boxHelper);
+                        scene.remove(b.arrowHelper);
+                        b.mesh.geometry.dispose();
+                        state.grid[b.row][b.col] = null;
+                        internalBuildings.splice(i, 1);
+                    }
+                } else {
+                    // Physics
+                    if (!b.grounded) {
+                        b.velocity += gravity * dt;
+                        b.mesh.position.y += b.velocity * dt;
+
+                        const targetY = b.type === 'park' ? 0.25 : b.height / 2;
+
+                        if (b.mesh.position.y <= targetY) {
+                            b.mesh.position.y = targetY;
+                            b.velocity = -b.velocity * 0.3; // Bounce
+                            
+                            if (Math.abs(b.velocity) < 0.5) {
+                                b.grounded = true;
+                                b.velocity = 0;
+                            }
+                        }
+                    }
+
+                    // Debug Overlay Update
+                    if (state.debugOverlayActive) {
+                        b.boxHelper.visible = true;
+                        b.boxHelper.update();
+                        
+                        b.arrowHelper.visible = true;
+                        b.arrowHelper.position.copy(b.mesh.position);
+                        const vMag = Math.abs(b.velocity);
+                        if (vMag > 0.01) {
+                            b.arrowHelper.setDirection(new THREE.Vector3(0, Math.sign(b.velocity), 0));
+                            b.arrowHelper.setLength(vMag * 0.2 + 0.5); // Scale for visibility
+                        } else {
+                            b.arrowHelper.setLength(0.01);
+                        }
+                    } else {
+                        b.boxHelper.visible = false;
+                        b.arrowHelper.visible = false;
+                    }
+
+                    // Stats accumulation
+                    activeCount++;
+                    totalMass += b.mass;
+                    totalHeight += b.height;
+                    if (b.type === 'residential') resCount++;
+                    if (b.type === 'commercial') comCount++;
+                    if (b.type === 'park') parkCount++;
+                }
+            }
+
+            // Update State
+            state.buildingCount = activeCount;
+            state.totalMass = totalMass;
+            state.averageHeight = activeCount > 0 ? totalHeight / activeCount : 0;
+            
+            // Expose clean building data
+            state.buildings = internalBuildings.filter(b => !b.demolishing).map(b => ({
+                id: b.id, type: b.type, x: b.x, z: b.z, height: b.height, mass: b.mass, velocity: b.velocity, grounded: b.grounded
+            }));
+
+            // Update HUDs
+            document.getElementById('stats-panel').innerHTML = `
+                <strong>City Builder Controls</strong><br>
+                <span class="key">1</span> Residential <span class="key">2</span> Commercial <span class="key">3</span> Park<br>
+                <span class="key">X</span> Demolish Mode <span class="key">D</span> Physics Debug<br>
+                <hr style="border-color:#333; margin:8px 0;">
+                Tool: <span class="highlight">${state.selectedTool.toUpperCase()}</span><br>
+                Total Buildings: ${state.buildingCount}<br>
+                Total Mass: ${state.totalMass.toFixed(0)}<br>
+                Res: ${resCount} | Com: ${comCount} | Park: ${parkCount}
+            `;
+
+            const debugPanel = document.getElementById('debug-panel');
+            if (state.debugOverlayActive) {
+                debugPanel.style.display = 'block';
+                debugPanel.innerHTML = `
+                    <strong>PHYSICS DEBUG</strong><br>
+                    Step Count: ${state.physicsStepCount}<br>
+                    Active Bodies: ${state.buildingCount}<br>
+                    Total Mass: ${state.totalMass.toFixed(2)}<br>
+                    Avg Height: ${state.averageHeight.toFixed(2)}
+                `;
+            } else {
+                debugPanel.style.display = 'none';
+            }
+
+            controls.update();
+            renderer.render(scene, camera);
+        }
+
+        animate();
+    </script>
+</body>
+</html>

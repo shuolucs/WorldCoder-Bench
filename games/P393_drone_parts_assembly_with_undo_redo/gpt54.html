@@ -1,0 +1,651 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>3D Drone Assembly with Undo/Redo</title>
+  <style>
+    html, body {
+      margin: 0;
+      overflow: hidden;
+      background: #1a1a2e;
+      font-family: Arial, sans-serif;
+    }
+
+    #app {
+      width: 100vw;
+      height: 100vh;
+      position: relative;
+    }
+
+    canvas {
+      display: block;
+    }
+
+    .ui-panel {
+      position: absolute;
+      z-index: 10;
+      user-select: none;
+    }
+
+    #controls {
+      top: 12px;
+      left: 12px;
+      display: flex;
+      gap: 8px;
+    }
+
+    button {
+      padding: 8px 12px;
+      border: none;
+      border-radius: 6px;
+      background: #4e5d94;
+      color: white;
+      cursor: pointer;
+      font-size: 14px;
+    }
+
+    button:hover:not(:disabled) {
+      background: #6476bb;
+    }
+
+    button:disabled {
+      background: #555;
+      color: #999;
+      cursor: not-allowed;
+    }
+
+    #hud-progress {
+      top: 12px;
+      left: 50%;
+      transform: translateX(-50%);
+      color: #ffffff;
+      font-size: 20px;
+      font-weight: bold;
+      text-shadow: 0 0 6px rgba(0,0,0,0.5);
+    }
+
+    #hud-tooltip {
+      bottom: 18px;
+      left: 50%;
+      transform: translateX(-50%);
+      color: #fff;
+      background: rgba(0,0,0,0.55);
+      padding: 8px 12px;
+      border-radius: 6px;
+      font-size: 14px;
+      min-width: 120px;
+      text-align: center;
+      pointer-events: none;
+    }
+
+    #hud-warning {
+      top: 50px;
+      left: 50%;
+      transform: translateX(-50%);
+      color: #ffcc66;
+      font-size: 18px;
+      font-weight: bold;
+      text-shadow: 0 0 8px rgba(0,0,0,0.6);
+      opacity: 0;
+      transition: opacity 0.25s ease;
+    }
+
+    #hud-complete {
+      top: 82px;
+      left: 50%;
+      transform: translateX(-50%);
+      color: #4cff88;
+      font-size: 28px;
+      font-weight: bold;
+      text-shadow: 0 0 10px rgba(0,0,0,0.6);
+      opacity: 0;
+      transition: opacity 0.3s ease;
+    }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <div id="controls" class="ui-panel">
+      <button id="btn-undo" disabled>Undo</button>
+      <button id="btn-redo" disabled>Redo</button>
+      <button id="btn-reset">Reset</button>
+    </div>
+
+    <div id="hud-progress" class="ui-panel">Parts Assembled: 0/5</div>
+    <div id="hud-warning" class="ui-panel"></div>
+    <div id="hud-complete" class="ui-panel">Assembly Complete!</div>
+    <div id="hud-tooltip" class="ui-panel">Hover a part</div>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
+    import { OrbitControls } from 'https://unpkg.com/three@0.160.0/examples/jsm/controls/OrbitControls.js';
+    import { GLTFLoader } from 'https://unpkg.com/three@0.160.0/examples/jsm/loaders/GLTFLoader.js';
+
+    const app = document.getElementById('app');
+    const btnUndo = document.getElementById('btn-undo');
+    const btnRedo = document.getElementById('btn-redo');
+    const btnReset = document.getElementById('btn-reset');
+    const hudProgress = document.getElementById('hud-progress');
+    const hudTooltip = document.getElementById('hud-tooltip');
+    const hudWarning = document.getElementById('hud-warning');
+    const hudComplete = document.getElementById('hud-complete');
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color('#1a1a2e');
+
+    const camera = new THREE.PerspectiveCamera(
+      60,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      100
+    );
+    camera.position.set(0, 5, 10);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    app.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.target.set(0, 0.8, 0);
+
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
+    scene.add(ambientLight);
+
+    const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+    dirLight.position.set(5, 10, 5);
+    scene.add(dirLight);
+
+    const grid = new THREE.GridHelper(20, 20, 0x444466, 0x2c2c4a);
+    grid.position.y = 0;
+    scene.add(grid);
+
+    const trayMat = new THREE.MeshStandardMaterial({
+      color: 0x2f355f,
+      roughness: 0.8,
+      metalness: 0.2
+    });
+    const tray = new THREE.Mesh(
+      new THREE.BoxGeometry(2.5, 0.2, 7.5),
+      trayMat
+    );
+    tray.position.set(5, 0.1, 0);
+    scene.add(tray);
+
+    const assemblyPad = new THREE.Mesh(
+      new THREE.CylinderGeometry(2.3, 2.3, 0.1, 32),
+      new THREE.MeshStandardMaterial({
+        color: 0x242844,
+        roughness: 0.9,
+        metalness: 0.1
+      })
+    );
+    assemblyPad.position.set(0, 0.05, 0);
+    scene.add(assemblyPad);
+
+    const raycaster = new THREE.Raycaster();
+    const mouse = new THREE.Vector2();
+
+    const partDefinitions = [
+      {
+        id: 'frame',
+        label: 'Frame',
+        geometry: new THREE.BoxGeometry(2, 0.2, 2),
+        color: 0x3a3a3a,
+        tray: new THREE.Vector3(5, 0.5, -3),
+        target: new THREE.Vector3(0, 0.5, 0),
+        rotation: new THREE.Euler(0, 0, 0),
+        targetRotation: new THREE.Euler(0, 0, 0)
+      },
+      {
+        id: 'motor_fl',
+        label: 'Motor_FL',
+        geometry: new THREE.CylinderGeometry(0.2, 0.2, 0.5, 24),
+        color: 0xff4444,
+        tray: new THREE.Vector3(5, 0.5, -1.5),
+        target: new THREE.Vector3(-0.8, 0.8, -0.8),
+        rotation: new THREE.Euler(0, 0, Math.PI / 2),
+        targetRotation: new THREE.Euler(0, 0, Math.PI / 2)
+      },
+      {
+        id: 'motor_fr',
+        label: 'Motor_FR',
+        geometry: new THREE.CylinderGeometry(0.2, 0.2, 0.5, 24),
+        color: 0x4488ff,
+        tray: new THREE.Vector3(5, 0.5, 0),
+        target: new THREE.Vector3(0.8, 0.8, -0.8),
+        rotation: new THREE.Euler(0, 0, Math.PI / 2),
+        targetRotation: new THREE.Euler(0, 0, Math.PI / 2)
+      },
+      {
+        id: 'motor_bl',
+        label: 'Motor_BL',
+        geometry: new THREE.CylinderGeometry(0.2, 0.2, 0.5, 24),
+        color: 0x44dd66,
+        tray: new THREE.Vector3(5, 0.5, 1.5),
+        target: new THREE.Vector3(-0.8, 0.8, 0.8),
+        rotation: new THREE.Euler(0, 0, Math.PI / 2),
+        targetRotation: new THREE.Euler(0, 0, Math.PI / 2)
+      },
+      {
+        id: 'motor_br',
+        label: 'Motor_BR',
+        geometry: new THREE.CylinderGeometry(0.2, 0.2, 0.5, 24),
+        color: 0xffdd33,
+        tray: new THREE.Vector3(5, 0.5, 3),
+        target: new THREE.Vector3(0.8, 0.8, 0.8),
+        rotation: new THREE.Euler(0, 0, Math.PI / 2),
+        targetRotation: new THREE.Euler(0, 0, Math.PI / 2)
+      }
+    ];
+
+    const parts = {};
+    const clickableParts = [];
+    const animations = [];
+    let stork = null;
+    let warningTimeout = null;
+    let pulseAnimation = null;
+
+    window.__3D_STATE__ = {
+      assembledParts: [],
+      undoStack: [],
+      redoStack: [],
+      totalAssembled: 0,
+      isComplete: false,
+      hoveredPart: null,
+      storkLoaded: false,
+      animating: false,
+      undoEnabled: false,
+      redoEnabled: false
+    };
+
+    function syncState() {
+      const assembled = Object.values(parts)
+        .filter(p => p.assembled)
+        .sort((a, b) => a.assembledOrder - b.assembledOrder)
+        .map(p => p.id);
+
+      window.__3D_STATE__.assembledParts = [...assembled];
+      window.__3D_STATE__.undoStack = [...history.undoStack];
+      window.__3D_STATE__.redoStack = [...history.redoStack];
+      window.__3D_STATE__.totalAssembled = assembled.length;
+      window.__3D_STATE__.isComplete = assembled.length === partDefinitions.length;
+      window.__3D_STATE__.animating = animations.length > 0;
+      window.__3D_STATE__.undoEnabled = history.undoStack.length > 0 && animations.length === 0;
+      window.__3D_STATE__.redoEnabled = history.redoStack.length > 0 && animations.length === 0;
+
+      btnUndo.disabled = !window.__3D_STATE__.undoEnabled;
+      btnRedo.disabled = !window.__3D_STATE__.redoEnabled;
+      hudProgress.textContent = `Parts Assembled: ${assembled.length}/5`;
+      hudComplete.style.opacity = window.__3D_STATE__.isComplete ? '1' : '0';
+    }
+
+    function setHoveredPart(id) {
+      window.__3D_STATE__.hoveredPart = id;
+      hudTooltip.textContent = id ? (parts[id]?.label || id) : 'Hover a part';
+    }
+
+    function showWarning(message) {
+      hudWarning.textContent = message;
+      hudWarning.style.opacity = '1';
+      if (warningTimeout) clearTimeout(warningTimeout);
+      warningTimeout = setTimeout(() => {
+        hudWarning.style.opacity = '0';
+      }, 1600);
+    }
+
+    function createGhost(def) {
+      const ghostMaterial = new THREE.MeshBasicMaterial({
+        color: 0xffffff,
+        wireframe: true,
+        transparent: true,
+        opacity: 0.28
+      });
+      const ghost = new THREE.Mesh(def.geometry.clone(), ghostMaterial);
+      ghost.position.copy(def.target);
+      ghost.rotation.copy(def.targetRotation);
+      scene.add(ghost);
+      return ghost;
+    }
+
+    function createPart(def) {
+      const material = new THREE.MeshStandardMaterial({
+        color: def.color,
+        emissive: 0x000000,
+        emissiveIntensity: 0.0,
+        roughness: 0.5,
+        metalness: 0.35
+      });
+
+      const mesh = new THREE.Mesh(def.geometry, material);
+      mesh.position.copy(def.tray);
+      mesh.rotation.copy(def.rotation);
+      mesh.castShadow = false;
+      mesh.receiveShadow = false;
+      mesh.userData.partId = def.id;
+
+      scene.add(mesh);
+      clickableParts.push(mesh);
+
+      const ghost = createGhost(def);
+
+      parts[def.id] = {
+        id: def.id,
+        label: def.label,
+        mesh,
+        ghost,
+        trayPosition: def.tray.clone(),
+        targetPosition: def.target.clone(),
+        trayRotation: def.rotation.clone(),
+        targetRotation: def.targetRotation.clone(),
+        assembled: false,
+        assembledOrder: Infinity,
+        baseScale: new THREE.Vector3(1, 1, 1)
+      };
+    }
+
+    partDefinitions.forEach(createPart);
+
+    const history = {
+      undoStack: [],
+      redoStack: [],
+      sequenceCounter: 0
+    };
+
+    function canAssemble(part) {
+      if (part.assembled) return false;
+      if (part.id === 'frame') return true;
+      return parts.frame.assembled;
+    }
+
+    function animatePart(part, toAssembled, onComplete) {
+      const startPos = part.mesh.position.clone();
+      const endPos = toAssembled ? part.targetPosition.clone() : part.trayPosition.clone();
+      const startRot = new THREE.Euler(part.mesh.rotation.x, part.mesh.rotation.y, part.mesh.rotation.z);
+      const endRot = toAssembled ? part.targetRotation.clone() : part.trayRotation.clone();
+
+      animations.push({
+        part,
+        duration: 0.5,
+        elapsed: 0,
+        startPos,
+        endPos,
+        startRot,
+        endRot,
+        onComplete
+      });
+      syncState();
+    }
+
+    function assemblePart(partId, pushHistory = true) {
+      const part = parts[partId];
+      if (!part || part.assembled || animations.length > 0) return;
+
+      if (!canAssemble(part)) {
+        showWarning('Place the frame first!');
+        return;
+      }
+
+      animatePart(part, true, () => {
+        part.assembled = true;
+        part.assembledOrder = history.sequenceCounter++;
+
+        if (pushHistory) {
+          history.undoStack.push(partId);
+          history.redoStack = [];
+        }
+
+        syncState();
+        checkComplete();
+      });
+    }
+
+    function unassemblePart(partId, moveToRedo = true) {
+      const part = parts[partId];
+      if (!part || !part.assembled || animations.length > 0) return;
+
+      animatePart(part, false, () => {
+        part.assembled = false;
+        part.assembledOrder = Infinity;
+
+        if (moveToRedo) {
+          history.redoStack.push(partId);
+        }
+
+        syncState();
+      });
+    }
+
+    function undo() {
+      if (animations.length > 0 || history.undoStack.length === 0) return;
+
+      const partId = history.undoStack.pop();
+      const assembledMotorIds = Object.values(parts)
+        .filter(p => p.assembled && p.id !== 'frame')
+        .map(p => p.id);
+
+      if (partId === 'frame' && assembledMotorIds.length > 0) {
+        history.undoStack.push(partId);
+        showWarning('Undo motors before undoing the frame!');
+        syncState();
+        return;
+      }
+
+      unassemblePart(partId, true);
+      syncState();
+    }
+
+    function redo() {
+      if (animations.length > 0 || history.redoStack.length === 0) return;
+
+      const partId = history.redoStack.pop();
+      const part = parts[partId];
+
+      if (!part) {
+        syncState();
+        return;
+      }
+
+      if (part.id !== 'frame' && !parts.frame.assembled) {
+        history.redoStack.push(partId);
+        showWarning('Redo the frame first!');
+        syncState();
+        return;
+      }
+
+      animatePart(part, true, () => {
+        part.assembled = true;
+        part.assembledOrder = history.sequenceCounter++;
+        history.undoStack.push(partId);
+        syncState();
+        checkComplete();
+      });
+
+      syncState();
+    }
+
+    function resetAll() {
+      if (animations.length > 0) return;
+
+      Object.values(parts).forEach(part => {
+        part.assembled = false;
+        part.assembledOrder = Infinity;
+        part.mesh.position.copy(part.trayPosition);
+        part.mesh.rotation.copy(part.trayRotation);
+        part.mesh.scale.set(1, 1, 1);
+      });
+
+      history.undoStack = [];
+      history.redoStack = [];
+      history.sequenceCounter = 0;
+      pulseAnimation = null;
+      hudComplete.style.opacity = '0';
+      syncState();
+    }
+
+    function checkComplete() {
+      const allAssembled = Object.values(parts).every(p => p.assembled);
+      if (!allAssembled) {
+        pulseAnimation = null;
+        return;
+      }
+
+      pulseAnimation = {
+        time: 0,
+        duration: 1.2
+      };
+      syncState();
+    }
+
+    btnUndo.addEventListener('click', undo);
+    btnRedo.addEventListener('click', redo);
+    btnReset.addEventListener('click', resetAll);
+
+    window.addEventListener('keydown', (e) => {
+      const key = e.key.toLowerCase();
+      if (e.ctrlKey && key === 'z') {
+        e.preventDefault();
+        undo();
+      }
+      if (e.ctrlKey && key === 'y') {
+        e.preventDefault();
+        redo();
+      }
+    });
+
+    renderer.domElement.addEventListener('pointermove', (event) => {
+      const rect = renderer.domElement.getBoundingClientRect();
+      mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+      mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+
+      raycaster.setFromCamera(mouse, camera);
+      const intersects = raycaster.intersectObjects(clickableParts);
+
+      Object.values(parts).forEach(part => {
+        part.mesh.material.emissive.setHex(0x000000);
+        part.mesh.material.emissiveIntensity = 0.0;
+      });
+
+      if (intersects.length > 0) {
+        const mesh = intersects[0].object;
+        const partId = mesh.userData.partId;
+        const part = parts[partId];
+        if (part) {
+          part.mesh.material.emissive.setHex(0xffffff);
+          part.mesh.material.emissiveIntensity = 0.18;
+          setHoveredPart(partId);
+          renderer.domElement.style.cursor = 'pointer';
+          return;
+        }
+      }
+
+      setHoveredPart(null);
+      renderer.domElement.style.cursor = 'default';
+    });
+
+    renderer.domElement.addEventListener('click', () => {
+      if (animations.length > 0) return;
+
+      raycaster.setFromCamera(mouse, camera);
+      const intersects = raycaster.intersectObjects(clickableParts);
+      if (intersects.length > 0) {
+        const partId = intersects[0].object.userData.partId;
+        assemblePart(partId, true);
+      }
+    });
+
+    const loader = new GLTFLoader();
+    loader.load(
+      'stork.glb',
+      (gltf) => {
+        stork = gltf.scene;
+        stork.scale.setScalar(0.3);
+        stork.position.set(0, 4, 0);
+        scene.add(stork);
+        window.__3D_STATE__.storkLoaded = true;
+      },
+      undefined,
+      () => {
+        window.__3D_STATE__.storkLoaded = false;
+      }
+    );
+
+    const clock = new THREE.Clock();
+
+    function updateAnimations(delta) {
+      for (let i = animations.length - 1; i >= 0; i--) {
+        const a = animations[i];
+        a.elapsed += delta;
+        const t = Math.min(a.elapsed / a.duration, 1);
+        const eased = t < 0.5
+          ? 4 * t * t * t
+          : 1 - Math.pow(-2 * t + 2, 3) / 2;
+
+        a.part.mesh.position.lerpVectors(a.startPos, a.endPos, eased);
+        a.part.mesh.rotation.x = THREE.MathUtils.lerp(a.startRot.x, a.endRot.x, eased);
+        a.part.mesh.rotation.y = THREE.MathUtils.lerp(a.startRot.y, a.endRot.y, eased);
+        a.part.mesh.rotation.z = THREE.MathUtils.lerp(a.startRot.z, a.endRot.z, eased);
+
+        if (t >= 1) {
+          a.part.mesh.position.copy(a.endPos);
+          a.part.mesh.rotation.set(a.endRot.x, a.endRot.y, a.endRot.z);
+          animations.splice(i, 1);
+          if (a.onComplete) a.onComplete();
+        }
+      }
+    }
+
+    function updatePulse(delta) {
+      if (!pulseAnimation) {
+        Object.values(parts).forEach(part => part.mesh.scale.set(1, 1, 1));
+        return;
+      }
+
+      pulseAnimation.time += delta;
+      const tt = pulseAnimation.time;
+      const pulse = 1 + 0.08 * Math.sin(tt * 12);
+
+      Object.values(parts).forEach(part => {
+        if (part.assembled) {
+          part.mesh.scale.setScalar(pulse);
+        }
+      });
+
+      if (pulseAnimation.time >= pulseAnimation.duration) {
+        Object.values(parts).forEach(part => part.mesh.scale.set(1, 1, 1));
+        pulseAnimation = null;
+      }
+    }
+
+    function animate() {
+      requestAnimationFrame(animate);
+      const delta = clock.getDelta();
+
+      controls.update();
+      updateAnimations(delta);
+      updatePulse(delta);
+
+      if (stork) {
+        stork.rotation.y += delta * 0.6;
+        stork.position.y = 4 + Math.sin(clock.elapsedTime * 1.5) * 0.1;
+      }
+
+      syncState();
+      renderer.render(scene, camera);
+    }
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    syncState();
+    animate();
+  </script>
+</body>
+</html>

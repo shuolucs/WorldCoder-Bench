@@ -1,0 +1,594 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Three.js GPGPU Boids</title>
+  <style>
+    html, body {
+      margin: 0;
+      height: 100%;
+      overflow: hidden;
+      background: #05070c;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: #fff;
+    }
+    #app {
+      width: 100%;
+      height: 100%;
+      position: relative;
+    }
+    .panel {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      z-index: 10;
+      background: rgba(0, 0, 0, 0.45);
+      border: 1px solid rgba(255,255,255,0.15);
+      border-radius: 10px;
+      padding: 12px 14px;
+      backdrop-filter: blur(6px);
+      min-width: 240px;
+    }
+    .panel h3 {
+      margin: 0 0 10px;
+      font-size: 14px;
+      font-weight: 600;
+    }
+    .control {
+      margin-bottom: 10px;
+    }
+    .control label {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      font-size: 12px;
+      margin-bottom: 4px;
+      color: #d7e3ff;
+    }
+    .control input[type="range"] {
+      width: 100%;
+    }
+    .hint {
+      font-size: 12px;
+      line-height: 1.4;
+      color: rgba(255,255,255,0.75);
+      margin-top: 8px;
+    }
+  </style>
+
+  <script type="importmap">
+  { "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+  } }
+  </script>
+</head>
+<body>
+  <div id="app">
+    <div class="panel">
+      <h3>GPU Boids 控制面板</h3>
+
+      <div class="control">
+        <label>
+          <span>分离半径</span>
+          <span id="separationRadiusValue">3</span>
+        </label>
+        <input id="separationRadius" type="range" min="1" max="10" step="0.5" value="3" />
+      </div>
+
+      <div class="control">
+        <label>
+          <span>对齐半径</span>
+          <span id="alignmentRadiusValue">10</span>
+        </label>
+        <input id="alignmentRadius" type="range" min="5" max="20" step="1" value="10" />
+      </div>
+
+      <div class="control">
+        <label>
+          <span>聚合强度</span>
+          <span id="cohesionValue">1.0</span>
+        </label>
+        <input id="cohesion" type="range" min="0" max="2" step="0.1" value="1.0" />
+      </div>
+
+      <div class="control">
+        <label>
+          <span>速度限制</span>
+          <span id="speedLimitValue">8</span>
+        </label>
+        <input id="speedLimit" type="range" min="1" max="20" step="1" value="8" />
+      </div>
+
+      <div class="hint">
+        鼠标移动到场景中，可在 y=0 平面产生“捕食者”驱散效果。<br/>
+        左键旋转 / 右键平移 / 滚轮缩放。
+      </div>
+    </div>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+    import { GPUComputationRenderer } from 'three/addons/misc/GPUComputationRenderer.js';
+
+    const BOID_COUNT = 500;
+    const TEX_WIDTH = 32;
+    const TEX_HEIGHT = 16;
+    const TEXELS = TEX_WIDTH * TEX_HEIGHT;
+    const BOUNDS = 25;
+    const EDGE_THRESHOLD = 5;
+
+    const app = document.getElementById('app');
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    app.appendChild(renderer.domElement);
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x05070c);
+    scene.fog = new THREE.Fog(0x05070c, 35, 95);
+
+    const camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 0.1, 300);
+    camera.position.set(0, 24, 52);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.target.set(0, 0, 0);
+
+    scene.add(new THREE.AmbientLight(0xffffff, 0.5));
+    const dirLight = new THREE.DirectionalLight(0xffffff, 1.2);
+    dirLight.position.set(20, 30, 10);
+    scene.add(dirLight);
+
+    const grid = new THREE.GridHelper(60, 30, 0x335577, 0x1a2940);
+    grid.position.y = -25;
+    grid.material.transparent = true;
+    grid.material.opacity = 0.18;
+    scene.add(grid);
+
+    const boxEdges = new THREE.EdgesGeometry(new THREE.BoxGeometry(BOUNDS * 2, BOUNDS * 2, BOUNDS * 2));
+    const boxLines = new THREE.LineSegments(
+      boxEdges,
+      new THREE.LineBasicMaterial({
+        color: 0xffffff,
+        transparent: true,
+        opacity: 0.35
+      })
+    );
+    scene.add(boxLines);
+
+    const plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+    const raycaster = new THREE.Raycaster();
+    const pointer = new THREE.Vector2();
+    const predator = new THREE.Vector3(9999, 9999, 9999);
+
+    const gpuCompute = new GPUComputationRenderer(TEX_WIDTH, TEX_HEIGHT, renderer);
+    if (renderer.capabilities.isWebGL2 === false) {
+      gpuCompute.setDataType(THREE.HalfFloatType);
+    }
+
+    const pos0 = gpuCompute.createTexture();
+    const vel0 = gpuCompute.createTexture();
+
+    function fillTextures(positionTexture, velocityTexture) {
+      const p = positionTexture.image.data;
+      const v = velocityTexture.image.data;
+
+      for (let i = 0; i < TEXELS; i++) {
+        const pi = i * 4;
+
+        if (i < BOID_COUNT) {
+          p[pi + 0] = THREE.MathUtils.randFloatSpread(BOUNDS * 2);
+          p[pi + 1] = THREE.MathUtils.randFloatSpread(BOUNDS * 2);
+          p[pi + 2] = THREE.MathUtils.randFloatSpread(BOUNDS * 2);
+          p[pi + 3] = 1;
+
+          const dir = new THREE.Vector3(
+            THREE.MathUtils.randFloatSpread(2),
+            THREE.MathUtils.randFloatSpread(2),
+            THREE.MathUtils.randFloatSpread(2)
+          ).normalize();
+
+          const speed = THREE.MathUtils.randFloat(1, 3);
+          v[pi + 0] = dir.x * speed;
+          v[pi + 1] = dir.y * speed;
+          v[pi + 2] = dir.z * speed;
+          v[pi + 3] = speed;
+        } else {
+          p[pi + 0] = 9999;
+          p[pi + 1] = 9999;
+          p[pi + 2] = 9999;
+          p[pi + 3] = 0;
+
+          v[pi + 0] = 0;
+          v[pi + 1] = 0;
+          v[pi + 2] = 0;
+          v[pi + 3] = 0;
+        }
+      }
+    }
+
+    fillTextures(pos0, vel0);
+
+    const positionShader = /* glsl */`
+      uniform float delta;
+      uniform float bounds;
+      uniform float boidCount;
+      void main() {
+        vec2 uv = gl_FragCoord.xy / resolution.xy;
+        vec4 posData = texture2D(texturePosition, uv);
+        vec4 velData = texture2D(textureVelocity, uv);
+
+        float idx = (gl_FragCoord.y - 0.5) * resolution.x + (gl_FragCoord.x - 0.5);
+        if (idx >= boidCount) {
+          gl_FragColor = posData;
+          return;
+        }
+
+        vec3 pos = posData.xyz + velData.xyz * delta;
+
+        pos = clamp(pos, vec3(-bounds), vec3(bounds));
+
+        gl_FragColor = vec4(pos, 1.0);
+      }
+    `;
+
+    const velocityShader = /* glsl */`
+      uniform float delta;
+      uniform float time;
+      uniform float boidCount;
+      uniform float bounds;
+      uniform float edgeThreshold;
+      uniform float separationRadius;
+      uniform float alignmentRadius;
+      uniform float cohesionWeight;
+      uniform float speedLimit;
+      uniform float separationWeight;
+      uniform float alignmentWeight;
+      uniform vec3 predator;
+
+      float safeLength(vec3 v) {
+        return max(length(v), 0.0001);
+      }
+
+      void main() {
+        vec2 uv = gl_FragCoord.xy / resolution.xy;
+        vec4 posData = texture2D(texturePosition, uv);
+        vec4 velData = texture2D(textureVelocity, uv);
+
+        float idx = (gl_FragCoord.y - 0.5) * resolution.x + (gl_FragCoord.x - 0.5);
+        if (idx >= boidCount) {
+          gl_FragColor = velData;
+          return;
+        }
+
+        vec3 selfPos = posData.xyz;
+        vec3 selfVel = velData.xyz;
+
+        vec3 separation = vec3(0.0);
+        vec3 alignment = vec3(0.0);
+        vec3 cohesion = vec3(0.0);
+
+        float sepCount = 0.0;
+        float aliCount = 0.0;
+
+        for (float y = 0.0; y < ${TEX_HEIGHT.toFixed(1)}; y += 1.0) {
+          for (float x = 0.0; x < ${TEX_WIDTH.toFixed(1)}; x += 1.0) {
+            float j = y * ${TEX_WIDTH.toFixed(1)} + x;
+            if (j >= boidCount) continue;
+            if (abs(j - idx) < 0.5) continue;
+
+            vec2 otherUV = (vec2(x, y) + 0.5) / resolution.xy;
+            vec3 otherPos = texture2D(texturePosition, otherUV).xyz;
+            vec3 otherVel = texture2D(textureVelocity, otherUV).xyz;
+
+            vec3 diff = selfPos - otherPos;
+            float dist = length(diff);
+
+            if (dist > 0.0 && dist < separationRadius) {
+              separation += normalize(diff) * (1.0 - dist / separationRadius) / max(dist, 0.05);
+              sepCount += 1.0;
+            }
+
+            if (dist > 0.0 && dist < alignmentRadius) {
+              alignment += normalize(otherVel);
+              cohesion += otherPos;
+              aliCount += 1.0;
+            }
+          }
+        }
+
+        if (sepCount > 0.0) {
+          separation /= sepCount;
+        }
+
+        if (aliCount > 0.0) {
+          alignment = normalize(alignment / aliCount) - normalize(selfVel + vec3(0.00001));
+          vec3 center = cohesion / aliCount;
+          cohesion = center - selfPos;
+          if (length(cohesion) > 0.0) cohesion = normalize(cohesion);
+        } else {
+          alignment = vec3(0.0);
+          cohesion = vec3(0.0);
+        }
+
+        vec3 boundaryForce = vec3(0.0);
+        if (selfPos.x > bounds - edgeThreshold) boundaryForce.x -= (selfPos.x - (bounds - edgeThreshold)) / edgeThreshold;
+        if (selfPos.x < -bounds + edgeThreshold) boundaryForce.x += ((-bounds + edgeThreshold) - selfPos.x) / edgeThreshold;
+        if (selfPos.y > bounds - edgeThreshold) boundaryForce.y -= (selfPos.y - (bounds - edgeThreshold)) / edgeThreshold;
+        if (selfPos.y < -bounds + edgeThreshold) boundaryForce.y += ((-bounds + edgeThreshold) - selfPos.y) / edgeThreshold;
+        if (selfPos.z > bounds - edgeThreshold) boundaryForce.z -= (selfPos.z - (bounds - edgeThreshold)) / edgeThreshold;
+        if (selfPos.z < -bounds + edgeThreshold) boundaryForce.z += ((-bounds + edgeThreshold) - selfPos.z) / edgeThreshold;
+
+        vec3 predatorForce = vec3(0.0);
+        vec3 predDiff = selfPos - predator;
+        float predDist = length(predDiff);
+        if (predDist < 10.0) {
+          predatorForce = normalize(predDiff + vec3(0.0001)) * (1.0 - predDist / 10.0) * 8.0 / max(predDist, 0.25);
+        }
+
+        vec3 noise = vec3(
+          sin(time * 0.7 + selfPos.y * 0.13 + selfPos.z * 0.11),
+          cos(time * 0.9 + selfPos.x * 0.17 + selfPos.z * 0.07),
+          sin(time * 0.5 + selfPos.x * 0.09 + selfPos.y * 0.15)
+        ) * 0.03;
+
+        vec3 newVel =
+          selfVel +
+          separation * separationWeight * delta * 10.0 +
+          alignment * alignmentWeight * delta * 6.0 +
+          cohesion * cohesionWeight * delta * 4.0 +
+          boundaryForce * delta * 14.0 +
+          predatorForce * delta * 22.0 +
+          noise * delta;
+
+        float speed = length(newVel);
+        if (speed < 0.2) {
+          newVel = normalize(selfVel + vec3(0.0001, 0.0, 0.0)) * 0.2;
+          speed = 0.2;
+        }
+        if (speed > speedLimit) {
+          newVel = normalize(newVel) * speedLimit;
+          speed = speedLimit;
+        }
+
+        gl_FragColor = vec4(newVel, speed);
+      }
+    `;
+
+    const posVar = gpuCompute.addVariable('texturePosition', positionShader, pos0);
+    const velVar = gpuCompute.addVariable('textureVelocity', velocityShader, vel0);
+
+    gpuCompute.setVariableDependencies(posVar, [posVar, velVar]);
+    gpuCompute.setVariableDependencies(velVar, [posVar, velVar]);
+
+    posVar.material.uniforms.delta = { value: 0 };
+    posVar.material.uniforms.bounds = { value: BOUNDS };
+    posVar.material.uniforms.boidCount = { value: BOID_COUNT };
+
+    velVar.material.uniforms.delta = { value: 0 };
+    velVar.material.uniforms.time = { value: 0 };
+    velVar.material.uniforms.boidCount = { value: BOID_COUNT };
+    velVar.material.uniforms.bounds = { value: BOUNDS };
+    velVar.material.uniforms.edgeThreshold = { value: EDGE_THRESHOLD };
+    velVar.material.uniforms.separationRadius = { value: 3 };
+    velVar.material.uniforms.alignmentRadius = { value: 10 };
+    velVar.material.uniforms.cohesionWeight = { value: 1.0 };
+    velVar.material.uniforms.speedLimit = { value: 8 };
+    velVar.material.uniforms.separationWeight = { value: 1.6 };
+    velVar.material.uniforms.alignmentWeight = { value: 1.0 };
+    velVar.material.uniforms.predator = { value: predator.clone() };
+
+    const error = gpuCompute.init();
+    if (error !== null) {
+      throw new Error(error);
+    }
+
+    const coneGeometry = new THREE.ConeGeometry(0.15, 0.5, 8);
+    coneGeometry.translate(0, 0.25, 0);
+    const coneMaterial = new THREE.MeshStandardMaterial({
+      color: 0xffffff,
+      roughness: 0.35,
+      metalness: 0.0,
+      vertexColors: true,
+      emissive: 0x112244,
+      emissiveIntensity: 0.35
+    });
+
+    const colorArray = new Float32Array(coneGeometry.attributes.position.count * 3);
+    for (let i = 0; i < coneGeometry.attributes.position.count; i++) {
+      colorArray[i * 3 + 0] = 1;
+      colorArray[i * 3 + 1] = 1;
+      colorArray[i * 3 + 2] = 1;
+    }
+    coneGeometry.setAttribute('color', new THREE.BufferAttribute(colorArray, 3));
+
+    const boids = new THREE.InstancedMesh(coneGeometry, coneMaterial, BOID_COUNT);
+    boids.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+
+    const instanceColors = new Float32Array(BOID_COUNT * 3);
+    boids.instanceColor = new THREE.InstancedBufferAttribute(instanceColors, 3);
+    scene.add(boids);
+
+    const dummy = new THREE.Object3D();
+    const upAxis = new THREE.Vector3(0, 1, 0);
+    const velDir = new THREE.Vector3();
+    const color = new THREE.Color();
+
+    const rtPosBuffer = new Float32Array(TEXELS * 4);
+    const rtVelBuffer = new Float32Array(TEXELS * 4);
+
+    const ui = {
+      separationRadius: document.getElementById('separationRadius'),
+      alignmentRadius: document.getElementById('alignmentRadius'),
+      cohesion: document.getElementById('cohesion'),
+      speedLimit: document.getElementById('speedLimit'),
+      separationRadiusValue: document.getElementById('separationRadiusValue'),
+      alignmentRadiusValue: document.getElementById('alignmentRadiusValue'),
+      cohesionValue: document.getElementById('cohesionValue'),
+      speedLimitValue: document.getElementById('speedLimitValue'),
+    };
+
+    function updateLabels() {
+      ui.separationRadiusValue.textContent = ui.separationRadius.value;
+      ui.alignmentRadiusValue.textContent = ui.alignmentRadius.value;
+      ui.cohesionValue.textContent = Number(ui.cohesion.value).toFixed(1);
+      ui.speedLimitValue.textContent = ui.speedLimit.value;
+    }
+    updateLabels();
+
+    [ui.separationRadius, ui.alignmentRadius, ui.cohesion, ui.speedLimit].forEach(el => {
+      el.addEventListener('input', updateLabels);
+    });
+
+    renderer.domElement.addEventListener('pointermove', (event) => {
+      const rect = renderer.domElement.getBoundingClientRect();
+      pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+      pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+
+      raycaster.setFromCamera(pointer, camera);
+      const hit = new THREE.Vector3();
+      if (raycaster.ray.intersectPlane(plane, hit)) {
+        predator.copy(hit);
+      }
+    });
+
+    renderer.domElement.addEventListener('pointerleave', () => {
+      predator.set(9999, 9999, 9999);
+    });
+
+    const clock = new THREE.Clock();
+    let frame = 0;
+
+    function updateInstances() {
+      const posRT = gpuCompute.getCurrentRenderTarget(posVar);
+      const velRT = gpuCompute.getCurrentRenderTarget(velVar);
+
+      renderer.readRenderTargetPixels(posRT, 0, 0, TEX_WIDTH, TEX_HEIGHT, rtPosBuffer);
+      renderer.readRenderTargetPixels(velRT, 0, 0, TEX_WIDTH, TEX_HEIGHT, rtVelBuffer);
+
+      let avgSpeed = 0;
+      let cx = 0, cy = 0, cz = 0;
+
+      for (let i = 0; i < BOID_COUNT; i++) {
+        const idx = i * 4;
+
+        const px = rtPosBuffer[idx + 0];
+        const py = rtPosBuffer[idx + 1];
+        const pz = rtPosBuffer[idx + 2];
+
+        const vx = rtVelBuffer[idx + 0];
+        const vy = rtVelBuffer[idx + 1];
+        const vz = rtVelBuffer[idx + 2];
+
+        const speed = Math.sqrt(vx * vx + vy * vy + vz * vz);
+        avgSpeed += speed;
+
+        cx += px;
+        cy += py;
+        cz += pz;
+
+        dummy.position.set(px, py, pz);
+
+        velDir.set(vx, vy, vz);
+        if (velDir.lengthSq() < 1e-6) velDir.set(0, 1, 0);
+        velDir.normalize();
+        dummy.quaternion.setFromUnitVectors(upAxis, velDir);
+
+        dummy.scale.setScalar(1);
+        dummy.updateMatrix();
+        boids.setMatrixAt(i, dummy.matrix);
+
+        const t = THREE.MathUtils.clamp(speed / Number(ui.speedLimit.value || 8), 0, 1);
+        color.setHSL(0.66 * (1.0 - t), 1.0, 0.6);
+        boids.setColorAt(i, color);
+      }
+
+      boids.instanceMatrix.needsUpdate = true;
+      if (boids.instanceColor) boids.instanceColor.needsUpdate = true;
+
+      avgSpeed /= BOID_COUNT;
+      cx /= BOID_COUNT;
+      cy /= BOID_COUNT;
+      cz /= BOID_COUNT;
+
+      if (frame % 10 === 0) {
+        let distSum = 0;
+        const sampleCount = 50;
+        for (let s = 0; s < sampleCount; s++) {
+          const a = Math.floor(Math.random() * BOID_COUNT);
+          let b = Math.floor(Math.random() * BOID_COUNT);
+          if (b === a) b = (b + 1) % BOID_COUNT;
+
+          const ia = a * 4;
+          const ib = b * 4;
+
+          const dx = rtPosBuffer[ia + 0] - rtPosBuffer[ib + 0];
+          const dy = rtPosBuffer[ia + 1] - rtPosBuffer[ib + 1];
+          const dz = rtPosBuffer[ia + 2] - rtPosBuffer[ib + 2];
+          distSum += Math.sqrt(dx * dx + dy * dy + dz * dz);
+        }
+
+        window.__3D_STATE__ = {
+          boidCount: BOID_COUNT,
+          separationRadius: Number(ui.separationRadius.value),
+          alignmentRadius: Number(ui.alignmentRadius.value),
+          cohesion: Number(ui.cohesion.value),
+          speedLimit: Number(ui.speedLimit.value),
+          avgSpeed,
+          avgNeighborDist: distSum / sampleCount,
+          centerOfMass: { x: cx, y: cy, z: cz }
+        };
+      }
+    }
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      const delta = Math.min(clock.getDelta(), 0.033);
+      const elapsed = clock.elapsedTime;
+      frame++;
+
+      controls.update();
+
+      posVar.material.uniforms.delta.value = delta;
+      velVar.material.uniforms.delta.value = delta;
+      velVar.material.uniforms.time.value = elapsed;
+      velVar.material.uniforms.predator.value.copy(predator);
+
+      velVar.material.uniforms.separationRadius.value = Number(ui.separationRadius.value);
+      velVar.material.uniforms.alignmentRadius.value = Number(ui.alignmentRadius.value);
+      velVar.material.uniforms.cohesionWeight.value = Number(ui.cohesion.value);
+      velVar.material.uniforms.speedLimit.value = Number(ui.speedLimit.value);
+
+      gpuCompute.compute();
+      updateInstances();
+
+      renderer.render(scene, camera);
+    }
+
+    animate();
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    window.__3D_STATE__ = {
+      boidCount: BOID_COUNT,
+      separationRadius: 3,
+      alignmentRadius: 10,
+      cohesion: 1.0,
+      speedLimit: 8,
+      avgSpeed: 0,
+      avgNeighborDist: 0,
+      centerOfMass: { x: 0, y: 0, z: 0 }
+    };
+  </script>
+</body>
+</html>

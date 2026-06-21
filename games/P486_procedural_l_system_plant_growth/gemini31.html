@@ -1,0 +1,532 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Procedural L-System Plant</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #1a1a2e;
+            font-family: monospace;
+            color: #ffffff;
+        }
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+        }
+        #hud {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 15px;
+            border-radius: 8px;
+            border: 1px solid #444;
+            pointer-events: none;
+            user-select: none;
+        }
+        .hud-line {
+            margin: 5px 0;
+            font-size: 14px;
+        }
+        .highlight {
+            color: #00FFCC;
+            font-weight: bold;
+        }
+        #controls-help {
+            margin-top: 15px;
+            font-size: 12px;
+            color: #aaa;
+            border-top: 1px solid #444;
+            padding-top: 10px;
+        }
+        #btnSnapshot {
+            position: absolute;
+            top: 220px;
+            left: 10px;
+            padding: 8px 16px;
+            background: #228B22;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-family: monospace;
+            font-weight: bold;
+            pointer-events: auto;
+        }
+        #btnSnapshot:hover {
+            background: #2ea82e;
+        }
+        #btnSnapshot:active {
+            background: #1a6b1a;
+        }
+    </style>
+    <!-- Import Three.js -->
+    <script async src="https://unpkg.com/es-module-shims@1.6.3/dist/es-module-shims.js"></script>
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://unpkg.com/three@0.154.0/build/three.module.js",
+          "three/addons/": "https://unpkg.com/three@0.154.0/examples/jsm/"
+        }
+      }
+    </script>
+</head>
+<body>
+    <div id="hud">
+        <div class="hud-line">Generation: <span id="genDisplay" class="highlight">0</span> / 4</div>
+        <div class="hud-line">Branches: <span id="branchCount" class="highlight">0</span></div>
+        <div class="hud-line">Leaves: <span id="leafCount" class="highlight">0</span></div>
+        <div class="hud-line">Theme: <span id="themeDisplay" class="highlight">natural</span></div>
+        <div class="hud-line">Selected Depth: <span id="selectedDepth" class="highlight">-</span></div>
+        
+        <div id="controls-help">
+            [G] Grow Next Gen<br>
+            [R] Reset to Gen 0<br>
+            [C] Cycle Theme<br>
+            [L] Toggle Leaves<br>
+            [Click] Select Branch
+        </div>
+    </div>
+    <button id="btnSnapshot">Snapshot Stats</button>
+    <div id="canvas-container"></div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        // --- State Management ---
+        window.__3D_STATE__ = {
+            generation: 0,
+            totalBranches: 0,
+            totalLeaves: 0,
+            growthProgress: 1.0,
+            colorTheme: 'natural',
+            leavesVisible: true,
+            selectedBranchDepth: -1,
+            maxGeneration: 4,
+            isGrowing: false,
+            plantHeight: 0,
+            snapshotTaken: false,
+            branchRadiusBase: 0.15
+        };
+
+        const state = window.__3D_STATE__;
+
+        // --- Constants & Themes ---
+        const AXIOM = 'F';
+        const RULE = 'FF+[+F-F-F]-[-F+F+F]';
+        const ANGLE = 25 * Math.PI / 180;
+        const GOLDEN_ANGLE = 137.5 * Math.PI / 180; // For 3D volume
+        
+        const THEMES = {
+            natural: { base: 0x8B4513, tip: 0x228B22, leaf: 0x22aa22 },
+            autumn:  { base: 0x8B4513, tip: 0xFF6600, leaf: 0xCC0000 },
+            fantasy: { base: 0x4B0082, tip: 0x9900FF, leaf: 0x00FFCC }
+        };
+        const THEME_KEYS = Object.keys(THEMES);
+
+        // --- Scene Setup ---
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x1a1a2e);
+
+        const camera = new THREE.Camera(); // Placeholder, initialized below
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        container.appendChild(renderer.domElement);
+
+        const perspectiveCamera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
+        perspectiveCamera.position.set(0, 8, 15);
+        perspectiveCamera.lookAt(0, 0, 0);
+
+        const controls = new OrbitControls(perspectiveCamera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.05;
+        controls.target.set(0, 4, 0); // Look slightly up
+
+        // Lights
+        const ambientLight = new THREE.AmbientLight(0x404040);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+        dirLight.position.set(5, 10, 5);
+        scene.add(dirLight);
+
+        // Ground & Grid
+        const groundGeom = new THREE.PlaneGeometry(20, 20);
+        const groundMat = new THREE.MeshLambertMaterial({ color: 0x556b2f });
+        const ground = new THREE.Mesh(groundGeom, groundMat);
+        ground.rotation.x = -Math.PI / 2;
+        scene.add(ground);
+
+        const gridHelper = new THREE.GridHelper(20, 20, 0x000000, 0x000000);
+        gridHelper.material.opacity = 0.2;
+        gridHelper.material.transparent = true;
+        scene.add(gridHelper);
+
+        // --- L-System Logic ---
+        let branchMesh = null;
+        let leafMesh = null;
+        let segmentsData = [];
+        let selectedInstanceId = -1;
+        let growthStartTime = 0;
+
+        const cylinderGeom = new THREE.CylinderGeometry(1, 1, 1, 8);
+        cylinderGeom.translate(0, 0.5, 0); // Origin at base
+        const sphereGeom = new THREE.SphereGeometry(1, 16, 16);
+
+        const branchMat = new THREE.MeshLambertMaterial({ color: 0xffffff });
+        const leafMat = new THREE.MeshLambertMaterial({ color: 0xffffff });
+
+        function generateString(gen) {
+            let str = AXIOM;
+            for (let i = 0; i < gen; i++) {
+                let nextStr = '';
+                for (let j = 0; j < str.length; j++) {
+                    nextStr += str[j] === 'F' ? RULE : str[j];
+                }
+                str = nextStr;
+            }
+            return str;
+        }
+
+        function buildPlant() {
+            // Cleanup old meshes
+            if (branchMesh) scene.remove(branchMesh);
+            if (leafMesh) scene.remove(leafMesh);
+            segmentsData = [];
+            selectedInstanceId = -1;
+            state.selectedBranchDepth = -1;
+            state.plantHeight = 0;
+
+            const lString = generateString(state.generation);
+            
+            const turtle = new THREE.Object3D();
+            turtle.position.set(0, 0, 0);
+            turtle.rotation.set(0, 0, 0);
+
+            let currentDepth = 0;
+            let maxDepth = 0;
+            const stack = [];
+            let currentLastSegment = null;
+
+            // Parse string and build segment data
+            for (let i = 0; i < lString.length; i++) {
+                const char = lString[i];
+                if (char === 'F') {
+                    const length = 1.0 * Math.pow(0.8, currentDepth);
+                    const radius = state.branchRadiusBase * Math.pow(0.7, currentDepth);
+                    
+                    const start = turtle.position.clone();
+                    turtle.translateY(length);
+                    const end = turtle.position.clone();
+
+                    const segment = {
+                        id: segmentsData.length,
+                        start: start,
+                        end: end,
+                        position: start.clone(),
+                        quaternion: turtle.quaternion.clone(),
+                        scale: new THREE.Vector3(radius, length, radius),
+                        depth: currentDepth,
+                        isTerminal: false,
+                        hasLeaf: false,
+                        leafIndex: -1
+                    };
+                    
+                    segmentsData.push(segment);
+                    currentLastSegment = segment;
+                    maxDepth = Math.max(maxDepth, currentDepth);
+                    state.plantHeight = Math.max(state.plantHeight, end.y);
+
+                } else if (char === '+') {
+                    turtle.rotateZ(-ANGLE);
+                } else if (char === '-') {
+                    turtle.rotateZ(ANGLE);
+                } else if (char === '[') {
+                    stack.push({
+                        pos: turtle.position.clone(),
+                        rot: turtle.rotation.clone(),
+                        depth: currentDepth,
+                        lastSeg: currentLastSegment
+                    });
+                    currentDepth++;
+                    turtle.rotateY(GOLDEN_ANGLE); // 3D twist
+                    currentLastSegment = null;
+                } else if (char === ']') {
+                    if (currentLastSegment) currentLastSegment.isTerminal = true;
+                    const s = stack.pop();
+                    turtle.position.copy(s.pos);
+                    turtle.rotation.copy(s.rot);
+                    currentDepth = s.depth;
+                    currentLastSegment = s.lastSeg;
+                }
+            }
+            if (currentLastSegment) currentLastSegment.isTerminal = true;
+
+            state.totalBranches = segmentsData.length;
+            
+            // Determine leaves
+            let leafCount = 0;
+            if (state.generation >= 2) {
+                segmentsData.forEach(seg => {
+                    if (seg.isTerminal) {
+                        seg.hasLeaf = true;
+                        seg.leafIndex = leafCount++;
+                    }
+                });
+            }
+            state.totalLeaves = leafCount;
+
+            // Create Instanced Meshes
+            if (state.totalBranches > 0) {
+                branchMesh = new THREE.InstancedMesh(cylinderGeom, branchMat, state.totalBranches);
+                branchMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+                scene.add(branchMesh);
+            }
+
+            if (state.totalLeaves > 0) {
+                leafMesh = new THREE.InstancedMesh(sphereGeom, leafMat, state.totalLeaves);
+                leafMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+                leafMesh.visible = state.leavesVisible;
+                scene.add(leafMesh);
+            }
+
+            // Pre-calculate colors
+            const theme = THEMES[state.colorTheme];
+            const baseColor = new THREE.Color(theme.base);
+            const tipColor = new THREE.Color(theme.tip);
+            const leafColor = new THREE.Color(theme.leaf);
+
+            segmentsData.forEach((seg, i) => {
+                const t = maxDepth === 0 ? 0 : seg.depth / maxDepth;
+                seg.baseColor = baseColor.clone().lerp(tipColor, t);
+                
+                if (branchMesh) {
+                    branchMesh.setColorAt(i, seg.baseColor);
+                    // Initialize matrix to 0 scale
+                    const dummy = new THREE.Object3D();
+                    dummy.position.copy(seg.position);
+                    dummy.quaternion.copy(seg.quaternion);
+                    dummy.scale.set(0, 0, 0);
+                    dummy.updateMatrix();
+                    branchMesh.setMatrixAt(i, dummy.matrix);
+                }
+
+                if (seg.hasLeaf && leafMesh) {
+                    leafMesh.setColorAt(seg.leafIndex, leafColor);
+                    const dummy = new THREE.Object3D();
+                    dummy.position.copy(seg.end);
+                    dummy.scale.set(0, 0, 0);
+                    dummy.updateMatrix();
+                    leafMesh.setMatrixAt(seg.leafIndex, dummy.matrix);
+                }
+            });
+
+            if (branchMesh) branchMesh.instanceColor.needsUpdate = true;
+            if (leafMesh) leafMesh.instanceColor.needsUpdate = true;
+
+            // Start Animation
+            state.isGrowing = true;
+            state.growthProgress = 0.0;
+            growthStartTime = performance.now() / 1000;
+            
+            updateHUD();
+        }
+
+        function applyTheme() {
+            if (!branchMesh) return;
+            
+            const theme = THEMES[state.colorTheme];
+            const baseColor = new THREE.Color(theme.base);
+            const tipColor = new THREE.Color(theme.tip);
+            const leafColor = new THREE.Color(theme.leaf);
+            
+            let maxDepth = 0;
+            segmentsData.forEach(s => maxDepth = Math.max(maxDepth, s.depth));
+
+            segmentsData.forEach((seg, i) => {
+                const t = maxDepth === 0 ? 0 : seg.depth / maxDepth;
+                seg.baseColor = baseColor.clone().lerp(tipColor, t);
+                
+                if (i === selectedInstanceId) {
+                    branchMesh.setColorAt(i, new THREE.Color(0xFFFF00));
+                } else {
+                    branchMesh.setColorAt(i, seg.baseColor);
+                }
+
+                if (seg.hasLeaf && leafMesh) {
+                    leafMesh.setColorAt(seg.leafIndex, leafColor);
+                }
+            });
+
+            branchMesh.instanceColor.needsUpdate = true;
+            if (leafMesh) leafMesh.instanceColor.needsUpdate = true;
+            updateHUD();
+        }
+
+        // --- Interaction ---
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+
+        window.addEventListener('pointerdown', (event) => {
+            if (event.target.id === 'btnSnapshot') return;
+            
+            mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+            raycaster.setFromCamera(mouse, perspectiveCamera);
+
+            if (branchMesh) {
+                const intersects = raycaster.intersectObject(branchMesh);
+                if (intersects.length > 0) {
+                    const instanceId = intersects[0].instanceId;
+                    
+                    // Reset old
+                    if (selectedInstanceId !== -1 && selectedInstanceId !== instanceId) {
+                        branchMesh.setColorAt(selectedInstanceId, segmentsData[selectedInstanceId].baseColor);
+                    }
+                    
+                    // Set new
+                    selectedInstanceId = instanceId;
+                    branchMesh.setColorAt(instanceId, new THREE.Color(0xFFFF00));
+                    branchMesh.instanceColor.needsUpdate = true;
+                    
+                    state.selectedBranchDepth = segmentsData[instanceId].depth;
+                } else {
+                    // Deselect
+                    if (selectedInstanceId !== -1) {
+                        branchMesh.setColorAt(selectedInstanceId, segmentsData[selectedInstanceId].baseColor);
+                        branchMesh.instanceColor.needsUpdate = true;
+                        selectedInstanceId = -1;
+                        state.selectedBranchDepth = -1;
+                    }
+                }
+                updateHUD();
+            }
+        });
+
+        window.addEventListener('keydown', (e) => {
+            const key = e.key.toLowerCase();
+            if (key === 'g') {
+                if (state.generation < state.maxGeneration && !state.isGrowing) {
+                    state.generation++;
+                    buildPlant();
+                }
+            } else if (key === 'r') {
+                if (!state.isGrowing) {
+                    state.generation = 0;
+                    buildPlant();
+                }
+            } else if (key === 'c') {
+                const idx = THEME_KEYS.indexOf(state.colorTheme);
+                state.colorTheme = THEME_KEYS[(idx + 1) % THEME_KEYS.length];
+                applyTheme();
+            } else if (key === 'l') {
+                state.leavesVisible = !state.leavesVisible;
+                if (leafMesh) leafMesh.visible = state.leavesVisible;
+            }
+        });
+
+        document.getElementById('btnSnapshot').addEventListener('click', () => {
+            state.snapshotTaken = true;
+            console.log('Snapshot taken:', JSON.parse(JSON.stringify(state)));
+        });
+
+        window.addEventListener('resize', () => {
+            perspectiveCamera.aspect = window.innerWidth / window.innerHeight;
+            perspectiveCamera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // --- UI Update ---
+        const elGen = document.getElementById('genDisplay');
+        const elBranch = document.getElementById('branchCount');
+        const elLeaf = document.getElementById('leafCount');
+        const elTheme = document.getElementById('themeDisplay');
+        const elDepth = document.getElementById('selectedDepth');
+
+        function updateHUD() {
+            elGen.innerText = state.generation;
+            elBranch.innerText = state.totalBranches;
+            elLeaf.innerText = state.totalLeaves;
+            elTheme.innerText = state.colorTheme;
+            elDepth.innerText = state.selectedBranchDepth === -1 ? '-' : state.selectedBranchDepth;
+        }
+
+        // --- Animation Loop ---
+        const dummyMatrix = new THREE.Matrix4();
+        const dummyObj = new THREE.Object3D();
+
+        function animate() {
+            requestAnimationFrame(animate);
+            controls.update();
+
+            if (state.isGrowing && branchMesh) {
+                const currentTime = performance.now() / 1000;
+                const elapsed = currentTime - growthStartTime;
+                const totalDuration = 2.0;
+                
+                state.growthProgress = Math.min(elapsed / totalDuration, 1.0);
+
+                const totalSegs = segmentsData.length;
+                let allDone = true;
+
+                for (let i = 0; i < totalSegs; i++) {
+                    const seg = segmentsData[i];
+                    // Sequential delay based on index
+                    const delay = (i / totalSegs) * 1.5; 
+                    const duration = 0.5;
+                    
+                    let p = (elapsed - delay) / duration;
+                    p = Math.max(0, Math.min(p, 1.0));
+                    
+                    // Smoothstep easing
+                    const easeP = p * p * (3 - 2 * p);
+
+                    dummyObj.position.copy(seg.position);
+                    dummyObj.quaternion.copy(seg.quaternion);
+                    dummyObj.scale.copy(seg.scale).multiplyScalar(easeP);
+                    dummyObj.updateMatrix();
+                    branchMesh.setMatrixAt(i, dummyObj.matrix);
+
+                    if (seg.hasLeaf && leafMesh) {
+                        // Leaves grow slightly after branch
+                        let leafP = (elapsed - (delay + 0.3)) / 0.3;
+                        leafP = Math.max(0, Math.min(leafP, 1.0));
+                        const leafEaseP = leafP * leafP * (3 - 2 * leafP);
+                        
+                        dummyObj.position.copy(seg.end);
+                        dummyObj.quaternion.identity();
+                        dummyObj.scale.setScalar(0.1 * leafEaseP);
+                        dummyObj.updateMatrix();
+                        leafMesh.setMatrixAt(seg.leafIndex, dummyObj.matrix);
+                    }
+
+                    if (p < 1.0) allDone = false;
+                }
+
+                branchMesh.instanceMatrix.needsUpdate = true;
+                if (leafMesh) leafMesh.instanceMatrix.needsUpdate = true;
+
+                if (allDone && state.growthProgress >= 1.0) {
+                    state.isGrowing = false;
+                    state.growthProgress = 1.0;
+                }
+            }
+
+            renderer.render(scene, perspectiveCamera);
+        }
+
+        // Init
+        buildPlant();
+        animate();
+
+    </script>
+</body>
+</html>

@@ -1,0 +1,624 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>3D Avocado Supply Chain</title>
+  <style>
+    html, body {
+      margin: 0;
+      overflow: hidden;
+      background: #1a1a2e;
+      font-family: Arial, sans-serif;
+      color: white;
+    }
+
+    #ui {
+      position: absolute;
+      top: 16px;
+      left: 16px;
+      z-index: 10;
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      background: rgba(0,0,0,0.35);
+      padding: 10px 12px;
+      border-radius: 8px;
+    }
+
+    button, input[type="range"] {
+      cursor: pointer;
+    }
+
+    #hud-panel {
+      position: absolute;
+      top: 16px;
+      right: 16px;
+      z-index: 10;
+      min-width: 240px;
+      background: rgba(0,0,0,0.5);
+      padding: 12px;
+      border-radius: 8px;
+      line-height: 1.5;
+      font-size: 14px;
+    }
+
+    #info {
+      position: absolute;
+      bottom: 16px;
+      left: 16px;
+      z-index: 10;
+      background: rgba(0,0,0,0.35);
+      padding: 8px 10px;
+      border-radius: 8px;
+      font-size: 13px;
+    }
+
+    canvas {
+      display: block;
+    }
+  </style>
+</head>
+<body>
+  <div id="ui">
+    <button id="btn-start">Start</button>
+    <button id="btn-pause">Pause</button>
+    <button id="btn-reset">Reset</button>
+    <label for="slider-speed">Speed</label>
+    <input id="slider-speed" type="range" min="0.5" max="3.0" step="0.1" value="1.0" />
+    <span id="speed-label">1.0x</span>
+  </div>
+
+  <div id="hud-panel">
+    <div><strong>Supply Chain HUD</strong></div>
+    <div>Total Spawned: <span id="hud-spawned">0</span></div>
+    <div>Total Delivered: <span id="hud-delivered">0</span></div>
+    <div>In Transit: <span id="hud-transit">0</span></div>
+    <hr />
+    <div>Selected Node: <span id="hud-selected">None</span></div>
+    <div>Node Throughput: <span id="hud-throughput">0</span></div>
+  </div>
+
+  <div id="info">
+    Click a node to inspect. Press <strong>B</strong> for bottleneck at PROCESSING. Press <strong>H</strong> for heatmap.
+  </div>
+
+  <script type="module">
+    import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js';
+    import { OrbitControls } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js';
+    import { GLTFLoader } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/GLTFLoader.js';
+
+    let scene, camera, renderer, controls, clock;
+    let avocadoModel = null;
+    let spawnAccumulator = 0;
+
+    const raycaster = new THREE.Raycaster();
+    const mouse = new THREE.Vector2();
+
+    const avocados = [];
+    const nodeMeshes = [];
+    const nodeRings = {};
+    const pathData = [];
+
+    const nodeOrder = ['farm', 'warehouse', 'processing', 'distribution', 'retail'];
+
+    const nodeConfig = {
+      farm:         { label: 'FARM',         pos: new THREE.Vector3(-12, 0,  0), color: 0x2ecc71 },
+      warehouse:    { label: 'WAREHOUSE',    pos: new THREE.Vector3(-6,  0, -4), color: 0xe67e22 },
+      processing:   { label: 'PROCESSING',   pos: new THREE.Vector3( 0,  0, -6), color: 0x3498db },
+      distribution: { label: 'DISTRIBUTION', pos: new THREE.Vector3( 6,  0, -4), color: 0x9b59b6 },
+      retail:       { label: 'RETAIL',       pos: new THREE.Vector3(12,  0,  0), color: 0xe74c3c }
+    };
+
+    const state = {
+      simulationRunning: false,
+      paused: false,
+      speedMultiplier: 1.0,
+      totalSpawned: 0,
+      totalDelivered: 0,
+      inTransitCount: 0,
+      nodeThrough: {
+        farm: 0,
+        warehouse: 0,
+        processing: 0,
+        distribution: 0,
+        retail: 0
+      },
+      selectedNode: null,
+      bottleneckActive: false,
+      heatmapActive: false,
+      avocadoPositions: [],
+      modelLoaded: false
+    };
+
+    window.__3D_STATE__ = state;
+
+    init();
+    animate();
+
+    function init() {
+      scene = new THREE.Scene();
+      scene.background = new THREE.Color(0x1a1a2e);
+
+      camera = new THREE.PerspectiveCamera(
+        60,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        1000
+      );
+      camera.position.set(0, 12, 20);
+      camera.lookAt(0, 0, 0);
+
+      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+      document.body.appendChild(renderer.domElement);
+
+      controls = new OrbitControls(camera, renderer.domElement);
+      controls.enableDamping = true;
+      controls.target.set(0, 0, -2);
+
+      clock = new THREE.Clock();
+
+      const ambient = new THREE.AmbientLight(0x404040, 0.6);
+      scene.add(ambient);
+
+      const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+      dirLight.position.set(10, 20, 10);
+      scene.add(dirLight);
+
+      const floor = new THREE.Mesh(
+        new THREE.PlaneGeometry(60, 40),
+        new THREE.MeshStandardMaterial({ color: 0x16213e, roughness: 1.0, metalness: 0.0 })
+      );
+      floor.rotation.x = -Math.PI / 2;
+      floor.position.y = -0.26;
+      scene.add(floor);
+
+      createNodes();
+      createPaths();
+      loadAvocadoModel();
+      setupUI();
+      setupInteraction();
+
+      window.addEventListener('resize', onResize);
+    }
+
+    function createNodes() {
+      for (const key of nodeOrder) {
+        const cfg = nodeConfig[key];
+
+        const material = new THREE.MeshStandardMaterial({
+          color: cfg.color,
+          emissive: 0x000000,
+          emissiveIntensity: 0
+        });
+
+        const platform = new THREE.Mesh(
+          new THREE.BoxGeometry(3, 0.5, 3),
+          material
+        );
+        platform.position.copy(cfg.pos);
+        platform.userData = {
+          type: 'node',
+          nodeKey: key,
+          label: cfg.label,
+          baseColor: cfg.color
+        };
+        scene.add(platform);
+        nodeMeshes.push(platform);
+
+        const label = createTextSprite(cfg.label);
+        label.position.set(cfg.pos.x, cfg.pos.y + 2.0, cfg.pos.z);
+        scene.add(label);
+
+        const ring = new THREE.Mesh(
+          new THREE.TorusGeometry(2.0, 0.08, 16, 64),
+          new THREE.MeshBasicMaterial({
+            color: 0xff0000,
+            transparent: true,
+            opacity: 0.9
+          })
+        );
+        ring.rotation.x = Math.PI / 2;
+        ring.position.set(cfg.pos.x, cfg.pos.y + 0.35, cfg.pos.z);
+        ring.visible = false;
+        scene.add(ring);
+        nodeRings[key] = ring;
+      }
+    }
+
+    function createPaths() {
+      for (let i = 0; i < nodeOrder.length - 1; i++) {
+        const aKey = nodeOrder[i];
+        const bKey = nodeOrder[i + 1];
+        const a = nodeConfig[aKey].pos.clone();
+        const b = nodeConfig[bKey].pos.clone();
+
+        const mid = a.clone().lerp(b, 0.5);
+        mid.y += 1.5;
+        mid.z += (i % 2 === 0 ? -1.0 : 1.0);
+
+        const curve = new THREE.CatmullRomCurve3([
+          new THREE.Vector3(a.x, 0.7, a.z),
+          new THREE.Vector3(mid.x, mid.y, mid.z),
+          new THREE.Vector3(b.x, 0.7, b.z)
+        ]);
+
+        const tube = new THREE.Mesh(
+          new THREE.TubeGeometry(curve, 40, 0.08, 12, false),
+          new THREE.MeshStandardMaterial({
+            color: 0x555555,
+            roughness: 0.7,
+            metalness: 0.2
+          })
+        );
+        scene.add(tube);
+
+        pathData.push({
+          from: aKey,
+          to: bKey,
+          curve
+        });
+      }
+    }
+
+    function createTextSprite(text) {
+      const canvas = document.createElement('canvas');
+      canvas.width = 512;
+      canvas.height = 128;
+      const ctx = canvas.getContext('2d');
+
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = 'rgba(0,0,0,0.45)';
+      roundRect(ctx, 10, 20, 492, 88, 16);
+      ctx.fill();
+
+      ctx.font = 'bold 42px Arial';
+      ctx.fillStyle = '#ffffff';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(text, canvas.width / 2, canvas.height / 2 + 2);
+
+      const texture = new THREE.CanvasTexture(canvas);
+      const material = new THREE.SpriteMaterial({
+        map: texture,
+        transparent: true
+      });
+
+      const sprite = new THREE.Sprite(material);
+      sprite.scale.set(4.8, 1.2, 1);
+      return sprite;
+    }
+
+    function roundRect(ctx, x, y, width, height, radius) {
+      ctx.beginPath();
+      ctx.moveTo(x + radius, y);
+      ctx.lineTo(x + width - radius, y);
+      ctx.quadraticCurveTo(x + width, y, x + width, y + radius);
+      ctx.lineTo(x + width, y + height - radius);
+      ctx.quadraticCurveTo(x + width, y + height, x + width - radius, y + height);
+      ctx.lineTo(x + radius, y + height);
+      ctx.quadraticCurveTo(x, y + height, x, y + height - radius);
+      ctx.lineTo(x, y + radius);
+      ctx.quadraticCurveTo(x, y, x + radius, y);
+      ctx.closePath();
+    }
+
+    function loadAvocadoModel() {
+      const loader = new GLTFLoader();
+      loader.load(
+        './Avocado.glb',
+        (gltf) => {
+          avocadoModel = gltf.scene;
+          avocadoModel.traverse((obj) => {
+            if (obj.isMesh) {
+              obj.castShadow = false;
+              obj.receiveShadow = false;
+              obj.material = obj.material.clone();
+              obj.material.transparent = true;
+              obj.material.opacity = 1;
+            }
+          });
+          state.modelLoaded = true;
+        },
+        undefined,
+        (err) => {
+          console.error('Failed to load Avocado.glb:', err);
+          state.modelLoaded = false;
+        }
+      );
+    }
+
+    function spawnAvocado() {
+      if (!avocadoModel) return;
+      if (avocados.length >= 10) return;
+
+      const instance = avocadoModel.clone(true);
+      instance.scale.set(15, 15, 15);
+
+      const startPos = pathData[0].curve.getPointAt(0);
+      instance.position.copy(startPos);
+      instance.position.y += 0.2;
+
+      instance.traverse((obj) => {
+        if (obj.isMesh) {
+          obj.material = obj.material.clone();
+          obj.material.transparent = true;
+          obj.material.opacity = 1;
+          obj.renderOrder = 1;
+        }
+      });
+
+      scene.add(instance);
+
+      avocados.push({
+        group: instance,
+        segmentIndex: 0,
+        progress: 0,
+        pausedAtNode: false,
+        pauseTimer: 0,
+        fadingOut: false,
+        fadeTimer: 0
+      });
+
+      state.totalSpawned++;
+      state.nodeThrough.farm++;
+    }
+
+    function setupUI() {
+      const btnStart = document.getElementById('btn-start');
+      const btnPause = document.getElementById('btn-pause');
+      const btnReset = document.getElementById('btn-reset');
+      const sliderSpeed = document.getElementById('slider-speed');
+      const speedLabel = document.getElementById('speed-label');
+
+      btnStart.addEventListener('click', () => {
+        state.simulationRunning = true;
+        state.paused = false;
+      });
+
+      btnPause.addEventListener('click', () => {
+        state.paused = !state.paused;
+        btnPause.textContent = state.paused ? 'Resume' : 'Pause';
+      });
+
+      btnReset.addEventListener('click', () => {
+        resetSimulation();
+        btnPause.textContent = 'Pause';
+      });
+
+      sliderSpeed.addEventListener('input', () => {
+        const v = safeNumber(parseFloat(sliderSpeed.value), 1.0);
+        state.speedMultiplier = v;
+        speedLabel.textContent = `${v.toFixed(1)}x`;
+      });
+
+      speedLabel.textContent = `${state.speedMultiplier.toFixed(1)}x`;
+    }
+
+    function setupInteraction() {
+      renderer.domElement.addEventListener('click', onClick);
+
+      window.addEventListener('keydown', (e) => {
+        if (e.key === 'b' || e.key === 'B') {
+          state.bottleneckActive = !state.bottleneckActive;
+          nodeRings.processing.visible = state.bottleneckActive;
+        }
+
+        if (e.key === 'h' || e.key === 'H') {
+          state.heatmapActive = !state.heatmapActive;
+          updateNodeVisuals();
+        }
+      });
+    }
+
+    function onClick(event) {
+      const rect = renderer.domElement.getBoundingClientRect();
+      mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+      mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+
+      raycaster.setFromCamera(mouse, camera);
+      const intersects = raycaster.intersectObjects(nodeMeshes, false);
+
+      if (intersects.length > 0) {
+        const obj = intersects[0].object;
+        const nodeKey = obj.userData.nodeKey;
+        state.selectedNode = nodeKey;
+        updateNodeVisuals();
+      }
+    }
+
+    function updateNodeVisuals() {
+      for (const mesh of nodeMeshes) {
+        const nodeKey = mesh.userData.nodeKey;
+        const throughput = safeNumber(state.nodeThrough[nodeKey], 0);
+        const heat = state.heatmapActive ? Math.min(throughput / 10, 1.0) : 0;
+        const selected = state.selectedNode === nodeKey;
+
+        mesh.material.emissive.setHex(selected ? 0xffff00 : mesh.userData.baseColor);
+        mesh.material.emissiveIntensity = selected ? 0.8 : heat * 0.9;
+      }
+    }
+
+    function resetSimulation() {
+      for (const avo of avocados) {
+        scene.remove(avo.group);
+      }
+      avocados.length = 0;
+      spawnAccumulator = 0;
+
+      state.simulationRunning = false;
+      state.paused = false;
+      state.totalSpawned = 0;
+      state.totalDelivered = 0;
+      state.inTransitCount = 0;
+      state.nodeThrough = {
+        farm: 0,
+        warehouse: 0,
+        processing: 0,
+        distribution: 0,
+        retail: 0
+      };
+      state.selectedNode = null;
+      state.avocadoPositions = [];
+
+      updateNodeVisuals();
+      updateHUD();
+    }
+
+    function updateAvocados(delta) {
+      const moveDelta = delta * state.speedMultiplier;
+
+      for (let i = avocados.length - 1; i >= 0; i--) {
+        const avo = avocados[i];
+
+        if (avo.fadingOut) {
+          avo.fadeTimer += delta;
+          const alpha = Math.max(0, 1 - avo.fadeTimer / 0.5);
+          avo.group.traverse((obj) => {
+            if (obj.isMesh && obj.material) {
+              obj.material.opacity = alpha;
+            }
+          });
+
+          if (avo.fadeTimer >= 0.5) {
+            scene.remove(avo.group);
+            avocados.splice(i, 1);
+            state.totalDelivered++;
+          }
+          continue;
+        }
+
+        if (avo.pausedAtNode) {
+          avo.pauseTimer += delta;
+          const currentNodeKey = nodeOrder[Math.min(avo.segmentIndex, nodeOrder.length - 1)];
+          const pauseTarget =
+            currentNodeKey === 'processing' && state.bottleneckActive ? 3.0 : 1.0;
+
+          if (avo.pauseTimer >= pauseTarget) {
+            avo.pausedAtNode = false;
+            avo.pauseTimer = 0;
+          }
+          continue;
+        }
+
+        const segment = pathData[avo.segmentIndex];
+        if (!segment) {
+          avo.fadingOut = true;
+          avo.fadeTimer = 0;
+          continue;
+        }
+
+        avo.progress += moveDelta / 3.0;
+        avo.progress = safeNumber(avo.progress, 0);
+
+        if (avo.progress >= 1) {
+          avo.progress = 1;
+        }
+
+        const p = segment.curve.getPointAt(Math.max(0, Math.min(1, avo.progress)));
+        const tangent = segment.curve.getTangentAt(Math.max(0, Math.min(1, avo.progress)));
+
+        avo.group.position.copy(p);
+        avo.group.position.y += 0.2;
+
+        const angle = Math.atan2(tangent.x, tangent.z);
+        avo.group.rotation.set(0, angle, 0);
+
+        if (avo.progress >= 1) {
+          const arrivedNode = segment.to;
+          state.nodeThrough[arrivedNode]++;
+
+          avo.segmentIndex++;
+          avo.progress = 0;
+
+          if (arrivedNode === 'retail') {
+            avo.fadingOut = true;
+            avo.fadeTimer = 0;
+          } else {
+            avo.pausedAtNode = true;
+            avo.pauseTimer = 0;
+          }
+        }
+      }
+    }
+
+    function updateHUD() {
+      const selected = state.selectedNode;
+      const throughput = selected ? safeNumber(state.nodeThrough[selected], 0) : 0;
+
+      document.getElementById('hud-spawned').textContent = safeInt(state.totalSpawned);
+      document.getElementById('hud-delivered').textContent = safeInt(state.totalDelivered);
+      document.getElementById('hud-transit').textContent = safeInt(state.inTransitCount);
+      document.getElementById('hud-selected').textContent = selected ? nodeConfig[selected].label : 'None';
+      document.getElementById('hud-throughput').textContent = safeInt(throughput);
+    }
+
+    function updateState() {
+      state.inTransitCount = avocados.length;
+
+      state.avocadoPositions = avocados.map(a => ({
+        x: safeNumber(a.group.position.x, 0),
+        y: safeNumber(a.group.position.y, 0),
+        z: safeNumber(a.group.position.z, 0)
+      }));
+
+      state.simulationRunning = !!state.simulationRunning;
+      state.paused = !!state.paused;
+      state.speedMultiplier = safeNumber(state.speedMultiplier, 1);
+      state.totalSpawned = safeInt(state.totalSpawned);
+      state.totalDelivered = safeInt(state.totalDelivered);
+      state.inTransitCount = safeInt(state.inTransitCount);
+      state.nodeThrough.farm = safeInt(state.nodeThrough.farm);
+      state.nodeThrough.warehouse = safeInt(state.nodeThrough.warehouse);
+      state.nodeThrough.processing = safeInt(state.nodeThrough.processing);
+      state.nodeThrough.distribution = safeInt(state.nodeThrough.distribution);
+      state.nodeThrough.retail = safeInt(state.nodeThrough.retail);
+      state.modelLoaded = !!state.modelLoaded;
+
+      window.__3D_STATE__ = state;
+    }
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      const delta = Math.min(clock.getDelta(), 0.1);
+
+      controls.update();
+
+      if (state.simulationRunning && !state.paused) {
+        spawnAccumulator += delta;
+
+        while (spawnAccumulator >= 2.0) {
+          spawnAccumulator -= 2.0;
+          spawnAvocado();
+        }
+
+        updateAvocados(delta);
+        updateNodeVisuals();
+      }
+
+      updateState();
+      updateHUD();
+
+      renderer.render(scene, camera);
+    }
+
+    function onResize() {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    }
+
+    function safeNumber(v, fallback = 0) {
+      return Number.isFinite(v) ? v : fallback;
+    }
+
+    function safeInt(v, fallback = 0) {
+      const n = Number.isFinite(v) ? v : fallback;
+      return Math.round(n);
+    }
+  </script>
+</body>
+</html>

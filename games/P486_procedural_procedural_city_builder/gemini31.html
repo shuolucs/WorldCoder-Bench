@@ -1,0 +1,540 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Procedural City Builder</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #000;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            user-select: none;
+        }
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+        }
+        #ui-layer {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+            display: flex;
+            justify-content: space-between;
+            padding: 20px;
+            box-sizing: border-box;
+        }
+        .panel {
+            background: rgba(10, 10, 30, 0.8);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            border-radius: 8px;
+            padding: 15px;
+            color: #fff;
+            pointer-events: auto;
+            backdrop-filter: blur(4px);
+        }
+        #toolbar {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            width: 200px;
+        }
+        #hud {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            width: 220px;
+            text-align: right;
+        }
+        button {
+            background: #2a2a4a;
+            color: #fff;
+            border: 2px solid transparent;
+            padding: 10px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-weight: bold;
+            transition: all 0.2s;
+        }
+        button:hover {
+            background: #3a3a6a;
+        }
+        button.active {
+            border: 3px solid #ffcc00;
+            background: #4a4a7a;
+        }
+        #demolishBtn {
+            margin-top: 10px;
+            border: 2px solid #cc3333;
+        }
+        #demolishBtn.active-demolish {
+            background: #cc3333;
+            color: white;
+        }
+        .hud-text {
+            font-size: 16px;
+            font-weight: bold;
+            margin: 5px 0;
+        }
+        #budgetDisplay { color: #44ff44; font-size: 18px; }
+        #statsPanel { color: #aaa; font-size: 14px; }
+        #populationDisplay { color: #44ccff; }
+        
+        .controls-hint {
+            position: absolute;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: rgba(0,0,0,0.5);
+            padding: 10px 20px;
+            border-radius: 20px;
+            color: #aaa;
+            font-size: 12px;
+            pointer-events: none;
+        }
+    </style>
+    <!-- Import maps polyfill -->
+    <script async src="https://unpkg.com/es-module-shims@1.8.0/dist/es-module-shims.js"></script>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://cdn.jsdelivr.net/npm/three@0.163.0/build/three.module.js",
+                "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.163.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="canvas-container"></div>
+    
+    <div id="ui-layer">
+        <div id="toolbar" class="panel">
+            <button id="btn-residential" class="build-btn active">Residential ($10)</button>
+            <button id="btn-commercial" class="build-btn">Commercial ($25)</button>
+            <button id="btn-park" class="build-btn">Park ($5)</button>
+            <button id="btn-monument" class="build-btn">Monument ($50)</button>
+            <button id="demolishBtn">Demolish</button>
+            <div style="height: 10px;"></div>
+            <button id="dayNightBtn">Toggle Day/Night</button>
+            <button id="resetBtn">Reset City</button>
+        </div>
+        
+        <div id="hud" class="panel">
+            <div id="budgetDisplay" class="hud-text">Budget: $500</div>
+            <div id="statsPanel" class="hud-text">R:0 C:0 P:0 M:0</div>
+            <div id="populationDisplay" class="hud-text">Pop: 0 | Workers: 0</div>
+        </div>
+    </div>
+
+    <div class="controls-hint">
+        Click to Build/Demolish | Drag to Rotate | Scroll to Zoom | Keys: 1-4 Select, R Auto-Rotate
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+        // --- State Management ---
+        window.__3D_STATE__ = {
+            budget: 500,
+            buildingCount: { residential: 0, commercial: 0, park: 0, monument: 0 },
+            totalBuildings: 0,
+            selectedType: 'residential',
+            isDemolishMode: false,
+            isNightMode: true,
+            population: 0,
+            workers: 0,
+            autoRotate: false,
+            gridOccupied: 0,
+            monumentExists: false,
+            lastPlacedType: null,
+            lastAction: 'none'
+        };
+
+        const COSTS = { residential: 10, commercial: 25, park: 5, monument: 50 };
+        const gridData = new Map(); // Key: "col,row", Value: { type, mesh, cost }
+
+        // --- Scene Setup ---
+        const container = document.getElementById('canvas-container');
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        container.appendChild(renderer.domElement);
+
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x0a0a2e);
+        scene.fog = new THREE.FogExp2(0x0a0a2e, 0.008);
+
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 1, 1000);
+        camera.position.set(40, 35, 40);
+        camera.lookAt(0, 0, 0);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.05;
+        controls.maxPolarAngle = Math.PI / 2 - 0.05; // Don't go below ground
+        controls.autoRotateSpeed = 2.0;
+
+        // --- Lighting ---
+        const ambientLight = new THREE.AmbientLight(0x101030, 0.2);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffeedd, 0.3);
+        dirLight.position.set(50, 80, 30);
+        dirLight.castShadow = true;
+        dirLight.shadow.camera.left = -50;
+        dirLight.shadow.camera.right = 50;
+        dirLight.shadow.camera.top = 50;
+        dirLight.shadow.camera.bottom = -50;
+        dirLight.shadow.camera.near = 0.5;
+        dirLight.shadow.camera.far = 200;
+        dirLight.shadow.mapSize.width = 2048;
+        dirLight.shadow.mapSize.height = 2048;
+        scene.add(dirLight);
+
+        // --- Environment ---
+        const groundGeo = new THREE.PlaneGeometry(200, 200);
+        const groundMat = new THREE.MeshStandardMaterial({ color: 0x2a4a2a, roughness: 0.8, metalness: 0.1 });
+        const groundPlane = new THREE.Mesh(groundGeo, groundMat);
+        groundPlane.rotation.x = -Math.PI / 2;
+        groundPlane.receiveShadow = true;
+        scene.add(groundPlane);
+
+        const gridHelper = new THREE.GridHelper(80, 20, 0x000000, 0x000000);
+        gridHelper.position.y = 0.02;
+        gridHelper.material.opacity = 0.2;
+        gridHelper.material.transparent = true;
+        scene.add(gridHelper);
+
+        // --- Materials ---
+        const matRes = new THREE.MeshStandardMaterial({ color: 0x8899aa, roughness: 0.7 });
+        const matCom = new THREE.MeshStandardMaterial({ color: 0xddaa44, emissive: 0x332200, emissiveIntensity: 0.3, roughness: 0.4 });
+        const matComWindow = new THREE.MeshStandardMaterial({ color: 0x000000, emissive: 0xaaaa55, emissiveIntensity: 0.8, wireframe: true });
+        const matParkGround = new THREE.MeshStandardMaterial({ color: 0x44aa44, roughness: 0.9 });
+        const matParkTree = new THREE.MeshStandardMaterial({ color: 0x228822, roughness: 0.8 });
+
+        // --- Monument Loading ---
+        let monumentPrefab = new THREE.Group();
+        // Fallback geometry while loading or if fails
+        const fallbackGeo = new THREE.Mesh(new THREE.BoxGeometry(2.5, 5, 2.5), new THREE.MeshStandardMaterial({ color: 0x884444 }));
+        fallbackGeo.position.y = 2.5;
+        fallbackGeo.castShadow = true;
+        monumentPrefab.add(fallbackGeo);
+
+        const gltfLoader = new GLTFLoader();
+        gltfLoader.load('AntiqueCamera.glb', (gltf) => {
+            const model = gltf.scene;
+            
+            // Calculate bounding box to scale it to fit ~3x3 footprint
+            const box = new THREE.Box3().setFromObject(model);
+            const size = box.getSize(new THREE.Vector3());
+            const maxDim = Math.max(size.x, size.z);
+            const scale = 3.0 / maxDim;
+            
+            model.scale.set(scale, scale, scale);
+            
+            // Center the model
+            const center = box.getCenter(new THREE.Vector3());
+            model.position.set(-center.x * scale, -box.min.y * scale, -center.z * scale);
+
+            model.traverse((child) => {
+                if (child.isMesh) {
+                    child.castShadow = true;
+                    child.receiveShadow = true;
+                }
+            });
+
+            // Replace fallback
+            monumentPrefab.clear();
+            monumentPrefab.add(model);
+        }, undefined, (error) => {
+            console.warn("Could not load AntiqueCamera.glb. Using fallback geometry.", error);
+        });
+
+        // --- Grid Logic ---
+        function getGridCoords(x, z) {
+            // Grid spans -40 to 40. Cells are 4x4.
+            // Columns/Rows 0 to 19.
+            const col = Math.floor((x + 40) / 4);
+            const row = Math.floor((z + 40) / 4);
+            
+            if (col < 0 || col > 19 || row < 0 || row > 19) return null;
+            
+            // Center of the cell
+            const cx = col * 4 - 38;
+            const cz = row * 4 - 38;
+            
+            return { cx, cz, key: `${col},${row}` };
+        }
+
+        // --- Building Logic ---
+        function build(type, intersectPoint) {
+            const coords = getGridCoords(intersectPoint.x, intersectPoint.z);
+            if (!coords) return;
+            if (gridData.has(coords.key)) return; // Cell occupied
+            
+            const cost = COSTS[type];
+            if (window.__3D_STATE__.budget < cost) return; // Insufficient funds
+
+            let mesh;
+            
+            if (type === 'residential') {
+                const h = 4 + Math.random() * 8;
+                mesh = new THREE.Mesh(new THREE.BoxGeometry(3, h, 3), matRes);
+                mesh.position.set(coords.cx, h / 2, coords.cz);
+                mesh.castShadow = true;
+                mesh.receiveShadow = true;
+            } 
+            else if (type === 'commercial') {
+                const h = 8 + Math.random() * 12;
+                mesh = new THREE.Group();
+                
+                const body = new THREE.Mesh(new THREE.BoxGeometry(3.5, h, 3.5), matCom);
+                body.castShadow = true;
+                body.receiveShadow = true;
+                
+                // Window detail: slightly larger wireframe box
+                const windows = new THREE.Mesh(new THREE.BoxGeometry(3.6, h * 0.9, 3.6), matComWindow);
+                
+                mesh.add(body);
+                mesh.add(windows);
+                mesh.position.set(coords.cx, h / 2, coords.cz);
+            } 
+            else if (type === 'park') {
+                mesh = new THREE.Group();
+                const ground = new THREE.Mesh(new THREE.BoxGeometry(4, 0.3, 4), matParkGround);
+                ground.position.y = 0.15;
+                ground.receiveShadow = true;
+                
+                const tree = new THREE.Mesh(new THREE.SphereGeometry(1.5, 8, 8), matParkTree);
+                tree.position.set(0, 0.3 + 1.5, 0);
+                tree.castShadow = true;
+                
+                mesh.add(ground);
+                mesh.add(tree);
+                mesh.position.set(coords.cx, 0, coords.cz);
+            } 
+            else if (type === 'monument') {
+                if (window.__3D_STATE__.monumentExists) {
+                    // Remove existing monument
+                    for (let [k, v] of gridData.entries()) {
+                        if (v.type === 'monument') {
+                            scene.remove(v.mesh);
+                            gridData.delete(k);
+                            window.__3D_STATE__.buildingCount.monument--;
+                            window.__3D_STATE__.totalBuildings--;
+                            window.__3D_STATE__.gridOccupied--;
+                            break;
+                        }
+                    }
+                }
+                mesh = monumentPrefab.clone();
+                mesh.position.set(coords.cx, 0, coords.cz);
+            }
+
+            if (mesh) {
+                scene.add(mesh);
+                gridData.set(coords.key, { type, mesh, cost });
+
+                // Update State
+                window.__3D_STATE__.budget -= cost;
+                window.__3D_STATE__.buildingCount[type]++;
+                window.__3D_STATE__.totalBuildings++;
+                window.__3D_STATE__.gridOccupied++;
+                if (type === 'residential') window.__3D_STATE__.population += 10;
+                if (type === 'commercial') window.__3D_STATE__.workers += 5;
+                if (type === 'monument') window.__3D_STATE__.monumentExists = true;
+                
+                window.__3D_STATE__.lastPlacedType = type;
+                window.__3D_STATE__.lastAction = 'place';
+                
+                updateUI();
+            }
+        }
+
+        function demolish(intersectPoint) {
+            const coords = getGridCoords(intersectPoint.x, intersectPoint.z);
+            if (!coords) return;
+            if (!gridData.has(coords.key)) return;
+
+            const cell = gridData.get(coords.key);
+            scene.remove(cell.mesh);
+            gridData.delete(coords.key);
+
+            const refund = Math.floor(cell.cost / 2);
+            
+            // Update State
+            window.__3D_STATE__.budget += refund;
+            window.__3D_STATE__.buildingCount[cell.type]--;
+            window.__3D_STATE__.totalBuildings--;
+            window.__3D_STATE__.gridOccupied--;
+            if (cell.type === 'residential') window.__3D_STATE__.population -= 10;
+            if (cell.type === 'commercial') window.__3D_STATE__.workers -= 5;
+            if (cell.type === 'monument') window.__3D_STATE__.monumentExists = false;
+            
+            window.__3D_STATE__.lastAction = 'demolish';
+            
+            updateUI();
+        }
+
+        // --- Interaction ---
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+
+        window.addEventListener('pointerdown', (event) => {
+            // Ignore clicks on UI
+            if (event.target.tagName === 'BUTTON' || event.target.closest('.panel')) return;
+            if (event.button !== 0) return; // Only left click
+
+            mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+            raycaster.setFromCamera(mouse, camera);
+            const intersects = raycaster.intersectObject(groundPlane);
+
+            if (intersects.length > 0) {
+                if (window.__3D_STATE__.isDemolishMode) {
+                    demolish(intersects[0].point);
+                } else {
+                    build(window.__3D_STATE__.selectedType, intersects[0].point);
+                }
+            }
+        });
+
+        // --- UI & Controls ---
+        const btnRes = document.getElementById('btn-residential');
+        const btnCom = document.getElementById('btn-commercial');
+        const btnPark = document.getElementById('btn-park');
+        const btnMon = document.getElementById('btn-monument');
+        const btnDemolish = document.getElementById('demolishBtn');
+        const buildBtns = [btnRes, btnCom, btnPark, btnMon];
+
+        function selectType(type) {
+            window.__3D_STATE__.selectedType = type;
+            window.__3D_STATE__.isDemolishMode = false;
+            
+            buildBtns.forEach(btn => btn.classList.remove('active'));
+            btnDemolish.classList.remove('active-demolish');
+            
+            if (type === 'residential') btnRes.classList.add('active');
+            if (type === 'commercial') btnCom.classList.add('active');
+            if (type === 'park') btnPark.classList.add('active');
+            if (type === 'monument') btnMon.classList.add('active');
+            
+            updateUI();
+        }
+
+        btnRes.onclick = () => selectType('residential');
+        btnCom.onclick = () => selectType('commercial');
+        btnPark.onclick = () => selectType('park');
+        btnMon.onclick = () => selectType('monument');
+
+        btnDemolish.onclick = () => {
+            window.__3D_STATE__.isDemolishMode = !window.__3D_STATE__.isDemolishMode;
+            if (window.__3D_STATE__.isDemolishMode) {
+                buildBtns.forEach(btn => btn.classList.remove('active'));
+                btnDemolish.classList.add('active-demolish');
+            } else {
+                selectType(window.__3D_STATE__.selectedType);
+            }
+            updateUI();
+        };
+
+        document.getElementById('dayNightBtn').onclick = () => {
+            window.__3D_STATE__.isNightMode = !window.__3D_STATE__.isNightMode;
+            if (window.__3D_STATE__.isNightMode) {
+                ambientLight.color.setHex(0x101030);
+                ambientLight.intensity = 0.2;
+                dirLight.intensity = 0.3;
+                scene.background.setHex(0x0a0a2e);
+                scene.fog.color.setHex(0x0a0a2e);
+            } else {
+                ambientLight.color.setHex(0x404060);
+                ambientLight.intensity = 0.4;
+                dirLight.intensity = 1.0;
+                scene.background.setHex(0x87CEEB);
+                scene.fog.color.setHex(0x87CEEB);
+            }
+            window.__3D_STATE__.lastAction = 'toggleDayNight';
+        };
+
+        document.getElementById('resetBtn').onclick = () => {
+            for (let [key, cell] of gridData.entries()) {
+                scene.remove(cell.mesh);
+            }
+            gridData.clear();
+
+            window.__3D_STATE__.budget = 500;
+            window.__3D_STATE__.buildingCount = { residential: 0, commercial: 0, park: 0, monument: 0 };
+            window.__3D_STATE__.totalBuildings = 0;
+            window.__3D_STATE__.population = 0;
+            window.__3D_STATE__.workers = 0;
+            window.__3D_STATE__.gridOccupied = 0;
+            window.__3D_STATE__.monumentExists = false;
+            window.__3D_STATE__.lastAction = 'reset';
+
+            selectType('residential');
+            updateUI();
+        };
+
+        window.addEventListener('keydown', (e) => {
+            if (e.key === '1') selectType('residential');
+            if (e.key === '2') selectType('commercial');
+            if (e.key === '3') selectType('park');
+            if (e.key === '4') selectType('monument');
+            if (e.key.toLowerCase() === 'r') {
+                window.__3D_STATE__.autoRotate = !window.__3D_STATE__.autoRotate;
+                controls.autoRotate = window.__3D_STATE__.autoRotate;
+            }
+        });
+
+        function updateUI() {
+            const state = window.__3D_STATE__;
+            document.getElementById('budgetDisplay').innerText = `Budget: $${state.budget}`;
+            document.getElementById('statsPanel').innerText = 
+                `R:${state.buildingCount.residential} C:${state.buildingCount.commercial} P:${state.buildingCount.park} M:${state.buildingCount.monument}`;
+            document.getElementById('populationDisplay').innerText = `Pop: ${state.population} | Workers: ${state.workers}`;
+            
+            // Update button colors based on affordability
+            btnRes.style.opacity = state.budget >= COSTS.residential ? '1' : '0.5';
+            btnCom.style.opacity = state.budget >= COSTS.commercial ? '1' : '0.5';
+            btnPark.style.opacity = state.budget >= COSTS.park ? '1' : '0.5';
+            btnMon.style.opacity = state.budget >= COSTS.monument ? '1' : '0.5';
+        }
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // --- Animation Loop ---
+        function animate() {
+            requestAnimationFrame(animate);
+            controls.update();
+            
+            // Animate emissive intensity for commercial windows slightly
+            if (window.__3D_STATE__.isNightMode) {
+                const time = Date.now() * 0.001;
+                matComWindow.emissiveIntensity = 0.8 + Math.sin(time * 2) * 0.2;
+            } else {
+                matComWindow.emissiveIntensity = 0.2;
+            }
+
+            renderer.render(scene, camera);
+        }
+
+        // Initialize
+        updateUI();
+        animate();
+    </script>
+</body>
+</html>

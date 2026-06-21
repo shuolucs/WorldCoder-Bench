@@ -1,0 +1,547 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>3D Abstract Particle Art Experience</title>
+  <style>
+    html, body {
+      margin: 0;
+      overflow: hidden;
+      background: #000;
+      width: 100%;
+      height: 100%;
+      font-family: monospace;
+    }
+    canvas {
+      display: block;
+    }
+    #hud {
+      position: fixed;
+      top: 12px;
+      left: 12px;
+      color: white;
+      background: rgba(20, 20, 20, 0.6);
+      padding: 15px;
+      line-height: 1.6;
+      z-index: 10;
+      user-select: none;
+      pointer-events: none;
+      min-width: 220px;
+    }
+    #help {
+      position: fixed;
+      bottom: 12px;
+      left: 12px;
+      color: rgba(255,255,255,0.85);
+      background: rgba(20, 20, 20, 0.45);
+      padding: 10px 12px;
+      font-size: 12px;
+      line-height: 1.5;
+      z-index: 10;
+      user-select: none;
+      pointer-events: none;
+    }
+  </style>
+</head>
+<body>
+  <div id="hud">
+    <div>Score: <span id="hud-score">0</span></div>
+    <div>Combo: <span id="hud-combo">1x</span></div>
+    <div>Total Bursts: <span id="hud-bursts">0</span></div>
+    <div>Particle Count: <span id="hud-particles">500</span></div>
+    <div>Color Mode: <span id="hud-colormode">rainbow</span></div>
+  </div>
+
+  <div id="help">
+    Mouse Move: gravity well position<br>
+    Click: burst + score<br>
+    G: toggle gravity<br>
+    R: reset scene<br>
+    C: cycle colors<br>
+    Space: pause/unpause
+  </div>
+
+  <script type="module">
+    import * as THREE from "https://unpkg.com/three@0.160.0/build/three.module.js";
+
+    const BASE_COUNT = 500;
+    const SPHERE_RADIUS = 20;
+    const BURST_PARTICLES_PER_CLICK = 50;
+    const BURST_LIFETIME = 2.0;
+    const BASE_ROTATION_SPEED = 0.002;
+
+    let score = 0;
+    let combo = 1;
+    let totalBursts = 0;
+    let gravityEnabled = true;
+    let colorMode = "rainbow";
+    let paused = false;
+    let frameCount = 0;
+    let rotationSpeed = BASE_ROTATION_SPEED;
+    let lastClickTime = -Infinity;
+
+    const clock = new THREE.Clock();
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x000000);
+
+    const camera = new THREE.PerspectiveCamera(
+      60,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      1000
+    );
+    camera.position.set(0, 0, 50);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    document.body.appendChild(renderer.domElement);
+
+    const raycaster = new THREE.Raycaster();
+    const mouseNDC = new THREE.Vector2();
+    const gravityPlane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0);
+    const gravityWellPosition = new THREE.Vector3(0, 0, 0);
+
+    const tempVec3 = new THREE.Vector3();
+    const tempDir = new THREE.Vector3();
+    const spherical = new THREE.Spherical();
+
+    function randomPointInSphere(radius) {
+      const u = Math.random();
+      const v = Math.random();
+      const w = Math.random();
+
+      const r = radius * Math.cbrt(u);
+      const theta = Math.acos(2 * v - 1);
+      const phi = 2 * Math.PI * w;
+
+      const sinTheta = Math.sin(theta);
+
+      return new THREE.Vector3(
+        r * sinTheta * Math.cos(phi),
+        r * Math.cos(theta),
+        r * sinTheta * Math.sin(phi)
+      );
+    }
+
+    function colorFromMode(life, targetColor) {
+      if (colorMode === "monochrome") {
+        targetColor.setRGB(1, 1, 1);
+      } else if (colorMode === "fire") {
+        // red to yellow based on life
+        const t = THREE.MathUtils.clamp(life, 0, 1);
+        targetColor.setRGB(1, 0.2 + 0.8 * t, 0);
+      } else {
+        targetColor.setHSL(Math.random(), 1.0, 0.5);
+      }
+    }
+
+    const basePositions = new Float32Array(BASE_COUNT * 3);
+    const baseColors = new Float32Array(BASE_COUNT * 3);
+    const baseLives = new Float32Array(BASE_COUNT);
+    const baseBasePositions = new Float32Array(BASE_COUNT * 3);
+
+    const baseGeometry = new THREE.BufferGeometry();
+    baseGeometry.setAttribute("position", new THREE.BufferAttribute(basePositions, 3));
+    baseGeometry.setAttribute("color", new THREE.BufferAttribute(baseColors, 3));
+
+    const baseMaterial = new THREE.PointsMaterial({
+      size: 0.35,
+      vertexColors: true,
+      transparent: true,
+      opacity: 0.95,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false
+    });
+
+    const basePoints = new THREE.Points(baseGeometry, baseMaterial);
+    scene.add(basePoints);
+
+    const colorTemp = new THREE.Color();
+
+    function applyBaseParticleColor(index) {
+      const i3 = index * 3;
+      if (colorMode === "monochrome") {
+        colorTemp.setRGB(1, 1, 1);
+      } else if (colorMode === "fire") {
+        const t = THREE.MathUtils.clamp(baseLives[index], 0, 1);
+        colorTemp.setRGB(1, 0.2 + 0.8 * t, 0);
+      } else {
+        colorTemp.setHSL(Math.random(), 1.0, 0.5);
+      }
+      baseColors[i3] = colorTemp.r;
+      baseColors[i3 + 1] = colorTemp.g;
+      baseColors[i3 + 2] = colorTemp.b;
+    }
+
+    function respawnBaseParticle(index) {
+      const p = randomPointInSphere(SPHERE_RADIUS);
+      const i3 = index * 3;
+      baseBasePositions[i3] = p.x;
+      baseBasePositions[i3 + 1] = p.y;
+      baseBasePositions[i3 + 2] = p.z;
+
+      basePositions[i3] = p.x;
+      basePositions[i3 + 1] = p.y;
+      basePositions[i3 + 2] = p.z;
+
+      baseLives[index] = 1.0;
+      applyBaseParticleColor(index);
+    }
+
+    function initBaseParticles() {
+      for (let i = 0; i < BASE_COUNT; i++) {
+        respawnBaseParticle(i);
+      }
+      baseGeometry.attributes.position.needsUpdate = true;
+      baseGeometry.attributes.color.needsUpdate = true;
+    }
+
+    initBaseParticles();
+
+    const burstGroup = new THREE.Group();
+    scene.add(burstGroup);
+    const activeBursts = [];
+
+    function createBurst(position) {
+      const count = BURST_PARTICLES_PER_CLICK;
+      const positions = new Float32Array(count * 3);
+      const colors = new Float32Array(count * 3);
+      const velocities = new Float32Array(count * 3);
+
+      for (let i = 0; i < count; i++) {
+        const i3 = i * 3;
+        positions[i3] = position.x;
+        positions[i3 + 1] = position.y;
+        positions[i3 + 2] = position.z;
+
+        tempDir.copy(randomPointInSphere(1)).normalize();
+        const speed = 4 + Math.random() * 8;
+        velocities[i3] = tempDir.x * speed;
+        velocities[i3 + 1] = tempDir.y * speed;
+        velocities[i3 + 2] = tempDir.z * speed;
+
+        if (colorMode === "monochrome") {
+          colorTemp.setRGB(1, 1, 1);
+        } else if (colorMode === "fire") {
+          colorTemp.setRGB(1, 0.5 + 0.5 * Math.random(), 0);
+        } else {
+          colorTemp.setHSL(Math.random(), 1.0, 0.5);
+        }
+
+        colors[i3] = colorTemp.r;
+        colors[i3 + 1] = colorTemp.g;
+        colors[i3 + 2] = colorTemp.b;
+      }
+
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+      geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+
+      const material = new THREE.PointsMaterial({
+        size: 0.5,
+        vertexColors: true,
+        transparent: true,
+        opacity: 1,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false
+      });
+
+      const points = new THREE.Points(geometry, material);
+      burstGroup.add(points);
+
+      activeBursts.push({
+        points,
+        geometry,
+        material,
+        positions,
+        colors,
+        velocities,
+        age: 0,
+        count
+      });
+    }
+
+    function updateMouseProjection(clientX, clientY) {
+      const rect = renderer.domElement.getBoundingClientRect();
+      mouseNDC.x = ((clientX - rect.left) / rect.width) * 2 - 1;
+      mouseNDC.y = -((clientY - rect.top) / rect.height) * 2 + 1;
+      raycaster.setFromCamera(mouseNDC, camera);
+      raycaster.ray.intersectPlane(gravityPlane, gravityWellPosition);
+    }
+
+    function handleClick(event) {
+      updateMouseProjection(event.clientX, event.clientY);
+
+      const now = performance.now() / 1000;
+      if (now - lastClickTime <= 2) {
+        combo = Math.min(10, combo + 1);
+      } else {
+        combo = 1;
+      }
+      lastClickTime = now;
+
+      score += 1 * combo;
+      totalBursts += 1;
+      createBurst(gravityWellPosition.clone());
+      updateHUD();
+    }
+
+    renderer.domElement.addEventListener("mousemove", (e) => {
+      updateMouseProjection(e.clientX, e.clientY);
+    });
+
+    renderer.domElement.addEventListener("click", handleClick);
+
+    window.addEventListener("keydown", (e) => {
+      if (e.code === "KeyG") {
+        gravityEnabled = !gravityEnabled;
+      } else if (e.code === "KeyR") {
+        resetScene();
+      } else if (e.code === "KeyC") {
+        cycleColorMode();
+      } else if (e.code === "Space") {
+        e.preventDefault();
+        paused = !paused;
+      }
+    });
+
+    function cycleColorMode() {
+      const modes = ["rainbow", "monochrome", "fire"];
+      colorMode = modes[(modes.indexOf(colorMode) + 1) % modes.length];
+
+      for (let i = 0; i < BASE_COUNT; i++) {
+        applyBaseParticleColor(i);
+      }
+      baseGeometry.attributes.color.needsUpdate = true;
+
+      for (const burst of activeBursts) {
+        const c = burst.colors;
+        for (let i = 0; i < burst.count; i++) {
+          const i3 = i * 3;
+          if (colorMode === "monochrome") {
+            colorTemp.setRGB(1, 1, 1);
+          } else if (colorMode === "fire") {
+            colorTemp.setRGB(1, 0.5 + 0.5 * Math.random(), 0);
+          } else {
+            colorTemp.setHSL(Math.random(), 1.0, 0.5);
+          }
+          c[i3] = colorTemp.r;
+          c[i3 + 1] = colorTemp.g;
+          c[i3 + 2] = colorTemp.b;
+        }
+        burst.geometry.attributes.color.needsUpdate = true;
+      }
+
+      updateHUD();
+    }
+
+    function clearBursts() {
+      while (activeBursts.length) {
+        const burst = activeBursts.pop();
+        burstGroup.remove(burst.points);
+        burst.geometry.dispose();
+        burst.material.dispose();
+      }
+    }
+
+    function resetScene() {
+      score = 0;
+      combo = 1;
+      totalBursts = 0;
+      lastClickTime = -Infinity;
+      rotationSpeed = BASE_ROTATION_SPEED;
+      basePoints.rotation.set(0, 0, 0);
+      initBaseParticles();
+      clearBursts();
+      updateHUD();
+    }
+
+    const hudScore = document.getElementById("hud-score");
+    const hudCombo = document.getElementById("hud-combo");
+    const hudBursts = document.getElementById("hud-bursts");
+    const hudParticles = document.getElementById("hud-particles");
+    const hudColorMode = document.getElementById("hud-colormode");
+
+    function getBurstParticleCount() {
+      let total = 0;
+      for (const b of activeBursts) total += b.count;
+      return total;
+    }
+
+    function updateHUD() {
+      hudScore.textContent = String(score);
+      hudCombo.textContent = `${combo}x`;
+      hudBursts.textContent = String(totalBursts);
+      hudParticles.textContent = String(BASE_COUNT + getBurstParticleCount());
+      hudColorMode.textContent = colorMode;
+    }
+
+    window.__3D_STATE__ = {
+      score: 0,
+      combo: 1,
+      totalBursts: 0,
+      baseParticleCount: BASE_COUNT,
+      burstParticleCount: 0,
+      totalParticleCount: BASE_COUNT,
+      gravityEnabled: true,
+      colorMode: "rainbow",
+      paused: false,
+      rotationSpeed: BASE_ROTATION_SPEED,
+      gravityWellPosition: { x: 0, y: 0, z: 0 },
+      frameCount: 0
+    };
+
+    function updateState() {
+      const burstParticleCount = getBurstParticleCount();
+      window.__3D_STATE__.score = score;
+      window.__3D_STATE__.combo = combo;
+      window.__3D_STATE__.totalBursts = totalBursts;
+      window.__3D_STATE__.baseParticleCount = BASE_COUNT;
+      window.__3D_STATE__.burstParticleCount = burstParticleCount;
+      window.__3D_STATE__.totalParticleCount = BASE_COUNT + burstParticleCount;
+      window.__3D_STATE__.gravityEnabled = gravityEnabled;
+      window.__3D_STATE__.colorMode = colorMode;
+      window.__3D_STATE__.paused = paused;
+      window.__3D_STATE__.rotationSpeed = rotationSpeed;
+      window.__3D_STATE__.gravityWellPosition = {
+        x: gravityWellPosition.x,
+        y: gravityWellPosition.y,
+        z: gravityWellPosition.z
+      };
+      window.__3D_STATE__.frameCount = frameCount;
+    }
+
+    function updateBaseParticles(elapsed) {
+      const angle = rotationSpeed;
+      const cosA = Math.cos(angle);
+      const sinA = Math.sin(angle);
+
+      for (let i = 0; i < BASE_COUNT; i++) {
+        baseLives[i] -= 0.001;
+        if (baseLives[i] <= 0) {
+          respawnBaseParticle(i);
+        }
+
+        const i3 = i * 3;
+
+        let x = baseBasePositions[i3];
+        let y = baseBasePositions[i3 + 1];
+        let z = baseBasePositions[i3 + 2];
+
+        // orbit around Y axis
+        const rx = x * cosA - z * sinA;
+        const rz = x * sinA + z * cosA;
+        baseBasePositions[i3] = rx;
+        baseBasePositions[i3 + 2] = rz;
+
+        x = rx;
+        z = rz;
+
+        // sine-wave oscillation
+        y += Math.sin(elapsed * 2 + i * 0.1) * 0.02;
+
+        // gravity well attraction
+        if (gravityEnabled) {
+          tempVec3.set(x, y, z);
+          const dist = tempVec3.distanceTo(gravityWellPosition);
+          if (dist < 10 && dist > 0.0001) {
+            tempDir.copy(gravityWellPosition).sub(tempVec3).normalize();
+            const force = 0.03 / dist;
+            x += tempDir.x * force;
+            y += tempDir.y * force;
+            z += tempDir.z * force;
+
+            // make attraction affect base position subtly so it persists
+            baseBasePositions[i3] += tempDir.x * force * 0.5;
+            baseBasePositions[i3 + 1] += tempDir.y * force * 0.5;
+            baseBasePositions[i3 + 2] += tempDir.z * force * 0.5;
+          }
+        }
+
+        basePositions[i3] = x;
+        basePositions[i3 + 1] = y;
+        basePositions[i3 + 2] = z;
+
+        if (colorMode === "fire") {
+          const t = THREE.MathUtils.clamp(baseLives[i], 0, 1);
+          baseColors[i3] = 1;
+          baseColors[i3 + 1] = 0.2 + 0.8 * t;
+          baseColors[i3 + 2] = 0;
+        }
+      }
+
+      baseGeometry.attributes.position.needsUpdate = true;
+      if (colorMode === "fire") {
+        baseGeometry.attributes.color.needsUpdate = true;
+      }
+    }
+
+    function updateBursts(dt) {
+      for (let i = activeBursts.length - 1; i >= 0; i--) {
+        const burst = activeBursts[i];
+        burst.age += dt;
+
+        const fade = 1 - burst.age / BURST_LIFETIME;
+        burst.material.opacity = Math.max(0, fade);
+
+        for (let j = 0; j < burst.count; j++) {
+          const j3 = j * 3;
+          burst.positions[j3] += burst.velocities[j3] * dt;
+          burst.positions[j3 + 1] += burst.velocities[j3 + 1] * dt;
+          burst.positions[j3 + 2] += burst.velocities[j3 + 2] * dt;
+
+          // slight damping
+          burst.velocities[j3] *= 0.99;
+          burst.velocities[j3 + 1] *= 0.99;
+          burst.velocities[j3 + 2] *= 0.99;
+        }
+
+        burst.geometry.attributes.position.needsUpdate = true;
+
+        if (burst.age >= BURST_LIFETIME) {
+          burstGroup.remove(burst.points);
+          burst.geometry.dispose();
+          burst.material.dispose();
+          activeBursts.splice(i, 1);
+        }
+      }
+    }
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      const dtRaw = clock.getDelta();
+      const dt = Math.min(dtRaw, 0.05);
+      const elapsed = clock.elapsedTime;
+
+      const now = performance.now() / 1000;
+      if (now - lastClickTime > 2) {
+        combo = 1;
+      }
+
+      if (!paused) {
+        frameCount++;
+        updateBaseParticles(elapsed);
+        updateBursts(dt);
+      }
+
+      updateHUD();
+      updateState();
+      renderer.render(scene, camera);
+    }
+
+    window.addEventListener("resize", () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    updateHUD();
+    updateState();
+    animate();
+  </script>
+</body>
+</html>

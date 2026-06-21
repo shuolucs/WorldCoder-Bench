@@ -1,0 +1,523 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sunglasses Virtual Try-On</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { overflow: hidden; background: #1a1a2e; font-family: Arial, sans-serif; }
+  canvas { display: block; }
+
+  #debug-overlay {
+    position: fixed;
+    top: 10px;
+    right: 10px;
+    background: rgba(0, 0, 0, 0.75);
+    color: #00ff88;
+    font-family: 'Courier New', monospace;
+    font-size: 13px;
+    padding: 15px 20px;
+    border-radius: 8px;
+    border: 1px solid rgba(0, 255, 136, 0.3);
+    z-index: 100;
+    min-width: 280px;
+    line-height: 1.6;
+    display: none;
+  }
+
+  #debug-overlay.visible {
+    display: block;
+  }
+
+  #debug-overlay .label {
+    color: #888;
+  }
+
+  #toolbar {
+    position: fixed;
+    bottom: 20px;
+    left: 50%;
+    transform: translateX(-50%);
+    display: flex;
+    gap: 10px;
+    z-index: 100;
+  }
+
+  #toolbar button {
+    padding: 10px 20px;
+    border: none;
+    border-radius: 25px;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.3s ease;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+
+  #btn-reset {
+    background: linear-gradient(135deg, #667eea, #764ba2);
+    color: white;
+  }
+
+  #btn-drop {
+    background: linear-gradient(135deg, #f093fb, #f5576c);
+    color: white;
+  }
+
+  #btn-lens {
+    background: linear-gradient(135deg, #4facfe, #00f2fe);
+    color: white;
+  }
+
+  #btn-wireframe {
+    background: linear-gradient(135deg, #43e97b, #38f9d7);
+    color: #1a1a2e;
+  }
+
+  #toolbar button:hover {
+    transform: scale(1.05);
+    box-shadow: 0 4px 15px rgba(0,0,0,0.3);
+  }
+
+  #toolbar button:active {
+    transform: scale(0.95);
+  }
+
+  #loading {
+    position: fixed;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    color: white;
+    font-size: 18px;
+    z-index: 200;
+  }
+
+  .hint {
+    position: fixed;
+    top: 10px;
+    left: 10px;
+    color: rgba(255,255,255,0.5);
+    font-size: 12px;
+    z-index: 100;
+  }
+</style>
+</head>
+<body>
+
+<div id="loading">Loading model...</div>
+<div class="hint">Press 'D' to toggle debug overlay</div>
+
+<div id="debug-overlay">
+  <div><span class="label">Position X:</span> <span id="dbg-px">0.000</span></div>
+  <div><span class="label">Position Y:</span> <span id="dbg-py">0.000</span></div>
+  <div><span class="label">Position Z:</span> <span id="dbg-pz">0.000</span></div>
+  <div><span class="label">Velocity Y:</span> <span id="dbg-vy">0.000</span></div>
+  <div><span class="label">Physics Steps:</span> <span id="dbg-steps">0</span></div>
+  <div><span class="label">Placed:</span> <span id="dbg-placed">false</span></div>
+  <div><span class="label">FPS:</span> <span id="dbg-fps">0</span></div>
+</div>
+
+<div id="toolbar">
+  <button id="btn-reset">Reset</button>
+  <button id="btn-drop">Drop</button>
+  <button id="btn-lens">Change Lens</button>
+  <button id="btn-wireframe">Toggle Wireframe</button>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+// State
+window.__3D_STATE__ = {
+  modelLoaded: false,
+  sunglassesY: 1.8,
+  sunglassesPlaced: false,
+  velocityY: 0,
+  physicsSteps: 0,
+  debugVisible: false,
+  lensColorIndex: 0,
+  wireframeEnabled: false,
+  groundContactCount: 0,
+  sceneObjectCount: 0
+};
+
+const LENS_COLORS = ['#333333', '#8B4513', '#006400', '#00008B'];
+const GRAVITY = 9.81;
+const SNAP_Y = 0.8;
+const GROUND_Y = -1.0;
+const INITIAL_Y = 1.8;
+const RESTITUTION = 0.3;
+const BOUNCE_THRESHOLD = 0.05;
+
+// Scene setup
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x1a1a2e);
+
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+camera.position.set(0, 1.5, 3);
+camera.lookAt(0, 0, 0);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+
+// Lights
+const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
+scene.add(ambientLight);
+
+const directionalLight = new THREE.DirectionalLight(0xffffff, 1.0);
+directionalLight.position.set(2, 3, 2);
+directionalLight.castShadow = true;
+directionalLight.shadow.mapSize.width = 1024;
+directionalLight.shadow.mapSize.height = 1024;
+directionalLight.shadow.camera.near = 0.1;
+directionalLight.shadow.camera.far = 10;
+directionalLight.shadow.camera.left = -3;
+directionalLight.shadow.camera.right = 3;
+directionalLight.shadow.camera.top = 3;
+directionalLight.shadow.camera.bottom = -3;
+scene.add(directionalLight);
+
+// Ground plane
+const groundGeometry = new THREE.PlaneGeometry(10, 10);
+const groundMaterial = new THREE.MeshStandardMaterial({
+  color: 0x2a2a4a,
+  roughness: 0.8,
+  metalness: 0.2
+});
+const ground = new THREE.Mesh(groundGeometry, groundMaterial);
+ground.rotation.x = -Math.PI / 2;
+ground.position.y = GROUND_Y;
+ground.receiveShadow = true;
+scene.add(ground);
+
+// OrbitControls
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.05;
+controls.minPolarAngle = 0.3;
+controls.maxPolarAngle = 1.5;
+controls.target.set(0, 0.5, 0);
+controls.update();
+
+// Create procedural sunglasses
+function createSunglasses() {
+  const group = new THREE.Group();
+
+  const frameMaterial = new THREE.MeshStandardMaterial({
+    color: 0x111111,
+    metalness: 0.8,
+    roughness: 0.2
+  });
+
+  const lensMaterial = new THREE.MeshStandardMaterial({
+    color: new THREE.Color(LENS_COLORS[0]),
+    transparent: true,
+    opacity: 0.6,
+    metalness: 0.3,
+    roughness: 0.1,
+    side: THREE.DoubleSide
+  });
+
+  // Left frame
+  const leftFrame = new THREE.Mesh(
+    new THREE.TorusGeometry(0.12, 0.012, 16, 32),
+    frameMaterial
+  );
+  leftFrame.position.set(-0.14, 0, 0);
+  group.add(leftFrame);
+
+  // Right frame
+  const rightFrame = new THREE.Mesh(
+    new THREE.TorusGeometry(0.12, 0.012, 16, 32),
+    frameMaterial
+  );
+  rightFrame.position.set(0.14, 0, 0);
+  group.add(rightFrame);
+
+  // Left lens
+  const leftLens = new THREE.Mesh(
+    new THREE.CircleGeometry(0.115, 32),
+    lensMaterial
+  );
+  leftLens.position.set(-0.14, 0, 0);
+  leftLens.name = 'lens';
+  group.add(leftLens);
+
+  // Right lens
+  const rightLens = new THREE.Mesh(
+    new THREE.CircleGeometry(0.115, 32),
+    lensMaterial
+  );
+  rightLens.position.set(0.14, 0, 0);
+  rightLens.name = 'lens';
+  group.add(rightLens);
+
+  // Bridge
+  const bridge = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.008, 0.008, 0.08, 8),
+    frameMaterial
+  );
+  bridge.rotation.z = Math.PI / 2;
+  bridge.position.set(0, 0.05, 0);
+  group.add(bridge);
+
+  // Left temple arm
+  const leftArm = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.006, 0.006, 0.35, 8),
+    frameMaterial
+  );
+  leftArm.rotation.x = Math.PI / 2;
+  leftArm.position.set(-0.26, 0.02, -0.17);
+  group.add(leftArm);
+
+  // Right temple arm
+  const rightArm = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.006, 0.006, 0.35, 8),
+    frameMaterial
+  );
+  rightArm.rotation.x = Math.PI / 2;
+  rightArm.position.set(0.26, 0.02, -0.17);
+  group.add(rightArm);
+
+  // Enable shadows on all children
+  group.traverse((child) => {
+    if (child.isMesh) {
+      child.castShadow = true;
+    }
+  });
+
+  group.position.y = INITIAL_Y;
+  group.name = 'sunglasses';
+
+  return { group, lensMaterial };
+}
+
+const { group: sunglasses, lensMaterial } = createSunglasses();
+scene.add(sunglasses);
+
+// Physics state
+let velocityY = 0;
+let placed = false;
+let falling = false; // falling after detach
+let hasBounced = false;
+
+// Load mannequin model
+let mannequin = null;
+const loader = new GLTFLoader();
+
+loader.load(
+  'Corset.glb',
+  (gltf) => {
+    mannequin = gltf.scene;
+
+    // Center and scale
+    const box = new THREE.Box3().setFromObject(mannequin);
+    const center = box.getCenter(new THREE.Vector3());
+    const size = box.getSize(new THREE.Vector3());
+
+    mannequin.position.sub(center);
+    mannequin.scale.setScalar(2.0);
+
+    // Recalculate after scaling
+    const box2 = new THREE.Box3().setFromObject(mannequin);
+    const center2 = box2.getCenter(new THREE.Vector3());
+    mannequin.position.y -= center2.y;
+
+    mannequin.traverse((child) => {
+      if (child.isMesh) {
+        child.castShadow = true;
+        child.receiveShadow = true;
+      }
+    });
+
+    scene.add(mannequin);
+    window.__3D_STATE__.modelLoaded = true;
+    document.getElementById('loading').style.display = 'none';
+  },
+  (progress) => {
+    const pct = progress.total > 0 ? Math.round((progress.loaded / progress.total) * 100) : 0;
+    document.getElementById('loading').textContent = `Loading model... ${pct}%`;
+  },
+  (error) => {
+    console.error('Error loading model:', error);
+    document.getElementById('loading').textContent = 'Model load failed. Scene still works.';
+    setTimeout(() => {
+      document.getElementById('loading').style.display = 'none';
+    }, 3000);
+  }
+);
+
+// FPS tracking
+let frameCount = 0;
+let fpsTime = 0;
+let currentFPS = 0;
+
+// Clock
+const clock = new THREE.Clock();
+
+// Animation loop
+function animate() {
+  requestAnimationFrame(animate);
+
+  const delta = clock.getDelta();
+  const clampedDelta = Math.min(delta, 0.05); // Prevent huge jumps
+
+  window.__3D_STATE__.physicsSteps++;
+
+  // FPS calculation
+  frameCount++;
+  fpsTime += delta;
+  if (fpsTime >= 1.0) {
+    currentFPS = Math.round(frameCount / fpsTime);
+    frameCount = 0;
+    fpsTime = 0;
+  }
+
+  // Physics
+  if (!placed) {
+    if (!falling) {
+      // Falling from initial position toward snap point
+      velocityY -= GRAVITY * clampedDelta;
+      sunglasses.position.y += velocityY * clampedDelta;
+
+      // Check snap
+      if (sunglasses.position.y <= SNAP_Y) {
+        sunglasses.position.y = SNAP_Y;
+        velocityY = 0;
+        placed = true;
+        hasBounced = false;
+      }
+    } else {
+      // Falling after detach - toward ground
+      velocityY -= GRAVITY * clampedDelta;
+      sunglasses.position.y += velocityY * clampedDelta;
+
+      // Ground collision
+      const sunglassesBottom = sunglasses.position.y - 0.12; // approximate half-height
+      if (sunglassesBottom <= GROUND_Y) {
+        sunglasses.position.y = GROUND_Y + 0.12;
+        window.__3D_STATE__.groundContactCount++;
+
+        if (!hasBounced && Math.abs(velocityY) > BOUNCE_THRESHOLD) {
+          velocityY = -velocityY * RESTITUTION;
+          hasBounced = true;
+        } else {
+          velocityY = 0;
+          falling = false;
+          // Sunglasses rest on ground
+        }
+      }
+    }
+  }
+
+  // Ensure no NaN
+  if (isNaN(velocityY)) velocityY = 0;
+  if (isNaN(sunglasses.position.y)) sunglasses.position.y = INITIAL_Y;
+  if (isNaN(sunglasses.position.x)) sunglasses.position.x = 0;
+  if (isNaN(sunglasses.position.z)) sunglasses.position.z = 0;
+
+  // Gentle floating animation when placed
+  if (placed) {
+    const time = clock.elapsedTime;
+    sunglasses.position.y = SNAP_Y + Math.sin(time * 1.5) * 0.005;
+  }
+
+  // Update state
+  window.__3D_STATE__.sunglassesY = sunglasses.position.y;
+  window.__3D_STATE__.sunglassesPlaced = placed;
+  window.__3D_STATE__.velocityY = velocityY;
+  window.__3D_STATE__.debugVisible = document.getElementById('debug-overlay').classList.contains('visible');
+  window.__3D_STATE__.sceneObjectCount = scene.children.length;
+
+  // Update debug overlay
+  if (window.__3D_STATE__.debugVisible) {
+    document.getElementById('dbg-px').textContent = sunglasses.position.x.toFixed(3);
+    document.getElementById('dbg-py').textContent = sunglasses.position.y.toFixed(3);
+    document.getElementById('dbg-pz').textContent = sunglasses.position.z.toFixed(3);
+    document.getElementById('dbg-vy').textContent = velocityY.toFixed(3);
+    document.getElementById('dbg-steps').textContent = window.__3D_STATE__.physicsSteps;
+    document.getElementById('dbg-placed').textContent = placed ? 'true' : 'false';
+    document.getElementById('dbg-fps').textContent = currentFPS;
+  }
+
+  controls.update();
+  renderer.render(scene, camera);
+}
+
+animate();
+
+// Button handlers
+document.getElementById('btn-reset').addEventListener('click', () => {
+  sunglasses.position.set(0, INITIAL_Y, 0);
+  velocityY = 0;
+  placed = false;
+  falling = false;
+  hasBounced = false;
+});
+
+document.getElementById('btn-drop').addEventListener('click', () => {
+  if (placed) {
+    placed = false;
+    falling = true;
+    hasBounced = false;
+    velocityY = 0;
+  }
+});
+
+document.getElementById('btn-lens').addEventListener('click', () => {
+  window.__3D_STATE__.lensColorIndex = (window.__3D_STATE__.lensColorIndex + 1) % LENS_COLORS.length;
+  const newColor = LENS_COLORS[window.__3D_STATE__.lensColorIndex];
+  lensMaterial.color.set(newColor);
+});
+
+document.getElementById('btn-wireframe').addEventListener('click', () => {
+  window.__3D_STATE__.wireframeEnabled = !window.__3D_STATE__.wireframeEnabled;
+  if (mannequin) {
+    mannequin.traverse((child) => {
+      if (child.isMesh && child.material) {
+        if (Array.isArray(child.material)) {
+          child.material.forEach(m => { m.wireframe = window.__3D_STATE__.wireframeEnabled; });
+        } else {
+          child.material.wireframe = window.__3D_STATE__.wireframeEnabled;
+        }
+      }
+    });
+  }
+});
+
+// Debug overlay toggle
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'd' || e.key === 'D') {
+    const overlay = document.getElementById('debug-overlay');
+    overlay.classList.toggle('visible');
+    window.__3D_STATE__.debugVisible = overlay.classList.contains('visible');
+  }
+});
+
+// Resize handler
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+</script>
+</body>
+</html>

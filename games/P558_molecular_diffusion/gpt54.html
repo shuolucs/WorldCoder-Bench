@@ -1,0 +1,705 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>3D Molecular Diffusion Simulation</title>
+  <style>
+    html, body {
+      margin: 0;
+      overflow: hidden;
+      background: #0a0a1a;
+      font-family: Arial, sans-serif;
+      color: #e8eefc;
+    }
+
+    #ui {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      z-index: 10;
+      background: rgba(10, 14, 28, 0.78);
+      border: 1px solid rgba(255,255,255,0.15);
+      border-radius: 10px;
+      padding: 12px 14px;
+      min-width: 280px;
+      backdrop-filter: blur(6px);
+    }
+
+    #ui h2 {
+      margin: 0 0 10px 0;
+      font-size: 16px;
+      font-weight: 600;
+    }
+
+    .control-row {
+      margin: 8px 0;
+      display: grid;
+      grid-template-columns: 120px 1fr 44px;
+      gap: 8px;
+      align-items: center;
+      font-size: 13px;
+    }
+
+    input[type="range"] {
+      width: 100%;
+    }
+
+    #hud {
+      position: absolute;
+      top: 12px;
+      right: 12px;
+      z-index: 10;
+      background: rgba(10, 14, 28, 0.78);
+      border: 1px solid rgba(255,255,255,0.15);
+      border-radius: 10px;
+      padding: 12px 14px;
+      min-width: 240px;
+      line-height: 1.55;
+      font-size: 13px;
+      backdrop-filter: blur(6px);
+    }
+
+    .hint {
+      margin-top: 10px;
+      font-size: 12px;
+      opacity: 0.85;
+    }
+  </style>
+
+  <script type="importmap">
+  { "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+  } }
+  </script>
+</head>
+<body>
+  <div id="ui">
+    <h2>Diffusion Controls</h2>
+    <div class="control-row">
+      <label for="slider-temperature">Temperature</label>
+      <input id="slider-temperature" type="range" min="0.1" max="5.0" step="0.1" value="1.0" />
+      <span id="temp-value">1.0</span>
+    </div>
+    <div class="control-row">
+      <label for="slider-drag">Drag</label>
+      <input id="slider-drag" type="range" min="0" max="10" step="0.5" value="2.0" />
+      <span id="drag-value">2.0</span>
+    </div>
+    <div class="hint">
+      Keys: <b>Space</b> pause/play, <b>R</b> reset, <b>T</b> trails, <b>H</b> heatmap
+    </div>
+  </div>
+
+  <div id="hud">
+    <div>Temperature: <span id="hud-temp">1.0</span></div>
+    <div>Avg speed A: <span id="hud-speed-a">0.00</span></div>
+    <div>Avg speed B: <span id="hud-speed-b">0.00</span></div>
+    <div>Mixing index: <span id="hud-mixing">0.000</span></div>
+    <div>Collisions/frame: <span id="hud-collisions">0</span></div>
+    <div>State: <span id="hud-paused">Playing</span></div>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+    // -----------------------------
+    // Basic setup
+    // -----------------------------
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0a0a1a);
+
+    const camera = new THREE.PerspectiveCamera(
+      60,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      1000
+    );
+    camera.position.set(0, 15, 25);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    document.body.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.target.set(0, 0, 0);
+
+    scene.add(new THREE.AmbientLight(0x334455, 0.3));
+    const dirLight = new THREE.DirectionalLight(0xffffff, 0.6);
+    dirLight.position.set(5, 10, 5);
+    scene.add(dirLight);
+
+    // -----------------------------
+    // Constants
+    // -----------------------------
+    const BOX_SIZE = 10;
+    const HALF_BOX = BOX_SIZE / 2;
+
+    const TYPE_A_COUNT = 30;
+    const TYPE_B_COUNT = 70;
+    const PARTICLE_COUNT = TYPE_A_COUNT + TYPE_B_COUNT;
+
+    const RADIUS_A = 0.2;
+    const RADIUS_B = 0.15;
+    const MASS_A = 2.0;
+    const MASS_B = 1.0;
+
+    const BASE_COLOR_A = new THREE.Color(0xff4444);
+    const BASE_COLOR_B = new THREE.Color(0x4488ff);
+    const WHITE = new THREE.Color(0xffffff);
+
+    const DT = 0.01;
+    const SUBSTEPS = 5;
+    const TRAIL_LENGTH = 15;
+    const MAX_SPEED_COLOR = 6.0;
+
+    let kT = 1.0;
+    let drag = 2.0;
+    let paused = false;
+    let trailsEnabled = true;
+    let heatmapEnabled = true;
+    let frameCount = 0;
+    let collisionsThisFrame = 0;
+
+    // -----------------------------
+    // UI
+    // -----------------------------
+    const tempSlider = document.getElementById('slider-temperature');
+    const dragSlider = document.getElementById('slider-drag');
+    const tempValue = document.getElementById('temp-value');
+    const dragValue = document.getElementById('drag-value');
+
+    tempSlider.addEventListener('input', () => {
+      kT = parseFloat(tempSlider.value);
+      tempValue.textContent = kT.toFixed(1);
+    });
+
+    dragSlider.addEventListener('input', () => {
+      drag = parseFloat(dragSlider.value);
+      dragValue.textContent = drag.toFixed(1);
+    });
+
+    // -----------------------------
+    // Container wireframe box
+    // -----------------------------
+    const boxGeom = new THREE.BoxGeometry(BOX_SIZE, BOX_SIZE, BOX_SIZE);
+    const edges = new THREE.EdgesGeometry(boxGeom);
+    const boxLines = new THREE.LineSegments(
+      edges,
+      new THREE.LineBasicMaterial({
+        color: 0xffffff,
+        transparent: true,
+        opacity: 0.3
+      })
+    );
+    scene.add(boxLines);
+
+    // -----------------------------
+    // Heatmap floor
+    // -----------------------------
+    const heatmapGroup = new THREE.Group();
+    scene.add(heatmapGroup);
+
+    const GRID = 10;
+    const CELL = BOX_SIZE / GRID;
+    const heatmapCells = [];
+
+    for (let ix = 0; ix < GRID; ix++) {
+      for (let iz = 0; iz < GRID; iz++) {
+        const cellGeom = new THREE.PlaneGeometry(CELL * 0.96, CELL * 0.96);
+        const cellMat = new THREE.MeshBasicMaterial({
+          color: 0x2244ff,
+          transparent: true,
+          opacity: 0.35,
+          side: THREE.DoubleSide,
+          depthWrite: false
+        });
+        const cell = new THREE.Mesh(cellGeom, cellMat);
+        cell.rotation.x = -Math.PI / 2;
+        cell.position.set(
+          -HALF_BOX + CELL * 0.5 + ix * CELL,
+          -HALF_BOX + 0.01,
+          -HALF_BOX + CELL * 0.5 + iz * CELL
+        );
+        heatmapGroup.add(cell);
+        heatmapCells.push(cell);
+      }
+    }
+
+    // -----------------------------
+    // Particle data
+    // -----------------------------
+    const particleGroup = new THREE.Group();
+    scene.add(particleGroup);
+
+    const trailGroup = new THREE.Group();
+    scene.add(trailGroup);
+
+    const sphereGeomA = new THREE.SphereGeometry(RADIUS_A, 16, 16);
+    const sphereGeomB = new THREE.SphereGeometry(RADIUS_B, 16, 16);
+
+    const trailGeomA = new THREE.SphereGeometry(RADIUS_A * 0.45, 10, 10);
+    const trailGeomB = new THREE.SphereGeometry(RADIUS_B * 0.45, 10, 10);
+
+    const particles = [];
+
+    function randomGaussian(mean = 0, stdDev = 1) {
+      let u = 0, v = 0;
+      while (u === 0) u = Math.random();
+      while (v === 0) v = Math.random();
+      const z = Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
+      return mean + z * stdDev;
+    }
+
+    function randomInRange(min, max) {
+      return min + Math.random() * (max - min);
+    }
+
+    function clamp(v, min, max) {
+      return Math.max(min, Math.min(max, v));
+    }
+
+    function createParticle(type) {
+      const isA = type === 'A';
+      const radius = isA ? RADIUS_A : RADIUS_B;
+      const mass = isA ? MASS_A : MASS_B;
+      const baseColor = isA ? BASE_COLOR_A : BASE_COLOR_B;
+
+      const material = new THREE.MeshPhongMaterial({
+        color: baseColor.clone(),
+        emissive: baseColor.clone().multiplyScalar(0.08),
+        shininess: 60
+      });
+
+      const mesh = new THREE.Mesh(isA ? sphereGeomA : sphereGeomB, material);
+      particleGroup.add(mesh);
+
+      const trailMeshes = [];
+      for (let i = 0; i < TRAIL_LENGTH; i++) {
+        const tMat = new THREE.MeshBasicMaterial({
+          color: baseColor.clone(),
+          transparent: true,
+          opacity: ((i + 1) / TRAIL_LENGTH) * 0.25
+        });
+        const tMesh = new THREE.Mesh(isA ? trailGeomA : trailGeomB, tMat);
+        tMesh.visible = trailsEnabled;
+        trailGroup.add(tMesh);
+        trailMeshes.push(tMesh);
+      }
+
+      return {
+        type,
+        radius,
+        mass,
+        baseColor: baseColor.clone(),
+        mesh,
+        trailMeshes,
+        trailPositions: [],
+        position: new THREE.Vector3(),
+        prevPosition: new THREE.Vector3(),
+        velocity: new THREE.Vector3()
+      };
+    }
+
+    for (let i = 0; i < TYPE_A_COUNT; i++) particles.push(createParticle('A'));
+    for (let i = 0; i < TYPE_B_COUNT; i++) particles.push(createParticle('B'));
+
+    function validPlacement(pos, radius, placedParticles) {
+      for (const p of placedParticles) {
+        const minDist = radius + p.radius + 0.02;
+        if (pos.distanceToSquared(p.position) < minDist * minDist) return false;
+      }
+      return true;
+    }
+
+    function resetParticles() {
+      const placed = [];
+
+      for (const p of particles) {
+        let tries = 0;
+        let pos = new THREE.Vector3();
+
+        while (tries < 5000) {
+          if (p.type === 'A') {
+            pos.set(
+              randomInRange(-HALF_BOX + p.radius, -p.radius - 0.1),
+              randomInRange(-HALF_BOX + p.radius, HALF_BOX - p.radius),
+              randomInRange(-HALF_BOX + p.radius, HALF_BOX - p.radius)
+            );
+          } else {
+            pos.set(
+              randomInRange(-HALF_BOX + p.radius, HALF_BOX - p.radius),
+              randomInRange(-HALF_BOX + p.radius, HALF_BOX - p.radius),
+              randomInRange(-HALF_BOX + p.radius, HALF_BOX - p.radius)
+            );
+          }
+
+          if (validPlacement(pos, p.radius, placed)) break;
+          tries++;
+        }
+
+        p.position.copy(pos);
+        p.prevPosition.copy(pos);
+
+        const vScale = Math.sqrt(kT / p.mass);
+        p.velocity.set(
+          randomGaussian(0, vScale),
+          randomGaussian(0, vScale),
+          randomGaussian(0, vScale)
+        );
+
+        p.mesh.position.copy(p.position);
+        p.trailPositions = [];
+        for (let i = 0; i < TRAIL_LENGTH; i++) {
+          p.trailPositions.push(p.position.clone());
+          p.trailMeshes[i].position.copy(p.position);
+          p.trailMeshes[i].visible = trailsEnabled;
+        }
+
+        placed.push(p);
+      }
+    }
+
+    resetParticles();
+
+    // -----------------------------
+    // Physics
+    // -----------------------------
+    const tempVec = new THREE.Vector3();
+    const normal = new THREE.Vector3();
+    const relVel = new THREE.Vector3();
+
+    function applyBrownian(p, dt) {
+      const sigma = Math.sqrt((2 * kT / p.mass) * dt);
+      p.velocity.x += randomGaussian(0, sigma);
+      p.velocity.y += randomGaussian(0, sigma);
+      p.velocity.z += randomGaussian(0, sigma);
+    }
+
+    function applyDrag(p, dt) {
+      const factor = Math.max(0, 1 - drag * dt);
+      p.velocity.multiplyScalar(factor);
+    }
+
+    function integrateVerlet(p, dt) {
+      const current = p.position.clone();
+      tempVec.copy(p.position).sub(p.prevPosition);
+      p.position.add(tempVec).addScaledVector(p.velocity, dt * dt);
+      p.prevPosition.copy(current);
+    }
+
+    function updateVelocityFromVerlet(p, dt) {
+      p.velocity.copy(p.position).sub(p.prevPosition).divideScalar(dt);
+    }
+
+    function resolveWallCollision(p) {
+      const min = -HALF_BOX + p.radius;
+      const max = HALF_BOX - p.radius;
+
+      if (p.position.x < min) {
+        p.position.x = min;
+        p.velocity.x = Math.abs(p.velocity.x);
+        p.prevPosition.x = p.position.x - p.velocity.x * DT;
+      } else if (p.position.x > max) {
+        p.position.x = max;
+        p.velocity.x = -Math.abs(p.velocity.x);
+        p.prevPosition.x = p.position.x - p.velocity.x * DT;
+      }
+
+      if (p.position.y < min) {
+        p.position.y = min;
+        p.velocity.y = Math.abs(p.velocity.y);
+        p.prevPosition.y = p.position.y - p.velocity.y * DT;
+      } else if (p.position.y > max) {
+        p.position.y = max;
+        p.velocity.y = -Math.abs(p.velocity.y);
+        p.prevPosition.y = p.position.y - p.velocity.y * DT;
+      }
+
+      if (p.position.z < min) {
+        p.position.z = min;
+        p.velocity.z = Math.abs(p.velocity.z);
+        p.prevPosition.z = p.position.z - p.velocity.z * DT;
+      } else if (p.position.z > max) {
+        p.position.z = max;
+        p.velocity.z = -Math.abs(p.velocity.z);
+        p.prevPosition.z = p.position.z - p.velocity.z * DT;
+      }
+    }
+
+    function resolveParticleCollisions(dt) {
+      let count = 0;
+
+      for (let i = 0; i < particles.length; i++) {
+        const pi = particles[i];
+
+        for (let j = i + 1; j < particles.length; j++) {
+          const pj = particles[j];
+
+          normal.subVectors(pj.position, pi.position);
+          let distSq = normal.lengthSq();
+          const minDist = pi.radius + pj.radius;
+          const minDistSq = minDist * minDist;
+
+          if (distSq < minDistSq) {
+            let dist = Math.sqrt(distSq);
+
+            if (dist < 1e-8) {
+              normal.set(randomGaussian(), randomGaussian(), randomGaussian()).normalize();
+              dist = 1e-8;
+            } else {
+              normal.divideScalar(dist);
+            }
+
+            const overlap = minDist - dist;
+            const totalMass = pi.mass + pj.mass;
+            const moveI = overlap * (pj.mass / totalMass);
+            const moveJ = overlap * (pi.mass / totalMass);
+
+            pi.position.addScaledVector(normal, -moveI);
+            pj.position.addScaledVector(normal, moveJ);
+
+            relVel.subVectors(pi.velocity, pj.velocity);
+            const approaching = relVel.dot(normal);
+
+            if (approaching > 0) {
+              const impulse = (2 * approaching) / ((1 / pi.mass) + (1 / pj.mass));
+              pi.velocity.addScaledVector(normal, -impulse / pi.mass);
+              pj.velocity.addScaledVector(normal, impulse / pj.mass);
+
+              pi.prevPosition.copy(pi.position).subScaledVector(pi.velocity, dt);
+              pj.prevPosition.copy(pj.position).subScaledVector(pj.velocity, dt);
+            }
+
+            count++;
+          }
+        }
+      }
+
+      return count;
+    }
+
+    // -----------------------------
+    // Visual updates
+    // -----------------------------
+    function updateTrails() {
+      for (const p of particles) {
+        p.trailPositions.push(p.position.clone());
+        if (p.trailPositions.length > TRAIL_LENGTH) p.trailPositions.shift();
+
+        for (let i = 0; i < TRAIL_LENGTH; i++) {
+          const mesh = p.trailMeshes[i];
+          const idx = p.trailPositions.length - 1 - i;
+
+          if (idx >= 0 && trailsEnabled) {
+            mesh.visible = true;
+            mesh.position.copy(p.trailPositions[idx]);
+            mesh.material.opacity = ((TRAIL_LENGTH - i) / TRAIL_LENGTH) * 0.25;
+          } else {
+            mesh.visible = false;
+          }
+        }
+      }
+    }
+
+    function updateParticleVisuals() {
+      for (const p of particles) {
+        p.mesh.position.copy(p.position);
+        const speed = p.velocity.length();
+        const t = clamp(speed / MAX_SPEED_COLOR, 0, 1);
+        const color = p.baseColor.clone().lerp(WHITE, t);
+        p.mesh.material.color.copy(color);
+        p.mesh.material.emissive.copy(color).multiplyScalar(0.08);
+      }
+    }
+
+    function updateHeatmap() {
+      heatmapGroup.visible = heatmapEnabled;
+      if (!heatmapEnabled) return;
+
+      const counts = new Array(GRID * GRID).fill(0);
+
+      for (const p of particles) {
+        const ix = clamp(Math.floor((p.position.x + HALF_BOX) / CELL), 0, GRID - 1);
+        const iz = clamp(Math.floor((p.position.z + HALF_BOX) / CELL), 0, GRID - 1);
+        counts[ix + iz * GRID]++;
+      }
+
+      let maxCount = 1;
+      for (const c of counts) maxCount = Math.max(maxCount, c);
+
+      for (let i = 0; i < heatmapCells.length; i++) {
+        const intensity = counts[i] / maxCount;
+        const color = new THREE.Color(0x2244ff).lerp(new THREE.Color(0xff3333), intensity);
+        heatmapCells[i].material.color.copy(color);
+        heatmapCells[i].material.opacity = 0.15 + intensity * 0.55;
+      }
+    }
+
+    // -----------------------------
+    // Stats / HUD / state
+    // -----------------------------
+    const hudTemp = document.getElementById('hud-temp');
+    const hudSpeedA = document.getElementById('hud-speed-a');
+    const hudSpeedB = document.getElementById('hud-speed-b');
+    const hudMixing = document.getElementById('hud-mixing');
+    const hudCollisions = document.getElementById('hud-collisions');
+    const hudPaused = document.getElementById('hud-paused');
+
+    function computeStats() {
+      let sumA = 0, sumB = 0;
+      let countA = 0, countB = 0;
+      let aLeft = 0;
+      let totalKE = 0;
+      let valid = true;
+
+      for (const p of particles) {
+        const speed = p.velocity.length();
+        totalKE += 0.5 * p.mass * speed * speed;
+
+        if (
+          !Number.isFinite(p.position.x) || !Number.isFinite(p.position.y) || !Number.isFinite(p.position.z) ||
+          !Number.isFinite(p.velocity.x) || !Number.isFinite(p.velocity.y) || !Number.isFinite(p.velocity.z)
+        ) {
+          valid = false;
+        }
+
+        if (p.type === 'A') {
+          sumA += speed;
+          countA++;
+          if (p.position.x < 0) aLeft++;
+        } else {
+          sumB += speed;
+          countB++;
+        }
+      }
+
+      const avgSpeedA = countA ? sumA / countA : 0;
+      const avgSpeedB = countB ? sumB / countB : 0;
+      const fractionAInLeft = countA ? aLeft / countA : 0;
+      const mixingIndex = clamp(1 - Math.abs(fractionAInLeft - 0.5) / 0.5, 0, 1);
+
+      return {
+        avgSpeedA,
+        avgSpeedB,
+        mixingIndex,
+        totalKE,
+        valid
+      };
+    }
+
+    function updateHUD(stats) {
+      hudTemp.textContent = kT.toFixed(1);
+      hudSpeedA.textContent = stats.avgSpeedA.toFixed(2);
+      hudSpeedB.textContent = stats.avgSpeedB.toFixed(2);
+      hudMixing.textContent = stats.mixingIndex.toFixed(3);
+      hudCollisions.textContent = String(collisionsThisFrame);
+      hudPaused.textContent = paused ? 'Paused' : 'Playing';
+    }
+
+    window.__3D_STATE__ = {};
+
+    function updateState(stats) {
+      window.__3D_STATE__ = {
+        particleCount: PARTICLE_COUNT,
+        typeACount: TYPE_A_COUNT,
+        typeBCount: TYPE_B_COUNT,
+        temperature: kT,
+        drag: drag,
+        avgSpeedA: Number(stats.avgSpeedA.toFixed(3)),
+        avgSpeedB: Number(stats.avgSpeedB.toFixed(3)),
+        mixingIndex: Number(stats.mixingIndex.toFixed(3)),
+        collisionsThisFrame: collisionsThisFrame,
+        isPaused: paused,
+        trailsEnabled: trailsEnabled,
+        heatmapEnabled: heatmapEnabled,
+        frameCount: frameCount,
+        particlesValid: stats.valid,
+        totalKE: Number(stats.totalKE.toFixed(3))
+      };
+    }
+
+    // -----------------------------
+    // Input
+    // -----------------------------
+    window.addEventListener('keydown', (e) => {
+      if (e.code === 'Space') {
+        e.preventDefault();
+        paused = !paused;
+      } else if (e.code === 'KeyR') {
+        resetParticles();
+      } else if (e.code === 'KeyT') {
+        trailsEnabled = !trailsEnabled;
+        for (const p of particles) {
+          for (const t of p.trailMeshes) t.visible = trailsEnabled;
+        }
+      } else if (e.code === 'KeyH') {
+        heatmapEnabled = !heatmapEnabled;
+        heatmapGroup.visible = heatmapEnabled;
+      }
+    });
+
+    // -----------------------------
+    // Animation loop
+    // -----------------------------
+    function stepSimulation() {
+      collisionsThisFrame = 0;
+
+      for (let s = 0; s < SUBSTEPS; s++) {
+        for (const p of particles) {
+          applyBrownian(p, DT);
+          applyDrag(p, DT);
+          integrateVerlet(p, DT);
+        }
+
+        for (const p of particles) {
+          updateVelocityFromVerlet(p, DT);
+          resolveWallCollision(p);
+        }
+
+        collisionsThisFrame += resolveParticleCollisions(DT);
+
+        for (const p of particles) {
+          p.prevPosition.copy(p.position).subScaledVector(p.velocity, DT);
+        }
+      }
+    }
+
+    function animate() {
+      requestAnimationFrame(animate);
+      frameCount++;
+
+      if (!paused) {
+        stepSimulation();
+        updateTrails();
+      }
+
+      updateParticleVisuals();
+      updateHeatmap();
+
+      const stats = computeStats();
+      updateHUD(stats);
+      updateState(stats);
+
+      controls.update();
+      renderer.render(scene, camera);
+    }
+
+    animate();
+
+    // -----------------------------
+    // Resize
+    // -----------------------------
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+  </script>
+</body>
+</html>

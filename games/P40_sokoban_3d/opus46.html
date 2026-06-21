@@ -1,0 +1,573 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3D Sokoban</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { overflow: hidden; background: #1a1a2e; font-family: 'Segoe UI', sans-serif; }
+  canvas { display: block; }
+  #ui {
+    position: absolute; top: 10px; left: 10px; z-index: 10;
+    display: flex; flex-direction: column; gap: 8px;
+  }
+  #ui button {
+    padding: 10px 20px; font-size: 15px; font-weight: 600;
+    border: none; border-radius: 8px; cursor: pointer;
+    transition: all 0.2s; color: #fff;
+  }
+  #undoBtn { background: #e94560; }
+  #undoBtn:hover { background: #c73e54; }
+  #resetBtn { background: #0f3460; }
+  #resetBtn:hover { background: #16213e; }
+  #info {
+    position: absolute; top: 10px; right: 10px; z-index: 10;
+    background: rgba(0,0,0,0.7); color: #fff; padding: 15px 20px;
+    border-radius: 10px; font-size: 16px; line-height: 1.8;
+  }
+  #winOverlay {
+    display: none; position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+    background: rgba(0,0,0,0.6); z-index: 100;
+    justify-content: center; align-items: center;
+  }
+  #winOverlay.show { display: flex; }
+  #winBox {
+    background: linear-gradient(135deg, #0f3460, #16213e);
+    color: #e94560; padding: 40px 60px; border-radius: 20px;
+    text-align: center; font-size: 32px; font-weight: bold;
+    box-shadow: 0 0 40px rgba(233,69,96,0.5);
+  }
+  #winBox p { margin-top: 10px; font-size: 18px; color: #eee; }
+</style>
+<script type="importmap">
+{ "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="ui">
+  <button id="undoBtn">⟲ Undo</button>
+  <button id="resetBtn">↺ Reset</button>
+</div>
+<div id="info">
+  <div>Moves: <span id="movesDisplay">0</span></div>
+  <div>Boxes on Target: <span id="botDisplay">0</span></div>
+  <div style="margin-top:8px;font-size:12px;color:#aaa;">WASD to move</div>
+</div>
+<div id="winOverlay">
+  <div id="winBox">
+    🎉 Level Complete!
+    <p>Congratulations!</p>
+  </div>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// ============ LEVEL DEFINITION ============
+// 0=empty, 1=wall, 2=floor
+// We define a fixed solvable level on 8x8 grid
+const GRID_SIZE = 8;
+
+const levelMap = [
+  [1,1,1,1,1,1,1,1],
+  [1,0,0,1,0,0,0,1],
+  [1,0,0,0,0,1,0,1],
+  [1,0,1,0,0,0,0,1],
+  [1,0,0,0,1,0,0,1],
+  [1,0,0,0,0,0,0,1],
+  [1,0,0,1,0,0,0,1],
+  [1,1,1,1,1,1,1,1],
+];
+
+const initialPlayer = { row: 1, col: 1 };
+const initialBoxes = [
+  { row: 2, col: 2 },
+  { row: 3, col: 3 },
+  { row: 4, col: 4 },
+];
+const targets = [
+  { row: 5, col: 5 },
+  { row: 5, col: 4 },
+  { row: 4, col: 5 },
+];
+
+// ============ GAME STATE ============
+let playerPos = { ...initialPlayer };
+let boxes = initialBoxes.map(b => ({ ...b }));
+let moves = 0;
+let levelComplete = false;
+let history = [];
+
+function cloneState() {
+  return {
+    playerPos: { ...playerPos },
+    boxes: boxes.map(b => ({ ...b })),
+    moves
+  };
+}
+
+function isWall(r, c) {
+  if (r < 0 || r >= GRID_SIZE || c < 0 || c >= GRID_SIZE) return true;
+  return levelMap[r][c] === 1;
+}
+
+function isBox(r, c) {
+  return boxes.some(b => b.row === r && b.col === c);
+}
+
+function getBoxIndex(r, c) {
+  return boxes.findIndex(b => b.row === r && b.col === c);
+}
+
+function countBoxesOnTarget() {
+  let count = 0;
+  for (const b of boxes) {
+    if (targets.some(t => t.row === b.row && t.col === b.col)) count++;
+  }
+  return count;
+}
+
+function updateState() {
+  const bot = countBoxesOnTarget();
+  levelComplete = bot === 3;
+
+  window.__3D_STATE__ = {
+    playerPos: { ...playerPos },
+    boxes: boxes.map(b => ({ ...b })),
+    targets: targets.map(t => ({ ...t })),
+    moves,
+    boxesOnTarget: bot,
+    levelComplete
+  };
+
+  document.getElementById('movesDisplay').textContent = moves;
+  document.getElementById('botDisplay').textContent = bot;
+
+  if (levelComplete) {
+    document.getElementById('winOverlay').classList.add('show');
+  } else {
+    document.getElementById('winOverlay').classList.remove('show');
+  }
+}
+
+function tryMove(dir) {
+  if (levelComplete) return false;
+
+  let dr = 0, dc = 0;
+  if (dir === 'W') dr = -1;
+  else if (dir === 'S') dr = 1;
+  else if (dir === 'A') dc = -1;
+  else if (dir === 'D') dc = 1;
+  else return false;
+
+  const nr = playerPos.row + dr;
+  const nc = playerPos.col + dc;
+
+  if (isWall(nr, nc)) return false;
+
+  if (isBox(nr, nc)) {
+    const bnr = nr + dr;
+    const bnc = nc + dc;
+    if (isWall(bnr, bnc) || isBox(bnr, bnc)) return false;
+
+    // Push box
+    const saved = cloneState();
+    history.push(saved);
+
+    const bi = getBoxIndex(nr, nc);
+    boxes[bi].row = bnr;
+    boxes[bi].col = bnc;
+    playerPos.row = nr;
+    playerPos.col = nc;
+    moves++;
+    updateState();
+    return true;
+  }
+
+  // Move to empty
+  const saved = cloneState();
+  history.push(saved);
+
+  playerPos.row = nr;
+  playerPos.col = nc;
+  moves++;
+  updateState();
+  return true;
+}
+
+function undo() {
+  if (history.length === 0) return;
+  const prev = history.pop();
+  playerPos = prev.playerPos;
+  boxes = prev.boxes;
+  moves = prev.moves;
+  updateState();
+}
+
+function resetLevel() {
+  playerPos = { ...initialPlayer };
+  boxes = initialBoxes.map(b => ({ ...b }));
+  moves = 0;
+  levelComplete = false;
+  history = [];
+  updateState();
+}
+
+// ============ THREE.JS SETUP ============
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x1a1a2e);
+scene.fog = new THREE.FogExp2(0x1a1a2e, 0.03);
+
+const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 100);
+camera.position.set(4, 12, 14);
+camera.lookAt(4, 0, 4);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.2;
+document.body.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(3.5, 0, 3.5);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+controls.maxPolarAngle = Math.PI / 2.2;
+controls.minDistance = 5;
+controls.maxDistance = 25;
+controls.update();
+
+// Lights
+const ambientLight = new THREE.AmbientLight(0x404060, 0.6);
+scene.add(ambientLight);
+
+const dirLight = new THREE.DirectionalLight(0xffeedd, 1.5);
+dirLight.position.set(8, 15, 10);
+dirLight.castShadow = true;
+dirLight.shadow.mapSize.set(2048, 2048);
+dirLight.shadow.camera.left = -10;
+dirLight.shadow.camera.right = 10;
+dirLight.shadow.camera.top = 10;
+dirLight.shadow.camera.bottom = -10;
+dirLight.shadow.camera.near = 1;
+dirLight.shadow.camera.far = 30;
+dirLight.shadow.bias = -0.001;
+scene.add(dirLight);
+
+const pointLight = new THREE.PointLight(0x4488ff, 0.5, 20);
+pointLight.position.set(3.5, 5, 3.5);
+scene.add(pointLight);
+
+// ============ MATERIALS ============
+const floorMat = new THREE.MeshStandardMaterial({
+  color: 0x2a2a4a,
+  roughness: 0.8,
+  metalness: 0.1
+});
+
+const wallMat = new THREE.MeshStandardMaterial({
+  color: 0x4a3f6b,
+  roughness: 0.6,
+  metalness: 0.2
+});
+
+const targetMat = new THREE.MeshStandardMaterial({
+  color: 0x00cc66,
+  roughness: 0.5,
+  metalness: 0.3,
+  emissive: 0x003311,
+  emissiveIntensity: 0.5
+});
+
+const boxMat = new THREE.MeshStandardMaterial({
+  color: 0xff8833,
+  roughness: 0.3,
+  metalness: 0.4
+});
+
+const boxOnTargetMat = new THREE.MeshStandardMaterial({
+  color: 0x33ff88,
+  roughness: 0.3,
+  metalness: 0.4,
+  emissive: 0x00ff44,
+  emissiveIntensity: 0.3
+});
+
+const playerMat = new THREE.MeshStandardMaterial({
+  color: 0xe94560,
+  roughness: 0.2,
+  metalness: 0.6,
+  emissive: 0x990022,
+  emissiveIntensity: 0.3
+});
+
+// ============ BUILD STATIC SCENE ============
+function gridToWorld(row, col) {
+  return { x: col, z: row };
+}
+
+// Floor tiles
+const floorGeo = new THREE.BoxGeometry(0.95, 0.1, 0.95);
+const wallGeo = new THREE.BoxGeometry(0.95, 1.2, 0.95);
+
+for (let r = 0; r < GRID_SIZE; r++) {
+  for (let c = 0; c < GRID_SIZE; c++) {
+    const { x, z } = gridToWorld(r, c);
+    if (levelMap[r][c] === 1) {
+      // Wall
+      const wall = new THREE.Mesh(wallGeo, wallMat);
+      wall.position.set(x, 0.6, z);
+      wall.castShadow = true;
+      wall.receiveShadow = true;
+      scene.add(wall);
+
+      // Floor under wall
+      const floor = new THREE.Mesh(floorGeo, floorMat);
+      floor.position.set(x, -0.05, z);
+      floor.receiveShadow = true;
+      scene.add(floor);
+    } else {
+      // Check if target
+      const isTarget = targets.some(t => t.row === r && t.col === c);
+      const mat = isTarget ? targetMat : floorMat;
+      const floor = new THREE.Mesh(floorGeo, mat);
+      floor.position.set(x, -0.05, z);
+      floor.receiveShadow = true;
+      scene.add(floor);
+
+      // Target marker ring
+      if (isTarget) {
+        const ringGeo = new THREE.TorusGeometry(0.35, 0.04, 8, 24);
+        const ringMat = new THREE.MeshStandardMaterial({
+          color: 0x00ff88,
+          emissive: 0x00ff44,
+          emissiveIntensity: 1.0
+        });
+        const ring = new THREE.Mesh(ringGeo, ringMat);
+        ring.rotation.x = -Math.PI / 2;
+        ring.position.set(x, 0.06, z);
+        scene.add(ring);
+
+        // Diamond marker
+        const diamondGeo = new THREE.OctahedronGeometry(0.12, 0);
+        const diamond = new THREE.Mesh(diamondGeo, ringMat);
+        diamond.position.set(x, 0.15, z);
+        scene.add(diamond);
+      }
+    }
+  }
+}
+
+// ============ DYNAMIC OBJECTS ============
+// Player sphere
+const playerGeo = new THREE.SphereGeometry(0.35, 32, 32);
+const playerMesh = new THREE.Mesh(playerGeo, playerMat);
+playerMesh.castShadow = true;
+playerMesh.receiveShadow = true;
+scene.add(playerMesh);
+
+// Player glow
+const glowGeo = new THREE.SphereGeometry(0.42, 16, 16);
+const glowMat = new THREE.MeshBasicMaterial({
+  color: 0xe94560,
+  transparent: true,
+  opacity: 0.15
+});
+const glowMesh = new THREE.Mesh(glowGeo, glowMat);
+playerMesh.add(glowMesh);
+
+// Box meshes
+const boxGeo = new THREE.BoxGeometry(0.7, 0.7, 0.7);
+const boxMeshes = [];
+for (let i = 0; i < 3; i++) {
+  const box = new THREE.Mesh(boxGeo, boxMat.clone());
+  box.castShadow = true;
+  box.receiveShadow = true;
+  scene.add(box);
+  boxMeshes.push(box);
+}
+
+// ============ ANIMATION STATE ============
+let animating = false;
+const animDuration = 120; // ms
+let animStart = 0;
+let animTargets = []; // { mesh, fromX, fromZ, toX, toZ }
+
+function startAnimation(targets) {
+  animating = true;
+  animStart = performance.now();
+  animTargets = targets;
+}
+
+function updateAnimation(now) {
+  if (!animating) return;
+  const t = Math.min((now - animStart) / animDuration, 1);
+  // Smooth step
+  const s = t * t * (3 - 2 * t);
+
+  for (const a of animTargets) {
+    a.mesh.position.x = a.fromX + (a.toX - a.fromX) * s;
+    a.mesh.position.z = a.fromZ + (a.toZ - a.fromZ) * s;
+
+    // Bounce for player
+    if (a.isPlayer) {
+      a.mesh.position.y = 0.35 + Math.sin(s * Math.PI) * 0.15;
+    }
+  }
+
+  if (t >= 1) {
+    animating = false;
+    animTargets = [];
+  }
+}
+
+function syncPositions(animate = false) {
+  const pw = gridToWorld(playerPos.row, playerPos.col);
+
+  if (animate && !animating) {
+    const anims = [];
+
+    // Player
+    anims.push({
+      mesh: playerMesh,
+      fromX: playerMesh.position.x,
+      fromZ: playerMesh.position.z,
+      toX: pw.x,
+      toZ: pw.z,
+      isPlayer: true
+    });
+
+    // Boxes
+    for (let i = 0; i < 3; i++) {
+      const bw = gridToWorld(boxes[i].row, boxes[i].col);
+      if (Math.abs(boxMeshes[i].position.x - bw.x) > 0.01 ||
+          Math.abs(boxMeshes[i].position.z - bw.z) > 0.01) {
+        anims.push({
+          mesh: boxMeshes[i],
+          fromX: boxMeshes[i].position.x,
+          fromZ: boxMeshes[i].position.z,
+          toX: bw.x,
+          toZ: bw.z,
+          isPlayer: false
+        });
+      }
+    }
+
+    if (anims.length > 0) {
+      startAnimation(anims);
+    }
+  } else {
+    playerMesh.position.set(pw.x, 0.35, pw.z);
+  }
+
+  // Update box materials and positions (immediate if not animating)
+  for (let i = 0; i < 3; i++) {
+    const bw = gridToWorld(boxes[i].row, boxes[i].col);
+    if (!animate || !animating) {
+      boxMeshes[i].position.set(bw.x, 0.35, bw.z);
+    }
+
+    const onTarget = targets.some(t => t.row === boxes[i].row && t.col === boxes[i].col);
+    if (onTarget) {
+      boxMeshes[i].material.color.setHex(0x33ff88);
+      boxMeshes[i].material.emissive.setHex(0x00ff44);
+      boxMeshes[i].material.emissiveIntensity = 0.3;
+    } else {
+      boxMeshes[i].material.color.setHex(0xff8833);
+      boxMeshes[i].material.emissive.setHex(0x000000);
+      boxMeshes[i].material.emissiveIntensity = 0;
+    }
+  }
+}
+
+// ============ INPUT ============
+function handleMove(dir) {
+  if (animating) return;
+  const moved = tryMove(dir);
+  if (moved) {
+    syncPositions(true);
+  }
+}
+
+window.addEventListener('keydown', (e) => {
+  const key = e.key.toUpperCase();
+  if (['W', 'A', 'S', 'D'].includes(key)) {
+    e.preventDefault();
+    handleMove(key);
+  }
+});
+
+// Arrow keys support
+window.addEventListener('keydown', (e) => {
+  const map = { 'ArrowUp': 'W', 'ArrowDown': 'S', 'ArrowLeft': 'A', 'ArrowRight': 'D' };
+  if (map[e.key]) {
+    e.preventDefault();
+    handleMove(map[e.key]);
+  }
+});
+
+document.getElementById('undoBtn').addEventListener('click', () => {
+  if (animating) return;
+  undo();
+  syncPositions(false);
+});
+
+document.getElementById('resetBtn').addEventListener('click', () => {
+  if (animating) return;
+  resetLevel();
+  syncPositions(false);
+});
+
+// ============ EXPOSE API ============
+window.__ICG_move__ = function(dir) {
+  handleMove(dir);
+};
+
+// ============ ANIMATION LOOP ============
+function animate(time) {
+  requestAnimationFrame(animate);
+  controls.update();
+  updateAnimation(time);
+
+  // Subtle player bob
+  if (!animating) {
+    playerMesh.position.y = 0.35 + Math.sin(time * 0.003) * 0.03;
+  }
+
+  // Rotate glow
+  glowMesh.rotation.y = time * 0.001;
+
+  // Box hover
+  for (let i = 0; i < 3; i++) {
+    if (!animating) {
+      boxMeshes[i].position.y = 0.35 + Math.sin(time * 0.002 + i * 2) * 0.02;
+    }
+    boxMeshes[i].rotation.y = time * 0.0005 + i;
+  }
+
+  renderer.render(scene, camera);
+}
+
+// ============ RESIZE ============
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// ============ INIT ============
+updateState();
+syncPositions(false);
+requestAnimationFrame(animate);
+
+</script>
+</body>
+</html>

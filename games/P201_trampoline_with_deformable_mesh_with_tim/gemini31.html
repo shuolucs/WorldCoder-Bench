@@ -1,0 +1,495 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Trampoline Simulation</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #1a1a2e;
+            font-family: monospace;
+        }
+        #hud {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(0, 0, 0, 0.6);
+            color: white;
+            padding: 15px;
+            border-radius: 8px;
+            font-size: 14px;
+            pointer-events: none;
+            line-height: 1.5;
+            min-width: 250px;
+        }
+        .hud-row {
+            display: flex;
+            justify-content: space-between;
+        }
+        .controls-help {
+            margin-top: 10px;
+            font-size: 12px;
+            color: #aaa;
+            border-top: 1px solid #555;
+            padding-top: 10px;
+        }
+    </style>
+    <!-- Import maps polyfill -->
+    <script async src="https://unpkg.com/es-module-shims@1.8.0/dist/es-module-shims.js"></script>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="hud">
+        <div class="hud-row"><span>Status:</span> <span id="pauseStatus">RUNNING</span></div>
+        <div class="hud-row"><span>Time Scale:</span> <span id="timeScaleDisplay">1.00</span></div>
+        <div class="hud-row"><span>Character Y:</span> <span id="charYDisplay">6.00</span></div>
+        <div class="hud-row"><span>Velocity:</span> <span id="velocityDisplay">0.00</span></div>
+        <div class="hud-row"><span>Bounce Count:</span> <span id="bounceCountDisplay">0</span></div>
+        <div class="hud-row"><span>Max Deform:</span> <span id="maxDeformDisplay">0.00</span></div>
+        
+        <div class="controls-help">
+            [↑/↓] Adjust Time Scale<br>
+            [Space] Toggle Pause<br>
+            [R] Reset Simulation<br>
+            [W] Toggle Wireframe
+        </div>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+        // --- State Management ---
+        window.__3D_STATE__ = {
+            characterY: 6,
+            characterVelocity: 0,
+            bounceCount: 0,
+            timeScale: 1.0,
+            isPaused: false,
+            maxDeformation: 0,
+            wireframeOn: false,
+            modelLoaded: false,
+            trampolineVertexCount: 0,
+            elapsedTime: 0,
+            characterMinY: 6,
+            springForce: 0
+        };
+
+        // --- Globals ---
+        let scene, camera, renderer, controls;
+        let character, mixer;
+        let trampolineSurface, posAttr, originalY;
+        let particles, particleVelocities;
+        
+        const clock = new THREE.Clock();
+        
+        // Physics variables
+        let charY = 6.0;
+        let charVel = 0.0;
+        let bounceCount = 0;
+        let timeScale = 1.0;
+        let savedTimeScale = 1.0;
+        let isPaused = false;
+        let simElapsedTime = 0;
+        let charMinY = 6.0;
+        let springForce = 0;
+        let maxDeform = 0;
+
+        const GRAVITY = -9.81;
+        const SPRING_CONSTANT = 45.0;
+        const DAMPING = 0.02;
+        const RESTORE_RATE = 0.1;
+
+        init();
+        animate();
+
+        function init() {
+            // 1. Scene Setup
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x1a1a2e);
+
+            camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+            camera.position.set(0, 8, 15);
+            camera.lookAt(0, 0, 0);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.shadowMap.enabled = true;
+            renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+            document.body.appendChild(renderer.domElement);
+
+            controls = new OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+            controls.target.set(0, 1, 0);
+
+            // Lights
+            const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+            scene.add(ambientLight);
+
+            const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+            dirLight.position.set(5, 15, 10);
+            dirLight.castShadow = true;
+            dirLight.shadow.camera.top = 10;
+            dirLight.shadow.camera.bottom = -10;
+            dirLight.shadow.camera.left = -10;
+            dirLight.shadow.camera.right = 10;
+            dirLight.shadow.mapSize.width = 2048;
+            dirLight.shadow.mapSize.height = 2048;
+            scene.add(dirLight);
+
+            // Ground
+            const gridHelper = new THREE.GridHelper(20, 20, 0x444444, 0x222222);
+            scene.add(gridHelper);
+
+            // 2. Trampoline Construction
+            const frameGeom = new THREE.TorusGeometry(4, 0.3, 16, 64);
+            frameGeom.rotateX(Math.PI / 2);
+            const frameMat = new THREE.MeshStandardMaterial({ 
+                color: 0x333333, 
+                metalness: 0.8, 
+                roughness: 0.2 
+            });
+            const frame = new THREE.Mesh(frameGeom, frameMat);
+            frame.position.y = 1;
+            frame.castShadow = true;
+            frame.receiveShadow = true;
+            scene.add(frame);
+
+            const legGeom = new THREE.CylinderGeometry(0.15, 0.15, 1, 16);
+            const legPositions = [
+                [4, 0.5, 0], [-4, 0.5, 0], [0, 0.5, 4], [0, 0.5, -4]
+            ];
+            legPositions.forEach(pos => {
+                const leg = new THREE.Mesh(legGeom, frameMat);
+                leg.position.set(...pos);
+                leg.castShadow = true;
+                leg.receiveShadow = true;
+                scene.add(leg);
+            });
+
+            // Deformable Surface
+            let surfGeom = new THREE.PlaneGeometry(8, 8, 32, 32);
+            surfGeom.rotateX(-Math.PI / 2); // Make horizontal, local Y is now up
+            surfGeom = surfGeom.toNonIndexed(); // Convert to non-indexed buffer geometry
+            
+            const surfMat = new THREE.MeshPhongMaterial({ 
+                color: 0x4488ff, 
+                side: THREE.DoubleSide,
+                wireframe: false,
+                shininess: 60
+            });
+            
+            trampolineSurface = new THREE.Mesh(surfGeom, surfMat);
+            trampolineSurface.position.y = 1;
+            trampolineSurface.receiveShadow = true;
+            scene.add(trampolineSurface);
+
+            posAttr = surfGeom.attributes.position;
+            originalY = new Float32Array(posAttr.count);
+            for(let i = 0; i < posAttr.count; i++) {
+                originalY[i] = posAttr.getY(i);
+            }
+            window.__3D_STATE__.trampolineVertexCount = posAttr.count;
+
+            // 3. 3D Asset Loading
+            const loader = new GLTFLoader();
+            // Using standard Khronos sample model URL for BrainStem
+            const modelUrl = 'https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Models/master/2.0/BrainStem/glTF-Binary/BrainStem.glb';
+            
+            loader.load(modelUrl, (gltf) => {
+                character = gltf.scene;
+                
+                // Scale to approx 1.5 units tall
+                const box = new THREE.Box3().setFromObject(character);
+                const height = box.max.y - box.min.y;
+                const scale = 1.5 / height;
+                character.scale.setScalar(scale);
+                
+                character.position.set(0, charY, 0);
+                
+                character.traverse((child) => {
+                    if (child.isMesh) {
+                        child.castShadow = true;
+                        child.receiveShadow = true;
+                    }
+                });
+
+                scene.add(character);
+
+                if (gltf.animations && gltf.animations.length > 0) {
+                    mixer = new THREE.AnimationMixer(character);
+                    mixer.clipAction(gltf.animations[0]).play();
+                }
+
+                window.__3D_STATE__.modelLoaded = true;
+            });
+
+            // 4. Particle System (Optional enhancement)
+            initParticles();
+
+            // 5. Event Listeners
+            window.addEventListener('resize', onWindowResize);
+            window.addEventListener('keydown', onKeyDown);
+        }
+
+        function initParticles() {
+            const particleCount = 40;
+            const pGeom = new THREE.BufferGeometry();
+            const pPos = new Float32Array(particleCount * 3);
+            particleVelocities = [];
+            
+            for(let i=0; i<particleCount; i++) {
+                particleVelocities.push(new THREE.Vector3());
+            }
+            
+            pGeom.setAttribute('position', new THREE.BufferAttribute(pPos, 3));
+            const pMat = new THREE.PointsMaterial({
+                color: 0x88ccff, 
+                size: 0.1,
+                transparent: true,
+                opacity: 0.8
+            });
+            
+            particles = new THREE.Points(pGeom, pMat);
+            particles.visible = false;
+            scene.add(particles);
+        }
+
+        function triggerParticles() {
+            particles.visible = true;
+            const pPos = particles.geometry.attributes.position.array;
+            for(let i=0; i<particleVelocities.length; i++) {
+                pPos[i*3] = (Math.random() - 0.5) * 1.5;
+                pPos[i*3+1] = 1.0;
+                pPos[i*3+2] = (Math.random() - 0.5) * 1.5;
+                
+                particleVelocities[i].set(
+                    (Math.random() - 0.5) * 4,
+                    Math.random() * 4 + 2,
+                    (Math.random() - 0.5) * 4
+                );
+            }
+            particles.geometry.attributes.position.needsUpdate = true;
+        }
+
+        function updateParticles(dt) {
+            if (!particles.visible) return;
+            let active = false;
+            const pPos = particles.geometry.attributes.position.array;
+            
+            for(let i=0; i<particleVelocities.length; i++) {
+                if (pPos[i*3+1] > 0) {
+                    active = true;
+                    particleVelocities[i].y += GRAVITY * dt;
+                    pPos[i*3] += particleVelocities[i].x * dt;
+                    pPos[i*3+1] += particleVelocities[i].y * dt;
+                    pPos[i*3+2] += particleVelocities[i].z * dt;
+                }
+            }
+            particles.geometry.attributes.position.needsUpdate = true;
+            if (!active) particles.visible = false;
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        function onKeyDown(e) {
+            switch(e.code) {
+                case 'ArrowUp':
+                    timeScale = Math.min(3.0, timeScale + 0.25);
+                    if(!isPaused) savedTimeScale = timeScale;
+                    break;
+                case 'ArrowDown':
+                    timeScale = Math.max(0.0, timeScale - 0.25);
+                    if(!isPaused) savedTimeScale = timeScale;
+                    break;
+                case 'Space':
+                    isPaused = !isPaused;
+                    if (isPaused) {
+                        savedTimeScale = timeScale;
+                        timeScale = 0;
+                    } else {
+                        timeScale = savedTimeScale;
+                    }
+                    break;
+                case 'KeyR':
+                    resetSimulation();
+                    break;
+                case 'KeyW':
+                    trampolineSurface.material.wireframe = !trampolineSurface.material.wireframe;
+                    break;
+            }
+        }
+
+        function resetSimulation() {
+            charY = 6.0;
+            charVel = 0.0;
+            bounceCount = 0;
+            timeScale = 1.0;
+            savedTimeScale = 1.0;
+            isPaused = false;
+            simElapsedTime = 0;
+            charMinY = 6.0;
+            springForce = 0;
+            maxDeform = 0;
+            
+            if (character) character.position.y = charY;
+            
+            // Reset trampoline mesh
+            for(let i = 0; i < posAttr.count; i++) {
+                posAttr.setY(i, originalY[i]);
+            }
+            posAttr.needsUpdate = true;
+            trampolineSurface.geometry.computeVertexNormals();
+            
+            particles.visible = false;
+        }
+
+        function updatePhysics(dt) {
+            if (!window.__3D_STATE__.modelLoaded) return;
+
+            // Clamp dt to prevent huge jumps if tab is inactive
+            dt = Math.min(dt, 0.1);
+            
+            // Apply time scale to delta time
+            const scaledDt = dt * timeScale;
+            if (scaledDt === 0) return;
+
+            simElapsedTime += scaledDt;
+            
+            if (mixer) mixer.update(scaledDt);
+
+            const prevVel = charVel;
+            
+            // Apply Gravity
+            charVel += GRAVITY * scaledDt;
+            charY += charVel * scaledDt;
+
+            let currentMaxDeform = 0;
+            springForce = 0;
+            let meshNeedsUpdate = false;
+
+            // Collision & Deformation Logic
+            if (charY < 1.0) {
+                const penetrationDepth = 1.0 - charY;
+                
+                // Central deformation calculation for spring force
+                const centralDeformation = penetrationDepth * 0.8;
+                springForce = SPRING_CONSTANT * centralDeformation;
+                
+                // Apply spring force
+                charVel += springForce * scaledDt;
+                
+                // Apply damping
+                charVel *= (1.0 - DAMPING);
+
+                // Deform vertices
+                for(let i = 0; i < posAttr.count; i++) {
+                    const vx = posAttr.getX(i);
+                    const vz = posAttr.getZ(i);
+                    const dist = Math.sqrt(vx*vx + vz*vz);
+                    
+                    if (dist < 3.0) {
+                        const deform = Math.max(0, (3.0 - dist) / 3.0) * penetrationDepth * 0.8;
+                        posAttr.setY(i, originalY[i] - deform);
+                        if (deform > currentMaxDeform) currentMaxDeform = deform;
+                    } else {
+                        posAttr.setY(i, originalY[i]);
+                    }
+                }
+                meshNeedsUpdate = true;
+
+                // Bounce detection
+                if (prevVel < 0 && charVel >= 0) {
+                    bounceCount++;
+                    triggerParticles();
+                }
+            } else {
+                // Restore trampoline shape smoothly
+                for(let i = 0; i < posAttr.count; i++) {
+                    const currentVertexY = posAttr.getY(i);
+                    if (Math.abs(currentVertexY - originalY[i]) > 0.001) {
+                        // Lerp back to original
+                        posAttr.setY(i, currentVertexY + (originalY[i] - currentVertexY) * RESTORE_RATE);
+                        meshNeedsUpdate = true;
+                    } else {
+                        posAttr.setY(i, originalY[i]);
+                    }
+                }
+            }
+
+            if (meshNeedsUpdate) {
+                posAttr.needsUpdate = true;
+                trampolineSurface.geometry.computeVertexNormals();
+            }
+
+            // Floor Clamp
+            if (charY < -1.0) {
+                charY = -1.0;
+                charVel = 0;
+            }
+
+            // NaN Safety
+            if (isNaN(charY)) charY = 6.0;
+            if (isNaN(charVel)) charVel = 0.0;
+
+            if (charY < charMinY) charMinY = charY;
+            maxDeform = currentMaxDeform;
+
+            character.position.y = charY;
+            
+            updateParticles(scaledDt);
+        }
+
+        function updateHUD() {
+            document.getElementById('timeScaleDisplay').innerText = timeScale.toFixed(2);
+            document.getElementById('charYDisplay').innerText = charY.toFixed(2);
+            document.getElementById('velocityDisplay').innerText = charVel.toFixed(2);
+            document.getElementById('bounceCountDisplay').innerText = bounceCount;
+            document.getElementById('pauseStatus').innerText = isPaused ? 'PAUSED' : 'RUNNING';
+            document.getElementById('pauseStatus').style.color = isPaused ? '#ff5555' : '#55ff55';
+            document.getElementById('maxDeformDisplay').innerText = maxDeform.toFixed(2);
+        }
+
+        function updateState() {
+            window.__3D_STATE__.characterY = charY;
+            window.__3D_STATE__.characterVelocity = charVel;
+            window.__3D_STATE__.bounceCount = bounceCount;
+            window.__3D_STATE__.timeScale = timeScale;
+            window.__3D_STATE__.isPaused = isPaused;
+            window.__3D_STATE__.maxDeformation = maxDeform;
+            window.__3D_STATE__.wireframeOn = trampolineSurface ? trampolineSurface.material.wireframe : false;
+            window.__3D_STATE__.elapsedTime = simElapsedTime;
+            window.__3D_STATE__.characterMinY = charMinY;
+            window.__3D_STATE__.springForce = springForce;
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            
+            const dt = clock.getDelta();
+            
+            updatePhysics(dt);
+            controls.update();
+            renderer.render(scene, camera);
+            
+            updateHUD();
+            updateState();
+        }
+    </script>
+</body>
+</html>

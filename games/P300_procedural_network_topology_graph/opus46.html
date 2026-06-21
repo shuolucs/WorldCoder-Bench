@@ -1,0 +1,565 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3D Network Topology Graph</title>
+<style>
+body {
+    margin: 0;
+    overflow: hidden;
+    background: #0a0a1a;
+    font-family: 'Segoe UI', Arial, sans-serif;
+}
+canvas { display: block; }
+#controls {
+    position: absolute;
+    top: 15px;
+    left: 15px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    z-index: 10;
+}
+#controls button {
+    padding: 8px 16px;
+    border: 1px solid #334466;
+    background: rgba(10, 10, 26, 0.85);
+    color: #aabbcc;
+    font-size: 13px;
+    cursor: pointer;
+    border-radius: 4px;
+    transition: all 0.2s;
+    backdrop-filter: blur(4px);
+}
+#controls button:hover {
+    background: rgba(30, 40, 60, 0.9);
+    border-color: #5577aa;
+    color: #ddeeff;
+}
+#controls button.active {
+    border-color: #00aaff;
+    color: #00aaff;
+    background: rgba(0, 100, 200, 0.15);
+}
+#controls button.hidden-type {
+    border-color: #663333;
+    color: #664444;
+    background: rgba(60, 20, 20, 0.3);
+}
+#hudInfo {
+    position: absolute;
+    bottom: 15px;
+    left: 15px;
+    color: #8899aa;
+    font-size: 14px;
+    background: rgba(10, 10, 26, 0.85);
+    padding: 10px 16px;
+    border-radius: 4px;
+    border: 1px solid #223344;
+    backdrop-filter: blur(4px);
+    z-index: 10;
+}
+</style>
+</head>
+<body>
+
+<div id="controls">
+    <button id="toggleLayout">Toggle Layout</button>
+    <button id="filterRouter" class="active">Routers (0-5)</button>
+    <button id="filterServer" class="active">Servers (6-12)</button>
+    <button id="filterClient" class="active">Clients (13-19)</button>
+    <button id="pulseBtn">Send Pulse</button>
+</div>
+<div id="hudInfo">Visible: 20/20 | Selected: none</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<script>
+(function() {
+    // ==================== SCENE SETUP ====================
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0a0a1a);
+
+    const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 200);
+    camera.position.set(0, 0, 50);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(window.devicePixelRatio);
+    document.body.appendChild(renderer.domElement);
+
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+    scene.add(ambientLight);
+
+    const pointLight = new THREE.PointLight(0xffffff, 0.8);
+    pointLight.position.set(20, 20, 20);
+    scene.add(pointLight);
+
+    const controls = new THREE.OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.08;
+
+    // ==================== STATE ====================
+    const state = {
+        nodeCount: 20,
+        edgeCount: 0,
+        hoveredNodeIndex: -1,
+        selectedNodeIndex: -1,
+        layoutMode: 'sphere',
+        routerVisible: true,
+        serverVisible: true,
+        clientVisible: true,
+        visibleNodeCount: 20,
+        pulseActive: false,
+        pulseProgress: 0,
+        cameraDistance: 50,
+        selectedEdgeCount: 0,
+        nodesArray: []
+    };
+    window.__3D_STATE__ = state;
+
+    // ==================== NODE GENERATION ====================
+    const NODE_COUNT = 20;
+    const nodeTypes = [];
+    const nodeColors = [];
+    const typeColor = {
+        'router': 0x00aaff,
+        'server': 0x00ff88,
+        'client': 0xff6644
+    };
+
+    for (let i = 0; i < NODE_COUNT; i++) {
+        if (i <= 5) { nodeTypes.push('router'); nodeColors.push(typeColor.router); }
+        else if (i <= 12) { nodeTypes.push('server'); nodeColors.push(typeColor.server); }
+        else { nodeTypes.push('client'); nodeColors.push(typeColor.client); }
+    }
+
+    // Golden angle spherical distribution
+    const goldenAngle = 137.5 * Math.PI / 180;
+    const spherePositions = [];
+
+    for (let i = 0; i < NODE_COUNT; i++) {
+        const theta = i * goldenAngle;
+        const phi = Math.acos(1 - 2 * (i + 0.5) / NODE_COUNT);
+        const r = 8 + (i / (NODE_COUNT - 1)) * 10; // radius between 8 and 18
+
+        const x = r * Math.sin(phi) * Math.cos(theta);
+        const y = r * Math.sin(phi) * Math.sin(theta);
+        const z = r * Math.cos(phi);
+
+        spherePositions.push(new THREE.Vector3(
+            isNaN(x) ? 0 : x,
+            isNaN(y) ? 0 : y,
+            isNaN(z) ? 0 : z
+        ));
+    }
+
+    // Flat positions (y=0)
+    const flatPositions = spherePositions.map(p => new THREE.Vector3(p.x, 0, p.z));
+
+    // Create node meshes
+    const nodeMeshes = [];
+    const nodeGroup = new THREE.Group();
+    scene.add(nodeGroup);
+
+    const nodeGeometry = new THREE.SphereGeometry(0.6, 16, 16);
+
+    for (let i = 0; i < NODE_COUNT; i++) {
+        const material = new THREE.MeshPhongMaterial({
+            color: nodeColors[i],
+            emissive: 0x000000,
+            shininess: 60
+        });
+        const mesh = new THREE.Mesh(nodeGeometry, material);
+        mesh.position.copy(spherePositions[i]);
+        mesh.userData = { index: i, type: nodeTypes[i], originalColor: nodeColors[i] };
+        nodeMeshes.push(mesh);
+        nodeGroup.add(mesh);
+    }
+
+    // ==================== LABELS ====================
+    function createLabel(text) {
+        const canvas = document.createElement('canvas');
+        canvas.width = 64;
+        canvas.height = 64;
+        const ctx = canvas.getContext('2d');
+        ctx.fillStyle = 'rgba(0,0,0,0)';
+        ctx.fillRect(0, 0, 64, 64);
+        ctx.font = 'bold 36px Arial';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillStyle = '#ffffff';
+        ctx.fillText(text, 32, 32);
+
+        const texture = new THREE.CanvasTexture(canvas);
+        const spriteMaterial = new THREE.SpriteMaterial({ map: texture, transparent: true, depthTest: false });
+        const sprite = new THREE.Sprite(spriteMaterial);
+        sprite.scale.set(1.5, 1.5, 1);
+        return sprite;
+    }
+
+    const labelSprites = [];
+    for (let i = 0; i < NODE_COUNT; i++) {
+        const label = createLabel(String(i));
+        label.position.copy(spherePositions[i]);
+        label.position.y += 1.2;
+        labelSprites.push(label);
+        nodeGroup.add(label);
+    }
+
+    // ==================== EDGES ====================
+    // Find 2 nearest neighbors for each node
+    const edgeSet = new Set();
+    const adjacency = Array.from({ length: NODE_COUNT }, () => []);
+
+    function addEdge(a, b) {
+        const key = Math.min(a, b) + '-' + Math.max(a, b);
+        if (!edgeSet.has(key)) {
+            edgeSet.add(key);
+            adjacency[a].push(b);
+            adjacency[b].push(a);
+        }
+    }
+
+    for (let i = 0; i < NODE_COUNT; i++) {
+        const distances = [];
+        for (let j = 0; j < NODE_COUNT; j++) {
+            if (i === j) continue;
+            distances.push({ index: j, dist: spherePositions[i].distanceTo(spherePositions[j]) });
+        }
+        distances.sort((a, b) => a.dist - b.dist);
+        addEdge(i, distances[0].index);
+        addEdge(i, distances[1].index);
+    }
+
+    // Router ring
+    for (let i = 0; i < 6; i++) {
+        addEdge(i, (i + 1) % 6);
+    }
+
+    const edges = [];
+    edgeSet.forEach(key => {
+        const [a, b] = key.split('-').map(Number);
+        edges.push([a, b]);
+    });
+
+    state.edgeCount = edges.length;
+
+    // Create edge lines
+    const edgeLines = [];
+    const edgeGroup = new THREE.Group();
+    scene.add(edgeGroup);
+
+    for (let i = 0; i < edges.length; i++) {
+        const [a, b] = edges[i];
+        const geometry = new THREE.BufferGeometry();
+        const positions = new Float32Array(6);
+        positions[0] = nodeMeshes[a].position.x;
+        positions[1] = nodeMeshes[a].position.y;
+        positions[2] = nodeMeshes[a].position.z;
+        positions[3] = nodeMeshes[b].position.x;
+        positions[4] = nodeMeshes[b].position.y;
+        positions[5] = nodeMeshes[b].position.z;
+        geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+
+        const material = new THREE.LineBasicMaterial({ color: 0x334466 });
+        const line = new THREE.LineSegments(geometry, material);
+        line.userData = { a, b, originalColor: 0x334466 };
+        edgeLines.push(line);
+        edgeGroup.add(line);
+    }
+
+    function updateEdgePositions() {
+        for (let i = 0; i < edges.length; i++) {
+            const [a, b] = edges[i];
+            const posAttr = edgeLines[i].geometry.getAttribute('position');
+            posAttr.array[0] = nodeMeshes[a].position.x;
+            posAttr.array[1] = nodeMeshes[a].position.y;
+            posAttr.array[2] = nodeMeshes[a].position.z;
+            posAttr.array[3] = nodeMeshes[b].position.x;
+            posAttr.array[4] = nodeMeshes[b].position.y;
+            posAttr.array[5] = nodeMeshes[b].position.z;
+            posAttr.needsUpdate = true;
+        }
+    }
+
+    // ==================== RAYCASTER ====================
+    const raycaster = new THREE.Raycaster();
+    const mouse = new THREE.Vector2();
+    let previousHovered = -1;
+
+    renderer.domElement.addEventListener('mousemove', (event) => {
+        mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+        mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+    });
+
+    renderer.domElement.addEventListener('click', (event) => {
+        raycaster.setFromCamera(mouse, camera);
+        const visibleNodes = nodeMeshes.filter(m => m.visible);
+        const intersects = raycaster.intersectObjects(visibleNodes);
+
+        if (intersects.length > 0) {
+            const idx = intersects[0].object.userData.index;
+            if (state.selectedNodeIndex === idx) {
+                // Deselect
+                deselectNode();
+            } else {
+                deselectNode();
+                selectNode(idx);
+            }
+        }
+    });
+
+    function selectNode(idx) {
+        state.selectedNodeIndex = idx;
+        nodeMeshes[idx].material.emissive.setHex(0xffffff);
+
+        // Highlight connected edges
+        let count = 0;
+        for (let i = 0; i < edges.length; i++) {
+            const [a, b] = edges[i];
+            if (a === idx || b === idx) {
+                edgeLines[i].material.color.setHex(0xffff00);
+                count++;
+            }
+        }
+        state.selectedEdgeCount = count;
+    }
+
+    function deselectNode() {
+        if (state.selectedNodeIndex !== -1) {
+            const idx = state.selectedNodeIndex;
+            nodeMeshes[idx].material.emissive.setHex(0x000000);
+            // Reset edges
+            for (let i = 0; i < edges.length; i++) {
+                edgeLines[i].material.color.setHex(0x334466);
+            }
+        }
+        state.selectedNodeIndex = -1;
+        state.selectedEdgeCount = 0;
+    }
+
+    // ==================== LAYOUT TOGGLE ====================
+    let layoutTransition = false;
+    let layoutTransitionTime = 0;
+    let layoutFrom = [];
+    let layoutTo = [];
+    const LAYOUT_DURATION = 1.0;
+
+    document.getElementById('toggleLayout').addEventListener('click', () => {
+        const targetMode = state.layoutMode === 'sphere' ? 'flat' : 'sphere';
+        const targetPositions = targetMode === 'sphere' ? spherePositions : flatPositions;
+
+        layoutFrom = nodeMeshes.map(m => m.position.clone());
+        layoutTo = targetPositions.map(p => p.clone());
+        layoutTransition = true;
+        layoutTransitionTime = 0;
+        state.layoutMode = targetMode;
+    });
+
+    // ==================== FILTER BUTTONS ====================
+    function updateVisibility() {
+        let visCount = 0;
+        for (let i = 0; i < NODE_COUNT; i++) {
+            const type = nodeTypes[i];
+            let vis = true;
+            if (type === 'router' && !state.routerVisible) vis = false;
+            if (type === 'server' && !state.serverVisible) vis = false;
+            if (type === 'client' && !state.clientVisible) vis = false;
+
+            nodeMeshes[i].visible = vis;
+            labelSprites[i].visible = vis;
+            if (vis) visCount++;
+        }
+        state.visibleNodeCount = visCount;
+
+        // Update edge visibility
+        for (let i = 0; i < edges.length; i++) {
+            const [a, b] = edges[i];
+            edgeLines[i].visible = nodeMeshes[a].visible && nodeMeshes[b].visible;
+        }
+
+        // If selected node becomes invisible, deselect
+        if (state.selectedNodeIndex !== -1 && !nodeMeshes[state.selectedNodeIndex].visible) {
+            deselectNode();
+        }
+
+        updateHUD();
+    }
+
+    document.getElementById('filterRouter').addEventListener('click', function() {
+        state.routerVisible = !state.routerVisible;
+        this.classList.toggle('active', state.routerVisible);
+        this.classList.toggle('hidden-type', !state.routerVisible);
+        updateVisibility();
+    });
+
+    document.getElementById('filterServer').addEventListener('click', function() {
+        state.serverVisible = !state.serverVisible;
+        this.classList.toggle('active', state.serverVisible);
+        this.classList.toggle('hidden-type', !state.serverVisible);
+        updateVisibility();
+    });
+
+    document.getElementById('filterClient').addEventListener('click', function() {
+        state.clientVisible = !state.clientVisible;
+        this.classList.toggle('active', state.clientVisible);
+        this.classList.toggle('hidden-type', !state.clientVisible);
+        updateVisibility();
+    });
+
+    // ==================== PULSE ANIMATION ====================
+    const pulseGeometry = new THREE.SphereGeometry(0.3, 12, 12);
+    const pulseMaterial = new THREE.MeshBasicMaterial({ color: 0xffff00 });
+    const pulseMesh = new THREE.Mesh(pulseGeometry, pulseMaterial);
+    pulseMesh.visible = false;
+    scene.add(pulseMesh);
+
+    const pulseRoute = [0, 1, 2, 3, 4, 5, 0]; // 6 segments
+    let pulseStartTime = 0;
+    const PULSE_SEGMENT_DURATION = 0.5;
+
+    document.getElementById('pulseBtn').addEventListener('click', () => {
+        if (state.pulseActive) return;
+        state.pulseActive = true;
+        state.pulseProgress = 0;
+        pulseStartTime = performance.now() / 1000;
+        pulseMesh.visible = true;
+    });
+
+    function updatePulse(time) {
+        if (!state.pulseActive) return;
+
+        const elapsed = time - pulseStartTime;
+        const totalDuration = 6 * PULSE_SEGMENT_DURATION;
+
+        if (elapsed >= totalDuration) {
+            state.pulseActive = false;
+            state.pulseProgress = 0;
+            pulseMesh.visible = false;
+            return;
+        }
+
+        const progress = elapsed / PULSE_SEGMENT_DURATION;
+        state.pulseProgress = progress;
+
+        const segIndex = Math.floor(progress);
+        const segT = progress - segIndex;
+
+        if (segIndex < 6) {
+            const fromNode = pulseRoute[segIndex];
+            const toNode = pulseRoute[segIndex + 1];
+            const fromPos = nodeMeshes[fromNode].position;
+            const toPos = nodeMeshes[toNode].position;
+
+            pulseMesh.position.lerpVectors(fromPos, toPos, segT);
+        }
+    }
+
+    // ==================== HUD ====================
+    const hudEl = document.getElementById('hudInfo');
+
+    function updateHUD() {
+        const sel = state.selectedNodeIndex === -1 ? 'none' : state.selectedNodeIndex;
+        hudEl.textContent = `Visible: ${state.visibleNodeCount}/20 | Selected: ${sel}`;
+    }
+
+    // ==================== ANIMATION LOOP ====================
+    const clock = new THREE.Clock();
+
+    function animate() {
+        requestAnimationFrame(animate);
+
+        const delta = clock.getDelta();
+        const time = clock.getElapsedTime();
+
+        controls.update();
+
+        // Layout transition
+        if (layoutTransition) {
+            layoutTransitionTime += delta;
+            const t = Math.min(layoutTransitionTime / LAYOUT_DURATION, 1);
+            const smoothT = t * t * (3 - 2 * t); // smoothstep
+
+            for (let i = 0; i < NODE_COUNT; i++) {
+                nodeMeshes[i].position.lerpVectors(layoutFrom[i], layoutTo[i], smoothT);
+                labelSprites[i].position.copy(nodeMeshes[i].position);
+                labelSprites[i].position.y += 1.2;
+            }
+            updateEdgePositions();
+
+            if (t >= 1) {
+                layoutTransition = false;
+            }
+        }
+
+        // Hover detection
+        raycaster.setFromCamera(mouse, camera);
+        const visibleNodes = nodeMeshes.filter(m => m.visible);
+        const intersects = raycaster.intersectObjects(visibleNodes);
+
+        let hoveredIdx = -1;
+        if (intersects.length > 0) {
+            hoveredIdx = intersects[0].object.userData.index;
+        }
+
+        // Unhover previous
+        if (previousHovered !== -1 && previousHovered !== hoveredIdx) {
+            const mesh = nodeMeshes[previousHovered];
+            mesh.scale.set(1, 1, 1);
+            if (previousHovered !== state.selectedNodeIndex) {
+                mesh.material.emissive.setHex(0x000000);
+            }
+        }
+
+        // Hover current
+        if (hoveredIdx !== -1) {
+            const mesh = nodeMeshes[hoveredIdx];
+            mesh.scale.set(1.5, 1.5, 1.5);
+            if (hoveredIdx !== state.selectedNodeIndex) {
+                mesh.material.emissive.setHex(0x333333);
+            }
+        }
+
+        previousHovered = hoveredIdx;
+        state.hoveredNodeIndex = hoveredIdx;
+
+        // Pulse
+        updatePulse(performance.now() / 1000);
+
+        // Update state
+        state.cameraDistance = camera.position.length();
+
+        state.nodesArray = [];
+        for (let i = 0; i < NODE_COUNT; i++) {
+            state.nodesArray.push({
+                x: nodeMeshes[i].position.x,
+                y: nodeMeshes[i].position.y,
+                z: nodeMeshes[i].position.z,
+                type: nodeTypes[i],
+                visible: nodeMeshes[i].visible
+            });
+        }
+
+        updateHUD();
+
+        renderer.render(scene, camera);
+    }
+
+    animate();
+
+    // ==================== RESIZE ====================
+    window.addEventListener('resize', () => {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    // Initialize visibility
+    updateVisibility();
+})();
+</script>
+</body>
+</html>

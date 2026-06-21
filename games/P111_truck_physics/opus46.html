@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Truck Driving Physics Simulation</title>
+<style>
+  body { margin: 0; overflow: hidden; background: #000; }
+  canvas { display: block; }
+  #hud {
+    position: absolute;
+    top: 10px;
+    left: 10px;
+    color: #0f0;
+    font-family: 'Courier New', monospace;
+    font-size: 14px;
+    background: rgba(0,0,0,0.7);
+    padding: 12px 16px;
+    border-radius: 8px;
+    border: 1px solid #0f04;
+    line-height: 1.8;
+    pointer-events: none;
+    z-index: 10;
+  }
+  #hud .label { color: #0a0; }
+  #hud .value { color: #0f0; font-weight: bold; }
+</style>
+<script type="importmap">
+{ "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+
+<div id="hud">
+  <div><span class="label">Speed: </span><span class="value" id="speed">0</span> <span class="label">km/h</span></div>
+  <div><span class="label">Position: </span><span class="value" id="position">0, 0</span></div>
+  <div><span class="label">Steering: </span><span class="value" id="steering">0°</span></div>
+  <div><span class="label">Collisions: </span><span class="value" id="collisions">0</span></div>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+// Scene setup
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x87CEEB);
+scene.fog = new THREE.Fog(0x87CEEB, 50, 150);
+
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 500);
+camera.position.set(0, 5, -10);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+
+// Lighting
+const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
+scene.add(ambientLight);
+
+const dirLight = new THREE.DirectionalLight(0xffffff, 1.2);
+dirLight.position.set(30, 50, 30);
+dirLight.castShadow = true;
+dirLight.shadow.mapSize.set(2048, 2048);
+dirLight.shadow.camera.left = -60;
+dirLight.shadow.camera.right = 60;
+dirLight.shadow.camera.top = 60;
+dirLight.shadow.camera.bottom = -60;
+scene.add(dirLight);
+
+const hemiLight = new THREE.HemisphereLight(0x87CEEB, 0x556633, 0.4);
+scene.add(hemiLight);
+
+// Ground
+const groundGeom = new THREE.PlaneGeometry(100, 100);
+const groundMat = new THREE.MeshStandardMaterial({ color: 0x808080, roughness: 0.9 });
+const ground = new THREE.Mesh(groundGeom, groundMat);
+ground.rotation.x = -Math.PI / 2;
+ground.receiveShadow = true;
+scene.add(ground);
+
+// Grid helper on ground
+const gridHelper = new THREE.GridHelper(100, 50, 0x666666, 0x555555);
+gridHelper.position.y = 0.01;
+scene.add(gridHelper);
+
+// Obstacles
+const obstacles = [];
+const obstacleBoxes = [];
+const obstacleMat = new THREE.MeshStandardMaterial({ color: 0xcc2222, roughness: 0.6 });
+
+for (let i = 0; i < 5; i++) {
+  const geom = new THREE.BoxGeometry(2, 2, 2);
+  const mesh = new THREE.Mesh(geom, obstacleMat);
+  let x, z;
+  do {
+    x = (Math.random() - 0.5) * 60;
+    z = (Math.random() - 0.5) * 60;
+  } while (Math.abs(x) < 5 && Math.abs(z) < 5); // avoid spawning on truck
+  mesh.position.set(x, 1, z);
+  mesh.castShadow = true;
+  mesh.receiveShadow = true;
+  scene.add(mesh);
+  obstacles.push(mesh);
+  const box = new THREE.Box3().setFromObject(mesh);
+  obstacleBoxes.push(box);
+}
+
+// Vehicle state
+let truckModel = null;
+let wheels = [];
+let speed = 0;
+let heading = 0; // radians
+let steeringAngle = 0; // radians
+let collisionCount = 0;
+let wheelRotation = 0;
+const truckPosition = new THREE.Vector3(0, 0, 0);
+
+const MAX_SPEED = 15;
+const ACCELERATION = 5;
+const BRAKE_DECEL = 8;
+const REVERSE_MAX = 5;
+const MAX_STEERING = THREE.MathUtils.degToRad(30);
+const STEERING_SPEED = THREE.MathUtils.degToRad(90);
+const STEERING_RETURN_SPEED = THREE.MathUtils.degToRad(120);
+const FRICTION = 0.98;
+const WHEEL_RADIUS = 0.3;
+
+// Input
+const keys = {};
+window.addEventListener('keydown', (e) => { keys[e.key.toLowerCase()] = true; });
+window.addEventListener('keyup', (e) => { keys[e.key.toLowerCase()] = false; });
+
+// State
+window.__3D_STATE__ = {
+  modelLoaded: false,
+  speed: 0,
+  position: { x: 0, y: 0, z: 0 },
+  rotation: 0,
+  steeringAngle: 0,
+  collisionCount: 0,
+  wheelRotation: 0
+};
+
+// Load truck model
+const loader = new GLTFLoader();
+loader.load('assets/CesiumMilkTruck.glb', (gltf) => {
+  truckModel = gltf.scene;
+  
+  // Compute bounding box to determine scale and position
+  const bbox = new THREE.Box3().setFromObject(truckModel);
+  const size = bbox.getSize(new THREE.Vector3());
+  const center = bbox.getCenter(new THREE.Vector3());
+  
+  // Scale to reasonable size (~4m long)
+  const targetLength = 4;
+  const scaleFactor = targetLength / Math.max(size.x, size.z);
+  truckModel.scale.setScalar(scaleFactor);
+  
+  // Recompute after scale
+  const bbox2 = new THREE.Box3().setFromObject(truckModel);
+  const size2 = bbox2.getSize(new THREE.Vector3());
+  const minY = bbox2.min.y;
+  
+  // Position so bottom is on ground
+  truckModel.position.y = -minY;
+  
+  // Enable shadows
+  truckModel.traverse((child) => {
+    if (child.isMesh) {
+      child.castShadow = true;
+      child.receiveShadow = true;
+    }
+  });
+  
+  // Find wheels
+  wheels = [];
+  truckModel.traverse((child) => {
+    if (child.name && child.name.toLowerCase().includes('wheel')) {
+      wheels.push(child);
+    }
+  });
+  
+  // If no wheels found by name, try to find them by other means
+  if (wheels.length === 0) {
+    truckModel.traverse((child) => {
+      if (child.isMesh && child.name) {
+        const n = child.name.toLowerCase();
+        if (n.includes('tire') || n.includes('rim') || n.includes('roue')) {
+          wheels.push(child);
+        }
+      }
+    });
+  }
+  
+  console.log('Wheels found:', wheels.map(w => w.name));
+  console.log('Model children:', []);
+  truckModel.traverse((c) => { if (c.name) console.log(' -', c.name, c.type); });
+  
+  // Create a wrapper group for the truck
+  const truckWrapper = new THREE.Group();
+  truckWrapper.add(truckModel);
+  scene.add(truckWrapper);
+  truckModel = truckWrapper;
+  
+  window.__3D_STATE__.modelLoaded = true;
+  
+}, undefined, (error) => {
+  console.error('Error loading truck model:', error);
+  
+  // Create a fallback truck
+  const fallbackGroup = new THREE.Group();
+  
+  const bodyGeom = new THREE.BoxGeometry(2, 1, 4);
+  const bodyMat = new THREE.MeshStandardMaterial({ color: 0x4488ff });
+  const body = new THREE.Mesh(bodyGeom, bodyMat);
+  body.position.y = 1;
+  body.castShadow = true;
+  fallbackGroup.add(body);
+  
+  const cabGeom = new THREE.BoxGeometry(1.8, 0.8, 1.5);
+  const cabMat = new THREE.MeshStandardMaterial({ color: 0x3366cc });
+  const cab = new THREE.Mesh(cabGeom, cabMat);
+  cab.position.set(0, 1.9, -0.8);
+  cab.castShadow = true;
+  fallbackGroup.add(cab);
+  
+  // Wheels
+  const wheelGeom = new THREE.CylinderGeometry(0.35, 0.35, 0.3, 16);
+  const wheelMat = new THREE.MeshStandardMaterial({ color: 0x222222 });
+  const wheelPositions = [
+    [-1.1, 0.35, 1.2],
+    [1.1, 0.35, 1.2],
+    [-1.1, 0.35, -1.2],
+    [1.1, 0.35, -1.2]
+  ];
+  
+  wheelPositions.forEach(pos => {
+    const wheel = new THREE.Mesh(wheelGeom, wheelMat);
+    wheel.position.set(pos[0], pos[1], pos[2]);
+    wheel.rotation.z = Math.PI / 2;
+    wheel.name = 'wheel';
+    wheel.castShadow = true;
+    fallbackGroup.add(wheel);
+    wheels.push(wheel);
+  });
+  
+  scene.add(fallbackGroup);
+  truckModel = fallbackGroup;
+  window.__3D_STATE__.modelLoaded = true;
+});
+
+// Truck AABB
+const truckBox = new THREE.Box3();
+const truckSize = new THREE.Vector3(2, 2, 4); // approximate
+
+function updateTruckBox() {
+  const halfW = truckSize.x / 2;
+  const halfL = truckSize.z / 2;
+  truckBox.min.set(
+    truckPosition.x - halfW,
+    0,
+    truckPosition.z - halfL
+  );
+  truckBox.max.set(
+    truckPosition.x + halfW,
+    truckSize.y,
+    truckPosition.z + halfL
+  );
+}
+
+// Clock
+const clock = new THREE.Clock();
+
+// Animation loop
+function animate() {
+  requestAnimationFrame(animate);
+  
+  const dt = Math.min(clock.getDelta(), 0.05);
+  
+  if (truckModel) {
+    // Steering
+    if (keys['a']) {
+      steeringAngle += STEERING_SPEED * dt;
+      if (steeringAngle > MAX_STEERING) steeringAngle = MAX_STEERING;
+    } else if (keys['d']) {
+      steeringAngle -= STEERING_SPEED * dt;
+      if (steeringAngle < -MAX_STEERING) steeringAngle = -MAX_STEERING;
+    } else {
+      // Return to center
+      if (steeringAngle > 0) {
+        steeringAngle -= STEERING_RETURN_SPEED * dt;
+        if (steeringAngle < 0) steeringAngle = 0;
+      } else if (steeringAngle < 0) {
+        steeringAngle += STEERING_RETURN_SPEED * dt;
+        if (steeringAngle > 0) steeringAngle = 0;
+      }
+    }
+    
+    // Acceleration / Braking
+    if (keys['w']) {
+      speed += ACCELERATION * dt;
+      if (speed > MAX_SPEED) speed = MAX_SPEED;
+    } else if (keys['s']) {
+      if (speed > 0.1) {
+        speed -= BRAKE_DECEL * dt;
+        if (speed < 0) speed = 0;
+      } else {
+        speed -= ACCELERATION * dt;
+        if (speed < -REVERSE_MAX) speed = -REVERSE_MAX;
+      }
+    }
+    
+    // Friction
+    speed *= FRICTION;
+    
+    // Stop if very slow
+    if (Math.abs(speed) < 0.01 && !keys['w'] && !keys['s']) {
+      speed = 0;
+    }
+    
+    // Turning (bicycle model)
+    if (Math.abs(speed) > 0.01) {
+      const wheelBase = 3.0;
+      const turnRadius = wheelBase / Math.tan(Math.abs(steeringAngle) + 0.001);
+      const angularVelocity = speed / turnRadius;
+      heading += (steeringAngle > 0 ? angularVelocity : -angularVelocity) * dt;
+    }
+    
+    // Update position
+    const prevPos = truckPosition.clone();
+    truckPosition.x += Math.sin(heading) * speed * dt;
+    truckPosition.z += Math.cos(heading) * speed * dt;
+    
+    // Clamp to ground bounds
+    truckPosition.x = THREE.MathUtils.clamp(truckPosition.x, -48, 48);
+    truckPosition.z = THREE.MathUtils.clamp(truckPosition.z, -48, 48);
+    
+    // Collision detection
+    updateTruckBox();
+    let collided = false;
+    for (let i = 0; i < obstacleBoxes.length; i++) {
+      if (truckBox.intersectsBox(obstacleBoxes[i])) {
+        collided = true;
+        collisionCount++;
+        
+        // Push back
+        const obstacleCenter = new THREE.Vector3();
+        obstacleBoxes[i].getCenter(obstacleCenter);
+        
+        const pushDir = new THREE.Vector3(
+          truckPosition.x - obstacleCenter.x,
+          0,
+          truckPosition.z - obstacleCenter.z
+        );
+        if (pushDir.length() < 0.01) {
+          pushDir.set(Math.sin(heading), 0, Math.cos(heading));
+        }
+        pushDir.normalize();
+        
+        truckPosition.x = prevPos.x + pushDir.x * 0.5;
+        truckPosition.z = prevPos.z + pushDir.z * 0.5;
+        speed = -speed * 0.2; // bounce
+        
+        break;
+      }
+    }
+    
+    // Apply to model
+    truckModel.position.set(truckPosition.x, 0, truckPosition.z);
+    truckModel.rotation.y = heading;
+    
+    // Wheel rotation
+    const wheelAngularSpeed = speed / WHEEL_RADIUS;
+    wheelRotation += wheelAngularSpeed * dt;
+    
+    wheels.forEach(wheel => {
+      wheel.rotation.x = wheelRotation;
+    });
+    
+    // Camera follow
+    const cameraOffset = new THREE.Vector3(0, 5, -10);
+    cameraOffset.applyAxisAngle(new THREE.Vector3(0, 1, 0), heading);
+    const targetCamPos = new THREE.Vector3(
+      truckPosition.x + cameraOffset.x,
+      cameraOffset.y,
+      truckPosition.z + cameraOffset.z
+    );
+    camera.position.lerp(targetCamPos, 0.05);
+    
+    const lookTarget = new THREE.Vector3(truckPosition.x, 1.5, truckPosition.z);
+    camera.lookAt(lookTarget);
+    
+    // HUD
+    const speedKmh = Math.abs(speed * 3.6);
+    document.getElementById('speed').textContent = speedKmh.toFixed(1);
+    document.getElementById('position').textContent = `${truckPosition.x.toFixed(1)}, ${truckPosition.z.toFixed(1)}`;
+    document.getElementById('steering').textContent = `${THREE.MathUtils.radToDeg(steeringAngle).toFixed(1)}°`;
+    document.getElementById('collisions').textContent = collisionCount;
+    
+    // State
+    window.__3D_STATE__.speed = speed;
+    window.__3D_STATE__.position = { x: truckPosition.x, y: truckPosition.y, z: truckPosition.z };
+    window.__3D_STATE__.rotation = heading;
+    window.__3D_STATE__.steeringAngle = steeringAngle;
+    window.__3D_STATE__.collisionCount = collisionCount;
+    window.__3D_STATE__.wheelRotation = wheelRotation;
+  }
+  
+  renderer.render(scene, camera);
+}
+
+animate();
+
+// Resize
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+</script>
+</body>
+</html>

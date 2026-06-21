@@ -1,0 +1,546 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Water Wheel Simulation</title>
+<style>
+  body { margin: 0; overflow: hidden; }
+  canvas { display: block; }
+  #debug-overlay {
+    position: fixed;
+    top: 10px;
+    left: 10px;
+    background: rgba(0, 0, 0, 0.7);
+    color: white;
+    font-family: monospace;
+    font-size: 14px;
+    padding: 10px;
+    z-index: 100;
+    border-radius: 5px;
+    line-height: 1.6;
+    min-width: 280px;
+  }
+  #toggle-debug {
+    position: fixed;
+    top: 10px;
+    right: 10px;
+    z-index: 100;
+    padding: 8px 16px;
+    background: rgba(0, 0, 0, 0.7);
+    color: white;
+    border: 1px solid #666;
+    border-radius: 5px;
+    cursor: pointer;
+    font-family: monospace;
+    font-size: 14px;
+  }
+  #toggle-debug:hover { background: rgba(0, 0, 0, 0.9); }
+  #controls-info {
+    position: fixed;
+    bottom: 10px;
+    left: 10px;
+    background: rgba(0, 0, 0, 0.7);
+    color: #aaa;
+    font-family: monospace;
+    font-size: 12px;
+    padding: 10px;
+    z-index: 100;
+    border-radius: 5px;
+    line-height: 1.5;
+  }
+</style>
+</head>
+<body>
+
+<div id="debug-overlay">
+  <div>Angular Velocity: <span id="dbg-angvel">0.000</span> rad/s</div>
+  <div>Particle Count: <span id="dbg-particles">0</span></div>
+  <div>Total Collisions: <span id="dbg-collisions">0</span></div>
+  <div>FPS: <span id="dbg-fps">0</span></div>
+  <div>Energy Transferred: <span id="dbg-energy">0.000</span></div>
+  <div>Simulation Time: <span id="dbg-time">0.00</span> s</div>
+</div>
+
+<button id="toggle-debug">Toggle Debug</button>
+
+<div id="controls-info">
+  [Space] Toggle Flow | [R] Reset | [B] Brake | [F] Toggle Friction | [Click Wheel] Spin
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.158.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.158.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+// State
+window.__3D_STATE__ = {
+  wheelAngularVelocity: 0,
+  wheelRotation: 0,
+  particleCount: 0,
+  totalCollisions: 0,
+  energyTransferred: 0,
+  flowEnabled: true,
+  frictionEnabled: true,
+  debugVisible: true,
+  simulationTime: 0,
+  helmetLoaded: false,
+  fps: 0,
+  maxParticles: 300,
+  brakeApplied: false
+};
+
+const state = window.__3D_STATE__;
+
+// Scene setup
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x1a2a3a);
+
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+camera.position.set(0, 5, 15);
+camera.lookAt(0, 0, 0);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.shadowMap.enabled = true;
+document.body.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 0, 0);
+controls.update();
+
+// Lights
+const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+scene.add(ambientLight);
+
+const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+dirLight.position.set(5, 10, 5);
+dirLight.castShadow = true;
+scene.add(dirLight);
+
+// Load GLTF model
+const gltfLoader = new GLTFLoader();
+gltfLoader.load(
+  '._DamagedHelmet.glb',
+  (gltf) => {
+    const model = gltf.scene;
+    model.position.set(5, 2, 0);
+    model.scale.set(1.5, 1.5, 1.5);
+    scene.add(model);
+    state.helmetLoaded = true;
+  },
+  undefined,
+  (error) => {
+    console.warn('Could not load GLB model:', error);
+    // Create a placeholder
+    const geo = new THREE.DodecahedronGeometry(1, 1);
+    const mat = new THREE.MeshStandardMaterial({ color: 0x886644, roughness: 0.8, metalness: 0.3 });
+    const placeholder = new THREE.Mesh(geo, mat);
+    placeholder.position.set(5, 2, 0);
+    placeholder.scale.set(1.5, 1.5, 1.5);
+    scene.add(placeholder);
+    state.helmetLoaded = true;
+  }
+);
+
+// Water Wheel
+const wheelGroup = new THREE.Group();
+scene.add(wheelGroup);
+
+// Axle
+const axleGeo = new THREE.CylinderGeometry(0.5, 0.5, 1.5, 32);
+const axleMat = new THREE.MeshStandardMaterial({ color: 0x8B4513 });
+const axle = new THREE.Mesh(axleGeo, axleMat);
+axle.rotation.x = Math.PI / 2;
+wheelGroup.add(axle);
+
+// Paddle blades
+const paddleMat = new THREE.MeshStandardMaterial({ color: 0xA0522D });
+const paddles = [];
+const numPaddles = 8;
+for (let i = 0; i < numPaddles; i++) {
+  const angle = (i / numPaddles) * Math.PI * 2;
+  const paddleGeo = new THREE.BoxGeometry(2.5, 0.8, 0.15);
+  const paddle = new THREE.Mesh(paddleGeo, paddleMat);
+  
+  // Position paddle at outer edge
+  const radius = 1.25; // half of 2.5 blade length, so outer edge is at ~2.5
+  paddle.position.set(Math.cos(angle) * (radius + 0.5), Math.sin(angle) * (radius + 0.5), 0);
+  paddle.rotation.z = angle;
+  
+  wheelGroup.add(paddle);
+  paddles.push(paddle);
+}
+
+// Torus rings
+const torusMat = new THREE.MeshStandardMaterial({ color: 0x8B4513 });
+const torusGeo = new THREE.TorusGeometry(2.5, 0.08, 8, 64);
+const torus1 = new THREE.Mesh(torusGeo, torusMat);
+torus1.position.z = 0.6;
+wheelGroup.add(torus1);
+
+const torus2 = new THREE.Mesh(torusGeo.clone(), torusMat);
+torus2.position.z = -0.6;
+wheelGroup.add(torus2);
+
+// Spokes for visual appeal
+const spokeMat = new THREE.MeshStandardMaterial({ color: 0x8B4513 });
+for (let i = 0; i < numPaddles; i++) {
+  const angle = (i / numPaddles) * Math.PI * 2;
+  const spokeGeo = new THREE.CylinderGeometry(0.06, 0.06, 4.5, 8);
+  const spoke = new THREE.Mesh(spokeGeo, spokeMat);
+  spoke.rotation.z = angle + Math.PI / 2;
+  spoke.position.z = 0.6;
+  wheelGroup.add(spoke);
+  
+  const spoke2 = new THREE.Mesh(spokeGeo.clone(), spokeMat);
+  spoke2.rotation.z = angle + Math.PI / 2;
+  spoke2.position.z = -0.6;
+  wheelGroup.add(spoke2);
+}
+
+// Ground plane
+const groundGeo = new THREE.PlaneGeometry(30, 30);
+const groundMat = new THREE.MeshStandardMaterial({ color: 0x2d4a2d });
+const ground = new THREE.Mesh(groundGeo, groundMat);
+ground.rotation.x = -Math.PI / 2;
+ground.position.y = -5;
+scene.add(ground);
+
+// Water channel visual
+const channelGeo = new THREE.BoxGeometry(8, 0.2, 2);
+const channelMat = new THREE.MeshStandardMaterial({ color: 0x555555, transparent: true, opacity: 0.5 });
+const channel = new THREE.Mesh(channelGeo, channelMat);
+channel.position.set(-3, 7.5, 0);
+channel.rotation.z = -0.15;
+scene.add(channel);
+
+// Water source indicator
+const sourceGeo = new THREE.SphereGeometry(0.3, 16, 16);
+const sourceMat = new THREE.MeshStandardMaterial({ color: 0x4FC3F7, emissive: 0x2196F3, emissiveIntensity: 0.5 });
+const sourceMarker = new THREE.Mesh(sourceGeo, sourceMat);
+sourceMarker.position.set(-6, 8, 0);
+scene.add(sourceMarker);
+
+// Particle System
+const MAX_PARTICLES = 300;
+const SPAWN_RATE = 5;
+const GRAVITY = -9.8;
+const PARTICLE_VX = 3.0;
+const SOURCE = new THREE.Vector3(-6, 8, 0);
+
+const particlePositions = new Float32Array(MAX_PARTICLES * 3);
+const particleVelocities = new Float32Array(MAX_PARTICLES * 3);
+const particleActive = new Uint8Array(MAX_PARTICLES);
+let activeParticleCount = 0;
+
+// Initialize all particles at source (hidden)
+for (let i = 0; i < MAX_PARTICLES; i++) {
+  particlePositions[i * 3] = SOURCE.x;
+  particlePositions[i * 3 + 1] = SOURCE.y;
+  particlePositions[i * 3 + 2] = SOURCE.z;
+  particleVelocities[i * 3] = 0;
+  particleVelocities[i * 3 + 1] = 0;
+  particleVelocities[i * 3 + 2] = 0;
+  particleActive[i] = 0;
+}
+
+const particleGeometry = new THREE.BufferGeometry();
+particleGeometry.setAttribute('position', new THREE.BufferAttribute(particlePositions, 3));
+
+const particleMaterial = new THREE.PointsMaterial({
+  color: 0x4FC3F7,
+  size: 0.15,
+  transparent: true,
+  opacity: 0.9,
+  blending: THREE.AdditiveBlending,
+  depthWrite: false
+});
+
+const particleSystem = new THREE.Points(particleGeometry, particleMaterial);
+scene.add(particleSystem);
+
+function resetParticle(i) {
+  particlePositions[i * 3] = SOURCE.x + (Math.random() - 0.5) * 0.3;
+  particlePositions[i * 3 + 1] = SOURCE.y + (Math.random() - 0.5) * 0.3;
+  particlePositions[i * 3 + 2] = (Math.random() - 0.5) * 0.8;
+  particleVelocities[i * 3] = PARTICLE_VX + (Math.random() - 0.5) * 0.5;
+  particleVelocities[i * 3 + 1] = 0;
+  particleVelocities[i * 3 + 2] = 0;
+}
+
+function spawnParticles() {
+  if (!state.flowEnabled) return;
+  let spawned = 0;
+  for (let i = 0; i < MAX_PARTICLES && spawned < SPAWN_RATE; i++) {
+    if (!particleActive[i]) {
+      particleActive[i] = 1;
+      resetParticle(i);
+      activeParticleCount++;
+      spawned++;
+    }
+  }
+}
+
+function recycleParticle(i) {
+  if (state.flowEnabled) {
+    resetParticle(i);
+  } else {
+    particleActive[i] = 0;
+    activeParticleCount--;
+    particlePositions[i * 3] = SOURCE.x;
+    particlePositions[i * 3 + 1] = SOURCE.y;
+    particlePositions[i * 3 + 2] = SOURCE.z;
+    particleVelocities[i * 3] = 0;
+    particleVelocities[i * 3 + 1] = 0;
+    particleVelocities[i * 3 + 2] = 0;
+  }
+}
+
+// Collision tracking to prevent multiple collisions per particle per cycle
+const particleCollided = new Uint8Array(MAX_PARTICLES);
+
+function updateParticles(dt) {
+  for (let i = 0; i < MAX_PARTICLES; i++) {
+    if (!particleActive[i]) continue;
+
+    const idx = i * 3;
+    
+    // Apply gravity
+    particleVelocities[idx + 1] += GRAVITY * dt;
+    
+    // Update position
+    particlePositions[idx] += particleVelocities[idx] * dt;
+    particlePositions[idx + 1] += particleVelocities[idx + 1] * dt;
+    particlePositions[idx + 2] += particleVelocities[idx + 2] * dt;
+
+    const px = particlePositions[idx];
+    const py = particlePositions[idx + 1];
+    const pz = particlePositions[idx + 2];
+
+    // Check collision with wheel (wheel center is at origin)
+    const distFromCenter = Math.sqrt(px * px + py * py);
+    const zDist = Math.abs(pz);
+
+    if (distFromCenter >= 2.0 && distFromCenter <= 3.0 && zDist < 1.0) {
+      if (!particleCollided[i]) {
+        // Check if near a paddle
+        const particleAngle = Math.atan2(py, px);
+        const wheelAngle = state.wheelRotation;
+        
+        for (let p = 0; p < numPaddles; p++) {
+          const paddleAngle = wheelAngle + (p / numPaddles) * Math.PI * 2;
+          const normalizedPaddleAngle = ((paddleAngle % (Math.PI * 2)) + Math.PI * 2) % (Math.PI * 2);
+          const normalizedParticleAngle = ((particleAngle % (Math.PI * 2)) + Math.PI * 2) % (Math.PI * 2);
+          
+          let angleDiff = Math.abs(normalizedParticleAngle - normalizedPaddleAngle);
+          if (angleDiff > Math.PI) angleDiff = Math.PI * 2 - angleDiff;
+          
+          if (angleDiff < 0.35) {
+            // Collision!
+            state.wheelAngularVelocity += 0.005;
+            state.totalCollisions++;
+            state.energyTransferred = state.totalCollisions * 0.005;
+            particleCollided[i] = 1;
+            
+            recycleParticle(i);
+            particleCollided[i] = 0;
+            break;
+          }
+        }
+      }
+    } else {
+      particleCollided[i] = 0;
+    }
+
+    // Recycle if below threshold
+    if (particlePositions[idx + 1] < -5) {
+      recycleParticle(i);
+    }
+    
+    // Recycle if too far
+    if (particlePositions[idx] > 15 || particlePositions[idx] < -10) {
+      recycleParticle(i);
+    }
+  }
+
+  particleGeometry.attributes.position.needsUpdate = true;
+}
+
+// Raycasting for click
+const raycaster = new THREE.Raycaster();
+const mouse = new THREE.Vector2();
+
+// Create an invisible click target for the wheel
+const wheelClickTarget = new THREE.Mesh(
+  new THREE.CylinderGeometry(3, 3, 1.5, 32),
+  new THREE.MeshBasicMaterial({ visible: false })
+);
+wheelClickTarget.rotation.x = Math.PI / 2;
+wheelGroup.add(wheelClickTarget);
+
+renderer.domElement.addEventListener('click', (event) => {
+  mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+  mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+  
+  raycaster.setFromCamera(mouse, camera);
+  const intersects = raycaster.intersectObject(wheelGroup, true);
+  
+  if (intersects.length > 0) {
+    state.wheelAngularVelocity += 0.5;
+  }
+});
+
+// Keyboard controls
+document.addEventListener('keydown', (event) => {
+  switch (event.code) {
+    case 'Space':
+      event.preventDefault();
+      state.flowEnabled = !state.flowEnabled;
+      break;
+    case 'KeyR':
+      state.wheelAngularVelocity = 0;
+      state.wheelRotation = 0;
+      state.totalCollisions = 0;
+      state.energyTransferred = 0;
+      state.simulationTime = 0;
+      wheelGroup.rotation.z = 0;
+      // Recycle all particles
+      for (let i = 0; i < MAX_PARTICLES; i++) {
+        if (particleActive[i]) {
+          particleActive[i] = 0;
+          activeParticleCount--;
+        }
+        particlePositions[i * 3] = SOURCE.x;
+        particlePositions[i * 3 + 1] = SOURCE.y;
+        particlePositions[i * 3 + 2] = SOURCE.z;
+        particleVelocities[i * 3] = 0;
+        particleVelocities[i * 3 + 1] = 0;
+        particleVelocities[i * 3 + 2] = 0;
+      }
+      activeParticleCount = 0;
+      particleGeometry.attributes.position.needsUpdate = true;
+      break;
+    case 'KeyB':
+      state.wheelAngularVelocity = 0;
+      state.brakeApplied = true;
+      break;
+    case 'KeyF':
+      state.frictionEnabled = !state.frictionEnabled;
+      break;
+  }
+});
+
+// Toggle debug
+const debugOverlay = document.getElementById('debug-overlay');
+const toggleBtn = document.getElementById('toggle-debug');
+toggleBtn.addEventListener('click', () => {
+  state.debugVisible = !state.debugVisible;
+  debugOverlay.style.display = state.debugVisible ? 'block' : 'none';
+});
+
+// Debug display elements
+const dbgAngVel = document.getElementById('dbg-angvel');
+const dbgParticles = document.getElementById('dbg-particles');
+const dbgCollisions = document.getElementById('dbg-collisions');
+const dbgFps = document.getElementById('dbg-fps');
+const dbgEnergy = document.getElementById('dbg-energy');
+const dbgTime = document.getElementById('dbg-time');
+
+// FPS tracking
+let frameCount = 0;
+let fpsTime = 0;
+let currentFps = 0;
+
+// Animation loop
+const clock = new THREE.Clock();
+let lastTime = performance.now();
+
+function animate() {
+  requestAnimationFrame(animate);
+  
+  const now = performance.now();
+  const dt = Math.min((now - lastTime) / 1000, 0.05); // Cap delta time
+  lastTime = now;
+  
+  // FPS
+  frameCount++;
+  fpsTime += dt;
+  if (fpsTime >= 1.0) {
+    currentFps = Math.round(frameCount / fpsTime);
+    state.fps = currentFps;
+    frameCount = 0;
+    fpsTime = 0;
+  }
+  
+  state.simulationTime += dt;
+  
+  // Spawn particles
+  spawnParticles();
+  
+  // Update particles
+  updateParticles(dt);
+  
+  // Apply friction
+  if (state.frictionEnabled) {
+    state.wheelAngularVelocity *= 0.998;
+  }
+  
+  // Cap angular velocity
+  if (state.wheelAngularVelocity > 2.0) state.wheelAngularVelocity = 2.0;
+  if (state.wheelAngularVelocity < -2.0) state.wheelAngularVelocity = -2.0;
+  
+  // Update wheel rotation
+  state.wheelRotation += state.wheelAngularVelocity * dt;
+  wheelGroup.rotation.z = state.wheelRotation;
+  
+  // Count active particles
+  let count = 0;
+  for (let i = 0; i < MAX_PARTICLES; i++) {
+    if (particleActive[i]) count++;
+  }
+  state.particleCount = count;
+  
+  // Reset brake flag
+  if (state.brakeApplied) {
+    state.brakeApplied = false;
+  }
+  
+  // Update debug overlay
+  if (state.debugVisible) {
+    dbgAngVel.textContent = state.wheelAngularVelocity.toFixed(3);
+    dbgParticles.textContent = state.particleCount;
+    dbgCollisions.textContent = state.totalCollisions;
+    dbgFps.textContent = currentFps;
+    dbgEnergy.textContent = state.energyTransferred.toFixed(3);
+    dbgTime.textContent = state.simulationTime.toFixed(2);
+  }
+  
+  // Pulse source marker
+  sourceMarker.material.emissiveIntensity = state.flowEnabled ? 0.5 + Math.sin(now * 0.005) * 0.3 : 0.1;
+  
+  controls.update();
+  renderer.render(scene, camera);
+}
+
+// Handle resize
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+animate();
+</script>
+</body>
+</html>

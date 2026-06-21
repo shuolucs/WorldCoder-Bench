@@ -1,0 +1,562 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3D Force-Directed Social Network</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { overflow: hidden; background: #0a0a1a; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+  canvas { display: block; }
+  #hud {
+    position: absolute; top: 16px; left: 16px;
+    background: rgba(10, 10, 30, 0.85);
+    border: 1px solid rgba(100, 140, 255, 0.3);
+    border-radius: 12px;
+    padding: 16px 20px;
+    color: #c8d8ff;
+    font-size: 14px;
+    line-height: 1.8;
+    backdrop-filter: blur(10px);
+    min-width: 220px;
+    pointer-events: none;
+  }
+  #hud .label { color: #6888cc; font-size: 12px; text-transform: uppercase; letter-spacing: 1px; }
+  #hud .value { color: #e0eaff; font-weight: 600; }
+  #hoverInfo {
+    position: absolute; bottom: 16px; left: 50%; transform: translateX(-50%);
+    background: rgba(10, 10, 30, 0.9);
+    border: 1px solid rgba(100, 140, 255, 0.4);
+    border-radius: 8px;
+    padding: 10px 24px;
+    color: #e0eaff;
+    font-size: 16px;
+    font-weight: 500;
+    backdrop-filter: blur(10px);
+    pointer-events: none;
+    transition: opacity 0.2s;
+  }
+  #controls {
+    position: absolute; top: 16px; right: 16px;
+    display: flex; flex-direction: column; gap: 8px;
+  }
+  #pauseBtn {
+    background: rgba(60, 100, 220, 0.7);
+    border: 1px solid rgba(100, 140, 255, 0.5);
+    border-radius: 8px;
+    padding: 10px 24px;
+    color: #fff;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    backdrop-filter: blur(10px);
+    transition: background 0.2s;
+  }
+  #pauseBtn:hover { background: rgba(80, 120, 240, 0.9); }
+  #instructions {
+    position: absolute; bottom: 60px; left: 50%; transform: translateX(-50%);
+    color: rgba(150, 170, 220, 0.6);
+    font-size: 12px;
+    pointer-events: none;
+    text-align: center;
+  }
+</style>
+<script type="importmap">
+{ "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="hud">
+  <div><span class="label">Nodes: </span><span class="value" id="nodeCount">0</span></div>
+  <div><span class="label">Edges: </span><span class="value" id="edgeCount">0</span></div>
+  <div><span class="label">Energy: </span><span class="value" id="simEnergy">0</span></div>
+  <div><span class="label">Pinned: </span><span class="value" id="pinnedCount">0</span></div>
+</div>
+<div id="hoverInfo">&nbsp;</div>
+<div id="controls">
+  <button id="pauseBtn">Pause</button>
+</div>
+<div id="instructions">Hover to inspect · Click to pin/unpin · Scroll to zoom · Drag to orbit</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// ─── Graph Data ───
+const names = [
+  "Alice","Bob","Charlie","Diana","Eve","Frank","Grace","Hank","Ivy","Jack",
+  "Karen","Leo","Mona","Nick","Olivia","Paul","Quinn","Rita","Sam","Tina",
+  "Uma","Victor","Wendy","Xander","Yara","Zane","Amber","Blake","Cora","Derek",
+  "Elena","Felix","Gina","Hugo","Iris","Jake","Kira","Liam","Maya","Noah",
+  "Opal","Pete","Rosa","Seth","Tara","Ugo","Vera","Wade","Xena","Yuri"
+];
+
+const groupColors = [0x4fc3f7, 0xef5350, 0x66bb6a, 0xffa726, 0xab47bc];
+
+const nodes = [];
+for (let i = 0; i < 50; i++) {
+  nodes.push({
+    id: i,
+    name: names[i],
+    group: i % 5,
+    x: (Math.random() - 0.5) * 60,
+    y: (Math.random() - 0.5) * 60,
+    z: (Math.random() - 0.5) * 60,
+    vx: 0, vy: 0, vz: 0,
+    pinned: false,
+    degree: 0
+  });
+}
+
+// Generate 80 unique edges with preference for same-group connections
+const edgeSet = new Set();
+const edges = [];
+
+function addEdge(s, t) {
+  const key = s < t ? `${s}-${t}` : `${t}-${s}`;
+  if (s === t || edgeSet.has(key)) return false;
+  edgeSet.add(key);
+  edges.push({ source: s, target: t });
+  nodes[s].degree++;
+  nodes[t].degree++;
+  return true;
+}
+
+// First ensure connectivity: create a spanning tree
+const shuffled = [...Array(50).keys()];
+for (let i = shuffled.length - 1; i > 0; i--) {
+  const j = Math.floor(Math.random() * (i + 1));
+  [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+}
+for (let i = 1; i < 50; i++) {
+  addEdge(shuffled[i - 1], shuffled[i]);
+}
+
+// Add intra-group edges
+while (edges.length < 65) {
+  const g = Math.floor(Math.random() * 5);
+  const groupNodes = nodes.filter(n => n.group === g);
+  const a = groupNodes[Math.floor(Math.random() * groupNodes.length)].id;
+  const b = groupNodes[Math.floor(Math.random() * groupNodes.length)].id;
+  addEdge(a, b);
+}
+
+// Fill remaining with random edges
+while (edges.length < 80) {
+  const a = Math.floor(Math.random() * 50);
+  const b = Math.floor(Math.random() * 50);
+  addEdge(a, b);
+}
+
+// Build adjacency list
+const adjacency = Array.from({ length: 50 }, () => new Set());
+for (const e of edges) {
+  adjacency[e.source].add(e.target);
+  adjacency[e.target].add(e.source);
+}
+
+// ─── Three.js Setup ───
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0a0a1a);
+scene.fog = new THREE.FogExp2(0x0a0a1a, 0.003);
+
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+camera.position.set(0, 0, 120);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+document.body.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+
+// Lights
+const ambientLight = new THREE.AmbientLight(0x334466, 0.8);
+scene.add(ambientLight);
+const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+dirLight.position.set(50, 80, 60);
+scene.add(dirLight);
+const dirLight2 = new THREE.DirectionalLight(0x6688cc, 0.4);
+dirLight2.position.set(-40, -30, -50);
+scene.add(dirLight2);
+
+// ─── Node Meshes ───
+const nodeMeshes = [];
+const nodeGroup = new THREE.Group();
+scene.add(nodeGroup);
+
+const baseGeometry = new THREE.SphereGeometry(1, 24, 18);
+const nodeMaterials = groupColors.map(c =>
+  new THREE.MeshPhongMaterial({
+    color: c,
+    emissive: new THREE.Color(c).multiplyScalar(0.15),
+    shininess: 80,
+    specular: 0x444444
+  })
+);
+
+const highlightMaterials = groupColors.map(c =>
+  new THREE.MeshPhongMaterial({
+    color: 0xffffff,
+    emissive: new THREE.Color(c),
+    emissiveIntensity: 0.8,
+    shininess: 120,
+    specular: 0xffffff
+  })
+);
+
+const dimMaterial = new THREE.MeshPhongMaterial({
+  color: 0x222233,
+  emissive: 0x111122,
+  shininess: 10,
+  transparent: true,
+  opacity: 0.3
+});
+
+for (let i = 0; i < 50; i++) {
+  const n = nodes[i];
+  const radius = 0.6 + n.degree * 0.25;
+  const mesh = new THREE.Mesh(baseGeometry, nodeMaterials[n.group]);
+  mesh.scale.setScalar(radius);
+  mesh.position.set(n.x, n.y, n.z);
+  mesh.userData = { nodeIndex: i };
+  nodeGroup.add(mesh);
+  nodeMeshes.push(mesh);
+}
+
+// ─── Edge Lines ───
+const edgePositions = new Float32Array(edges.length * 6);
+const edgeGeometry = new THREE.BufferGeometry();
+edgeGeometry.setAttribute('position', new THREE.BufferAttribute(edgePositions, 3));
+
+const edgeColors = new Float32Array(edges.length * 6);
+edgeGeometry.setAttribute('color', new THREE.BufferAttribute(edgeColors, 3));
+
+const edgeMaterial = new THREE.LineBasicMaterial({
+  vertexColors: true,
+  transparent: true,
+  opacity: 0.4,
+  linewidth: 1
+});
+const edgeLines = new THREE.LineSegments(edgeGeometry, edgeMaterial);
+scene.add(edgeLines);
+
+function updateEdgeColors(hoveredNode) {
+  const colorAttr = edgeGeometry.getAttribute('color');
+  for (let i = 0; i < edges.length; i++) {
+    const e = edges[i];
+    let r, g, b;
+    if (hoveredNode !== null && (e.source === hoveredNode || e.target === hoveredNode)) {
+      r = 1.0; g = 1.0; b = 1.0;
+    } else if (hoveredNode !== null) {
+      r = 0.1; g = 0.1; b = 0.15;
+    } else {
+      const c1 = new THREE.Color(groupColors[nodes[e.source].group]);
+      const c2 = new THREE.Color(groupColors[nodes[e.target].group]);
+      r = (c1.r + c2.r) * 0.5;
+      g = (c1.g + c2.g) * 0.5;
+      b = (c1.b + c2.b) * 0.5;
+    }
+    colorAttr.setXYZ(i * 2, r, g, b);
+    colorAttr.setXYZ(i * 2 + 1, r, g, b);
+  }
+  colorAttr.needsUpdate = true;
+}
+
+// Initialize edge colors
+updateEdgeColors(null);
+
+// ─── Force Simulation ───
+let isPaused = false;
+const dt = 0.15;
+const damping = 0.9;
+const repulsionStrength = 800;
+const springStrength = 0.02;
+const restLength = 15;
+const centeringStrength = 0.005;
+
+function simulateForces() {
+  if (isPaused) return;
+
+  // Reset forces
+  for (const n of nodes) {
+    n.fx = 0; n.fy = 0; n.fz = 0;
+  }
+
+  // Repulsion (Coulomb-like) between all pairs
+  for (let i = 0; i < 50; i++) {
+    for (let j = i + 1; j < 50; j++) {
+      let dx = nodes[i].x - nodes[j].x;
+      let dy = nodes[i].y - nodes[j].y;
+      let dz = nodes[i].z - nodes[j].z;
+      let distSq = dx * dx + dy * dy + dz * dz;
+      if (distSq < 0.01) {
+        dx = (Math.random() - 0.5) * 0.1;
+        dy = (Math.random() - 0.5) * 0.1;
+        dz = (Math.random() - 0.5) * 0.1;
+        distSq = dx * dx + dy * dy + dz * dz;
+      }
+      const dist = Math.sqrt(distSq);
+      const force = repulsionStrength / distSq;
+      const fx = (dx / dist) * force;
+      const fy = (dy / dist) * force;
+      const fz = (dz / dist) * force;
+      nodes[i].fx += fx;
+      nodes[i].fy += fy;
+      nodes[i].fz += fz;
+      nodes[j].fx -= fx;
+      nodes[j].fy -= fy;
+      nodes[j].fz -= fz;
+    }
+  }
+
+  // Spring attraction along edges
+  for (const e of edges) {
+    const s = nodes[e.source];
+    const t = nodes[e.target];
+    let dx = t.x - s.x;
+    let dy = t.y - s.y;
+    let dz = t.z - s.z;
+    const dist = Math.sqrt(dx * dx + dy * dy + dz * dz) || 0.001;
+    const displacement = dist - restLength;
+    const force = springStrength * displacement;
+    const fx = (dx / dist) * force;
+    const fy = (dy / dist) * force;
+    const fz = (dz / dist) * force;
+    s.fx += fx;
+    s.fy += fy;
+    s.fz += fz;
+    t.fx -= fx;
+    t.fy -= fy;
+    t.fz -= fz;
+  }
+
+  // Centering force
+  for (const n of nodes) {
+    n.fx -= n.x * centeringStrength;
+    n.fy -= n.y * centeringStrength;
+    n.fz -= n.z * centeringStrength;
+  }
+
+  // Semi-implicit Euler integration
+  for (const n of nodes) {
+    if (n.pinned) {
+      n.vx = 0; n.vy = 0; n.vz = 0;
+      continue;
+    }
+    // Clamp forces to prevent explosion
+    const maxForce = 50;
+    n.fx = Math.max(-maxForce, Math.min(maxForce, n.fx));
+    n.fy = Math.max(-maxForce, Math.min(maxForce, n.fy));
+    n.fz = Math.max(-maxForce, Math.min(maxForce, n.fz));
+
+    n.vx = (n.vx + n.fx * dt) * damping;
+    n.vy = (n.vy + n.fy * dt) * damping;
+    n.vz = (n.vz + n.fz * dt) * damping;
+
+    // Clamp velocity
+    const maxVel = 20;
+    n.vx = Math.max(-maxVel, Math.min(maxVel, n.vx));
+    n.vy = Math.max(-maxVel, Math.min(maxVel, n.vy));
+    n.vz = Math.max(-maxVel, Math.min(maxVel, n.vz));
+
+    n.x += n.vx * dt;
+    n.y += n.vy * dt;
+    n.z += n.vz * dt;
+
+    // Ensure finite
+    if (!isFinite(n.x)) n.x = 0;
+    if (!isFinite(n.y)) n.y = 0;
+    if (!isFinite(n.z)) n.z = 0;
+    if (!isFinite(n.vx)) n.vx = 0;
+    if (!isFinite(n.vy)) n.vy = 0;
+    if (!isFinite(n.vz)) n.vz = 0;
+  }
+}
+
+function computeEnergy() {
+  let energy = 0;
+  for (const n of nodes) {
+    energy += n.vx * n.vx + n.vy * n.vy + n.vz * n.vz;
+  }
+  // Add potential energy from springs
+  for (const e of edges) {
+    const s = nodes[e.source];
+    const t = nodes[e.target];
+    const dx = t.x - s.x;
+    const dy = t.y - s.y;
+    const dz = t.z - s.z;
+    const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    const disp = dist - restLength;
+    energy += 0.5 * springStrength * disp * disp;
+  }
+  return isFinite(energy) ? energy : 0;
+}
+
+// ─── Interaction ───
+const raycaster = new THREE.Raycaster();
+const mouse = new THREE.Vector2();
+let hoveredNode = null;
+
+function onMouseMove(event) {
+  mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+  mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+}
+
+function onClick(event) {
+  if (hoveredNode !== null) {
+    nodes[hoveredNode].pinned = !nodes[hoveredNode].pinned;
+    if (nodes[hoveredNode].pinned) {
+      nodes[hoveredNode].vx = 0;
+      nodes[hoveredNode].vy = 0;
+      nodes[hoveredNode].vz = 0;
+    }
+  }
+}
+
+window.addEventListener('mousemove', onMouseMove);
+window.addEventListener('click', onClick);
+
+const hoverInfoEl = document.getElementById('hoverInfo');
+
+function updateHover() {
+  raycaster.setFromCamera(mouse, camera);
+  const intersects = raycaster.intersectObjects(nodeMeshes);
+
+  const prevHovered = hoveredNode;
+
+  if (intersects.length > 0) {
+    hoveredNode = intersects[0].object.userData.nodeIndex;
+    hoverInfoEl.textContent = nodes[hoveredNode].name + (nodes[hoveredNode].pinned ? ' 📌' : '');
+    hoverInfoEl.style.opacity = '1';
+  } else {
+    hoveredNode = null;
+    hoverInfoEl.textContent = '\u00A0';
+    hoverInfoEl.style.opacity = '0.3';
+  }
+
+  if (prevHovered !== hoveredNode) {
+    // Update node materials
+    for (let i = 0; i < 50; i++) {
+      const n = nodes[i];
+      const mesh = nodeMeshes[i];
+      if (hoveredNode === null) {
+        mesh.material = nodeMaterials[n.group];
+      } else if (i === hoveredNode || adjacency[hoveredNode].has(i)) {
+        mesh.material = highlightMaterials[n.group];
+      } else {
+        mesh.material = dimMaterial;
+      }
+    }
+    // Update edge colors
+    updateEdgeColors(hoveredNode);
+    edgeMaterial.opacity = hoveredNode !== null ? 0.6 : 0.4;
+  }
+}
+
+// ─── Pause Button ───
+const pauseBtn = document.getElementById('pauseBtn');
+pauseBtn.addEventListener('click', () => {
+  isPaused = !isPaused;
+  pauseBtn.textContent = isPaused ? 'Resume' : 'Pause';
+  pauseBtn.style.background = isPaused ? 'rgba(220, 60, 60, 0.7)' : 'rgba(60, 100, 220, 0.7)';
+});
+
+// ─── HUD Elements ───
+const nodeCountEl = document.getElementById('nodeCount');
+const edgeCountEl = document.getElementById('edgeCount');
+const simEnergyEl = document.getElementById('simEnergy');
+const pinnedCountEl = document.getElementById('pinnedCount');
+
+nodeCountEl.textContent = '50';
+edgeCountEl.textContent = '80';
+
+// ─── Pin indicator rings ───
+const ringGeometry = new THREE.RingGeometry(1.2, 1.5, 24);
+const ringMaterial = new THREE.MeshBasicMaterial({ color: 0xff4444, side: THREE.DoubleSide, transparent: true, opacity: 0.8 });
+const pinIndicators = [];
+for (let i = 0; i < 50; i++) {
+  const ring = new THREE.Mesh(ringGeometry, ringMaterial);
+  ring.visible = false;
+  nodeGroup.add(ring);
+  pinIndicators.push(ring);
+}
+
+// ─── Resize ───
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// ─── Animation Loop ───
+function animate() {
+  requestAnimationFrame(animate);
+
+  // Force simulation
+  simulateForces();
+
+  // Update mesh positions
+  for (let i = 0; i < 50; i++) {
+    const n = nodes[i];
+    nodeMeshes[i].position.set(n.x, n.y, n.z);
+
+    // Update scale based on degree
+    const radius = 0.6 + n.degree * 0.25;
+    nodeMeshes[i].scale.setScalar(radius);
+
+    // Pin indicator
+    pinIndicators[i].visible = n.pinned;
+    if (n.pinned) {
+      pinIndicators[i].position.set(n.x, n.y, n.z);
+      pinIndicators[i].lookAt(camera.position);
+      pinIndicators[i].scale.setScalar(radius);
+    }
+  }
+
+  // Update edge positions
+  const posAttr = edgeGeometry.getAttribute('position');
+  for (let i = 0; i < edges.length; i++) {
+    const s = nodes[edges[i].source];
+    const t = nodes[edges[i].target];
+    posAttr.setXYZ(i * 2, s.x, s.y, s.z);
+    posAttr.setXYZ(i * 2 + 1, t.x, t.y, t.z);
+  }
+  posAttr.needsUpdate = true;
+
+  // Hover detection
+  updateHover();
+
+  // HUD
+  const energy = computeEnergy();
+  simEnergyEl.textContent = energy.toFixed(2);
+  const pinnedCount = nodes.filter(n => n.pinned).length;
+  pinnedCountEl.textContent = pinnedCount.toString();
+
+  // State exposure
+  window.__3D_STATE__ = {
+    nodeCount: 50,
+    edgeCount: 80,
+    nodes: nodes.map(n => ({
+      x: n.x, y: n.y, z: n.z,
+      name: n.name, group: n.group,
+      pinned: n.pinned, degree: n.degree
+    })),
+    simEnergy: energy,
+    isPaused: isPaused,
+    pinnedCount: pinnedCount
+  };
+
+  controls.update();
+  renderer.render(scene, camera);
+}
+
+animate();
+</script>
+</body>
+</html>

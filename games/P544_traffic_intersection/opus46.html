@@ -1,0 +1,679 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3D Traffic Intersection Simulator</title>
+<script type="importmap">
+{ "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+} }
+</script>
+<style>
+body { margin: 0; overflow: hidden; font-family: Arial, sans-serif; }
+canvas { display: block; }
+#hud {
+    position: absolute; top: 10px; left: 10px;
+    background: rgba(0,0,0,0.75); color: #fff; padding: 12px 16px;
+    border-radius: 8px; font-size: 13px; line-height: 1.8;
+    min-width: 220px; pointer-events: none;
+}
+#hud span { color: #8cf; font-weight: bold; }
+#controls {
+    position: absolute; bottom: 10px; left: 10px;
+    background: rgba(0,0,0,0.75); color: #fff; padding: 12px 16px;
+    border-radius: 8px; font-size: 13px; line-height: 2;
+}
+#controls label { display: block; margin: 4px 0; }
+#controls input[type="range"] { width: 160px; vertical-align: middle; }
+#instructions {
+    position: absolute; top: 10px; right: 10px;
+    background: rgba(0,0,0,0.75); color: #ccc; padding: 10px 14px;
+    border-radius: 8px; font-size: 12px; line-height: 1.7;
+}
+</style>
+</head>
+<body>
+
+<div id="hud">
+    Vehicles: <span id="hud-vehicles">0</span><br>
+    Collisions: <span id="hud-collisions">0</span><br>
+    NS Light: <span id="hud-ns-light">Red</span><br>
+    EW Light: <span id="hud-ew-light">Red</span><br>
+    Cycle Time: <span id="hud-cycle">0.0</span>s<br>
+    Model Loaded: <span id="hud-model">No</span>
+</div>
+
+<div id="controls">
+    <label>Spawn Rate: <input type="range" id="slider-spawn-rate" min="1" max="8" step="0.5" value="3"> <span id="spawn-val">3</span>s</label>
+    <label>Base Speed: <input type="range" id="slider-speed" min="2" max="15" step="1" value="5"> <span id="speed-val">5</span></label>
+</div>
+
+<div id="instructions">
+    <b>Controls:</b><br>
+    Space — Pause/Play<br>
+    R — Reset<br>
+    F — Emergency Stop (5s)
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+// ─── State ───
+let isPaused = false;
+let totalCollisions = 0;
+let frameCount = 0;
+let modelLoaded = false;
+let emergencyStop = false;
+let emergencyTimer = 0;
+let spawnRate = 3;
+let baseSpeed = 5;
+let spawnTimer = 0;
+let carTemplate = null;
+
+const vehicles = [];
+const trafficLights = { ns: [], ew: [] };
+
+// Traffic light phases: 0=NS green/EW red, 1=NS yellow/EW red, 2=NS red/EW green, 3=NS red/EW yellow
+const phaseDurations = [8, 2, 8, 2];
+let currentPhase = 0;
+let phaseTimer = 0;
+
+window.__3D_STATE__ = {
+    vehicleCount: 0, totalCollisions: 0,
+    nsLight: 'Red', ewLight: 'Red',
+    cycleTime: 0, modelLoaded: false,
+    isPaused: false, spawnRate: 3, baseSpeed: 5,
+    frameCount: 0, vehiclesValid: true, emergencyStop: false
+};
+
+// ─── Renderer ───
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+
+// ─── Scene ───
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x88aacc);
+
+// ─── Camera ───
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 200);
+camera.position.set(0, 30, 30);
+camera.lookAt(0, 0, 0);
+
+// ─── Controls ───
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 0, 0);
+controls.update();
+
+// ─── Lights ───
+const ambientLight = new THREE.AmbientLight(0x667788, 0.5);
+scene.add(ambientLight);
+
+const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+dirLight.position.set(10, 20, 10);
+dirLight.castShadow = true;
+dirLight.shadow.mapSize.set(2048, 2048);
+dirLight.shadow.camera.left = -35;
+dirLight.shadow.camera.right = 35;
+dirLight.shadow.camera.top = 35;
+dirLight.shadow.camera.bottom = -35;
+scene.add(dirLight);
+
+// ─── Ground ───
+const groundGeo = new THREE.PlaneGeometry(60, 60);
+const groundMat = new THREE.MeshStandardMaterial({ color: 0x445544 });
+const ground = new THREE.Mesh(groundGeo, groundMat);
+ground.rotation.x = -Math.PI / 2;
+ground.receiveShadow = true;
+scene.add(ground);
+
+// ─── Roads ───
+function createRoad(width, length, rotY, posX, posZ) {
+    const geo = new THREE.PlaneGeometry(width, length);
+    const mat = new THREE.MeshStandardMaterial({ color: 0x333333 });
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.rotation.x = -Math.PI / 2;
+    mesh.rotation.z = rotY;
+    mesh.position.set(posX, 0.005, posZ);
+    mesh.receiveShadow = true;
+    scene.add(mesh);
+}
+
+// NS road
+createRoad(6, 60, 0, 0, 0);
+// EW road
+createRoad(60, 6, 0, 0, 0);
+
+// ─── Dashed Center Lines ───
+function addDashLines() {
+    const dashMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
+    // NS center line dashes (avoid intersection area -4 to 4)
+    for (let z = -28; z <= 28; z += 3) {
+        if (z > -4 && z < 4) continue;
+        const geo = new THREE.BoxGeometry(0.1, 0.01, 1.5);
+        const dash = new THREE.Mesh(geo, dashMat);
+        dash.position.set(0, 0.01, z);
+        scene.add(dash);
+    }
+    // EW center line dashes
+    for (let x = -28; x <= 28; x += 3) {
+        if (x > -4 && x < 4) continue;
+        const geo = new THREE.BoxGeometry(1.5, 0.01, 0.1);
+        const dash = new THREE.Mesh(geo, dashMat);
+        dash.position.set(x, 0.01, 0);
+        scene.add(dash);
+    }
+}
+addDashLines();
+
+// ─── Traffic Light Poles ───
+const lightPositions = [
+    { x: 4.5, z: 4.5, facing: 'ns' },   // SE corner -> controls NS south-bound
+    { x: -4.5, z: -4.5, facing: 'ns' },  // NW corner -> controls NS north-bound
+    { x: 4.5, z: -4.5, facing: 'ew' },   // NE corner -> controls EW
+    { x: -4.5, z: 4.5, facing: 'ew' },   // SW corner -> controls EW
+];
+
+function createTrafficLight(px, pz, facing) {
+    const group = new THREE.Group();
+    group.position.set(px, 0, pz);
+
+    // Pole
+    const poleGeo = new THREE.CylinderGeometry(0.1, 0.1, 3, 8);
+    const poleMat = new THREE.MeshStandardMaterial({ color: 0x444444 });
+    const pole = new THREE.Mesh(poleGeo, poleMat);
+    pole.position.y = 1.5;
+    pole.castShadow = true;
+    group.add(pole);
+
+    // Housing
+    const housingGeo = new THREE.BoxGeometry(0.5, 1.2, 0.3);
+    const housingMat = new THREE.MeshStandardMaterial({ color: 0x222222 });
+    const housing = new THREE.Mesh(housingGeo, housingMat);
+    housing.position.y = 3.6;
+    group.add(housing);
+
+    // Light spheres
+    const colors = [0xff0000, 0xffaa00, 0x00ff00];
+    const offsets = [0.35, 0, -0.35];
+    const spheres = [];
+
+    colors.forEach((color, i) => {
+        const sGeo = new THREE.SphereGeometry(0.15, 12, 12);
+        const sMat = new THREE.MeshStandardMaterial({
+            color: color,
+            emissive: color,
+            emissiveIntensity: 0.1
+        });
+        const sphere = new THREE.Mesh(sGeo, sMat);
+        sphere.position.set(0, 3.6 + offsets[i], 0.2);
+        group.add(sphere);
+        spheres.push({ mesh: sphere, color: color, type: i === 0 ? 'red' : i === 1 ? 'yellow' : 'green' });
+    });
+
+    scene.add(group);
+
+    const lightData = { group, spheres, facing };
+    if (facing === 'ns') trafficLights.ns.push(lightData);
+    else trafficLights.ew.push(lightData);
+}
+
+lightPositions.forEach(lp => createTrafficLight(lp.x, lp.z, lp.facing));
+
+function updateTrafficLights() {
+    let nsState, ewState;
+
+    if (emergencyStop) {
+        nsState = 'red'; ewState = 'red';
+    } else {
+        switch (currentPhase) {
+            case 0: nsState = 'green'; ewState = 'red'; break;
+            case 1: nsState = 'yellow'; ewState = 'red'; break;
+            case 2: nsState = 'red'; ewState = 'green'; break;
+            case 3: nsState = 'red'; ewState = 'yellow'; break;
+        }
+    }
+
+    function setLights(lights, state) {
+        lights.forEach(ld => {
+            ld.spheres.forEach(s => {
+                if (s.type === state) {
+                    s.mesh.material.emissiveIntensity = 2;
+                } else {
+                    s.mesh.material.emissiveIntensity = 0.1;
+                }
+            });
+        });
+    }
+
+    setLights(trafficLights.ns, nsState);
+    setLights(trafficLights.ew, ewState);
+
+    return { nsState, ewState };
+}
+
+// ─── Vehicle Creation ───
+const loader = new GLTFLoader();
+const vehicleColors = [0xff3333, 0x3333ff, 0x33ff33, 0xffff33, 0xff33ff, 0x33ffff, 0xff8800, 0x8800ff];
+
+// Try to load GLB, fallback to box
+let useBoxFallback = false;
+
+function loadCarModel() {
+    return new Promise((resolve) => {
+        loader.load(
+            'https://threejs.org/examples/models/gltf/ToyCar.glb',
+            (gltf) => {
+                carTemplate = gltf.scene;
+                // Normalize scale
+                const box = new THREE.Box3().setFromObject(carTemplate);
+                const size = box.getSize(new THREE.Vector3());
+                const maxDim = Math.max(size.x, size.y, size.z);
+                const scale = 2.5 / maxDim;
+                carTemplate.scale.multiplyScalar(scale);
+                modelLoaded = true;
+                resolve();
+            },
+            undefined,
+            () => {
+                console.warn('GLB load failed, using box fallback');
+                useBoxFallback = true;
+                modelLoaded = false;
+                resolve();
+            }
+        );
+    });
+}
+
+const directions = ['north', 'south', 'east', 'west'];
+
+function getSpawnConfig(direction) {
+    switch (direction) {
+        case 'north': return { x: 1.5, z: -28, vx: 0, vz: 1, rotY: 0 };
+        case 'south': return { x: -1.5, z: 28, vx: 0, vz: -1, rotY: Math.PI };
+        case 'east': return { x: 28, z: 1.5, vx: -1, vz: 0, rotY: Math.PI / 2 };
+        case 'west': return { x: -28, z: -1.5, vx: 1, vz: 0, rotY: -Math.PI / 2 };
+    }
+}
+
+function createVehicleMesh(color) {
+    if (carTemplate && !useBoxFallback) {
+        const clone = carTemplate.clone();
+        clone.traverse(child => {
+            if (child.isMesh) {
+                child.material = child.material.clone();
+                if (child.material.name && child.material.name.toLowerCase().includes('paint')) {
+                    child.material.color.set(color);
+                }
+                child.castShadow = true;
+            }
+        });
+        return clone;
+    } else {
+        // Box fallback
+        const group = new THREE.Group();
+        // Body
+        const bodyGeo = new THREE.BoxGeometry(1.5, 0.8, 3);
+        const bodyMat = new THREE.MeshStandardMaterial({ color });
+        const body = new THREE.Mesh(bodyGeo, bodyMat);
+        body.position.y = 0.6;
+        body.castShadow = true;
+        group.add(body);
+        // Cabin
+        const cabGeo = new THREE.BoxGeometry(1.2, 0.6, 1.5);
+        const cabMat = new THREE.MeshStandardMaterial({ color: 0x88bbff, transparent: true, opacity: 0.6 });
+        const cab = new THREE.Mesh(cabGeo, cabMat);
+        cab.position.y = 1.3;
+        cab.position.z = -0.2;
+        cab.castShadow = true;
+        group.add(cab);
+        // Wheels
+        const wheelGeo = new THREE.CylinderGeometry(0.25, 0.25, 0.15, 12);
+        const wheelMat = new THREE.MeshStandardMaterial({ color: 0x222222 });
+        [[-0.8, 0.25, 0.8], [0.8, 0.25, 0.8], [-0.8, 0.25, -0.8], [0.8, 0.25, -0.8]].forEach(([wx, wy, wz]) => {
+            const wheel = new THREE.Mesh(wheelGeo, wheelMat);
+            wheel.rotation.z = Math.PI / 2;
+            wheel.position.set(wx, wy, wz);
+            group.add(wheel);
+        });
+        return group;
+    }
+}
+
+function spawnVehicle(direction) {
+    if (vehicles.length >= 12) return;
+
+    const dir = direction || directions[Math.floor(Math.random() * 4)];
+    const config = getSpawnConfig(dir);
+    const color = vehicleColors[Math.floor(Math.random() * vehicleColors.length)];
+
+    const mesh = createVehicleMesh(color);
+    mesh.position.set(config.x, 0, config.z);
+    mesh.rotation.y = config.rotY;
+    scene.add(mesh);
+
+    const vehicle = {
+        mesh,
+        direction: dir,
+        vx: config.vx,
+        vz: config.vz,
+        speed: baseSpeed,
+        maxSpeed: baseSpeed,
+        braking: false,
+        collided: false,
+        collisionTimer: 0,
+        flashTimer: 0,
+        originalColor: color,
+        removed: false,
+        aabb: new THREE.Box3()
+    };
+
+    updateVehicleAABB(vehicle);
+    vehicles.push(vehicle);
+}
+
+function updateVehicleAABB(vehicle) {
+    const p = vehicle.mesh.position;
+    const hw = 0.75, hh = 0.6, hl = 1.5;
+    vehicle.aabb.min.set(p.x - hw, p.y, p.z - hl);
+    vehicle.aabb.max.set(p.x + hw, p.y + hh * 2, p.z + hl);
+}
+
+// ─── Traffic Light State Query ───
+function getNSLightState() {
+    if (emergencyStop) return 'red';
+    switch (currentPhase) {
+        case 0: return 'green';
+        case 1: return 'yellow';
+        default: return 'red';
+    }
+}
+
+function getEWLightState() {
+    if (emergencyStop) return 'red';
+    switch (currentPhase) {
+        case 2: return 'green';
+        case 3: return 'yellow';
+        default: return 'red';
+    }
+}
+
+function shouldStopForLight(vehicle) {
+    const p = vehicle.mesh.position;
+    const stopDist = 5; // stop line distance from center
+
+    if (vehicle.direction === 'north' || vehicle.direction === 'south') {
+        const state = getNSLightState();
+        if (state === 'red' || state === 'yellow') {
+            if (vehicle.direction === 'north' && p.z < -stopDist + 2 && p.z > -stopDist - 3) return true;
+            if (vehicle.direction === 'south' && p.z > stopDist - 2 && p.z < stopDist + 3) return true;
+        }
+    } else {
+        const state = getEWLightState();
+        if (state === 'red' || state === 'yellow') {
+            if (vehicle.direction === 'east' && p.x > stopDist - 2 && p.x < stopDist + 3) return true;
+            if (vehicle.direction === 'west' && p.x < -stopDist + 2 && p.x > -stopDist - 3) return true;
+        }
+    }
+    return false;
+}
+
+function checkForwardVehicle(vehicle) {
+    const p = vehicle.mesh.position;
+    const rayLength = 5;
+
+    for (const other of vehicles) {
+        if (other === vehicle || other.removed || other.collided) continue;
+        const op = other.mesh.position;
+        const dx = op.x - p.x;
+        const dz = op.z - p.z;
+
+        // Check if other is ahead in our direction
+        let ahead = false;
+        let dist = 0;
+
+        switch (vehicle.direction) {
+            case 'north':
+                if (dz > 0 && dz < rayLength && Math.abs(dx) < 2) { ahead = true; dist = dz; }
+                break;
+            case 'south':
+                if (dz < 0 && -dz < rayLength && Math.abs(dx) < 2) { ahead = true; dist = -dz; }
+                break;
+            case 'east':
+                if (dx < 0 && -dx < rayLength && Math.abs(dz) < 2) { ahead = true; dist = -dx; }
+                break;
+            case 'west':
+                if (dx > 0 && dx < rayLength && Math.abs(dz) < 2) { ahead = true; dist = dx; }
+                break;
+        }
+
+        if (ahead) return true;
+    }
+    return false;
+}
+
+// ─── Update Vehicles ───
+function updateVehicles(dt) {
+    const toRemove = [];
+
+    for (let i = 0; i < vehicles.length; i++) {
+        const v = vehicles[i];
+        if (v.removed) continue;
+
+        if (v.collided) {
+            v.collisionTimer -= dt;
+            v.flashTimer += dt;
+            // Flash red
+            const flash = Math.sin(v.flashTimer * 10) > 0;
+            v.mesh.traverse(child => {
+                if (child.isMesh) {
+                    child.material.emissive = flash ? new THREE.Color(0xff0000) : new THREE.Color(0x000000);
+                    child.material.emissiveIntensity = flash ? 1 : 0;
+                }
+            });
+            if (v.collisionTimer <= 0) {
+                v.removed = true;
+                scene.remove(v.mesh);
+                toRemove.push(i);
+            }
+            continue;
+        }
+
+        // Check if should brake
+        const stopForLight = shouldStopForLight(v);
+        const vehicleAhead = checkForwardVehicle(v);
+
+        if (stopForLight || vehicleAhead) {
+            v.speed = Math.max(0, v.speed - 8 * dt);
+        } else {
+            v.speed = Math.min(v.maxSpeed, v.speed + 4 * dt);
+        }
+
+        // Move
+        v.mesh.position.x += v.vx * v.speed * dt;
+        v.mesh.position.z += v.vz * v.speed * dt;
+
+        updateVehicleAABB(v);
+
+        // Remove if out of bounds
+        const p = v.mesh.position;
+        if (Math.abs(p.x) > 30 || Math.abs(p.z) > 30) {
+            v.removed = true;
+            scene.remove(v.mesh);
+            toRemove.push(i);
+        }
+    }
+
+    // Collision detection (AABB overlap)
+    for (let i = 0; i < vehicles.length; i++) {
+        for (let j = i + 1; j < vehicles.length; j++) {
+            const a = vehicles[i], b = vehicles[j];
+            if (a.removed || b.removed || a.collided || b.collided) continue;
+            if (a.aabb.intersectsBox(b.aabb)) {
+                a.collided = true; a.collisionTimer = 2; a.speed = 0; a.flashTimer = 0;
+                b.collided = true; b.collisionTimer = 2; b.speed = 0; b.flashTimer = 0;
+                totalCollisions++;
+            }
+        }
+    }
+
+    // Remove marked vehicles (reverse order)
+    for (let i = toRemove.length - 1; i >= 0; i--) {
+        vehicles.splice(toRemove[i], 1);
+    }
+}
+
+// ─── UI ───
+const sliderSpawn = document.getElementById('slider-spawn-rate');
+const sliderSpeed = document.getElementById('slider-speed');
+const spawnValEl = document.getElementById('spawn-val');
+const speedValEl = document.getElementById('speed-val');
+
+sliderSpawn.addEventListener('input', () => {
+    spawnRate = parseFloat(sliderSpawn.value);
+    spawnValEl.textContent = spawnRate;
+});
+
+sliderSpeed.addEventListener('input', () => {
+    baseSpeed = parseInt(sliderSpeed.value);
+    speedValEl.textContent = baseSpeed;
+    vehicles.forEach(v => { v.maxSpeed = baseSpeed; });
+});
+
+document.addEventListener('keydown', (e) => {
+    if (e.code === 'Space') {
+        e.preventDefault();
+        isPaused = !isPaused;
+    } else if (e.code === 'KeyR') {
+        resetSimulation();
+    } else if (e.code === 'KeyF') {
+        if (!emergencyStop) {
+            emergencyStop = true;
+            emergencyTimer = 5;
+        }
+    }
+});
+
+function resetSimulation() {
+    vehicles.forEach(v => scene.remove(v.mesh));
+    vehicles.length = 0;
+    totalCollisions = 0;
+    currentPhase = 0;
+    phaseTimer = 0;
+    emergencyStop = false;
+    emergencyTimer = 0;
+    spawnTimer = 0;
+}
+
+// ─── HUD Update ───
+function updateHUD(nsState, ewState) {
+    document.getElementById('hud-vehicles').textContent = vehicles.filter(v => !v.removed).length;
+    document.getElementById('hud-collisions').textContent = totalCollisions;
+    document.getElementById('hud-ns-light').textContent = nsState.charAt(0).toUpperCase() + nsState.slice(1);
+    document.getElementById('hud-ew-light').textContent = ewState.charAt(0).toUpperCase() + ewState.slice(1);
+    document.getElementById('hud-cycle').textContent = phaseTimer.toFixed(1);
+    document.getElementById('hud-model').textContent = modelLoaded ? 'Yes' : 'No';
+}
+
+// ─── Animation Loop ───
+const clock = new THREE.Clock();
+
+async function init() {
+    await loadCarModel();
+
+    // Spawn initial vehicles
+    spawnVehicle('north');
+    spawnVehicle('south');
+    spawnVehicle('east');
+    spawnVehicle('west');
+
+    animate();
+}
+
+function animate() {
+    requestAnimationFrame(animate);
+
+    const dt = Math.min(clock.getDelta(), 0.05);
+
+    if (!isPaused) {
+        // Traffic light cycle
+        if (emergencyStop) {
+            emergencyTimer -= dt;
+            if (emergencyTimer <= 0) {
+                emergencyStop = false;
+            }
+        } else {
+            phaseTimer += dt;
+            if (phaseTimer >= phaseDurations[currentPhase]) {
+                phaseTimer = 0;
+                currentPhase = (currentPhase + 1) % 4;
+            }
+        }
+
+        // Spawn timer
+        spawnTimer += dt;
+        if (spawnTimer >= spawnRate) {
+            spawnTimer = 0;
+            spawnVehicle();
+        }
+
+        // Update vehicles
+        updateVehicles(dt);
+    }
+
+    const { nsState, ewState } = updateTrafficLights();
+
+    // Check vehicles valid
+    let vehiclesValid = true;
+    vehicles.forEach(v => {
+        const p = v.mesh.position;
+        if (isNaN(p.x) || isNaN(p.y) || isNaN(p.z)) vehiclesValid = false;
+    });
+
+    const activeVehicles = vehicles.filter(v => !v.removed).length;
+
+    // Update HUD
+    updateHUD(nsState, ewState);
+
+    frameCount++;
+
+    // Update state
+    const nsLabel = nsState.charAt(0).toUpperCase() + nsState.slice(1);
+    const ewLabel = ewState.charAt(0).toUpperCase() + ewState.slice(1);
+
+    window.__3D_STATE__ = {
+        vehicleCount: activeVehicles,
+        totalCollisions,
+        nsLight: nsLabel,
+        ewLight: ewLabel,
+        cycleTime: parseFloat(phaseTimer.toFixed(1)),
+        modelLoaded,
+        isPaused,
+        spawnRate,
+        baseSpeed,
+        frameCount,
+        vehiclesValid,
+        emergencyStop
+    };
+
+    controls.update();
+    renderer.render(scene, camera);
+}
+
+window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+init();
+</script>
+</body>
+</html>

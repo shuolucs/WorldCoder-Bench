@@ -1,0 +1,559 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Double Spring System with Particles</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      background: #111122;
+      font-family: Arial, sans-serif;
+    }
+    canvas {
+      display: block;
+    }
+    #hud {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      color: #ffffff;
+      background: rgba(0,0,0,0.35);
+      padding: 10px 12px;
+      border-radius: 8px;
+      font-size: 14px;
+      line-height: 1.45;
+      white-space: pre-line;
+      z-index: 10;
+      user-select: none;
+    }
+    #resetBtn {
+      position: absolute;
+      top: 10px;
+      right: 10px;
+      z-index: 10;
+      padding: 8px 14px;
+      font-size: 14px;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      background: #2b2b44;
+      color: white;
+    }
+    #resetBtn:hover {
+      background: #3b3b66;
+    }
+  </style>
+</head>
+<body>
+  <div id="hud"></div>
+  <button id="resetBtn">Reset</button>
+
+  <script type="module">
+    import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js';
+
+    // -----------------------
+    // Scene Setup
+    // -----------------------
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x111122);
+
+    const camera = new THREE.PerspectiveCamera(
+      60,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      100
+    );
+    camera.position.set(0, 2, 12);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    document.body.appendChild(renderer.domElement);
+
+    const ambientLight = new THREE.AmbientLight(0x404060, 0.5);
+    scene.add(ambientLight);
+
+    const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
+    directionalLight.position.set(5, 10, 5);
+    scene.add(directionalLight);
+
+    const grid = new THREE.GridHelper(20, 20, 0x333355, 0x333355);
+    grid.position.y = 0;
+    scene.add(grid);
+
+    // -----------------------
+    // Constants / Physics
+    // -----------------------
+    const dt = 1 / 60;
+    const MAX_VEL = 20;
+    const G = 9.81;
+    const PARTICLE_G = 2.0;
+
+    const anchorPos = new THREE.Vector3(0, 6, 0);
+
+    const massAData = {
+      mass: 2.0,
+      radius: 0.4,
+      initialPos: new THREE.Vector3(0, 3, 0),
+      pos: new THREE.Vector3(0, 3, 0),
+      vel: new THREE.Vector3(0, 0, 0)
+    };
+
+    const massBData = {
+      mass: 1.5,
+      radius: 0.4,
+      initialPos: new THREE.Vector3(0, 0, 0),
+      pos: new THREE.Vector3(0, 0, 0),
+      vel: new THREE.Vector3(0, 0, 0)
+    };
+
+    let k1 = 40.0;
+    let k2 = 30.0;
+    const restLength1 = 2.0;
+    const restLength2 = 2.0;
+    const damping1 = 0.5;
+    const damping2 = 0.4;
+
+    let gravityOn = true;
+    let paused = false;
+    let simTime = 0;
+    let frameCount = 0;
+
+    // -----------------------
+    // Visual Objects
+    // -----------------------
+    const sphereGeoSmall = new THREE.SphereGeometry(0.2, 24, 24);
+    const sphereGeoMass = new THREE.SphereGeometry(0.4, 32, 32);
+
+    const anchorMesh = new THREE.Mesh(
+      sphereGeoSmall,
+      new THREE.MeshStandardMaterial({ color: 0xff3333 })
+    );
+    anchorMesh.position.copy(anchorPos);
+    scene.add(anchorMesh);
+
+    const massAMesh = new THREE.Mesh(
+      sphereGeoMass,
+      new THREE.MeshStandardMaterial({ color: 0x3366ff })
+    );
+    massAMesh.position.copy(massAData.pos);
+    scene.add(massAMesh);
+
+    const massBMesh = new THREE.Mesh(
+      sphereGeoMass,
+      new THREE.MeshStandardMaterial({ color: 0x33cc66 })
+    );
+    massBMesh.position.copy(massBData.pos);
+    scene.add(massBMesh);
+
+    const springMat = new THREE.LineBasicMaterial({ color: 0xffffff });
+
+    const spring1Geom = new THREE.BufferGeometry().setFromPoints([
+      anchorPos.clone(),
+      massAData.pos.clone()
+    ]);
+    const spring1Line = new THREE.Line(spring1Geom, springMat);
+    scene.add(spring1Line);
+
+    const spring2Geom = new THREE.BufferGeometry().setFromPoints([
+      massAData.pos.clone(),
+      massBData.pos.clone()
+    ]);
+    const spring2Line = new THREE.Line(spring2Geom, springMat);
+    scene.add(spring2Line);
+
+    // -----------------------
+    // Particles
+    // -----------------------
+    const MAX_PARTICLES = 200;
+    const particleRadius = 0.05;
+    const particleGeo = new THREE.SphereGeometry(particleRadius, 10, 10);
+
+    const particlePool = [];
+    const activeParticles = [];
+
+    function createParticle(color) {
+      const mat = new THREE.MeshStandardMaterial({
+        color,
+        transparent: true,
+        opacity: 0,
+        depthWrite: false
+      });
+      const mesh = new THREE.Mesh(particleGeo, mat);
+      mesh.visible = false;
+      scene.add(mesh);
+      return {
+        mesh,
+        vel: new THREE.Vector3(),
+        life: 0,
+        maxLife: 1.0,
+        active: false
+      };
+    }
+
+    for (let i = 0; i < MAX_PARTICLES; i++) {
+      const p = createParticle(0xffffff);
+      particlePool.push(p);
+    }
+
+    function randomDirection() {
+      const v = new THREE.Vector3(
+        Math.random() * 2 - 1,
+        Math.random() * 2 - 1,
+        Math.random() * 2 - 1
+      );
+      if (v.lengthSq() < 1e-8) v.set(0, 1, 0);
+      return v.normalize();
+    }
+
+    function emitParticle(origin, color) {
+      let particle = particlePool.find(p => !p.active);
+      if (!particle) return;
+
+      particle.active = true;
+      particle.life = 1.0;
+      particle.maxLife = 1.0;
+      particle.mesh.visible = true;
+      particle.mesh.position.copy(origin);
+      particle.mesh.material.color.set(color);
+      particle.mesh.material.opacity = 1.0;
+
+      const speed = 0.5 + Math.random() * 1.0;
+      particle.vel.copy(randomDirection().multiplyScalar(speed));
+
+      if (!activeParticles.includes(particle)) {
+        activeParticles.push(particle);
+      }
+    }
+
+    function updateParticles() {
+      for (let i = activeParticles.length - 1; i >= 0; i--) {
+        const p = activeParticles[i];
+        if (!p.active) {
+          activeParticles.splice(i, 1);
+          continue;
+        }
+
+        p.vel.y -= PARTICLE_G * dt;
+        p.mesh.position.addScaledVector(p.vel, dt);
+        p.life -= dt;
+
+        const alpha = Math.max(0, p.life / p.maxLife);
+        p.mesh.material.opacity = alpha;
+
+        if (p.life <= 0) {
+          p.active = false;
+          p.mesh.visible = false;
+          activeParticles.splice(i, 1);
+        }
+      }
+    }
+
+    function emitParticlesForMasses() {
+      for (let i = 0; i < 2; i++) {
+        emitParticle(massAData.pos, 0x3366ff);
+        emitParticle(massBData.pos, 0x33cc66);
+      }
+    }
+
+    function resetParticles() {
+      for (const p of particlePool) {
+        p.active = false;
+        p.mesh.visible = false;
+        p.life = 0;
+        p.mesh.material.opacity = 0;
+      }
+      activeParticles.length = 0;
+    }
+
+    // -----------------------
+    // Drag Interaction
+    // -----------------------
+    const raycaster = new THREE.Raycaster();
+    const mouse = new THREE.Vector2();
+    const dragPlane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0); // z=0
+    const dragPoint = new THREE.Vector3();
+    let dragging = null;
+
+    function updateMouse(event) {
+      const rect = renderer.domElement.getBoundingClientRect();
+      mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+      mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+    }
+
+    renderer.domElement.addEventListener('pointerdown', (event) => {
+      updateMouse(event);
+      raycaster.setFromCamera(mouse, camera);
+      const intersects = raycaster.intersectObjects([massAMesh, massBMesh], false);
+      if (intersects.length > 0) {
+        const obj = intersects[0].object;
+        if (obj === massAMesh) dragging = 'A';
+        if (obj === massBMesh) dragging = 'B';
+      }
+    });
+
+    renderer.domElement.addEventListener('pointermove', (event) => {
+      if (!dragging) return;
+      updateMouse(event);
+      raycaster.setFromCamera(mouse, camera);
+      if (raycaster.ray.intersectPlane(dragPlane, dragPoint)) {
+        if (dragging === 'A') {
+          massAData.pos.copy(dragPoint);
+          massAData.vel.set(0, 0, 0);
+        } else if (dragging === 'B') {
+          massBData.pos.copy(dragPoint);
+          massBData.vel.set(0, 0, 0);
+        }
+      }
+    });
+
+    function endDrag() {
+      dragging = null;
+    }
+
+    renderer.domElement.addEventListener('pointerup', endDrag);
+    renderer.domElement.addEventListener('pointerleave', endDrag);
+
+    // -----------------------
+    // Physics Helpers
+    // -----------------------
+    function clampVelocity(v) {
+      v.x = THREE.MathUtils.clamp(v.x, -MAX_VEL, MAX_VEL);
+      v.y = THREE.MathUtils.clamp(v.y, -MAX_VEL, MAX_VEL);
+      v.z = THREE.MathUtils.clamp(v.z, -MAX_VEL, MAX_VEL);
+    }
+
+    function springForce(pos1, vel1, pos2, vel2, restLength, stiffness, damping) {
+      const delta = new THREE.Vector3().subVectors(pos2, pos1);
+      const length = delta.length();
+      if (length < 1e-6) {
+        return new THREE.Vector3();
+      }
+
+      const dir = delta.clone().divideScalar(length);
+      const stretch = length - restLength;
+      const relVel = new THREE.Vector3().subVectors(vel2, vel1);
+      const relAlong = relVel.dot(dir);
+      const magnitude = stiffness * stretch + damping * relAlong;
+      return dir.multiplyScalar(magnitude);
+    }
+
+    function resetSystem() {
+      massAData.pos.copy(massAData.initialPos);
+      massAData.vel.set(0, 0, 0);
+      massBData.pos.copy(massBData.initialPos);
+      massBData.vel.set(0, 0, 0);
+      dragging = null;
+      simTime = 0;
+      frameCount = 0;
+      resetParticles();
+    }
+
+    // -----------------------
+    // Keyboard / UI
+    // -----------------------
+    const hud = document.getElementById('hud');
+    const resetBtn = document.getElementById('resetBtn');
+
+    resetBtn.addEventListener('click', resetSystem);
+
+    window.addEventListener('keydown', (e) => {
+      const key = e.key.toLowerCase();
+
+      if (key === 'r') {
+        resetSystem();
+      } else if (key === 'g') {
+        gravityOn = !gravityOn;
+      } else if (key === 'p') {
+        paused = !paused;
+      } else if (key === '1') {
+        k1 = Math.min(200, k1 + 10);
+      } else if (key === '2') {
+        k2 = Math.min(200, k2 + 10);
+      } else if (key === '3') {
+        k1 = Math.max(10, k1 - 10);
+      } else if (key === '4') {
+        k2 = Math.max(10, k2 - 10);
+      }
+    });
+
+    // -----------------------
+    // Energy / State
+    // -----------------------
+    window.__3D_STATE__ = {
+      massA_pos: { x: 0, y: 0, z: 0 },
+      massB_pos: { x: 0, y: 0, z: 0 },
+      massA_vel: { x: 0, y: 0, z: 0 },
+      massB_vel: { x: 0, y: 0, z: 0 },
+      k1,
+      k2,
+      gravityOn,
+      paused,
+      particleCount: 0,
+      totalEnergy: 0,
+      spring1_length: 0,
+      spring2_length: 0,
+      dragging: null,
+      simTime: 0,
+      massA_mass: 2.0,
+      massB_mass: 1.5,
+      frameCount: 0
+    };
+
+    function computeEnergy() {
+      const vA2 = massAData.vel.lengthSq();
+      const vB2 = massBData.vel.lengthSq();
+      const ke = 0.5 * massAData.mass * vA2 + 0.5 * massBData.mass * vB2;
+
+      const gUsed = gravityOn ? G : 0;
+      const peGravity =
+        massAData.mass * gUsed * massAData.pos.y +
+        massBData.mass * gUsed * massBData.pos.y;
+
+      const len1 = anchorPos.distanceTo(massAData.pos);
+      const len2 = massAData.pos.distanceTo(massBData.pos);
+      const stretch1 = len1 - restLength1;
+      const stretch2 = len2 - restLength2;
+      const peSpring =
+        0.5 * k1 * stretch1 * stretch1 +
+        0.5 * k2 * stretch2 * stretch2;
+
+      return {
+        total: ke + peGravity + peSpring,
+        len1,
+        len2
+      };
+    }
+
+    function updateHUDAndState() {
+      const energyData = computeEnergy();
+
+      hud.textContent =
+`k1: ${k1.toFixed(1)}
+k2: ${k2.toFixed(1)}
+Mass A y: ${massAData.pos.y.toFixed(2)}
+Mass B y: ${massBData.pos.y.toFixed(2)}
+Gravity: ${gravityOn ? 'ON' : 'OFF'}
+Simulation: ${paused ? 'PAUSED' : 'RUNNING'}
+Active particles: ${activeParticles.length}
+Total energy: ${energyData.total.toFixed(2)}`;
+
+      window.__3D_STATE__.massA_pos = { x: massAData.pos.x, y: massAData.pos.y, z: massAData.pos.z };
+      window.__3D_STATE__.massB_pos = { x: massBData.pos.x, y: massBData.pos.y, z: massBData.pos.z };
+      window.__3D_STATE__.massA_vel = { x: massAData.vel.x, y: massAData.vel.y, z: massAData.vel.z };
+      window.__3D_STATE__.massB_vel = { x: massBData.vel.x, y: massBData.vel.y, z: massBData.vel.z };
+      window.__3D_STATE__.k1 = k1;
+      window.__3D_STATE__.k2 = k2;
+      window.__3D_STATE__.gravityOn = gravityOn;
+      window.__3D_STATE__.paused = paused;
+      window.__3D_STATE__.particleCount = activeParticles.length;
+      window.__3D_STATE__.totalEnergy = energyData.total;
+      window.__3D_STATE__.spring1_length = energyData.len1;
+      window.__3D_STATE__.spring2_length = energyData.len2;
+      window.__3D_STATE__.dragging = dragging;
+      window.__3D_STATE__.simTime = simTime;
+      window.__3D_STATE__.massA_mass = 2.0;
+      window.__3D_STATE__.massB_mass = 1.5;
+      window.__3D_STATE__.frameCount = frameCount;
+    }
+
+    // -----------------------
+    // Physics Update
+    // -----------------------
+    function stepPhysics() {
+      const forceA = new THREE.Vector3();
+      const forceB = new THREE.Vector3();
+
+      if (gravityOn && dragging !== 'A') forceA.y -= massAData.mass * G;
+      if (gravityOn && dragging !== 'B') forceB.y -= massBData.mass * G;
+
+      const f1OnA = springForce(
+        anchorPos,
+        new THREE.Vector3(0, 0, 0),
+        massAData.pos,
+        massAData.vel,
+        restLength1,
+        k1,
+        damping1
+      );
+      if (dragging !== 'A') forceA.add(f1OnA.negate());
+
+      const f2OnB = springForce(
+        massAData.pos,
+        massAData.vel,
+        massBData.pos,
+        massBData.vel,
+        restLength2,
+        k2,
+        damping2
+      );
+
+      if (dragging !== 'A') forceA.add(f2OnB);
+      if (dragging !== 'B') forceB.add(f2OnB.clone().negate());
+
+      if (dragging !== 'A') {
+        const accA = forceA.multiplyScalar(1 / massAData.mass);
+        massAData.vel.addScaledVector(accA, dt);
+        clampVelocity(massAData.vel);
+        massAData.pos.addScaledVector(massAData.vel, dt);
+      } else {
+        massAData.vel.set(0, 0, 0);
+      }
+
+      if (dragging !== 'B') {
+        const accB = forceB.multiplyScalar(1 / massBData.mass);
+        massBData.vel.addScaledVector(accB, dt);
+        clampVelocity(massBData.vel);
+        massBData.pos.addScaledVector(massBData.vel, dt);
+      } else {
+        massBData.vel.set(0, 0, 0);
+      }
+    }
+
+    function updateVisuals() {
+      massAMesh.position.copy(massAData.pos);
+      massBMesh.position.copy(massBData.pos);
+
+      spring1Line.geometry.setFromPoints([anchorPos, massAData.pos]);
+      spring2Line.geometry.setFromPoints([massAData.pos, massBData.pos]);
+    }
+
+    // -----------------------
+    // Animation Loop
+    // -----------------------
+    function animate() {
+      requestAnimationFrame(animate);
+
+      if (!paused) {
+        stepPhysics();
+        emitParticlesForMasses();
+        updateParticles();
+        simTime += dt;
+        frameCount++;
+      } else {
+        updateParticles();
+      }
+
+      updateVisuals();
+      updateHUDAndState();
+      renderer.render(scene, camera);
+    }
+
+    resetSystem();
+    animate();
+
+    // -----------------------
+    // Resize
+    // -----------------------
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+  </script>
+</body>
+</html>

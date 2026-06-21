@@ -1,0 +1,495 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Three.js Projectile Motion with Air Drag + Undo/Redo</title>
+  <style>
+    html, body {
+      margin: 0;
+      overflow: hidden;
+      width: 100%;
+      height: 100%;
+      font-family: Arial, sans-serif;
+      background: #111;
+      color: white;
+    }
+
+    canvas {
+      display: block;
+    }
+
+    #positionHUD, #launchCountHUD, #maxHeightHUD {
+      position: absolute;
+      left: 12px;
+      background: rgba(0, 0, 0, 0.55);
+      padding: 8px 10px;
+      border-radius: 8px;
+      font-size: 14px;
+      z-index: 10;
+    }
+
+    #positionHUD { top: 12px; }
+    #launchCountHUD { top: 52px; }
+    #maxHeightHUD { top: 92px; }
+
+    #controlPanel {
+      position: absolute;
+      left: 50%;
+      bottom: 12px;
+      transform: translateX(-50%);
+      background: rgba(0, 0, 0, 0.7);
+      padding: 14px 18px;
+      border-radius: 12px;
+      display: flex;
+      gap: 16px;
+      align-items: center;
+      flex-wrap: wrap;
+      z-index: 10;
+    }
+
+    .control-group {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    label {
+      font-size: 14px;
+    }
+
+    input[type="range"] {
+      width: 140px;
+    }
+
+    button {
+      padding: 8px 14px;
+      border: none;
+      border-radius: 8px;
+      background: #2e7d32;
+      color: white;
+      cursor: pointer;
+      font-size: 14px;
+    }
+
+    button:hover:not(:disabled) {
+      background: #3f9b44;
+    }
+
+    button:disabled {
+      background: #666;
+      cursor: not-allowed;
+      opacity: 0.6;
+    }
+  </style>
+</head>
+<body>
+  <div id="positionHUD">Position: (-30.0, 0.5)</div>
+  <div id="launchCountHUD">Launch Count: 0</div>
+  <div id="maxHeightHUD">Max Height: 0.5</div>
+
+  <div id="controlPanel">
+    <div class="control-group">
+      <label for="angleSlider">Angle:</label>
+      <input id="angleSlider" type="range" min="10" max="80" value="45" />
+      <span id="angleLabel">45°</span>
+    </div>
+
+    <div class="control-group">
+      <label for="speedSlider">Speed:</label>
+      <input id="speedSlider" type="range" min="5" max="40" value="20" />
+      <span id="speedLabel">20 m/s</span>
+    </div>
+
+    <button id="launchBtn">Launch</button>
+    <button id="resetBtn">Reset</button>
+    <button id="undoBtn" disabled>Undo</button>
+    <button id="redoBtn" disabled>Redo</button>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js';
+    import { GLTFLoader } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/GLTFLoader.js';
+
+    // Scene setup
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x87ceeb);
+
+    const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 500);
+    camera.position.set(0, 10, 30);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(window.devicePixelRatio);
+    document.body.appendChild(renderer.domElement);
+
+    // Lights
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
+    scene.add(ambientLight);
+
+    const directionalLight = new THREE.DirectionalLight(0xffffff, 1.0);
+    directionalLight.position.set(10, 20, 10);
+    scene.add(directionalLight);
+
+    // Ground
+    const groundGeometry = new THREE.PlaneGeometry(100, 100);
+    const groundMaterial = new THREE.MeshStandardMaterial({ color: 0x228b22 });
+    const ground = new THREE.Mesh(groundGeometry, groundMaterial);
+    ground.rotation.x = -Math.PI / 2;
+    ground.position.y = 0;
+    scene.add(ground);
+
+    // Grid helper
+    const gridHelper = new THREE.GridHelper(100, 100, 0xffffff, 0xffffff);
+    gridHelper.position.y = 0.01;
+    gridHelper.material.opacity = 0.25;
+    gridHelper.material.transparent = true;
+    scene.add(gridHelper);
+
+    // Target marker
+    const targetPosition = new THREE.Vector3(20, 0.5, 0);
+    const target = new THREE.Mesh(
+      new THREE.SphereGeometry(0.5, 24, 24),
+      new THREE.MeshStandardMaterial({ color: 0xff0000 })
+    );
+    target.position.copy(targetPosition);
+    scene.add(target);
+
+    // Physics constants
+    const Cd = 0.47;
+    const rho = 1.225;
+    const A = 0.1;
+    const mass = 1.0;
+    const gravity = 9.81;
+    const dt = 1 / 60;
+
+    // Start position
+    const startPosition = new THREE.Vector3(-30, 0.5, 0);
+
+    // Projectile setup
+    let projectile;
+    let projectileLoaded = false;
+
+    const fallbackProjectile = new THREE.Mesh(
+      new THREE.SphereGeometry(1, 24, 24),
+      new THREE.MeshStandardMaterial({ color: 0xddddff })
+    );
+    fallbackProjectile.position.copy(startPosition);
+    fallbackProjectile.visible = false;
+    scene.add(fallbackProjectile);
+    projectile = fallbackProjectile;
+
+    const loader = new GLTFLoader();
+    loader.load(
+      'Corset.glb',
+      (gltf) => {
+        const model = gltf.scene;
+        model.scale.set(3, 3, 3);
+        model.position.copy(startPosition);
+        scene.add(model);
+
+        if (projectile && projectile !== model) {
+          projectile.visible = false;
+        }
+
+        projectile = model;
+        projectileLoaded = true;
+      },
+      undefined,
+      (error) => {
+        console.warn('Failed to load Corset.glb, using fallback sphere.', error);
+        fallbackProjectile.visible = true;
+        projectile = fallbackProjectile;
+      }
+    );
+
+    // Trail
+    let trailPoints = [];
+    let trailLine = null;
+
+    function rebuildTrail(points) {
+      if (trailLine) {
+        scene.remove(trailLine);
+        trailLine.geometry.dispose();
+        trailLine.material.dispose();
+        trailLine = null;
+      }
+
+      if (points.length < 2) return;
+
+      const geometry = new THREE.BufferGeometry().setFromPoints(points);
+      const material = new THREE.LineBasicMaterial({ color: 0xffff00 });
+      trailLine = new THREE.Line(geometry, material);
+      scene.add(trailLine);
+    }
+
+    function updateTrail() {
+      rebuildTrail(trailPoints);
+    }
+
+    function clearTrail() {
+      trailPoints = [];
+      if (trailLine) {
+        scene.remove(trailLine);
+        trailLine.geometry.dispose();
+        trailLine.material.dispose();
+        trailLine = null;
+      }
+    }
+
+    // State
+    const velocity = new THREE.Vector3(0, 0, 0);
+    let isFlying = false;
+    let hasLanded = false;
+    let launchCount = 0;
+    let maxHeight = startPosition.y;
+
+    const undoStack = [];
+    const redoStack = [];
+
+    // UI
+    const angleSlider = document.getElementById('angleSlider');
+    const speedSlider = document.getElementById('speedSlider');
+    const angleLabel = document.getElementById('angleLabel');
+    const speedLabel = document.getElementById('speedLabel');
+    const launchBtn = document.getElementById('launchBtn');
+    const resetBtn = document.getElementById('resetBtn');
+    const undoBtn = document.getElementById('undoBtn');
+    const redoBtn = document.getElementById('redoBtn');
+
+    const positionHUD = document.getElementById('positionHUD');
+    const launchCountHUD = document.getElementById('launchCountHUD');
+    const maxHeightHUD = document.getElementById('maxHeightHUD');
+
+    function updateButtonStates() {
+      undoBtn.disabled = undoStack.length === 0;
+      redoBtn.disabled = redoStack.length === 0;
+    }
+
+    function getLaunchAngle() {
+      return parseFloat(angleSlider.value);
+    }
+
+    function getLaunchSpeed() {
+      return parseFloat(speedSlider.value);
+    }
+
+    function updateLabels() {
+      angleLabel.textContent = `${angleSlider.value}°`;
+      speedLabel.textContent = `${speedSlider.value} m/s`;
+    }
+
+    function resetProjectileToStart() {
+      projectile.position.copy(startPosition);
+      velocity.set(0, 0, 0);
+      isFlying = false;
+      hasLanded = false;
+      maxHeight = startPosition.y;
+      clearTrail();
+    }
+
+    function takeCompletedLaunchSnapshot() {
+      return {
+        landingPosition: {
+          x: projectile.position.x,
+          y: projectile.position.y,
+          z: projectile.position.z
+        },
+        trajectoryPoints: trailPoints.map(p => ({ x: p.x, y: p.y, z: p.z })),
+        maxHeight,
+        launchAngle: getLaunchAngle(),
+        launchSpeed: getLaunchSpeed()
+      };
+    }
+
+    function restoreCompletedLaunchSnapshot(snapshot) {
+      projectile.position.set(
+        snapshot.landingPosition.x,
+        snapshot.landingPosition.y,
+        snapshot.landingPosition.z
+      );
+      velocity.set(0, 0, 0);
+      isFlying = false;
+      hasLanded = true;
+      maxHeight = snapshot.maxHeight;
+
+      angleSlider.value = snapshot.launchAngle;
+      speedSlider.value = snapshot.launchSpeed;
+      updateLabels();
+
+      trailPoints = snapshot.trajectoryPoints.map(p => new THREE.Vector3(p.x, p.y, p.z));
+      updateTrail();
+    }
+
+    function updateHUD() {
+      positionHUD.textContent = `Position: (${projectile.position.x.toFixed(1)}, ${projectile.position.y.toFixed(1)})`;
+      launchCountHUD.textContent = `Launch Count: ${launchCount}`;
+      maxHeightHUD.textContent = `Max Height: ${maxHeight.toFixed(2)}`;
+    }
+
+    function update3DState() {
+      const dist = projectile.position.distanceTo(targetPosition);
+      window.__3D_STATE__ = {
+        projectileX: projectile.position.x,
+        projectileY: projectile.position.y,
+        projectileZ: projectile.position.z,
+        velocityX: velocity.x,
+        velocityY: velocity.y,
+        velocityZ: velocity.z,
+        isFlying,
+        hasLanded,
+        launchAngle: getLaunchAngle(),
+        launchSpeed: getLaunchSpeed(),
+        launchCount,
+        undoStackSize: undoStack.length,
+        redoStackSize: redoStack.length,
+        trailPointCount: trailPoints.length,
+        distanceToTarget: dist,
+        dragEnabled: true,
+        maxHeight
+      };
+    }
+
+    function launchProjectile() {
+      if (isFlying) return;
+
+      redoStack.length = 0;
+      updateButtonStates();
+
+      clearTrail();
+      projectile.position.copy(startPosition);
+      hasLanded = false;
+      maxHeight = startPosition.y;
+
+      const angleDeg = getLaunchAngle();
+      const speed = getLaunchSpeed();
+      const angleRad = THREE.MathUtils.degToRad(angleDeg);
+
+      velocity.set(
+        speed * Math.cos(angleRad),
+        speed * Math.sin(angleRad),
+        0
+      );
+
+      isFlying = true;
+      launchCount++;
+      trailPoints.push(projectile.position.clone());
+    }
+
+    function resetSceneState() {
+      resetProjectileToStart();
+      updateHUD();
+      update3DState();
+    }
+
+    angleSlider.addEventListener('input', () => {
+      updateLabels();
+      update3DState();
+    });
+
+    speedSlider.addEventListener('input', () => {
+      updateLabels();
+      update3DState();
+    });
+
+    launchBtn.addEventListener('click', launchProjectile);
+
+    resetBtn.addEventListener('click', () => {
+      resetSceneState();
+    });
+
+    undoBtn.addEventListener('click', () => {
+      if (undoStack.length === 0 || isFlying) return;
+
+      const snapshot = undoStack.pop();
+      redoStack.push(snapshot);
+
+      resetProjectileToStart();
+      updateButtonStates();
+      updateHUD();
+      update3DState();
+    });
+
+    redoBtn.addEventListener('click', () => {
+      if (redoStack.length === 0 || isFlying) return;
+
+      const snapshot = redoStack.pop();
+      undoStack.push(snapshot);
+      restoreCompletedLaunchSnapshot(snapshot);
+
+      updateButtonStates();
+      updateHUD();
+      update3DState();
+    });
+
+    window.addEventListener('keydown', (e) => {
+      if (e.code === 'Space') {
+        e.preventDefault();
+        launchProjectile();
+      }
+    });
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    // Animation loop
+    function animate() {
+      requestAnimationFrame(animate);
+
+      if (isFlying) {
+        const speedMag = velocity.length();
+
+        // Quadratic drag acceleration: a_drag = F_drag / m
+        // F_drag = -0.5 * Cd * rho * A * |v| * v
+        const dragAccel = new THREE.Vector3(0, 0, 0);
+        if (speedMag > 0) {
+          const dragFactor = -0.5 * Cd * rho * A * speedMag / mass;
+          dragAccel.copy(velocity).multiplyScalar(dragFactor);
+        }
+
+        const accel = new THREE.Vector3(
+          dragAccel.x,
+          dragAccel.y - gravity,
+          dragAccel.z
+        );
+
+        // Euler integration
+        velocity.addScaledVector(accel, dt);
+        projectile.position.addScaledVector(velocity, dt);
+
+        if (projectile.position.y > maxHeight) {
+          maxHeight = projectile.position.y;
+        }
+
+        trailPoints.push(projectile.position.clone());
+        updateTrail();
+
+        // Stop at ground
+        if (projectile.position.y <= 0) {
+          projectile.position.y = 0;
+          isFlying = false;
+          hasLanded = true;
+          velocity.set(0, 0, 0);
+
+          const snapshot = takeCompletedLaunchSnapshot();
+          undoStack.push(snapshot);
+          updateButtonStates();
+        }
+      }
+
+      updateHUD();
+      update3DState();
+      renderer.render(scene, camera);
+    }
+
+    updateLabels();
+    resetSceneState();
+    updateButtonStates();
+    animate();
+  </script>
+</body>
+</html>

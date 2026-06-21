@@ -1,0 +1,657 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Magnetic Field Lines 3D</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { overflow: hidden; background: #1a1a2e; }
+  canvas { display: block; }
+  #hud {
+    position: absolute;
+    top: 10px;
+    left: 10px;
+    background: rgba(0,0,0,0.7);
+    color: #fff;
+    padding: 12px 16px;
+    border-radius: 8px;
+    font-family: 'Courier New', monospace;
+    font-size: 14px;
+    line-height: 1.6;
+    pointer-events: none;
+    user-select: none;
+  }
+  #instructions {
+    position: absolute;
+    bottom: 15px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: rgba(0,0,0,0.7);
+    color: #ccc;
+    padding: 8px 16px;
+    border-radius: 6px;
+    font-family: 'Courier New', monospace;
+    font-size: 12px;
+    pointer-events: none;
+    user-select: none;
+    white-space: nowrap;
+  }
+</style>
+</head>
+<body>
+<div id="hud">
+  <div id="hud-dipoles">Dipoles: 0</div>
+  <div id="hud-selected">Selected: none</div>
+  <div id="hud-fieldlines">Field Lines: 0</div>
+  <div id="hud-undo">Undo Stack: 0</div>
+  <div id="hud-redo">Redo Stack: 0</div>
+</div>
+<div id="instructions">Click grid to place dipole | Click dipole to select | R: rotate | Del: remove | Ctrl+Z/Y: undo/redo</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<script>
+(function() {
+
+// --- State ---
+const dipoles = []; // { mesh, position: Vector3, moment: Vector3, dirIndex: 0-5 }
+let selectedDipoleIndex = -1;
+const undoStack = [];
+const redoStack = [];
+const fieldLineObjects = [];
+let totalFieldPoints = 0;
+
+const DIRECTIONS = [
+  new THREE.Vector3(0, 1, 0),
+  new THREE.Vector3(1, 0, 0),
+  new THREE.Vector3(0, -1, 0),
+  new THREE.Vector3(-1, 0, 0),
+  new THREE.Vector3(0, 0, 1),
+  new THREE.Vector3(0, 0, -1),
+];
+
+// --- Global State ---
+window.__3D_STATE__ = {
+  dipoleCount: 0,
+  selectedDipoleIndex: -1,
+  fieldLineCount: 0,
+  undoStackSize: 0,
+  redoStackSize: 0,
+  lastAction: 'none',
+  dipoles: [],
+  cameraDistance: 0,
+  totalFieldPoints: 0,
+  sceneReady: false,
+};
+
+function updateState(lastAction) {
+  const s = window.__3D_STATE__;
+  s.dipoleCount = dipoles.length;
+  s.selectedDipoleIndex = selectedDipoleIndex;
+  s.fieldLineCount = fieldLineObjects.length;
+  s.undoStackSize = undoStack.length;
+  s.redoStackSize = redoStack.length;
+  if (lastAction !== undefined) s.lastAction = lastAction;
+  s.dipoles = dipoles.map(d => ({
+    x: d.position.x, y: d.position.y, z: d.position.z,
+    momentX: d.moment.x, momentY: d.moment.y, momentZ: d.moment.z
+  }));
+  s.cameraDistance = camera.position.length();
+  s.totalFieldPoints = totalFieldPoints;
+  updateHUD();
+}
+
+function updateHUD() {
+  document.getElementById('hud-dipoles').textContent = 'Dipoles: ' + dipoles.length;
+  document.getElementById('hud-selected').textContent = 'Selected: ' + (selectedDipoleIndex >= 0 ? 'Dipole #' + selectedDipoleIndex : 'none');
+  document.getElementById('hud-fieldlines').textContent = 'Field Lines: ' + fieldLineObjects.length;
+  document.getElementById('hud-undo').textContent = 'Undo Stack: ' + undoStack.length;
+  document.getElementById('hud-redo').textContent = 'Redo Stack: ' + redoStack.length;
+}
+
+// --- Scene Setup ---
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x1a1a2e);
+
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+camera.position.set(0, 8, 12);
+camera.lookAt(0, 0, 0);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(window.devicePixelRatio);
+document.body.appendChild(renderer.domElement);
+
+const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+scene.add(ambientLight);
+
+const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+dirLight.position.set(5, 10, 5);
+scene.add(dirLight);
+
+const gridHelper = new THREE.GridHelper(20, 20, 0x444466, 0x333355);
+gridHelper.material.opacity = 0.6;
+gridHelper.material.transparent = true;
+scene.add(gridHelper);
+
+const controls = new THREE.OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.1;
+
+// Invisible plane for raycasting
+const planeGeo = new THREE.PlaneGeometry(20, 20);
+const planeMat = new THREE.MeshBasicMaterial({ visible: false, side: THREE.DoubleSide });
+const clickPlane = new THREE.Mesh(planeGeo, planeMat);
+clickPlane.rotation.x = -Math.PI / 2;
+clickPlane.position.y = 0;
+scene.add(clickPlane);
+
+const raycaster = new THREE.Raycaster();
+const mouse = new THREE.Vector2();
+
+// --- Dipole Creation ---
+function createDipoleMesh(position, moment, dirIndex) {
+  const group = new THREE.Group();
+
+  // North (top) - red
+  const northGeo = new THREE.CylinderGeometry(0.3, 0.3, 0.3, 16);
+  const northMat = new THREE.MeshPhongMaterial({ color: 0xff3333, emissive: 0x000000 });
+  const northMesh = new THREE.Mesh(northGeo, northMat);
+  northMesh.position.y = 0.15;
+  group.add(northMesh);
+
+  // South (bottom) - blue
+  const southGeo = new THREE.CylinderGeometry(0.3, 0.3, 0.3, 16);
+  const southMat = new THREE.MeshPhongMaterial({ color: 0x3333ff, emissive: 0x000000 });
+  const southMesh = new THREE.Mesh(southGeo, southMat);
+  southMesh.position.y = -0.15;
+  group.add(southMesh);
+
+  group.position.copy(position);
+
+  // Orient the group so that local +Y aligns with moment direction
+  orientDipole(group, moment);
+
+  scene.add(group);
+
+  return group;
+}
+
+function orientDipole(group, moment) {
+  group.quaternion.identity();
+  const up = new THREE.Vector3(0, 1, 0);
+  const dir = moment.clone().normalize();
+  if (dir.distanceTo(up) < 0.001) {
+    // Already aligned
+  } else if (dir.distanceTo(up.clone().negate()) < 0.001) {
+    group.quaternion.setFromAxisAngle(new THREE.Vector3(1, 0, 0), Math.PI);
+  } else {
+    const quat = new THREE.Quaternion();
+    quat.setFromUnitVectors(up, dir);
+    group.quaternion.copy(quat);
+  }
+}
+
+function setDipoleHighlight(dipoleObj, highlight) {
+  if (!dipoleObj || !dipoleObj.mesh) return;
+  dipoleObj.mesh.children.forEach(child => {
+    if (child.material) {
+      child.material.emissive.set(highlight ? 0x666600 : 0x000000);
+    }
+  });
+}
+
+function addDipole(x, z, moment, dirIndex, skipFieldUpdate) {
+  const pos = new THREE.Vector3(x, 0.3, z);
+  const mesh = createDipoleMesh(pos, moment, dirIndex);
+  const dipoleObj = {
+    mesh: mesh,
+    position: pos.clone(),
+    moment: moment.clone(),
+    dirIndex: dirIndex
+  };
+  dipoles.push(dipoleObj);
+  if (!skipFieldUpdate) recomputeFieldLines();
+  return dipoles.length - 1;
+}
+
+function removeDipoleAt(index) {
+  if (index < 0 || index >= dipoles.length) return null;
+  const d = dipoles[index];
+  scene.remove(d.mesh);
+  dipoles.splice(index, 1);
+  if (selectedDipoleIndex === index) {
+    selectedDipoleIndex = -1;
+  } else if (selectedDipoleIndex > index) {
+    selectedDipoleIndex--;
+  }
+  recomputeFieldLines();
+  return d;
+}
+
+function selectDipole(index) {
+  if (selectedDipoleIndex >= 0 && selectedDipoleIndex < dipoles.length) {
+    setDipoleHighlight(dipoles[selectedDipoleIndex], false);
+  }
+  selectedDipoleIndex = index;
+  if (index >= 0 && index < dipoles.length) {
+    setDipoleHighlight(dipoles[index], true);
+  }
+}
+
+// --- Magnetic Field Computation ---
+function magneticFieldAt(point) {
+  const B = new THREE.Vector3(0, 0, 0);
+  for (let i = 0; i < dipoles.length; i++) {
+    const d = dipoles[i];
+    const r = new THREE.Vector3().subVectors(point, d.position);
+    const rLen = r.length();
+    if (rLen < 0.01) continue;
+    const rHat = r.clone().normalize();
+    const mDotR = d.moment.dot(rHat);
+    const term1 = rHat.clone().multiplyScalar(3 * mDotR);
+    const term2 = d.moment.clone();
+    const contrib = term1.sub(term2).divideScalar(rLen * rLen * rLen);
+    B.add(contrib);
+  }
+  return B;
+}
+
+function rk4Step(pos, stepSize, direction) {
+  const k1 = magneticFieldAt(pos);
+  if (k1.length() < 0.001) return null;
+  k1.normalize().multiplyScalar(stepSize * direction);
+
+  const p2 = pos.clone().add(k1.clone().multiplyScalar(0.5));
+  const k2 = magneticFieldAt(p2);
+  if (k2.length() < 0.001) return null;
+  k2.normalize().multiplyScalar(stepSize * direction);
+
+  const p3 = pos.clone().add(k2.clone().multiplyScalar(0.5));
+  const k3 = magneticFieldAt(p3);
+  if (k3.length() < 0.001) return null;
+  k3.normalize().multiplyScalar(stepSize * direction);
+
+  const p4 = pos.clone().add(k3);
+  const k4 = magneticFieldAt(p4);
+  if (k4.length() < 0.001) return null;
+  k4.normalize().multiplyScalar(stepSize * direction);
+
+  const delta = new THREE.Vector3()
+    .add(k1)
+    .add(k2.multiplyScalar(2))
+    .add(k3.multiplyScalar(2))
+    .add(k4)
+    .divideScalar(6);
+
+  return pos.clone().add(delta);
+}
+
+function traceFieldLine(startPos, direction) {
+  const points = [startPos.clone()];
+  let current = startPos.clone();
+  const stepSize = 0.15;
+  const maxSteps = 200;
+
+  for (let step = 0; step < maxSteps; step++) {
+    const next = rk4Step(current, stepSize, direction);
+    if (!next) break;
+
+    // Check bounds
+    if (next.length() > 15) break;
+
+    // Check field magnitude
+    const B = magneticFieldAt(next);
+    if (B.length() < 0.001) break;
+
+    // Check proximity to any dipole (south pole end)
+    let hitDipole = false;
+    for (let i = 0; i < dipoles.length; i++) {
+      const dist = next.distanceTo(dipoles[i].position);
+      if (dist < 0.3) {
+        hitDipole = true;
+        points.push(next);
+        break;
+      }
+    }
+    if (hitDipole) break;
+
+    points.push(next);
+    current = next;
+  }
+
+  return points;
+}
+
+function clearFieldLines() {
+  for (let i = 0; i < fieldLineObjects.length; i++) {
+    scene.remove(fieldLineObjects[i]);
+    fieldLineObjects[i].geometry.dispose();
+    fieldLineObjects[i].material.dispose();
+  }
+  fieldLineObjects.length = 0;
+  totalFieldPoints = 0;
+}
+
+function recomputeFieldLines() {
+  clearFieldLines();
+
+  if (dipoles.length === 0) {
+    updateState();
+    return;
+  }
+
+  for (let di = 0; di < dipoles.length; di++) {
+    const d = dipoles[di];
+    const moment = d.moment.clone().normalize();
+
+    // Find perpendicular plane
+    let perp1, perp2;
+    const arbitrary = Math.abs(moment.dot(new THREE.Vector3(1, 0, 0))) < 0.9
+      ? new THREE.Vector3(1, 0, 0)
+      : new THREE.Vector3(0, 1, 0);
+    perp1 = new THREE.Vector3().crossVectors(moment, arbitrary).normalize();
+    perp2 = new THREE.Vector3().crossVectors(moment, perp1).normalize();
+
+    const numLines = 8;
+    const radius = 0.5;
+
+    for (let li = 0; li < numLines; li++) {
+      const angle = (li / numLines) * Math.PI * 2;
+      const offset = perp1.clone().multiplyScalar(Math.cos(angle) * radius)
+        .add(perp2.clone().multiplyScalar(Math.sin(angle) * radius));
+      const startPos = d.position.clone().add(offset);
+
+      // Trace in field direction (from north)
+      const points = traceFieldLine(startPos, 1);
+
+      if (points.length >= 2) {
+        createFieldLineMesh(points, d);
+      }
+    }
+  }
+
+  updateState();
+}
+
+function createFieldLineMesh(points, sourceDipole) {
+  const geometry = new THREE.BufferGeometry();
+  const positions = new Float32Array(points.length * 3);
+  const colors = new Float32Array(points.length * 3);
+
+  for (let i = 0; i < points.length; i++) {
+    positions[i * 3] = points[i].x;
+    positions[i * 3 + 1] = points[i].y;
+    positions[i * 3 + 2] = points[i].z;
+
+    // Color based on dot product of field direction with source moment
+    const B = magneticFieldAt(points[i]);
+    const bNorm = B.clone().normalize();
+    const dot = bNorm.dot(sourceDipole.moment.clone().normalize());
+
+    // Map: dot=1 (aligned with moment, near north) -> red, dot=-1 (near south) -> blue
+    const t = (dot + 1) * 0.5; // 0 to 1
+    const r = t;
+    const g = 0.1;
+    const b = 1 - t;
+
+    colors[i * 3] = r;
+    colors[i * 3 + 1] = g;
+    colors[i * 3 + 2] = b;
+  }
+
+  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+  const material = new THREE.LineBasicMaterial({
+    vertexColors: true,
+    linewidth: 1,
+    transparent: true,
+    opacity: 0.85
+  });
+
+  const line = new THREE.Line(geometry, material);
+  scene.add(line);
+  fieldLineObjects.push(line);
+  totalFieldPoints += points.length;
+}
+
+// --- Action System ---
+function pushAction(action) {
+  undoStack.push(action);
+  redoStack.length = 0;
+}
+
+function performUndo() {
+  if (undoStack.length === 0) return;
+  const action = undoStack.pop();
+
+  if (action.type === 'place') {
+    // Find dipole at that position
+    const idx = findDipoleAtPosition(action.x, action.z);
+    if (idx >= 0) {
+      const d = dipoles[idx];
+      scene.remove(d.mesh);
+      dipoles.splice(idx, 1);
+      if (selectedDipoleIndex === idx) selectedDipoleIndex = -1;
+      else if (selectedDipoleIndex > idx) selectedDipoleIndex--;
+    }
+    redoStack.push(action);
+  } else if (action.type === 'remove') {
+    // Re-add the dipole
+    const pos = new THREE.Vector3(action.x, 0.3, action.z);
+    const moment = new THREE.Vector3(action.momentX, action.momentY, action.momentZ);
+    const mesh = createDipoleMesh(pos, moment, action.dirIndex);
+    const dipoleObj = {
+      mesh, position: pos.clone(), moment: moment.clone(), dirIndex: action.dirIndex
+    };
+    // Insert at original index
+    dipoles.splice(action.index, 0, dipoleObj);
+    if (selectedDipoleIndex >= action.index) selectedDipoleIndex++;
+    redoStack.push(action);
+  } else if (action.type === 'rotate') {
+    // Restore previous direction
+    const idx = findDipoleAtPosition(action.x, action.z);
+    if (idx >= 0) {
+      const d = dipoles[idx];
+      d.dirIndex = action.prevDirIndex;
+      d.moment.copy(DIRECTIONS[d.dirIndex]);
+      orientDipole(d.mesh, d.moment);
+    }
+    redoStack.push(action);
+  }
+
+  recomputeFieldLines();
+  updateState('undo');
+}
+
+function performRedo() {
+  if (redoStack.length === 0) return;
+  const action = redoStack.pop();
+
+  if (action.type === 'place') {
+    const moment = new THREE.Vector3(action.momentX, action.momentY, action.momentZ);
+    addDipole(action.x, action.z, moment, action.dirIndex, true);
+    undoStack.push(action);
+  } else if (action.type === 'remove') {
+    const idx = findDipoleAtPosition(action.x, action.z);
+    if (idx >= 0) {
+      const d = dipoles[idx];
+      scene.remove(d.mesh);
+      dipoles.splice(idx, 1);
+      if (selectedDipoleIndex === idx) selectedDipoleIndex = -1;
+      else if (selectedDipoleIndex > idx) selectedDipoleIndex--;
+    }
+    undoStack.push(action);
+  } else if (action.type === 'rotate') {
+    const idx = findDipoleAtPosition(action.x, action.z);
+    if (idx >= 0) {
+      const d = dipoles[idx];
+      d.dirIndex = action.newDirIndex;
+      d.moment.copy(DIRECTIONS[d.dirIndex]);
+      orientDipole(d.mesh, d.moment);
+    }
+    undoStack.push(action);
+  }
+
+  recomputeFieldLines();
+  updateState('redo');
+}
+
+function findDipoleAtPosition(x, z) {
+  for (let i = 0; i < dipoles.length; i++) {
+    if (Math.abs(dipoles[i].position.x - x) < 0.01 && Math.abs(dipoles[i].position.z - z) < 0.01) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+// --- Input Handling ---
+function onMouseClick(event) {
+  if (event.target !== renderer.domElement) return;
+
+  mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+  mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+  raycaster.setFromCamera(mouse, camera);
+
+  // Check dipole clicks first
+  const dipoleMeshes = dipoles.map(d => d.mesh.children).flat();
+  const dipoleIntersects = raycaster.intersectObjects(dipoleMeshes, false);
+
+  if (dipoleIntersects.length > 0) {
+    // Find which dipole was clicked
+    const clickedMesh = dipoleIntersects[0].object;
+    for (let i = 0; i < dipoles.length; i++) {
+      if (dipoles[i].mesh.children.includes(clickedMesh)) {
+        selectDipole(i);
+        updateState('select');
+        return;
+      }
+    }
+  }
+
+  // Check grid plane click
+  const planeIntersects = raycaster.intersectObject(clickPlane);
+  if (planeIntersects.length > 0) {
+    const point = planeIntersects[0].point;
+    const snappedX = Math.round(point.x);
+    const snappedZ = Math.round(point.z);
+
+    // Check if there's already a dipole there
+    const existingIdx = findDipoleAtPosition(snappedX, snappedZ);
+    if (existingIdx >= 0) {
+      selectDipole(existingIdx);
+      updateState('select');
+      return;
+    }
+
+    // Deselect current
+    if (selectedDipoleIndex >= 0) {
+      setDipoleHighlight(dipoles[selectedDipoleIndex], false);
+      selectedDipoleIndex = -1;
+    }
+
+    // Place new dipole
+    const moment = DIRECTIONS[0].clone();
+    const action = {
+      type: 'place',
+      x: snappedX,
+      z: snappedZ,
+      momentX: moment.x,
+      momentY: moment.y,
+      momentZ: moment.z,
+      dirIndex: 0
+    };
+    pushAction(action);
+    addDipole(snappedX, snappedZ, moment, 0);
+    updateState('place');
+  } else {
+    // Deselect
+    if (selectedDipoleIndex >= 0) {
+      setDipoleHighlight(dipoles[selectedDipoleIndex], false);
+      selectedDipoleIndex = -1;
+      updateState('deselect');
+    }
+  }
+}
+
+function onKeyDown(event) {
+  if (event.key === 'r' || event.key === 'R') {
+    if (selectedDipoleIndex >= 0 && selectedDipoleIndex < dipoles.length) {
+      const d = dipoles[selectedDipoleIndex];
+      const prevDirIndex = d.dirIndex;
+      const newDirIndex = (d.dirIndex + 1) % 6;
+
+      const action = {
+        type: 'rotate',
+        x: d.position.x,
+        z: d.position.z,
+        prevDirIndex: prevDirIndex,
+        newDirIndex: newDirIndex
+      };
+      pushAction(action);
+
+      d.dirIndex = newDirIndex;
+      d.moment.copy(DIRECTIONS[newDirIndex]);
+      orientDipole(d.mesh, d.moment);
+      recomputeFieldLines();
+      updateState('rotate');
+    }
+  } else if (event.key === 'Delete' || event.key === 'Backspace') {
+    if (selectedDipoleIndex >= 0 && selectedDipoleIndex < dipoles.length) {
+      const d = dipoles[selectedDipoleIndex];
+      const action = {
+        type: 'remove',
+        x: d.position.x,
+        z: d.position.z,
+        momentX: d.moment.x,
+        momentY: d.moment.y,
+        momentZ: d.moment.z,
+        dirIndex: d.dirIndex,
+        index: selectedDipoleIndex
+      };
+      pushAction(action);
+
+      scene.remove(d.mesh);
+      dipoles.splice(selectedDipoleIndex, 1);
+      selectedDipoleIndex = -1;
+      recomputeFieldLines();
+      updateState('remove');
+    }
+  } else if (event.key === 'z' && (event.ctrlKey || event.metaKey)) {
+    event.preventDefault();
+    performUndo();
+  } else if (event.key === 'y' && (event.ctrlKey || event.metaKey)) {
+    event.preventDefault();
+    performRedo();
+  }
+}
+
+renderer.domElement.addEventListener('click', onMouseClick);
+window.addEventListener('keydown', onKeyDown);
+
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// --- Animation Loop ---
+function animate() {
+  requestAnimationFrame(animate);
+  controls.update();
+  renderer.render(scene, camera);
+}
+
+// --- Init ---
+window.__3D_STATE__.sceneReady = true;
+updateState('none');
+animate();
+
+})();
+</script>
+</body>
+</html>

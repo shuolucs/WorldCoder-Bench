@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sunglasses Virtual Try-On</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #1a1a2e;
+            font-family: sans-serif;
+        }
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+        }
+        #toolbar {
+            position: absolute;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            gap: 10px;
+            background: rgba(0, 0, 0, 0.6);
+            padding: 10px 20px;
+            border-radius: 8px;
+            z-index: 10;
+        }
+        button {
+            background: #4a4e69;
+            color: white;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-weight: bold;
+            transition: background 0.2s;
+        }
+        button:hover {
+            background: #9a8c98;
+        }
+        #debug-overlay {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            background: rgba(0, 0, 0, 0.7);
+            color: #00ff00;
+            font-family: monospace;
+            padding: 15px;
+            border-radius: 8px;
+            pointer-events: none;
+            display: none;
+            z-index: 10;
+            min-width: 200px;
+        }
+        .debug-line {
+            margin: 5px 0;
+        }
+        #loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: white;
+            font-size: 24px;
+            pointer-events: none;
+            z-index: 20;
+        }
+    </style>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="loading">Loading Model...</div>
+    <div id="canvas-container"></div>
+    
+    <div id="toolbar">
+        <button id="btn-reset">Reset</button>
+        <button id="btn-drop">Drop</button>
+        <button id="btn-lens">Change Lens</button>
+        <button id="btn-wireframe">Toggle Wireframe</button>
+    </div>
+
+    <div id="debug-overlay">
+        <div class="debug-line">FPS: <span id="dbg-fps">0</span></div>
+        <div class="debug-line">Pos: <span id="dbg-pos">0, 0, 0</span></div>
+        <div class="debug-line">Vel Y: <span id="dbg-vel">0</span></div>
+        <div class="debug-line">Steps: <span id="dbg-steps">0</span></div>
+        <div class="debug-line">Placed: <span id="dbg-placed">false</span></div>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+        // State Management
+        window.__3D_STATE__ = {
+            modelLoaded: false,
+            sunglassesY: 1.8,
+            sunglassesPlaced: false,
+            velocityY: 0,
+            physicsSteps: 0,
+            debugVisible: false,
+            lensColorIndex: 0,
+            wireframeEnabled: false,
+            groundContactCount: 0,
+            sceneObjectCount: 0
+        };
+
+        const state = window.__3D_STATE__;
+        const lensColors = ['#333333', '#8B4513', '#006400', '#00008B'];
+        let isDropped = false;
+        let hasBounced = false;
+
+        // Scene Setup
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color('#1a1a2e');
+
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+        camera.position.set(0, 1.5, 3);
+        camera.lookAt(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        document.getElementById('canvas-container').appendChild(renderer.domElement);
+
+        // Controls
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.target.set(0, 0.8, 0);
+        controls.minPolarAngle = 0.3;
+        controls.maxPolarAngle = 1.5;
+
+        // Lighting
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+        dirLight.position.set(2, 3, 2);
+        dirLight.castShadow = true;
+        dirLight.shadow.mapSize.width = 1024;
+        dirLight.shadow.mapSize.height = 1024;
+        scene.add(dirLight);
+
+        // Ground
+        const groundGeo = new THREE.PlaneGeometry(10, 10);
+        const groundMat = new THREE.MeshStandardMaterial({ color: 0x222222, roughness: 0.8 });
+        const ground = new THREE.Mesh(groundGeo, groundMat);
+        ground.rotation.x = -Math.PI / 2;
+        ground.position.y = -1;
+        ground.receiveShadow = true;
+        scene.add(ground);
+
+        // Mannequin (Corset.glb)
+        let mannequin;
+        const loader = new GLTFLoader();
+        // Using a reliable public URL for the sample model
+        loader.load('https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Models/master/2.0/Corset/glTF-Binary/Corset.glb', (gltf) => {
+            mannequin = gltf.scene;
+            
+            // Center and scale
+            const box = new THREE.Box3().setFromObject(mannequin);
+            const center = box.getCenter(new THREE.Vector3());
+            mannequin.position.sub(center);
+            mannequin.position.y += 0.5; // Adjust height
+            
+            const scale = 2.0;
+            mannequin.scale.set(scale, scale, scale);
+            
+            mannequin.traverse((child) => {
+                if (child.isMesh) {
+                    child.castShadow = true;
+                    child.receiveShadow = true;
+                }
+            });
+            
+            scene.add(mannequin);
+            state.modelLoaded = true;
+            document.getElementById('loading').style.display = 'none';
+        });
+
+        // Procedural Sunglasses
+        const sunglassesGroup = new THREE.Group();
+        
+        const frameMat = new THREE.MeshStandardMaterial({ color: 0x111111, roughness: 0.4 });
+        const lensMat = new THREE.MeshStandardMaterial({ 
+            color: lensColors[state.lensColorIndex], 
+            transparent: true, 
+            opacity: 0.7,
+            roughness: 0.1,
+            metalness: 0.5
+        });
+
+        const frameGeo = new THREE.TorusGeometry(0.15, 0.02, 16, 64);
+        const lensGeo = new THREE.CircleGeometry(0.14, 32);
+        const bridgeGeo = new THREE.CylinderGeometry(0.01, 0.01, 0.12);
+
+        // Left Lens
+        const leftFrame = new THREE.Mesh(frameGeo, frameMat);
+        const leftLens = new THREE.Mesh(lensGeo, lensMat);
+        leftFrame.position.set(-0.17, 0, 0);
+        leftLens.position.set(-0.17, 0, 0);
+        leftFrame.castShadow = true;
+        
+        // Right Lens
+        const rightFrame = new THREE.Mesh(frameGeo, frameMat);
+        const rightLens = new THREE.Mesh(lensGeo, lensMat);
+        rightFrame.position.set(0.17, 0, 0);
+        rightLens.position.set(0.17, 0, 0);
+        rightFrame.castShadow = true;
+
+        // Bridge
+        const bridge = new THREE.Mesh(bridgeGeo, frameMat);
+        bridge.rotation.z = Math.PI / 2;
+        bridge.castShadow = true;
+
+        // Arms (simple)
+        const armGeo = new THREE.CylinderGeometry(0.01, 0.01, 0.4);
+        const leftArm = new THREE.Mesh(armGeo, frameMat);
+        leftArm.position.set(-0.32, 0, -0.2);
+        leftArm.rotation.x = Math.PI / 2;
+        const rightArm = new THREE.Mesh(armGeo, frameMat);
+        rightArm.position.set(0.32, 0, -0.2);
+        rightArm.rotation.x = Math.PI / 2;
+
+        sunglassesGroup.add(leftFrame, leftLens, rightFrame, rightLens, bridge, leftArm, rightArm);
+        
+        // Initial position
+        sunglassesGroup.position.set(0, state.sunglassesY, 0.15);
+        scene.add(sunglassesGroup);
+
+        // UI Interactions
+        document.getElementById('btn-reset').addEventListener('click', () => {
+            state.sunglassesY = 1.8;
+            state.velocityY = 0;
+            state.sunglassesPlaced = false;
+            isDropped = false;
+            hasBounced = false;
+        });
+
+        document.getElementById('btn-drop').addEventListener('click', () => {
+            if (state.sunglassesPlaced) {
+                state.sunglassesPlaced = false;
+                isDropped = true;
+                hasBounced = false;
+            }
+        });
+
+        document.getElementById('btn-lens').addEventListener('click', () => {
+            state.lensColorIndex = (state.lensColorIndex + 1) % lensColors.length;
+            lensMat.color.set(lensColors[state.lensColorIndex]);
+        });
+
+        document.getElementById('btn-wireframe').addEventListener('click', () => {
+            if (mannequin) {
+                state.wireframeEnabled = !state.wireframeEnabled;
+                mannequin.traverse((child) => {
+                    if (child.isMesh && child.material) {
+                        child.material.wireframe = state.wireframeEnabled;
+                    }
+                });
+            }
+        });
+
+        window.addEventListener('keydown', (e) => {
+            if (e.key.toLowerCase() === 'd') {
+                state.debugVisible = !state.debugVisible;
+                document.getElementById('debug-overlay').style.display = state.debugVisible ? 'block' : 'none';
+            }
+        });
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // Animation Loop & Physics
+        const clock = new THREE.Clock();
+        let frames = 0;
+        let prevTime = performance.now();
+        let currentFps = 0;
+
+        // DOM Elements for debug
+        const elFps = document.getElementById('dbg-fps');
+        const elPos = document.getElementById('dbg-pos');
+        const elVel = document.getElementById('dbg-vel');
+        const elSteps = document.getElementById('dbg-steps');
+        const elPlaced = document.getElementById('dbg-placed');
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const dt = Math.min(clock.getDelta(), 0.1); // Cap dt to prevent huge jumps
+            state.physicsSteps++;
+
+            // Physics Logic
+            if (!state.sunglassesPlaced && !isDropped) {
+                // Falling to head
+                state.velocityY += -9.81 * dt;
+                state.sunglassesY += state.velocityY * dt;
+                
+                if (state.sunglassesY <= 0.8) {
+                    state.sunglassesY = 0.8;
+                    state.velocityY = 0;
+                    state.sunglassesPlaced = true;
+                }
+            } else if (isDropped) {
+                // Falling to ground
+                state.velocityY += -9.81 * dt;
+                state.sunglassesY += state.velocityY * dt;
+                
+                const groundLevel = -0.85; // Ground is -1, offset by glasses radius
+                
+                if (state.sunglassesY <= groundLevel) {
+                    if (!hasBounced) {
+                        state.sunglassesY = groundLevel;
+                        state.velocityY = -state.velocityY * 0.3; // Restitution 0.3
+                        hasBounced = true;
+                        state.groundContactCount++;
+                    } else {
+                        state.sunglassesY = groundLevel;
+                        state.velocityY = 0;
+                    }
+                }
+            }
+
+            // Ensure no NaNs
+            if (isNaN(state.sunglassesY)) state.sunglassesY = 1.8;
+            if (isNaN(state.velocityY)) state.velocityY = 0;
+
+            sunglassesGroup.position.y = state.sunglassesY;
+
+            // Update State Object
+            state.sceneObjectCount = scene.children.length;
+
+            // FPS Calculation
+            frames++;
+            const time = performance.now();
+            if (time >= prevTime + 1000) {
+                currentFps = Math.round((frames * 1000) / (time - prevTime));
+                frames = 0;
+                prevTime = time;
+            }
+
+            // Update Debug Overlay
+            if (state.debugVisible) {
+                elFps.textContent = currentFps;
+                elPos.textContent = `${sunglassesGroup.position.x.toFixed(2)}, ${sunglassesGroup.position.y.toFixed(2)}, ${sunglassesGroup.position.z.toFixed(2)}`;
+                elVel.textContent = state.velocityY.toFixed(3);
+                elSteps.textContent = state.physicsSteps;
+                elPlaced.textContent = state.sunglassesPlaced;
+            }
+
+            controls.update();
+            renderer.render(scene, camera);
+        }
+
+        animate();
+    </script>
+</body>
+</html>

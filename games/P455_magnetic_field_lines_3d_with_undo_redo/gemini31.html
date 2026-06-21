@@ -1,0 +1,544 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Magnetic Field Visualizer</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #1a1a2e;
+            font-family: monospace;
+            user-select: none;
+        }
+        canvas {
+            display: block;
+        }
+        #hud {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(0, 0, 0, 0.6);
+            color: white;
+            padding: 15px;
+            border-radius: 8px;
+            pointer-events: none;
+            font-size: 14px;
+            line-height: 1.5;
+        }
+        #instructions {
+            position: absolute;
+            bottom: 20px;
+            width: 100%;
+            text-align: center;
+            color: white;
+            background: rgba(0, 0, 0, 0.4);
+            padding: 10px 0;
+            pointer-events: none;
+            font-size: 14px;
+        }
+    </style>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="hud">
+        <div id="hud-dipoles">Dipoles: 0</div>
+        <div id="hud-selected">Selected: none</div>
+        <div id="hud-lines">Field Lines: 0</div>
+        <div id="hud-undo">Undo Stack: 0</div>
+        <div id="hud-redo">Redo Stack: 0</div>
+    </div>
+    <div id="instructions">
+        Click grid to place dipole | Click dipole to select | R: rotate | Del: remove | Ctrl+Z/Y: undo/redo
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        // --- State Management ---
+        window.__3D_STATE__ = {
+            dipoleCount: 0,
+            selectedDipoleIndex: -1,
+            fieldLineCount: 0,
+            undoStackSize: 0,
+            redoStackSize: 0,
+            lastAction: 'none',
+            dipoles: [],
+            cameraDistance: 12,
+            totalFieldPoints: 0,
+            sceneReady: false
+        };
+
+        // --- Globals ---
+        let scene, camera, renderer, controls;
+        let dipoles = []; // { id, mesh, position, dirIndex }
+        let fieldLinesGroup;
+        let selectedId = -1;
+        let nextDipoleId = 1;
+        
+        let undoStack = [];
+        let redoStack = [];
+
+        const DIRS = [
+            new THREE.Vector3(0, 1, 0),  // +Y
+            new THREE.Vector3(1, 0, 0),  // +X
+            new THREE.Vector3(0, -1, 0), // -Y
+            new THREE.Vector3(-1, 0, 0), // -X
+            new THREE.Vector3(0, 0, 1),  // +Z
+            new THREE.Vector3(0, 0, -1)  // -Z
+        ];
+
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+        const gridPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+
+        init();
+        animate();
+
+        function init() {
+            // Scene setup
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x1a1a2e);
+
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.position.set(0, 8, 12);
+            camera.lookAt(0, 0, 0);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            document.body.appendChild(renderer.domElement);
+
+            // Lights
+            const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+            scene.add(ambientLight);
+
+            const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+            dirLight.position.set(5, 10, 5);
+            scene.add(dirLight);
+
+            // Grid
+            const gridHelper = new THREE.GridHelper(20, 20, 0xffffff, 0xffffff);
+            gridHelper.material.transparent = true;
+            gridHelper.material.opacity = 0.2;
+            scene.add(gridHelper);
+
+            // Field Lines Group
+            fieldLinesGroup = new THREE.Group();
+            scene.add(fieldLinesGroup);
+
+            // Controls
+            controls = new OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+            controls.dampingFactor = 0.05;
+
+            // Events
+            window.addEventListener('resize', onWindowResize);
+            window.addEventListener('pointerdown', onPointerDown);
+            window.addEventListener('keydown', onKeyDown);
+
+            window.__3D_STATE__.sceneReady = true;
+            updateState('init');
+        }
+
+        function createDipoleMesh() {
+            const group = new THREE.Group();
+            const geo = new THREE.CylinderGeometry(0.3, 0.3, 0.3, 16);
+            
+            const matN = new THREE.MeshLambertMaterial({ color: 0xff0000 });
+            const meshN = new THREE.Mesh(geo, matN);
+            meshN.position.y = 0.15;
+            
+            const matS = new THREE.MeshLambertMaterial({ color: 0x0000ff });
+            const meshS = new THREE.Mesh(geo, matS);
+            meshS.position.y = -0.15;
+            
+            group.add(meshN);
+            group.add(meshS);
+            return group;
+        }
+
+        function updateDipoleRotation(dipole) {
+            const dir = DIRS[dipole.dirIndex];
+            const up = new THREE.Vector3(0, 1, 0);
+            dipole.mesh.quaternion.setFromUnitVectors(up, dir);
+        }
+
+        function setSelection(id) {
+            selectedId = id;
+            dipoles.forEach(d => {
+                const isSel = d.id === selectedId;
+                d.mesh.children.forEach(child => {
+                    child.material.emissive.setHex(isSel ? 0x666600 : 0x000000);
+                });
+            });
+            updateState(id !== -1 ? 'select' : 'deselect');
+        }
+
+        // --- Interaction ---
+
+        function onPointerDown(event) {
+            if (event.button !== 0) return; // Only left click
+
+            mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+            raycaster.setFromCamera(mouse, camera);
+
+            // Check intersection with dipoles
+            const dipoleMeshes = dipoles.map(d => d.mesh);
+            const intersects = raycaster.intersectObjects(dipoleMeshes, true);
+
+            if (intersects.length > 0) {
+                // Clicked a dipole
+                let object = intersects[0].object;
+                while (object.parent && object.parent.type === 'Group') {
+                    object = object.parent;
+                }
+                const clickedDipole = dipoles.find(d => d.mesh === object);
+                if (clickedDipole) {
+                    setSelection(clickedDipole.id);
+                }
+            } else {
+                // Check intersection with grid plane
+                const target = new THREE.Vector3();
+                raycaster.ray.intersectPlane(gridPlane, target);
+                
+                if (target) {
+                    // Clicked empty space on grid
+                    const x = Math.round(target.x);
+                    const z = Math.round(target.z);
+                    
+                    // Check if dipole already exists here
+                    const exists = dipoles.some(d => d.position.x === x && d.position.z === z);
+                    if (!exists && Math.abs(x) <= 10 && Math.abs(z) <= 10) {
+                        executeCommand({
+                            type: 'place',
+                            id: nextDipoleId++,
+                            pos: new THREE.Vector3(x, 0, z),
+                            dirIndex: 0
+                        });
+                        setSelection(-1);
+                    } else {
+                        setSelection(-1);
+                    }
+                } else {
+                    setSelection(-1);
+                }
+            }
+        }
+
+        function onKeyDown(event) {
+            if (event.ctrlKey || event.metaKey) {
+                if (event.key.toLowerCase() === 'z') {
+                    undo();
+                } else if (event.key.toLowerCase() === 'y') {
+                    redo();
+                }
+                return;
+            }
+
+            if (selectedId !== -1) {
+                const dipole = dipoles.find(d => d.id === selectedId);
+                if (!dipole) return;
+
+                if (event.key.toLowerCase() === 'r') {
+                    const newDir = (dipole.dirIndex + 1) % 6;
+                    executeCommand({
+                        type: 'rotate',
+                        id: dipole.id,
+                        oldDir: dipole.dirIndex,
+                        newDir: newDir
+                    });
+                } else if (event.key === 'Delete' || event.key === 'Backspace') {
+                    executeCommand({
+                        type: 'remove',
+                        id: dipole.id,
+                        pos: dipole.position.clone(),
+                        dirIndex: dipole.dirIndex
+                    });
+                }
+            }
+        }
+
+        // --- Undo/Redo System ---
+
+        function executeCommand(cmd, isUndo = false, isRedo = false) {
+            if (!isUndo && !isRedo) {
+                undoStack.push(cmd);
+                redoStack = [];
+            }
+
+            let actionName = cmd.type;
+
+            if (cmd.type === 'place') {
+                if (isUndo) {
+                    removeDipoleInternal(cmd.id);
+                } else {
+                    addDipoleInternal(cmd.id, cmd.pos, cmd.dirIndex);
+                }
+            } else if (cmd.type === 'remove') {
+                if (isUndo) {
+                    addDipoleInternal(cmd.id, cmd.pos, cmd.dirIndex);
+                } else {
+                    removeDipoleInternal(cmd.id);
+                }
+            } else if (cmd.type === 'rotate') {
+                const d = dipoles.find(x => x.id === cmd.id);
+                if (d) {
+                    d.dirIndex = isUndo ? cmd.oldDir : cmd.newDir;
+                    updateDipoleRotation(d);
+                }
+            }
+
+            recomputeFields();
+            
+            if (isUndo) actionName = 'undo';
+            if (isRedo) actionName = 'redo';
+            updateState(actionName);
+        }
+
+        function undo() {
+            if (undoStack.length === 0) return;
+            const cmd = undoStack.pop();
+            redoStack.push(cmd);
+            executeCommand(cmd, true, false);
+        }
+
+        function redo() {
+            if (redoStack.length === 0) return;
+            const cmd = redoStack.pop();
+            undoStack.push(cmd);
+            executeCommand(cmd, false, true);
+        }
+
+        function addDipoleInternal(id, pos, dirIndex) {
+            const mesh = createDipoleMesh();
+            mesh.position.copy(pos);
+            scene.add(mesh);
+            const dipole = { id, mesh, position: pos.clone(), dirIndex };
+            dipoles.push(dipole);
+            updateDipoleRotation(dipole);
+        }
+
+        function removeDipoleInternal(id) {
+            const index = dipoles.findIndex(d => d.id === id);
+            if (index !== -1) {
+                const d = dipoles[index];
+                scene.remove(d.mesh);
+                d.mesh.children.forEach(c => {
+                    c.geometry.dispose();
+                    c.material.dispose();
+                });
+                dipoles.splice(index, 1);
+                if (selectedId === id) setSelection(-1);
+            }
+        }
+
+        // --- Physics & Field Lines ---
+
+        function getB(position) {
+            const B = new THREE.Vector3(0, 0, 0);
+            for (const dipole of dipoles) {
+                const r = new THREE.Vector3().subVectors(position, dipole.position);
+                const rMag = r.length();
+                if (rMag < 0.05) continue; // Avoid singularity
+
+                const rHat = r.clone().normalize();
+                const m = DIRS[dipole.dirIndex];
+                
+                const dot = m.dot(rHat);
+                const term1 = rHat.clone().multiplyScalar(3 * dot);
+                const B_dip = term1.sub(m).multiplyScalar(1 / Math.pow(rMag, 3));
+                
+                B.add(B_dip);
+            }
+            return B;
+        }
+
+        function rk4Step(p, h) {
+            const k1 = getB(p);
+            if (k1.lengthSq() < 1e-12) return null;
+            k1.normalize().multiplyScalar(h);
+
+            const k2 = getB(p.clone().add(k1.clone().multiplyScalar(0.5)));
+            if (k2.lengthSq() < 1e-12) return null;
+            k2.normalize().multiplyScalar(h);
+
+            const k3 = getB(p.clone().add(k2.clone().multiplyScalar(0.5)));
+            if (k3.lengthSq() < 1e-12) return null;
+            k3.normalize().multiplyScalar(h);
+
+            const k4 = getB(p.clone().add(k3));
+            if (k4.lengthSq() < 1e-12) return null;
+            k4.normalize().multiplyScalar(h);
+
+            const step = k1.add(k2.multiplyScalar(2)).add(k3.multiplyScalar(2)).add(k4).multiplyScalar(1/6);
+            return p.clone().add(step);
+        }
+
+        function traceLine(start, sign, sourceMoment) {
+            const pts = [];
+            const colors = [];
+            let p = start.clone();
+            
+            const colorBlue = new THREE.Color(0x0000ff);
+            const colorRed = new THREE.Color(0xff0000);
+
+            for (let i = 0; i < 200; i++) {
+                pts.push(p);
+                
+                const B = getB(p);
+                const Bmag = B.length();
+                if (Bmag < 0.001) break;
+
+                const Bdir = B.clone().normalize();
+                const dot = Bdir.dot(sourceMoment); // -1 to 1
+                
+                const c = new THREE.Color();
+                c.lerpColors(colorBlue, colorRed, (dot + 1) / 2);
+                colors.push(c.r, c.g, c.b);
+
+                if (p.length() > 15) break;
+                
+                let hitDipole = false;
+                for (const d of dipoles) {
+                    if (p.distanceTo(d.position) < 0.3) {
+                        hitDipole = true;
+                        break;
+                    }
+                }
+                if (hitDipole && i > 0) break;
+
+                const nextP = rk4Step(p, sign * 0.15);
+                if (!nextP) break;
+                p = nextP;
+            }
+            return { pts, colors };
+        }
+
+        function recomputeFields() {
+            // Clear old lines
+            while (fieldLinesGroup.children.length > 0) {
+                const line = fieldLinesGroup.children[0];
+                line.geometry.dispose();
+                line.material.dispose();
+                fieldLinesGroup.remove(line);
+            }
+
+            let totalPoints = 0;
+            let lineCount = 0;
+
+            for (const dipole of dipoles) {
+                const m = DIRS[dipole.dirIndex];
+                
+                // Find orthogonal vectors for equator
+                let v1 = new THREE.Vector3(1, 0, 0);
+                if (Math.abs(m.dot(v1)) > 0.9) v1.set(0, 1, 0);
+                v1.cross(m).normalize();
+                const v2 = m.clone().cross(v1).normalize();
+
+                for (let i = 0; i < 8; i++) {
+                    const angle = (i / 8) * Math.PI * 2;
+                    const offset = v1.clone().multiplyScalar(Math.cos(angle))
+                                     .add(v2.clone().multiplyScalar(Math.sin(angle)))
+                                     .multiplyScalar(0.5);
+                    const start = dipole.position.clone().add(offset);
+
+                    const fwd = traceLine(start, 1, m);
+                    const bwd = traceLine(start, -1, m);
+
+                    // Combine
+                    bwd.pts.reverse();
+                    const bwdColors = [];
+                    for (let j = bwd.colors.length / 3 - 1; j >= 0; j--) {
+                        bwdColors.push(bwd.colors[j*3], bwd.colors[j*3+1], bwd.colors[j*3+2]);
+                    }
+
+                    const finalPts = bwd.pts.concat(fwd.pts.slice(1));
+                    const finalColors = bwdColors.concat(fwd.colors.slice(3));
+
+                    if (finalPts.length > 1) {
+                        const geometry = new THREE.BufferGeometry().setFromPoints(finalPts);
+                        geometry.setAttribute('color', new THREE.Float32BufferAttribute(finalColors, 3));
+                        
+                        const material = new THREE.LineBasicMaterial({ vertexColors: true, linewidth: 1 });
+                        const line = new THREE.Line(geometry, material);
+                        
+                        fieldLinesGroup.add(line);
+                        lineCount++;
+                        totalPoints += finalPts.length;
+                    }
+                }
+            }
+
+            window.__3D_STATE__.fieldLineCount = lineCount;
+            window.__3D_STATE__.totalFieldPoints = totalPoints;
+        }
+
+        // --- State & UI ---
+
+        function updateState(action) {
+            const state = window.__3D_STATE__;
+            state.dipoleCount = dipoles.length;
+            
+            const selIndex = dipoles.findIndex(d => d.id === selectedId);
+            state.selectedDipoleIndex = selIndex;
+            
+            state.undoStackSize = undoStack.length;
+            state.redoStackSize = redoStack.length;
+            state.lastAction = action;
+            state.cameraDistance = camera.position.length();
+            
+            state.dipoles = dipoles.map(d => {
+                const m = DIRS[d.dirIndex];
+                return {
+                    x: d.position.x,
+                    y: d.position.y,
+                    z: d.position.z,
+                    momentX: m.x,
+                    momentY: m.y,
+                    momentZ: m.z
+                };
+            });
+
+            updateHUD();
+        }
+
+        function updateHUD() {
+            const state = window.__3D_STATE__;
+            document.getElementById('hud-dipoles').innerText = `Dipoles: ${state.dipoleCount}`;
+            document.getElementById('hud-selected').innerText = state.selectedDipoleIndex !== -1 ? `Selected: Dipole #${state.selectedDipoleIndex}` : 'Selected: none';
+            document.getElementById('hud-lines').innerText = `Field Lines: ${state.fieldLineCount}`;
+            document.getElementById('hud-undo').innerText = `Undo Stack: ${state.undoStackSize}`;
+            document.getElementById('hud-redo').innerText = `Redo Stack: ${state.redoStackSize}`;
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            controls.update();
+            
+            const currentDist = camera.position.length();
+            if (Math.abs(window.__3D_STATE__.cameraDistance - currentDist) > 0.1) {
+                window.__3D_STATE__.cameraDistance = currentDist;
+            }
+
+            renderer.render(scene, camera);
+        }
+    </script>
+</body>
+</html>

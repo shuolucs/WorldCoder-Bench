@@ -1,0 +1,910 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3D Fire Escape Pathfinding Simulation</title>
+<script type="importmap">
+{ "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+} }
+</script>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { overflow: hidden; background: #0d0d12; font-family: 'Courier New', monospace; }
+canvas { display: block; }
+#hud {
+    position: absolute; top: 10px; left: 10px;
+    color: #44ff44; background: rgba(0,0,0,0.8);
+    padding: 15px; border-radius: 8px;
+    border: 1px solid #44ff44; font-size: 13px;
+    min-width: 240px; z-index: 10;
+}
+#hud h2 { margin-bottom: 10px; color: #ff8844; font-size: 16px; }
+#hud div { margin: 4px 0; }
+#hud .label { color: #888; }
+#hud .value { color: #44ff44; font-weight: bold; }
+#controls {
+    position: absolute; bottom: 10px; left: 10px;
+    color: #ccc; background: rgba(0,0,0,0.8);
+    padding: 15px; border-radius: 8px;
+    border: 1px solid #555; font-size: 13px;
+    z-index: 10;
+}
+#controls label { display: block; margin: 6px 0 2px; }
+#controls input[type="range"] { width: 200px; }
+#controls .keys { margin-top: 10px; color: #888; font-size: 11px; }
+#message {
+    position: absolute; top: 50%; left: 50%;
+    transform: translate(-50%, -50%);
+    font-size: 64px; font-weight: bold;
+    color: #00ff44; text-shadow: 0 0 30px #00ff44, 0 0 60px #00ff44;
+    display: none; z-index: 20;
+    animation: pulse 0.5s ease-in-out infinite alternate;
+}
+@keyframes pulse {
+    from { opacity: 0.7; transform: translate(-50%, -50%) scale(0.95); }
+    to { opacity: 1.0; transform: translate(-50%, -50%) scale(1.05); }
+}
+#dead-message {
+    position: absolute; top: 50%; left: 50%;
+    transform: translate(-50%, -50%);
+    font-size: 64px; font-weight: bold;
+    color: #ff2222; text-shadow: 0 0 30px #ff2222, 0 0 60px #ff2222;
+    display: none; z-index: 20;
+}
+</style>
+</head>
+<body>
+<div id="hud">
+    <h2>🔥 FIRE ESCAPE SIM</h2>
+    <div><span class="label">Status: </span><span class="value" id="hud-status">Idle</span></div>
+    <div><span class="label">Health: </span><span class="value" id="hud-health">100</span></div>
+    <div><span class="label">Fire Cells: </span><span class="value" id="hud-fire">0</span></div>
+    <div><span class="label">Path Length: </span><span class="value" id="hud-path">0</span></div>
+    <div><span class="label">Dist to Exit: </span><span class="value" id="hud-dist">0.0</span></div>
+    <div><span class="label">Model Loaded: </span><span class="value" id="hud-model">No</span></div>
+</div>
+<div id="controls">
+    <label>Fire Speed: <span id="fire-speed-val">0.3</span></label>
+    <input type="range" id="slider-fire-speed" min="0.1" max="1.0" step="0.05" value="0.3">
+    <label>Agent Speed: <span id="agent-speed-val">4</span></label>
+    <input type="range" id="slider-agent-speed" min="1" max="10" step="0.5" value="4">
+    <div class="keys">
+        [G] Start/Restart | [Space] Pause | [R] Reset
+    </div>
+</div>
+<div id="message">ESCAPED!</div>
+<div id="dead-message">☠ DEAD ☠</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+// --- State ---
+window.__3D_STATE__ = {
+    status: 'Idle',
+    health: 100,
+    fireCellCount: 0,
+    pathLength: 0,
+    distToExit: 0,
+    agentPosition: { x: 5, y: 0.3, z: 5 },
+    modelLoaded: false,
+    isPaused: false,
+    fireSpeed: 0.3,
+    agentSpeed: 4,
+    frameCount: 0,
+    agentValid: true
+};
+
+// --- Scene Setup ---
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0d0d12);
+
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 200);
+camera.position.set(20, 15, 20);
+camera.lookAt(0, 0, 0);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.shadowMap.enabled = true;
+document.body.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+
+// Lights
+const ambientLight = new THREE.AmbientLight(0x332211, 0.3);
+scene.add(ambientLight);
+
+const dirLight = new THREE.DirectionalLight(0xff8844, 0.6);
+dirLight.position.set(10, 20, 5);
+dirLight.castShadow = true;
+scene.add(dirLight);
+
+// Additional fill light
+const fillLight = new THREE.HemisphereLight(0x443322, 0x111111, 0.2);
+scene.add(fillLight);
+
+// --- Grid / Navigation ---
+const CELL_SIZE = 0.5;
+let gridMinX = -20, gridMaxX = 20, gridMinZ = -20, gridMaxZ = 20;
+let gridWidth, gridHeight;
+let grid = []; // 2D array: 0 = walkable, 1 = blocked, 2 = fire
+let gridInitialized = false;
+
+function worldToGrid(x, z) {
+    const gx = Math.round((x - gridMinX) / CELL_SIZE);
+    const gz = Math.round((z - gridMinZ) / CELL_SIZE);
+    return [gx, gz];
+}
+
+function gridToWorld(gx, gz) {
+    return [gridMinX + gx * CELL_SIZE, gridMinZ + gz * CELL_SIZE];
+}
+
+function isValidCell(gx, gz) {
+    return gx >= 0 && gx < gridWidth && gz >= 0 && gz < gridHeight;
+}
+
+// --- Agent ---
+const agentGeom = new THREE.SphereGeometry(0.3, 16, 16);
+const agentMat = new THREE.MeshStandardMaterial({ color: 0x44ff44, emissive: 0x22aa22, emissiveIntensity: 0.5 });
+const agent = new THREE.Mesh(agentGeom, agentMat);
+const AGENT_START = new THREE.Vector3(5, 0.3, 5);
+agent.position.copy(AGENT_START);
+scene.add(agent);
+
+// Agent trail
+const agentLight = new THREE.PointLight(0x44ff44, 1, 5);
+agent.add(agentLight);
+
+let agentPath = [];
+let currentWaypointIndex = 0;
+let agentHealth = 100;
+let agentSpeed = 4;
+
+// --- Exit ---
+const EXIT_POS = new THREE.Vector3(-6, 0.1, 8);
+const exitGeom = new THREE.TorusGeometry(0.8, 0.1, 16, 32);
+const exitMat = new THREE.MeshStandardMaterial({
+    color: 0x00ff44, emissive: 0x00ff44, emissiveIntensity: 1.0,
+    transparent: true, opacity: 1.0
+});
+const exitMesh = new THREE.Mesh(exitGeom, exitMat);
+exitMesh.position.copy(EXIT_POS);
+exitMesh.rotation.x = -Math.PI / 2;
+scene.add(exitMesh);
+
+// Exit glow
+const exitLight = new THREE.PointLight(0x00ff44, 2, 8);
+exitLight.position.copy(EXIT_POS).add(new THREE.Vector3(0, 1, 0));
+scene.add(exitLight);
+
+// Exit marker beacon
+const exitBeaconGeom = new THREE.CylinderGeometry(0.05, 0.05, 3, 8);
+const exitBeaconMat = new THREE.MeshBasicMaterial({ color: 0x00ff44, transparent: true, opacity: 0.3 });
+const exitBeacon = new THREE.Mesh(exitBeaconGeom, exitBeaconMat);
+exitBeacon.position.set(EXIT_POS.x, 1.5, EXIT_POS.z);
+scene.add(exitBeacon);
+
+// --- Fire ---
+const FIRE_START = new THREE.Vector3(-3, 0, -3);
+let fireSpeed = 0.3;
+let fireCells = new Set(); // "gx,gz" strings
+let fireTimeSinceLastSpread = 0;
+let firePlanes = new Map(); // "gx,gz" -> mesh
+const fireGroup = new THREE.Group();
+scene.add(fireGroup);
+
+// Fire particles
+const fireParticleGroups = [];
+
+function createFireParticles(position) {
+    const count = 80;
+    const geometry = new THREE.BufferGeometry();
+    const positions = new Float32Array(count * 3);
+    const colors = new Float32Array(count * 3);
+    const sizes = new Float32Array(count);
+    const velocities = [];
+
+    for (let i = 0; i < count; i++) {
+        positions[i * 3] = position.x + (Math.random() - 0.5) * 0.5;
+        positions[i * 3 + 1] = position.y + Math.random() * 2;
+        positions[i * 3 + 2] = position.z + (Math.random() - 0.5) * 0.5;
+
+        const t = Math.random();
+        colors[i * 3] = 1.0;
+        colors[i * 3 + 1] = 0.3 + t * 0.5;
+        colors[i * 3 + 2] = t * 0.1;
+
+        sizes[i] = 0.1 + Math.random() * 0.3;
+        velocities.push(new THREE.Vector3(
+            (Math.random() - 0.5) * 0.3,
+            0.5 + Math.random() * 1.5,
+            (Math.random() - 0.5) * 0.3
+        ));
+    }
+
+    geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+    geometry.setAttribute('size', new THREE.BufferAttribute(sizes, 1));
+
+    const material = new THREE.PointsMaterial({
+        size: 0.3,
+        vertexColors: true,
+        transparent: true,
+        opacity: 0.8,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false
+    });
+
+    const points = new THREE.Points(geometry, material);
+    scene.add(points);
+
+    return { points, velocities, basePos: position.clone(), geometry };
+}
+
+function updateFireParticles(dt) {
+    for (const group of fireParticleGroups) {
+        const pos = group.geometry.attributes.position.array;
+        for (let i = 0; i < group.velocities.length; i++) {
+            pos[i * 3] += group.velocities[i].x * dt;
+            pos[i * 3 + 1] += group.velocities[i].y * dt;
+            pos[i * 3 + 2] += group.velocities[i].z * dt;
+
+            // Reset if too high
+            if (pos[i * 3 + 1] > group.basePos.y + 3) {
+                pos[i * 3] = group.basePos.x + (Math.random() - 0.5) * 0.5;
+                pos[i * 3 + 1] = group.basePos.y;
+                pos[i * 3 + 2] = group.basePos.z + (Math.random() - 0.5) * 0.5;
+            }
+        }
+        group.geometry.attributes.position.needsUpdate = true;
+    }
+}
+
+function addFireCell(gx, gz) {
+    const key = `${gx},${gz}`;
+    if (fireCells.has(key)) return;
+    fireCells.add(key);
+
+    const [wx, wz] = gridToWorld(gx, gz);
+    const planeGeom = new THREE.PlaneGeometry(CELL_SIZE * 0.9, CELL_SIZE * 0.9);
+    const planeMat = new THREE.MeshBasicMaterial({
+        color: 0xff2200,
+        transparent: true,
+        opacity: 0.5,
+        side: THREE.DoubleSide,
+        blending: THREE.AdditiveBlending
+    });
+    const plane = new THREE.Mesh(planeGeom, planeMat);
+    plane.rotation.x = -Math.PI / 2;
+    plane.position.set(wx, 0.05, wz);
+    fireGroup.add(plane);
+    firePlanes.set(key, plane);
+
+    // Mark grid
+    if (isValidCell(gx, gz)) {
+        grid[gx][gz] = 2;
+    }
+}
+
+function spreadFire(dt) {
+    fireTimeSinceLastSpread += dt;
+    const spreadInterval = CELL_SIZE / fireSpeed;
+
+    if (fireTimeSinceLastSpread >= spreadInterval) {
+        fireTimeSinceLastSpread = 0;
+
+        const newCells = [];
+        for (const key of fireCells) {
+            const [gx, gz] = key.split(',').map(Number);
+            const neighbors = [
+                [gx + 1, gz], [gx - 1, gz], [gx, gz + 1], [gx, gz - 1]
+            ];
+            for (const [nx, nz] of neighbors) {
+                if (isValidCell(nx, nz) && grid[nx][nz] === 0) {
+                    // Random chance to spread
+                    if (Math.random() < 0.4) {
+                        newCells.push([nx, nz]);
+                    }
+                }
+            }
+        }
+        for (const [nx, nz] of newCells) {
+            addFireCell(nx, nz);
+        }
+    }
+
+    // Animate fire planes
+    const time = performance.now() * 0.001;
+    for (const [key, plane] of firePlanes) {
+        plane.material.opacity = 0.3 + 0.3 * Math.sin(time * 3 + plane.position.x + plane.position.z);
+    }
+}
+
+// --- Path visualization ---
+const pathGroup = new THREE.Group();
+scene.add(pathGroup);
+
+function visualizePath(path) {
+    // Clear old
+    while (pathGroup.children.length > 0) {
+        const c = pathGroup.children[0];
+        pathGroup.remove(c);
+        c.geometry?.dispose();
+        c.material?.dispose();
+    }
+
+    if (path.length < 2) return;
+
+    const points = path.map(([gx, gz]) => {
+        const [wx, wz] = gridToWorld(gx, gz);
+        return new THREE.Vector3(wx, 0.15, wz);
+    });
+
+    const lineGeom = new THREE.BufferGeometry().setFromPoints(points);
+    const lineMat = new THREE.LineBasicMaterial({ color: 0x44ff44, transparent: true, opacity: 0.6 });
+    const line = new THREE.Line(lineGeom, lineMat);
+    pathGroup.add(line);
+}
+
+// --- A* Pathfinding ---
+function heuristic(ax, az, bx, bz) {
+    return Math.abs(ax - bx) + Math.abs(az - bz);
+}
+
+function findPath(startX, startZ, endX, endZ) {
+    const [sgx, sgz] = worldToGrid(startX, startZ);
+    const [egx, egz] = worldToGrid(endX, endZ);
+
+    if (!isValidCell(sgx, sgz) || !isValidCell(egx, egz)) return [];
+
+    // A*
+    const openSet = new Map();
+    const closedSet = new Set();
+    const gScore = new Map();
+    const fScore = new Map();
+    const cameFrom = new Map();
+
+    const startKey = `${sgx},${sgz}`;
+    const endKey = `${egx},${egz}`;
+
+    gScore.set(startKey, 0);
+    fScore.set(startKey, heuristic(sgx, sgz, egx, egz));
+    openSet.set(startKey, [sgx, sgz]);
+
+    const maxIterations = 50000;
+    let iterations = 0;
+
+    while (openSet.size > 0 && iterations < maxIterations) {
+        iterations++;
+
+        // Find lowest fScore in openSet
+        let currentKey = null;
+        let currentF = Infinity;
+        for (const [key, _] of openSet) {
+            const f = fScore.get(key) || Infinity;
+            if (f < currentF) {
+                currentF = f;
+                currentKey = key;
+            }
+        }
+
+        if (currentKey === endKey) {
+            // Reconstruct path
+            const path = [];
+            let ck = currentKey;
+            while (ck) {
+                const [cx, cz] = ck.split(',').map(Number);
+                path.unshift([cx, cz]);
+                ck = cameFrom.get(ck);
+            }
+            return path;
+        }
+
+        const [cx, cz] = openSet.get(currentKey);
+        openSet.delete(currentKey);
+        closedSet.add(currentKey);
+
+        const neighbors = [
+            [cx + 1, cz], [cx - 1, cz], [cx, cz + 1], [cx, cz - 1],
+            [cx + 1, cz + 1], [cx - 1, cz - 1], [cx + 1, cz - 1], [cx - 1, cz + 1]
+        ];
+
+        for (const [nx, nz] of neighbors) {
+            if (!isValidCell(nx, nz)) continue;
+            const nKey = `${nx},${nz}`;
+            if (closedSet.has(nKey)) continue;
+            if (grid[nx][nz] !== 0) continue;
+
+            // Diagonal check
+            const isDiag = (nx !== cx && nz !== cz);
+            if (isDiag) {
+                if (grid[nx][cz] !== 0 || grid[cx][nz] !== 0) continue;
+            }
+
+            const moveCost = isDiag ? 1.414 : 1.0;
+            const tentativeG = (gScore.get(currentKey) || 0) + moveCost;
+
+            if (tentativeG < (gScore.get(nKey) || Infinity)) {
+                cameFrom.set(nKey, currentKey);
+                gScore.set(nKey, tentativeG);
+                fScore.set(nKey, tentativeG + heuristic(nx, nz, egx, egz));
+                if (!openSet.has(nKey)) {
+                    openSet.set(nKey, [nx, nz]);
+                }
+            }
+        }
+    }
+
+    return []; // No path found
+}
+
+// --- Build Navigation Grid ---
+let collisionMeshes = [];
+
+function buildNavGrid() {
+    gridWidth = Math.ceil((gridMaxX - gridMinX) / CELL_SIZE) + 1;
+    gridHeight = Math.ceil((gridMaxZ - gridMinZ) / CELL_SIZE) + 1;
+
+    grid = [];
+    for (let x = 0; x < gridWidth; x++) {
+        grid[x] = [];
+        for (let z = 0; z < gridHeight; z++) {
+            grid[x][z] = 0; // walkable by default
+        }
+    }
+
+    // Use raycasting to detect obstacles
+    const raycaster = new THREE.Raycaster();
+
+    for (let gx = 0; gx < gridWidth; gx++) {
+        for (let gz = 0; gz < gridHeight; gz++) {
+            const [wx, wz] = gridToWorld(gx, gz);
+
+            // Cast ray downward from high up
+            raycaster.set(new THREE.Vector3(wx, 20, wz), new THREE.Vector3(0, -1, 0));
+            const hits = raycaster.intersectObjects(collisionMeshes, true);
+
+            if (hits.length === 0) {
+                // No floor - mark as blocked (void)
+                grid[gx][gz] = 1;
+            } else {
+                // Check if there's a wall by casting horizontally
+                const floorY = hits[0].point.y;
+
+                // If floor is too high or too low relative to agent level, block
+                // We'll consider walkable floors near y=0
+                if (floorY > 2.0 || floorY < -1.0) {
+                    // Could be upper floor or basement - for simplicity mark walkable if any floor
+                }
+
+                // Check for walls by casting rays in 4 directions at agent height
+                let blocked = false;
+                const agentHeight = 0.3;
+                const checkOrigin = new THREE.Vector3(wx, floorY + agentHeight, wz);
+
+                // Check if there's geometry very close (wall detection)
+                for (const dir of [
+                    new THREE.Vector3(1, 0, 0),
+                    new THREE.Vector3(-1, 0, 0),
+                    new THREE.Vector3(0, 0, 1),
+                    new THREE.Vector3(0, 0, -1)
+                ]) {
+                    raycaster.set(checkOrigin, dir);
+                    raycaster.far = CELL_SIZE * 0.3;
+                    const wallHits = raycaster.intersectObjects(collisionMeshes, true);
+                    if (wallHits.length > 0 && wallHits[0].distance < CELL_SIZE * 0.25) {
+                        blocked = true;
+                        break;
+                    }
+                }
+
+                // Also check upward for ceiling/wall collision at this cell
+                raycaster.set(new THREE.Vector3(wx, floorY + 0.1, wz), new THREE.Vector3(0, 1, 0));
+                raycaster.far = 0.6;
+                const ceilHits = raycaster.intersectObjects(collisionMeshes, true);
+                if (ceilHits.length > 0 && ceilHits[0].distance < 0.4) {
+                    blocked = true;
+                }
+
+                if (blocked) {
+                    grid[gx][gz] = 1;
+                }
+            }
+        }
+    }
+
+    gridInitialized = true;
+    console.log(`Nav grid built: ${gridWidth}x${gridHeight}, cells: ${gridWidth * gridHeight}`);
+}
+
+// --- Load Environment ---
+let modelLoaded = false;
+const loader = new GLTFLoader();
+
+// Add a ground plane as fallback
+const groundGeom = new THREE.PlaneGeometry(40, 40);
+const groundMat = new THREE.MeshStandardMaterial({ color: 0x222222, roughness: 0.9 });
+const ground = new THREE.Mesh(groundGeom, groundMat);
+ground.rotation.x = -Math.PI / 2;
+ground.position.y = -0.01;
+ground.receiveShadow = true;
+scene.add(ground);
+
+// Try loading the GLB
+loader.load('collision-world.glb',
+    (gltf) => {
+        const model = gltf.scene;
+        model.scale.setScalar(0.5);
+
+        // Center at origin
+        const box = new THREE.Box3().setFromObject(model);
+        const center = box.getCenter(new THREE.Vector3());
+        model.position.sub(center);
+        model.position.y -= box.min.y * 0.5; // Adjust to sit on ground
+
+        model.traverse((child) => {
+            if (child.isMesh) {
+                child.castShadow = true;
+                child.receiveShadow = true;
+                collisionMeshes.push(child);
+            }
+        });
+
+        scene.add(model);
+        modelLoaded = true;
+        window.__3D_STATE__.modelLoaded = true;
+        document.getElementById('hud-model').textContent = 'Yes';
+
+        // Recalculate grid bounds from model
+        const modelBox = new THREE.Box3().setFromObject(model);
+        gridMinX = Math.floor(modelBox.min.x) - 2;
+        gridMaxX = Math.ceil(modelBox.max.x) + 2;
+        gridMinZ = Math.floor(modelBox.min.z) - 2;
+        gridMaxZ = Math.ceil(modelBox.max.z) + 2;
+
+        buildNavGrid();
+        console.log('Model loaded and nav grid built');
+    },
+    undefined,
+    (error) => {
+        console.warn('Could not load collision-world.glb, using fallback environment', error);
+        modelLoaded = false;
+        window.__3D_STATE__.modelLoaded = false;
+
+        // Create fallback walls
+        createFallbackEnvironment();
+        buildNavGrid();
+    }
+);
+
+function createFallbackEnvironment() {
+    const wallMat = new THREE.MeshStandardMaterial({ color: 0x555555, roughness: 0.8 });
+
+    const walls = [
+        // Outer walls
+        { pos: [0, 1.5, -10], size: [20, 3, 0.3] },
+        { pos: [0, 1.5, 10], size: [20, 3, 0.3] },
+        { pos: [-10, 1.5, 0], size: [0.3, 3, 20] },
+        { pos: [10, 1.5, 0], size: [0.3, 3, 20] },
+        // Inner walls
+        { pos: [-3, 1.5, -3], size: [6, 3, 0.3] },
+        { pos: [3, 1.5, 3], size: [0.3, 3, 6] },
+        { pos: [-5, 1.5, 5], size: [4, 3, 0.3] },
+        { pos: [5, 1.5, -5], size: [0.3, 3, 4] },
+        { pos: [0, 1.5, -7], size: [3, 3, 0.3] },
+        { pos: [-7, 1.5, 2], size: [0.3, 3, 5] },
+        { pos: [2, 1.5, 7], size: [5, 3, 0.3] },
+    ];
+
+    for (const w of walls) {
+        const geom = new THREE.BoxGeometry(...w.size);
+        const mesh = new THREE.Mesh(geom, wallMat);
+        mesh.position.set(...w.pos);
+        mesh.castShadow = true;
+        mesh.receiveShadow = true;
+        scene.add(mesh);
+        collisionMeshes.push(mesh);
+    }
+}
+
+// --- Simulation State ---
+let simStatus = 'Idle'; // 'Idle', 'Running', 'Escaped', 'Dead'
+let isPaused = false;
+let frameCount = 0;
+let pathRecomputeTimer = 0;
+
+function startSimulation() {
+    if (!gridInitialized) {
+        console.warn('Grid not initialized yet');
+        return;
+    }
+
+    // Reset
+    resetSimulation();
+    simStatus = 'Running';
+
+    // Start fire
+    const [fgx, fgz] = worldToGrid(FIRE_START.x, FIRE_START.z);
+    addFireCell(fgx, fgz);
+    // Add initial fire area
+    for (let dx = -1; dx <= 1; dx++) {
+        for (let dz = -1; dz <= 1; dz++) {
+            if (isValidCell(fgx + dx, fgz + dz)) {
+                addFireCell(fgx + dx, fgz + dz);
+            }
+        }
+    }
+
+    // Create fire particles at fire start
+    for (let i = 0; i < 3; i++) {
+        const offset = new THREE.Vector3(
+            (Math.random() - 0.5) * 2,
+            0,
+            (Math.random() - 0.5) * 2
+        );
+        fireParticleGroups.push(createFireParticles(FIRE_START.clone().add(offset)));
+    }
+
+    // Compute initial path
+    computePath();
+
+    document.getElementById('message').style.display = 'none';
+    document.getElementById('dead-message').style.display = 'none';
+}
+
+function resetSimulation() {
+    simStatus = 'Idle';
+    isPaused = false;
+    agentHealth = 100;
+    agent.position.copy(AGENT_START);
+    agentPath = [];
+    currentWaypointIndex = 0;
+    fireTimeSinceLastSpread = 0;
+    pathRecomputeTimer = 0;
+
+    // Clear fire
+    fireCells.clear();
+    for (const [key, plane] of firePlanes) {
+        fireGroup.remove(plane);
+        plane.geometry.dispose();
+        plane.material.dispose();
+    }
+    firePlanes.clear();
+
+    // Clear fire particles
+    for (const group of fireParticleGroups) {
+        scene.remove(group.points);
+        group.geometry.dispose();
+        group.points.material.dispose();
+    }
+    fireParticleGroups.length = 0;
+
+    // Clear path visualization
+    while (pathGroup.children.length > 0) {
+        const c = pathGroup.children[0];
+        pathGroup.remove(c);
+        c.geometry?.dispose();
+        c.material?.dispose();
+    }
+
+    // Reset grid fire cells
+    if (gridInitialized) {
+        for (let x = 0; x < gridWidth; x++) {
+            for (let z = 0; z < gridHeight; z++) {
+                if (grid[x][z] === 2) grid[x][z] = 0;
+            }
+        }
+    }
+
+    document.getElementById('message').style.display = 'none';
+    document.getElementById('dead-message').style.display = 'none';
+}
+
+function computePath() {
+    if (!gridInitialized) return;
+
+    const path = findPath(agent.position.x, agent.position.z, EXIT_POS.x, EXIT_POS.z);
+    agentPath = path;
+    currentWaypointIndex = 0;
+    visualizePath(path);
+}
+
+// --- Update ---
+const clock = new THREE.Clock();
+
+function update() {
+    const dt = clock.getDelta();
+    const time = performance.now() * 0.001;
+
+    // Update sliders
+    fireSpeed = parseFloat(document.getElementById('slider-fire-speed').value);
+    agentSpeed = parseFloat(document.getElementById('slider-agent-speed').value);
+    document.getElementById('fire-speed-val').textContent = fireSpeed.toFixed(2);
+    document.getElementById('agent-speed-val').textContent = agentSpeed.toFixed(1);
+
+    // Exit pulsing
+    exitMat.opacity = 0.6 + 0.4 * Math.sin(time * 3);
+    exitMat.emissiveIntensity = 0.5 + 0.5 * Math.sin(time * 3);
+
+    if (simStatus === 'Running' && !isPaused) {
+        // Spread fire
+        spreadFire(dt);
+
+        // Update fire particles
+        updateFireParticles(dt);
+
+        // Add new fire particle emitters as fire spreads
+        if (fireCells.size > 20 && fireParticleGroups.length < 8 && Math.random() < 0.01) {
+            const keys = Array.from(fireCells);
+            const randomKey = keys[Math.floor(Math.random() * keys.length)];
+            const [gx, gz] = randomKey.split(',').map(Number);
+            const [wx, wz] = gridToWorld(gx, gz);
+            fireParticleGroups.push(createFireParticles(new THREE.Vector3(wx, 0, wz)));
+        }
+
+        // Recompute path periodically (fire changes the grid)
+        pathRecomputeTimer += dt;
+        if (pathRecomputeTimer > 2.0) {
+            pathRecomputeTimer = 0;
+            computePath();
+        }
+
+        // Move agent along path
+        if (agentPath.length > 0 && currentWaypointIndex < agentPath.length) {
+            const [tgx, tgz] = agentPath[currentWaypointIndex];
+            const [twx, twz] = gridToWorld(tgx, tgz);
+            const target = new THREE.Vector3(twx, agent.position.y, twz);
+            const dir = target.clone().sub(agent.position);
+            dir.y = 0;
+            const dist = dir.length();
+
+            if (dist < 0.2) {
+                currentWaypointIndex++;
+            } else {
+                dir.normalize();
+                const move = dir.multiplyScalar(agentSpeed * dt);
+                if (move.length() > dist) {
+                    agent.position.x = twx;
+                    agent.position.z = twz;
+                } else {
+                    agent.position.add(move);
+                }
+            }
+        }
+
+        // Check if agent is in fire
+        const [agx, agz] = worldToGrid(agent.position.x, agent.position.z);
+        const agentKey = `${agx},${agz}`;
+        if (fireCells.has(agentKey)) {
+            agentHealth -= 10 * dt;
+            agentMat.color.setHex(0xff4444);
+            agentMat.emissive.setHex(0xff2222);
+        } else {
+            agentMat.color.setHex(0x44ff44);
+            agentMat.emissive.setHex(0x22aa22);
+        }
+
+        // Check health
+        if (agentHealth <= 0) {
+            agentHealth = 0;
+            simStatus = 'Dead';
+            document.getElementById('dead-message').style.display = 'block';
+        }
+
+        // Check exit
+        const distToExit = agent.position.distanceTo(EXIT_POS);
+        if (distToExit < 1.0) {
+            simStatus = 'Escaped';
+            document.getElementById('message').style.display = 'block';
+        }
+    } else if (simStatus !== 'Running') {
+        // Still update fire particles for visual
+        updateFireParticles(dt);
+    }
+
+    // Update agent glow
+    agent.material.emissiveIntensity = 0.3 + 0.2 * Math.sin(time * 5);
+
+    controls.update();
+}
+
+// --- HUD Update ---
+function updateHUD() {
+    const distToExit = agent.position.distanceTo(EXIT_POS);
+
+    document.getElementById('hud-status').textContent = simStatus;
+    document.getElementById('hud-health').textContent = Math.max(0, Math.round(agentHealth));
+    document.getElementById('hud-fire').textContent = fireCells.size;
+    document.getElementById('hud-path').textContent = agentPath.length;
+    document.getElementById('hud-dist').textContent = distToExit.toFixed(1);
+
+    // Color status
+    const statusEl = document.getElementById('hud-status');
+    switch (simStatus) {
+        case 'Idle': statusEl.style.color = '#888'; break;
+        case 'Running': statusEl.style.color = '#44ff44'; break;
+        case 'Escaped': statusEl.style.color = '#00ff44'; break;
+        case 'Dead': statusEl.style.color = '#ff2222'; break;
+    }
+
+    // Health color
+    const healthEl = document.getElementById('hud-health');
+    if (agentHealth > 60) healthEl.style.color = '#44ff44';
+    else if (agentHealth > 30) healthEl.style.color = '#ffaa00';
+    else healthEl.style.color = '#ff2222';
+}
+
+// --- State Update ---
+function updateState() {
+    const distToExit = agent.position.distanceTo(EXIT_POS);
+    const pos = agent.position;
+    const agentValid = !isNaN(pos.x) && !isNaN(pos.y) && !isNaN(pos.z);
+
+    window.__3D_STATE__ = {
+        status: simStatus,
+        health: Math.max(0, Math.round(agentHealth)),
+        fireCellCount: fireCells.size,
+        pathLength: agentPath.length,
+        distToExit: parseFloat(distToExit.toFixed(2)),
+        agentPosition: { x: pos.x, y: pos.y, z: pos.z },
+        modelLoaded: modelLoaded,
+        isPaused: isPaused,
+        fireSpeed: fireSpeed,
+        agentSpeed: agentSpeed,
+        frameCount: frameCount,
+        agentValid: agentValid
+    };
+}
+
+// --- Input ---
+document.addEventListener('keydown', (e) => {
+    if (e.code === 'KeyG') {
+        startSimulation();
+    } else if (e.code === 'Space') {
+        e.preventDefault();
+        isPaused = !isPaused;
+    } else if (e.code === 'KeyR') {
+        resetSimulation();
+    }
+});
+
+// --- Resize ---
+window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// --- Animation Loop ---
+function animate() {
+    requestAnimationFrame(animate);
+    frameCount++;
+
+    update();
+    updateHUD();
+    updateState();
+
+    renderer.render(scene, camera);
+}
+
+animate();
+
+// If model doesn't load within 3 seconds, build fallback
+setTimeout(() => {
+    if (!modelLoaded && !gridInitialized) {
+        console.log('Timeout: building fallback environment');
+        createFallbackEnvironment();
+        buildNavGrid();
+    }
+}, 3000);
+
+</script>
+</body>
+</html>

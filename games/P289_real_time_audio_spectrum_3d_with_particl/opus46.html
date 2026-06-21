@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3D Audio Spectrum Visualizer</title>
+<style>
+body {
+    margin: 0;
+    overflow: hidden;
+    background: #0a0a1a;
+    font-family: 'Courier New', monospace;
+}
+canvas { display: block; }
+#hud {
+    position: absolute;
+    top: 10px;
+    left: 10px;
+    color: #88ccff;
+    background: rgba(0, 0, 0, 0.7);
+    padding: 15px;
+    border-radius: 8px;
+    font-size: 14px;
+    line-height: 1.6;
+    border: 1px solid rgba(136, 204, 255, 0.3);
+    min-width: 220px;
+    pointer-events: none;
+}
+#hud .label { color: #667788; }
+#hud .value { color: #88ccff; font-weight: bold; }
+#controls {
+    position: absolute;
+    bottom: 10px;
+    left: 10px;
+    display: flex;
+    gap: 10px;
+    align-items: center;
+}
+#controls button {
+    background: rgba(136, 204, 255, 0.15);
+    color: #88ccff;
+    border: 1px solid rgba(136, 204, 255, 0.4);
+    padding: 8px 16px;
+    border-radius: 5px;
+    cursor: pointer;
+    font-family: 'Courier New', monospace;
+    font-size: 13px;
+    transition: background 0.2s;
+}
+#controls button:hover {
+    background: rgba(136, 204, 255, 0.3);
+}
+#keybinds {
+    position: absolute;
+    bottom: 10px;
+    right: 10px;
+    color: #445566;
+    background: rgba(0, 0, 0, 0.5);
+    padding: 10px 15px;
+    border-radius: 8px;
+    font-size: 12px;
+    line-height: 1.8;
+}
+#keybinds span { color: #88ccff; }
+</style>
+</head>
+<body>
+
+<div id="hud">
+    <div><span class="label">Mode: </span><span class="value" id="hud-mode">bars</span></div>
+    <div><span class="label">Gain: </span><span class="value" id="hud-gain">1.00</span></div>
+    <div><span class="label">Playing: </span><span class="value" id="hud-playing">true</span></div>
+    <div><span class="label">Particles: </span><span class="value" id="hud-particles">0</span></div>
+    <div><span class="label">Max Height: </span><span class="value" id="hud-max">0.0</span></div>
+    <div><span class="label">Avg Height: </span><span class="value" id="hud-avg">0.0</span></div>
+    <div><span class="label">FPS Frame: </span><span class="value" id="hud-frame">0</span></div>
+</div>
+
+<div id="controls">
+    <button id="gain-down">Gain -</button>
+    <button id="gain-up">Gain +</button>
+</div>
+
+<div id="keybinds">
+    <span>[1]</span> Bars &nbsp; <span>[2]</span> Circular &nbsp; <span>[3]</span> Wave<br>
+    <span>[Space]</span> Play/Pause &nbsp; <span>[P]</span> Particles &nbsp; <span>[R]</span> Reset Cam
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<script>
+(function() {
+    // --- State ---
+    const state = {
+        mode: 'bars',
+        playing: true,
+        gain: 1.0,
+        particlesEnabled: true,
+        activeParticleCount: 0,
+        barCount: 32,
+        maxBarHeight: 0,
+        avgBarHeight: 0,
+        cameraDistance: 0,
+        frameCount: 0,
+        barPositions: [],
+        timeElapsed: 0
+    };
+    window.__3D_STATE__ = state;
+
+    // --- Scene Setup ---
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0a0a1a);
+
+    const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+    const initialCameraPos = new THREE.Vector3(0, 30, 60);
+    camera.position.copy(initialCameraPos);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(window.devicePixelRatio);
+    document.body.appendChild(renderer.domElement);
+
+    // Lights
+    const ambientLight = new THREE.AmbientLight(0x404040);
+    scene.add(ambientLight);
+
+    const directionalLight = new THREE.DirectionalLight(0xffffff, 1.0);
+    directionalLight.position.set(10, 40, 20);
+    scene.add(directionalLight);
+
+    // OrbitControls
+    const controls = new THREE.OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.05;
+    controls.target.set(0, 0, 0);
+
+    // --- Bars ---
+    const BAR_COUNT = 32;
+    const bars = [];
+    const barGeometry = new THREE.BoxGeometry(1.2, 1, 1.2);
+
+    for (let i = 0; i < BAR_COUNT; i++) {
+        const material = new THREE.MeshPhongMaterial({ color: 0x0000ff, shininess: 80 });
+        const mesh = new THREE.Mesh(barGeometry, material);
+        scene.add(mesh);
+        bars.push(mesh);
+    }
+
+    state.barPositions = new Array(BAR_COUNT).fill(null).map(() => ({ x: 0, y: 0, z: 0 }));
+
+    // --- Particle System ---
+    const MAX_PARTICLES = 2000;
+    const particlePositions = new Float32Array(MAX_PARTICLES * 3);
+    const particleAlphas = new Float32Array(MAX_PARTICLES);
+    const particleGeometry = new THREE.BufferGeometry();
+    particleGeometry.setAttribute('position', new THREE.BufferAttribute(particlePositions, 3));
+    particleGeometry.setAttribute('alpha', new THREE.BufferAttribute(particleAlphas, 1));
+
+    const particleMaterial = new THREE.PointsMaterial({
+        size: 0.3,
+        color: 0x88ccff,
+        blending: THREE.AdditiveBlending,
+        transparent: true,
+        opacity: 0.8,
+        depthWrite: false
+    });
+
+    const particleSystem = new THREE.Points(particleGeometry, particleMaterial);
+    scene.add(particleSystem);
+
+    // Particle data
+    const particles = [];
+    for (let i = 0; i < MAX_PARTICLES; i++) {
+        particles.push({
+            alive: false,
+            x: 0, y: -1000, z: 0,
+            vx: 0, vy: 0, vz: 0,
+            life: 0,
+            maxLife: 2.0
+        });
+        particlePositions[i * 3] = 0;
+        particlePositions[i * 3 + 1] = -1000;
+        particlePositions[i * 3 + 2] = 0;
+        particleAlphas[i] = 0;
+    }
+
+    let nextParticleIndex = 0;
+
+    function emitParticle(x, y, z) {
+        const p = particles[nextParticleIndex];
+        p.alive = true;
+        p.x = x + (Math.random() - 0.5) * 1.0;
+        p.y = y;
+        p.z = z + (Math.random() - 0.5) * 1.0;
+        p.vx = (Math.random() - 0.5) * 0.5;
+        p.vy = 0.1 + Math.random() * 0.4;
+        p.vz = (Math.random() - 0.5) * 0.5;
+        p.life = 0;
+        p.maxLife = 1.5 + Math.random() * 1.0;
+        nextParticleIndex = (nextParticleIndex + 1) % MAX_PARTICLES;
+    }
+
+    // --- Frequency simulation ---
+    let simulationTime = 0;
+    let frozenValues = null;
+
+    function getFrequencyValues(time) {
+        const values = [];
+        for (let i = 0; i < BAR_COUNT; i++) {
+            let v = Math.sin(time * (1 + i * 0.15)) * 0.5 + 0.5;
+            v += Math.cos(time * 0.7 + i * 0.3) * 0.3;
+            v = Math.max(0, Math.min(1, v));
+            v *= state.gain;
+            v = Math.max(0, Math.min(1, v));
+            values.push(v);
+        }
+        return values;
+    }
+
+    // --- Animation ---
+    const clock = new THREE.Clock();
+
+    function animate() {
+        requestAnimationFrame(animate);
+
+        const delta = clock.getDelta();
+        state.frameCount++;
+
+        if (state.playing) {
+            simulationTime += delta;
+        }
+        state.timeElapsed = simulationTime;
+
+        // Get frequency values
+        let values;
+        if (state.playing) {
+            values = getFrequencyValues(simulationTime);
+            frozenValues = values;
+        } else {
+            values = frozenValues || getFrequencyValues(simulationTime);
+        }
+
+        // Update bars
+        let maxH = 0;
+        let sumH = 0;
+
+        for (let i = 0; i < BAR_COUNT; i++) {
+            const value = values[i];
+            const yScale = 1 + value * 25;
+            const hue = (1 - value) * 0.65;
+            const color = new THREE.Color();
+            color.setHSL(hue, 0.9, 0.5);
+
+            bars[i].material.color.copy(color);
+            bars[i].material.emissive.copy(color).multiplyScalar(0.2);
+            bars[i].scale.set(1, yScale, 1);
+
+            let px, py, pz;
+
+            if (state.mode === 'bars') {
+                px = (i - (BAR_COUNT - 1) / 2) * 2;
+                py = yScale / 2;
+                pz = 0;
+            } else if (state.mode === 'circular') {
+                const angle = (i / BAR_COUNT) * Math.PI * 2;
+                const radius = 20;
+                px = Math.cos(angle) * radius;
+                py = yScale / 2;
+                pz = Math.sin(angle) * radius;
+                bars[i].rotation.y = -angle + Math.PI / 2;
+            } else if (state.mode === 'wave') {
+                px = (i - (BAR_COUNT - 1) / 2) * 2;
+                py = yScale / 2;
+                pz = Math.sin(i * 0.5 + simulationTime) * 5;
+            }
+
+            bars[i].position.set(px, py, pz);
+
+            if (state.mode !== 'circular') {
+                bars[i].rotation.y = 0;
+            }
+
+            state.barPositions[i] = { x: px, y: py, z: pz };
+
+            if (yScale > maxH) maxH = yScale;
+            sumH += yScale;
+        }
+
+        state.maxBarHeight = maxH;
+        state.avgBarHeight = sumH / BAR_COUNT;
+
+        // Emit particles
+        if (state.particlesEnabled && state.playing) {
+            const emitCount = Math.floor(5 + state.gain * 3);
+            for (let e = 0; e < emitCount; e++) {
+                const barIdx = Math.floor(Math.random() * BAR_COUNT);
+                const bar = bars[barIdx];
+                const topY = bar.position.y + bar.scale.y / 2;
+                emitParticle(bar.position.x, topY, bar.position.z);
+            }
+        }
+
+        // Update particles
+        let activeCount = 0;
+        for (let i = 0; i < MAX_PARTICLES; i++) {
+            const p = particles[i];
+            if (p.alive) {
+                p.life += delta;
+                if (p.life >= p.maxLife) {
+                    p.alive = false;
+                    particlePositions[i * 3 + 1] = -1000;
+                    particleAlphas[i] = 0;
+                } else {
+                    p.x += p.vx * delta * 2;
+                    p.y += p.vy * delta * 2;
+                    p.z += p.vz * delta * 2;
+                    p.vy += 0.02 * delta;
+
+                    particlePositions[i * 3] = p.x;
+                    particlePositions[i * 3 + 1] = p.y;
+                    particlePositions[i * 3 + 2] = p.z;
+
+                    const lifeRatio = p.life / p.maxLife;
+                    particleAlphas[i] = 1.0 - lifeRatio;
+                    activeCount++;
+                }
+            }
+        }
+
+        particleGeometry.attributes.position.needsUpdate = true;
+        particleMaterial.opacity = state.particlesEnabled ? 0.8 : 0.0;
+
+        state.activeParticleCount = activeCount;
+
+        // Camera distance
+        state.cameraDistance = camera.position.length();
+
+        // Update HUD
+        document.getElementById('hud-mode').textContent = state.mode;
+        document.getElementById('hud-gain').textContent = state.gain.toFixed(2);
+        document.getElementById('hud-playing').textContent = state.playing.toString();
+        document.getElementById('hud-particles').textContent = activeCount;
+        document.getElementById('hud-max').textContent = state.maxBarHeight.toFixed(1);
+        document.getElementById('hud-avg').textContent = state.avgBarHeight.toFixed(1);
+        document.getElementById('hud-frame').textContent = state.frameCount;
+
+        controls.update();
+        renderer.render(scene, camera);
+    }
+
+    animate();
+
+    // --- Controls ---
+    document.addEventListener('keydown', (e) => {
+        const key = e.key.toLowerCase();
+
+        if (key === '1') {
+            state.mode = 'bars';
+        } else if (key === '2') {
+            state.mode = 'circular';
+        } else if (key === '3') {
+            state.mode = 'wave';
+        } else if (key === ' ' || e.code === 'Space') {
+            e.preventDefault();
+            state.playing = !state.playing;
+        } else if (key === 'p') {
+            state.particlesEnabled = !state.particlesEnabled;
+            if (!state.particlesEnabled) {
+                // Kill all particles
+                for (let i = 0; i < MAX_PARTICLES; i++) {
+                    particles[i].alive = false;
+                    particlePositions[i * 3 + 1] = -1000;
+                    particleAlphas[i] = 0;
+                }
+            }
+        } else if (key === 'r') {
+            camera.position.copy(initialCameraPos);
+            controls.target.set(0, 0, 0);
+            controls.update();
+        }
+    });
+
+    document.getElementById('gain-up').addEventListener('click', () => {
+        state.gain = Math.min(3.0, state.gain + 0.25);
+    });
+
+    document.getElementById('gain-down').addEventListener('click', () => {
+        state.gain = Math.max(0.25, state.gain - 0.25);
+    });
+
+    // Resize
+    window.addEventListener('resize', () => {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+})();
+</script>
+</body>
+</html>

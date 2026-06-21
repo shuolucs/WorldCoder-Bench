@@ -1,0 +1,424 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Interactive 3D Histogram</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #1a1a2e;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            color: #ffffff;
+        }
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            position: absolute;
+            top: 0;
+            left: 0;
+            z-index: 1;
+        }
+        #css2d-container {
+            width: 100vw;
+            height: 100vh;
+            position: absolute;
+            top: 0;
+            left: 0;
+            z-index: 2;
+            pointer-events: none; /* Let clicks pass through to WebGL */
+        }
+        #hud {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            background: rgba(0, 0, 0, 0.6);
+            padding: 15px;
+            border-radius: 8px;
+            z-index: 3;
+            pointer-events: auto;
+            border: 1px solid rgba(255,255,255,0.2);
+            min-width: 200px;
+        }
+        .hud-line {
+            margin-bottom: 8px;
+            font-size: 14px;
+        }
+        .hud-buttons {
+            margin-top: 15px;
+            display: flex;
+            gap: 8px;
+        }
+        button {
+            background: #34495e;
+            color: white;
+            border: none;
+            padding: 6px 12px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+            transition: background 0.2s;
+        }
+        button:hover {
+            background: #415b76;
+        }
+        button:active {
+            background: #2c3e50;
+        }
+        .label {
+            color: #ffffff;
+            font-size: 14px;
+            font-weight: bold;
+            text-shadow: 1px 1px 2px rgba(0,0,0,0.8);
+            pointer-events: none;
+            text-align: center;
+        }
+        .name-label {
+            margin-top: 10px;
+            font-size: 12px;
+            color: #cccccc;
+        }
+        .val-label {
+            margin-bottom: 10px;
+            font-size: 16px;
+        }
+    </style>
+    <!-- Import maps polyfill -->
+    <script async src="https://unpkg.com/es-module-shims@1.8.0/dist/es-module-shims.js"></script>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="hud">
+        <div id="hud-selected" class="hud-line">Selected: None</div>
+        <div id="hud-undo" class="hud-line">Undo Stack: 0</div>
+        <div id="hud-redo" class="hud-line">Redo Stack: 0</div>
+        <div id="hud-total" class="hud-line">Total: 0</div>
+        <div class="hud-buttons">
+            <button id="btn-undo">Undo (Z)</button>
+            <button id="btn-redo">Redo (Y)</button>
+            <button id="btn-reset">Reset</button>
+        </div>
+    </div>
+    <div id="canvas-container"></div>
+    <div id="css2d-container"></div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer.js';
+
+        // --- Configuration & Data ---
+        const categories = ['Sales', 'Marketing', 'Engineering', 'Design', 'Support'];
+        const initialValues = [4, 7, 10, 5, 8];
+        const colors = [0xe74c3c, 0x3498db, 0x2ecc71, 0xf39c12, 0x9b59b6];
+        const spacing = 1.8;
+        const maxHistory = 20;
+        const animDuration = 300;
+
+        // --- State ---
+        let values = [...initialValues];
+        let selectedIndex = -1;
+        let undoStack = [];
+        let redoStack = [];
+        let lastAction = 'none';
+        let isAnimating = false;
+
+        const bars = [];
+        const valueLabels = [];
+        const animations = new Array(5).fill(null);
+
+        // Initialize Global State
+        window.__3D_STATE__ = {
+            categoryNames: [...categories],
+            categoryValues: [...values],
+            selectedIndex: -1,
+            undoStackSize: 0,
+            redoStackSize: 0,
+            totalSum: 0,
+            barHeights: [0,0,0,0,0],
+            lastAction: 'none',
+            animating: false
+        };
+
+        // --- Scene Setup ---
+        const container = document.getElementById('canvas-container');
+        const cssContainer = document.getElementById('css2d-container');
+
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x1a1a2e);
+
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+        camera.position.set(8, 6, 8);
+        camera.lookAt(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        container.appendChild(renderer.domElement);
+
+        const labelRenderer = new CSS2DRenderer();
+        labelRenderer.setSize(window.innerWidth, window.innerHeight);
+        labelRenderer.domElement.style.position = 'absolute';
+        labelRenderer.domElement.style.top = '0px';
+        cssContainer.appendChild(labelRenderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.05;
+
+        // Lights
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+        dirLight.position.set(5, 10, 5);
+        scene.add(dirLight);
+
+        // Grid
+        const gridHelper = new THREE.GridHelper(10, 10, 0x444444, 0x222222);
+        scene.add(gridHelper);
+
+        // --- Build Histogram ---
+        // Base geometry with origin at bottom center
+        const geometry = new THREE.BoxGeometry(1, 1, 1);
+        geometry.translate(0, 0.5, 0);
+
+        for (let i = 0; i < 5; i++) {
+            const material = new THREE.MeshStandardMaterial({
+                color: colors[i],
+                metalness: 0.3,
+                roughness: 0.7
+            });
+
+            const mesh = new THREE.Mesh(geometry, material);
+            mesh.position.x = (i - 2) * spacing;
+            mesh.position.y = 0;
+            mesh.scale.y = Math.max(0.001, values[i]);
+            mesh.userData.index = i;
+            scene.add(mesh);
+            bars.push(mesh);
+
+            // Category Name Label (Bottom)
+            const nameDiv = document.createElement('div');
+            nameDiv.className = 'label name-label';
+            nameDiv.textContent = categories[i];
+            const nameLabel = new CSS2DObject(nameDiv);
+            nameLabel.position.set(mesh.position.x, -0.5, 0);
+            scene.add(nameLabel);
+
+            // Value Label (Top)
+            const valDiv = document.createElement('div');
+            valDiv.className = 'label val-label';
+            valDiv.textContent = values[i];
+            const valLabel = new CSS2DObject(valDiv);
+            valLabel.position.set(mesh.position.x, mesh.scale.y + 0.5, 0);
+            scene.add(valLabel);
+            valueLabels.push(valLabel);
+        }
+
+        // --- Interaction Logic ---
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+
+        function selectBar(index) {
+            selectedIndex = index;
+            bars.forEach((bar, i) => {
+                if (i === index) {
+                    bar.material.emissive.setHex(0xffffff);
+                    bar.material.emissiveIntensity = 0.3;
+                } else {
+                    bar.material.emissive.setHex(0x000000);
+                    bar.material.emissiveIntensity = 0;
+                }
+            });
+            updateHUD();
+        }
+
+        window.addEventListener('pointerdown', (e) => {
+            // Ignore clicks on HUD
+            if (e.target.closest('#hud')) return;
+
+            mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+            raycaster.setFromCamera(mouse, camera);
+            
+            const intersects = raycaster.intersectObjects(bars);
+            if (intersects.length > 0) {
+                selectBar(intersects[0].object.userData.index);
+                lastAction = 'select';
+            } else {
+                selectBar(-1);
+                lastAction = 'deselect';
+            }
+        });
+
+        // --- Undo/Redo & Value Modification ---
+        function pushUndo(action) {
+            undoStack.push(action);
+            if (undoStack.length > maxHistory) undoStack.shift();
+            redoStack = [];
+            updateHUD();
+        }
+
+        function applyValue(index, val) {
+            values[index] = val;
+            animations[index] = {
+                startVal: bars[index].scale.y,
+                endVal: Math.max(0.001, val),
+                startTime: performance.now(),
+                duration: animDuration
+            };
+            updateHUD();
+        }
+
+        function changeValue(index, delta) {
+            const oldVal = values[index];
+            const newVal = Math.min(15, Math.max(0, oldVal + delta));
+            if (oldVal !== newVal) {
+                pushUndo({ type: 'single', index, oldVal, newVal });
+                applyValue(index, newVal);
+                lastAction = delta > 0 ? 'increment' : 'decrement';
+            }
+        }
+
+        function undo() {
+            if (undoStack.length === 0) return;
+            const action = undoStack.pop();
+            redoStack.push(action);
+            
+            if (action.type === 'single') {
+                applyValue(action.index, action.oldVal);
+            } else if (action.type === 'batch') {
+                action.changes.forEach(c => applyValue(c.index, c.oldVal));
+            }
+            lastAction = 'undo';
+            updateHUD();
+        }
+
+        function redo() {
+            if (redoStack.length === 0) return;
+            const action = redoStack.pop();
+            undoStack.push(action);
+            
+            if (action.type === 'single') {
+                applyValue(action.index, action.newVal);
+            } else if (action.type === 'batch') {
+                action.changes.forEach(c => applyValue(c.index, c.newVal));
+            }
+            lastAction = 'redo';
+            updateHUD();
+        }
+
+        function reset() {
+            const changes = [];
+            for (let i = 0; i < 5; i++) {
+                if (values[i] !== initialValues[i]) {
+                    changes.push({ index: i, oldVal: values[i], newVal: initialValues[i] });
+                }
+            }
+            if (changes.length > 0) {
+                pushUndo({ type: 'batch', changes });
+                changes.forEach(c => applyValue(c.index, c.newVal));
+                lastAction = 'reset';
+            }
+        }
+
+        // Keyboard Events
+        window.addEventListener('keydown', (e) => {
+            if (selectedIndex !== -1) {
+                if (e.key === 'ArrowUp') { changeValue(selectedIndex, 1); e.preventDefault(); }
+                if (e.key === 'ArrowDown') { changeValue(selectedIndex, -1); e.preventDefault(); }
+            }
+            
+            if (e.code === 'KeyZ') {
+                if (!e.shiftKey) undo();
+                else redo();
+            }
+            if (e.code === 'KeyY') {
+                redo();
+            }
+        });
+
+        // Button Events
+        document.getElementById('btn-undo').addEventListener('click', undo);
+        document.getElementById('btn-redo').addEventListener('click', redo);
+        document.getElementById('btn-reset').addEventListener('click', reset);
+
+        // --- HUD Update ---
+        function updateHUD() {
+            const sum = values.reduce((a, b) => a + b, 0);
+            const selName = selectedIndex !== -1 ? categories[selectedIndex] : 'None';
+            
+            document.getElementById('hud-selected').textContent = `Selected: ${selName}`;
+            document.getElementById('hud-undo').textContent = `Undo Stack: ${undoStack.length}`;
+            document.getElementById('hud-redo').textContent = `Redo Stack: ${redoStack.length}`;
+            document.getElementById('hud-total').textContent = `Total: ${sum}`;
+        }
+        updateHUD();
+
+        // --- Resize Handler ---
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            labelRenderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // --- Animation Loop ---
+        function animate() {
+            requestAnimationFrame(animate);
+            
+            isAnimating = false;
+            const now = performance.now();
+            
+            for (let i = 0; i < 5; i++) {
+                const anim = animations[i];
+                if (anim) {
+                    let t = (now - anim.startTime) / anim.duration;
+                    if (t >= 1) {
+                        t = 1;
+                        animations[i] = null;
+                        bars[i].scale.y = anim.endVal;
+                    } else {
+                        isAnimating = true;
+                        // easeOutQuad
+                        const ease = t * (2 - t);
+                        bars[i].scale.y = anim.startVal + (anim.endVal - anim.startVal) * ease;
+                    }
+                }
+                
+                // Update label position and text
+                valueLabels[i].position.y = bars[i].scale.y + 0.5;
+                valueLabels[i].element.textContent = values[i];
+            }
+            
+            controls.update();
+            renderer.render(scene, camera);
+            labelRenderer.render(scene, camera);
+            
+            // Update Global State
+            window.__3D_STATE__ = {
+                categoryNames: [...categories],
+                categoryValues: [...values],
+                selectedIndex: selectedIndex,
+                undoStackSize: undoStack.length,
+                redoStackSize: redoStack.length,
+                totalSum: values.reduce((a, b) => a + b, 0),
+                barHeights: bars.map(b => b.scale.y),
+                lastAction: lastAction,
+                animating: isAnimating
+            };
+        }
+
+        animate();
+    </script>
+</body>
+</html>

@@ -1,0 +1,821 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Avalanche Rescue Simulation</title>
+  <style>
+    html, body {
+      margin: 0;
+      overflow: hidden;
+      background: #0b1220;
+      font-family: Arial, Helvetica, sans-serif;
+    }
+
+    canvas {
+      display: block;
+    }
+
+    .hud {
+      position: absolute;
+      color: white;
+      font-size: 24px;
+      text-shadow: 0 1px 4px rgba(0,0,0,0.8);
+      z-index: 10;
+      user-select: none;
+    }
+
+    #score-display { top: 12px; left: 16px; }
+    #boulder-display { top: 44px; left: 16px; font-size: 20px; }
+    #barrier-token-display { top: 72px; left: 16px; font-size: 20px; }
+
+    #time-display { top: 12px; right: 16px; }
+    #shield-display { top: 44px; right: 16px; font-size: 20px; }
+
+    #status-display {
+      bottom: 18px;
+      left: 50%;
+      transform: translateX(-50%);
+      font-size: 24px;
+      padding: 8px 16px;
+      background: rgba(0,0,0,0.35);
+      border-radius: 8px;
+    }
+
+    #reset-btn {
+      position: absolute;
+      right: 16px;
+      bottom: 16px;
+      z-index: 10;
+      font-size: 18px;
+      padding: 10px 16px;
+      border: none;
+      border-radius: 8px;
+      background: #ffffff;
+      color: #111;
+      cursor: pointer;
+    }
+
+    #reset-btn:hover {
+      background: #eaeaea;
+    }
+
+    #help {
+      position: absolute;
+      left: 16px;
+      bottom: 16px;
+      z-index: 10;
+      color: #d8e6ff;
+      font-size: 14px;
+      line-height: 1.4;
+      background: rgba(0,0,0,0.35);
+      padding: 10px 12px;
+      border-radius: 8px;
+      max-width: 390px;
+    }
+  </style>
+</head>
+<body>
+  <div id="score-display" class="hud">Score: 0</div>
+  <div id="boulder-display" class="hud">Boulders Remaining: 20</div>
+  <div id="barrier-token-display" class="hud">Barrier Tokens: 2</div>
+
+  <div id="time-display" class="hud">Time: 0.0s</div>
+  <div id="shield-display" class="hud">Shield HP: 0/3</div>
+
+  <div id="status-display" class="hud">Status: READY</div>
+  <button id="reset-btn">Reset</button>
+
+  <div id="help">
+    <strong>Controls</strong><br/>
+    Space: Start/Pause<br/>
+    R: Reset<br/>
+    Click barrier: Select / highlight<br/>
+    Arrow keys: Move selected barrier<br/>
+    B: Spawn barrier (uses token)<br/>
+    S: Toggle stork shield
+  </div>
+
+  <script type="module">
+    import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
+    import { OrbitControls } from 'https://unpkg.com/three@0.160.0/examples/jsm/controls/OrbitControls.js';
+    import { GLTFLoader } from 'https://unpkg.com/three@0.160.0/examples/jsm/loaders/GLTFLoader.js';
+
+    let scene, camera, renderer, controls, clock;
+    let terrain, terrainGeom;
+    let stork, storkMixer = null, storkLoaded = false;
+    let shieldMesh = null;
+    let safeZone;
+    const barriers = [];
+    const boulders = [];
+    const initialBoulderStates = [];
+    let selectedBarrierIndex = -1;
+
+    const raycaster = new THREE.Raycaster();
+    const mouse = new THREE.Vector2();
+
+    const TERRAIN_SIZE = 100;
+    const TERRAIN_SEG = 64;
+    const TERRAIN_ANGLE_DEG = 25;
+    const TERRAIN_ANGLE = THREE.MathUtils.degToRad(TERRAIN_ANGLE_DEG);
+    const EFFECTIVE_GRAVITY = 9.8 * Math.sin(TERRAIN_ANGLE);
+    const FRICTION = 0.15;
+
+    const hud = {
+      score: document.getElementById('score-display'),
+      time: document.getElementById('time-display'),
+      boulders: document.getElementById('boulder-display'),
+      shield: document.getElementById('shield-display'),
+      barrierTokens: document.getElementById('barrier-token-display'),
+      status: document.getElementById('status-display'),
+      resetBtn: document.getElementById('reset-btn'),
+    };
+
+    const state = {
+      simulationRunning: false,
+      simulationTime: 0,
+      score: 0,
+      bouldersRemaining: 20,
+      bouldersCollected: 0,
+      storkHits: 0,
+      storkAlive: true,
+      shieldActive: false,
+      shieldHP: 0,
+      barrierCount: 3,
+      barrierTokens: 2,
+      selectedBarrierIndex: -1,
+      storkPosition: { x: 0, y: 5, z: 0 },
+      averageBoulderSpeed: 0,
+      status: 'READY',
+      terrainAngleDeg: 25,
+      gravityAccel: EFFECTIVE_GRAVITY,
+      frictionCoeff: FRICTION,
+      boulderPositions: [],
+      storkModelLoaded: false
+    };
+
+    window.__3D_STATE__ = state;
+
+    init();
+    animate();
+
+    function init() {
+      scene = new THREE.Scene();
+      scene.background = new THREE.Color(0x9ec9f5);
+      scene.fog = new THREE.Fog(0x9ec9f5, 80, 180);
+
+      camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 500);
+      camera.position.set(0, 40, 60);
+      camera.lookAt(0, 0, 0);
+
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+      renderer.shadowMap.enabled = true;
+      document.body.appendChild(renderer.domElement);
+
+      controls = new OrbitControls(camera, renderer.domElement);
+      controls.target.set(0, 5, 0);
+      controls.enableDamping = true;
+
+      clock = new THREE.Clock();
+
+      setupLights();
+      createTerrain();
+      createSafeZone();
+      createBarriers();
+      createBoulders();
+      loadStork();
+      addSkyDecor();
+
+      window.addEventListener('resize', onResize);
+      window.addEventListener('keydown', onKeyDown);
+      renderer.domElement.addEventListener('pointerdown', onPointerDown);
+      hud.resetBtn.addEventListener('click', resetSimulation);
+
+      updateHUD();
+      syncState();
+    }
+
+    function setupLights() {
+      const dir = new THREE.DirectionalLight(0xffffff, 1.2);
+      dir.position.set(10, 50, 20);
+      dir.castShadow = true;
+      dir.shadow.mapSize.set(2048, 2048);
+      dir.shadow.camera.near = 1;
+      dir.shadow.camera.far = 200;
+      dir.shadow.camera.left = -80;
+      dir.shadow.camera.right = 80;
+      dir.shadow.camera.top = 80;
+      dir.shadow.camera.bottom = -80;
+      scene.add(dir);
+
+      const amb = new THREE.AmbientLight(0xffffff, 0.4);
+      scene.add(amb);
+
+      const hemi = new THREE.HemisphereLight(0xaaddff, 0x445566, 0.5);
+      scene.add(hemi);
+    }
+
+    function noiseHeight(x, z) {
+      return (
+        Math.sin(x * 0.12) * 3.2 +
+        Math.cos(z * 0.15) * 2.8 +
+        Math.sin((x + z) * 0.08) * 4.0 +
+        Math.cos((x - z) * 0.05) * 2.0 +
+        Math.sin(Math.sqrt(x * x + z * z) * 0.18) * 1.8
+      );
+    }
+
+    function createTerrain() {
+      terrainGeom = new THREE.PlaneGeometry(TERRAIN_SIZE, TERRAIN_SIZE, TERRAIN_SEG, TERRAIN_SEG);
+
+      const pos = terrainGeom.attributes.position;
+      const colors = [];
+
+      for (let i = 0; i < pos.count; i++) {
+        const x = pos.getX(i);
+        const y = pos.getY(i);
+
+        const height = noiseHeight(x, y);
+        pos.setZ(i, height);
+
+        const c = THREE.MathUtils.clamp(0.82 + height * 0.015, 0.72, 0.96);
+        colors.push(c, c, c + 0.02);
+      }
+
+      terrainGeom.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+      terrainGeom.computeVertexNormals();
+
+      const mat = new THREE.MeshStandardMaterial({
+        vertexColors: true,
+        roughness: 0.95,
+        metalness: 0.02
+      });
+
+      terrain = new THREE.Mesh(terrainGeom, mat);
+      terrain.rotation.x = -Math.PI / 2 + TERRAIN_ANGLE;
+      terrain.position.set(0, 20, -15);
+      terrain.receiveShadow = true;
+      scene.add(terrain);
+    }
+
+    function createSafeZone() {
+      const geom = new THREE.PlaneGeometry(10, 10);
+      const mat = new THREE.MeshBasicMaterial({
+        color: 0x00ff66,
+        transparent: true,
+        opacity: 0.35,
+        side: THREE.DoubleSide
+      });
+      safeZone = new THREE.Mesh(geom, mat);
+      safeZone.rotation.x = -Math.PI / 2 + TERRAIN_ANGLE;
+      safeZone.position.set(0, -8, 20);
+      scene.add(safeZone);
+    }
+
+    function makeBarrier(pos) {
+      const geom = new THREE.BoxGeometry(8, 3, 1);
+      const mat = new THREE.MeshStandardMaterial({ color: 0x8b5a2b });
+      const mesh = new THREE.Mesh(geom, mat);
+      mesh.position.copy(pos);
+      mesh.castShadow = true;
+      mesh.receiveShadow = true;
+      mesh.userData.isBarrier = true;
+      scene.add(mesh);
+      barriers.push(mesh);
+      return mesh;
+    }
+
+    function createBarriers() {
+      makeBarrier(new THREE.Vector3(-12, 10, -2));
+      makeBarrier(new THREE.Vector3(10, 6, 8));
+      makeBarrier(new THREE.Vector3(0, 2, 14));
+      state.barrierCount = barriers.length;
+    }
+
+    function createBoulders() {
+      for (let i = 0; i < 20; i++) {
+        const r = THREE.MathUtils.randFloat(0.5, 1.5);
+        const geom = new THREE.SphereGeometry(r, 20, 20);
+        const mat = new THREE.MeshStandardMaterial({
+          color: 0xf7fbff,
+          roughness: 0.95,
+          metalness: 0.0
+        });
+        const mesh = new THREE.Mesh(geom, mat);
+        mesh.castShadow = true;
+        mesh.receiveShadow = true;
+
+        const startX = THREE.MathUtils.randFloat(-30, 30);
+        const startZ = THREE.MathUtils.randFloat(-40, -30);
+        const startY = 28 + THREE.MathUtils.randFloat(-1, 1);
+
+        mesh.position.set(startX, startY, startZ);
+        scene.add(mesh);
+
+        const b = {
+          mesh,
+          radius: r,
+          velocity: new THREE.Vector3(
+            THREE.MathUtils.randFloat(-0.2, 0.2),
+            0,
+            THREE.MathUtils.randFloat(0.3, 1.2)
+          ),
+          active: true,
+          collected: false,
+          hitStorkCooldown: 0
+        };
+
+        boulders.push(b);
+        initialBoulderStates.push({
+          position: mesh.position.clone(),
+          velocity: b.velocity.clone(),
+          radius: r
+        });
+      }
+    }
+
+    function loadStork() {
+      const loader = new GLTFLoader();
+      loader.load(
+        '._stork.glb',
+        (gltf) => {
+          stork = gltf.scene;
+          stork.scale.set(2, 2, 2);
+          stork.position.set(0, 5, 0);
+          stork.traverse((obj) => {
+            if (obj.isMesh) {
+              obj.castShadow = true;
+              obj.receiveShadow = true;
+              if (obj.material) obj.material = obj.material.clone();
+            }
+          });
+          scene.add(stork);
+
+          if (gltf.animations && gltf.animations.length > 0) {
+            storkMixer = new THREE.AnimationMixer(stork);
+            const action = storkMixer.clipAction(gltf.animations[0]);
+            action.play();
+          }
+
+          storkLoaded = true;
+          state.storkModelLoaded = true;
+          syncState();
+        },
+        undefined,
+        () => {
+          const fallback = new THREE.Group();
+
+          const body = new THREE.Mesh(
+            new THREE.SphereGeometry(1.2, 16, 16),
+            new THREE.MeshStandardMaterial({ color: 0xffffff })
+          );
+          body.scale.set(1.2, 1.0, 1.8);
+          fallback.add(body);
+
+          const neck = new THREE.Mesh(
+            new THREE.CylinderGeometry(0.18, 0.22, 1.7, 10),
+            new THREE.MeshStandardMaterial({ color: 0xf5f5f5 })
+          );
+          neck.position.set(0.6, 1.2, 0);
+          neck.rotation.z = -0.5;
+          fallback.add(neck);
+
+          const head = new THREE.Mesh(
+            new THREE.SphereGeometry(0.35, 12, 12),
+            new THREE.MeshStandardMaterial({ color: 0xfafafa })
+          );
+          head.position.set(1.2, 2.0, 0);
+          fallback.add(head);
+
+          const beak = new THREE.Mesh(
+            new THREE.ConeGeometry(0.12, 0.6, 8),
+            new THREE.MeshStandardMaterial({ color: 0xff9933 })
+          );
+          beak.position.set(1.55, 1.95, 0);
+          beak.rotation.z = -Math.PI / 2;
+          fallback.add(beak);
+
+          fallback.scale.set(2, 2, 2);
+          fallback.position.set(0, 5, 0);
+          fallback.traverse(o => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; }});
+          scene.add(fallback);
+          stork = fallback;
+          storkLoaded = true;
+          state.storkModelLoaded = false;
+          syncState();
+        }
+      );
+    }
+
+    function addSkyDecor() {
+      const group = new THREE.Group();
+      for (let i = 0; i < 14; i++) {
+        const cloud = new THREE.Mesh(
+          new THREE.SphereGeometry(2 + Math.random() * 2, 12, 12),
+          new THREE.MeshStandardMaterial({ color: 0xffffff, transparent: true, opacity: 0.85 })
+        );
+        cloud.position.set(
+          THREE.MathUtils.randFloat(-60, 60),
+          THREE.MathUtils.randFloat(35, 55),
+          THREE.MathUtils.randFloat(-60, 20)
+        );
+        cloud.scale.set(1.5, 1.0, 1.0 + Math.random());
+        group.add(cloud);
+      }
+      scene.add(group);
+    }
+
+    function terrainHeightAt(x, z) {
+      const local = worldToTerrainLocal(x, z);
+      const h = noiseHeight(local.x, local.z);
+
+      const p = new THREE.Vector3(local.x, local.z, h);
+      p.applyEuler(new THREE.Euler(terrain.rotation.x, terrain.rotation.y, terrain.rotation.z));
+      p.add(terrain.position);
+      return p.y;
+    }
+
+    function worldToTerrainLocal(x, z) {
+      const inv = new THREE.Matrix4().copy(terrain.matrixWorld).invert();
+      const probe = new THREE.Vector3(x, 0, z).applyMatrix4(inv);
+      return { x: probe.x, z: probe.y };
+    }
+
+    function getDownhillDirection() {
+      const dir = new THREE.Vector3(0, 0, 1);
+      return dir.normalize();
+    }
+
+    function updateBoulders(dt) {
+      const downhill = getDownhillDirection();
+
+      let activeCount = 0;
+      let totalSpeed = 0;
+
+      for (const b of boulders) {
+        if (!b.active) continue;
+
+        if (b.hitStorkCooldown > 0) b.hitStorkCooldown -= dt;
+
+        const accel = downhill.clone().multiplyScalar(EFFECTIVE_GRAVITY);
+
+        const frictionForce = b.velocity.clone().multiplyScalar(-FRICTION);
+        b.velocity.add(accel.multiplyScalar(dt));
+        b.velocity.add(frictionForce.multiplyScalar(dt));
+
+        b.mesh.position.add(b.velocity.clone().multiplyScalar(dt));
+
+        const th = terrainHeightAt(b.mesh.position.x, b.mesh.position.z);
+        b.mesh.position.y = th + b.radius;
+
+        const speed = b.velocity.length();
+        if (speed > 0.01) {
+          const axis = new THREE.Vector3(b.velocity.z, 0, -b.velocity.x).normalize();
+          b.mesh.rotateOnWorldAxis(axis, speed * dt * 0.8);
+        }
+
+        handleBarrierCollisions(b);
+        handleSafeZone(b);
+        handleStorkCollision(b);
+        handleOffTerrain(b);
+
+        if (b.active) {
+          activeCount++;
+          totalSpeed += b.velocity.length();
+        }
+      }
+
+      state.averageBoulderSpeed = activeCount ? totalSpeed / activeCount : 0;
+    }
+
+    function handleBarrierCollisions(b) {
+      for (let i = 0; i < barriers.length; i++) {
+        const barrier = barriers[i];
+        const dx = b.mesh.position.x - barrier.position.x;
+        const dz = b.mesh.position.z - barrier.position.z;
+
+        if (Math.abs(dx) < 4.5 + b.radius && Math.abs(dz) < 1.2 + b.radius && Math.abs(b.mesh.position.y - barrier.position.y) < 3.0) {
+          b.velocity.multiplyScalar(0.2);
+          b.velocity.x += (dx >= 0 ? 1 : -1) * THREE.MathUtils.randFloat(1.2, 2.2);
+          b.velocity.z *= -0.35;
+          b.mesh.position.z += dz >= 0 ? 1.5 : -1.5;
+        }
+      }
+    }
+
+    function handleSafeZone(b) {
+      const dx = b.mesh.position.x - safeZone.position.x;
+      const dz = b.mesh.position.z - safeZone.position.z;
+      if (Math.abs(dx) <= 5 && Math.abs(dz) <= 5 && b.active) {
+        b.active = false;
+        b.collected = true;
+        b.mesh.visible = false;
+        state.score += 10;
+        state.bouldersCollected++;
+      }
+    }
+
+    function flashStorkRed() {
+      if (!stork) return;
+      const touched = [];
+      stork.traverse(obj => {
+        if (obj.isMesh && obj.material && obj.material.color) {
+          touched.push({ obj, color: obj.material.color.clone() });
+          obj.material.color.set(0xff3333);
+        }
+      });
+      setTimeout(() => {
+        touched.forEach(item => item.obj.material.color.copy(item.color));
+      }, 220);
+    }
+
+    function handleStorkCollision(b) {
+      if (!stork || !state.storkAlive || !b.active) return;
+
+      const storkPos = new THREE.Vector3();
+      stork.getWorldPosition(storkPos);
+      const dist = b.mesh.position.distanceTo(storkPos);
+
+      if (state.shieldActive && shieldMesh && dist < 4 + b.radius) {
+        b.active = false;
+        b.mesh.visible = false;
+        state.score += 25;
+        state.shieldHP--;
+        if (state.shieldHP <= 0) {
+          state.shieldHP = 0;
+          state.shieldActive = false;
+          if (shieldMesh) shieldMesh.visible = false;
+        }
+        return;
+      }
+
+      if (dist < 3 && b.hitStorkCooldown <= 0) {
+        b.hitStorkCooldown = 0.5;
+        b.active = false;
+        b.mesh.visible = false;
+        state.score -= 50;
+        state.storkHits++;
+        flashStorkRed();
+        if (state.storkHits >= 5) {
+          state.storkAlive = false;
+        }
+      }
+    }
+
+    function handleOffTerrain(b) {
+      const x = b.mesh.position.x;
+      const z = b.mesh.position.z;
+      if (Math.abs(x) > 55 || z > 55 || z < -55) {
+        b.active = false;
+        b.mesh.visible = false;
+      }
+    }
+
+    function updateStork(dt, elapsed) {
+      if (!stork) return;
+
+      const terrainY = terrainHeightAt(0, 0);
+      stork.position.set(0, terrainY + 1.8 + Math.sin(elapsed * Math.PI) * 0.3, 0);
+
+      if (shieldMesh) {
+        shieldMesh.position.copy(stork.position);
+        shieldMesh.visible = state.shieldActive;
+      }
+
+      state.storkPosition.x = stork.position.x;
+      state.storkPosition.y = stork.position.y;
+      state.storkPosition.z = stork.position.z;
+
+      if (storkMixer) storkMixer.update(dt);
+    }
+
+    function ensureShield() {
+      if (shieldMesh) return;
+      shieldMesh = new THREE.Mesh(
+        new THREE.SphereGeometry(4, 24, 24),
+        new THREE.MeshBasicMaterial({
+          color: 0x3399ff,
+          transparent: true,
+          opacity: 0.22,
+          wireframe: false
+        })
+      );
+      shieldMesh.visible = false;
+      scene.add(shieldMesh);
+    }
+
+    function onPointerDown(event) {
+      mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+      mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+      raycaster.setFromCamera(mouse, camera);
+
+      const hits = raycaster.intersectObjects(barriers, false);
+      if (hits.length > 0) {
+        const barrier = hits[0].object;
+        selectedBarrierIndex = barriers.indexOf(barrier);
+      } else {
+        selectedBarrierIndex = -1;
+      }
+      updateBarrierSelection();
+      syncState();
+    }
+
+    function updateBarrierSelection() {
+      barriers.forEach((b, i) => {
+        b.material.color.set(i === selectedBarrierIndex ? 0xffff00 : 0x8b5a2b);
+      });
+      state.selectedBarrierIndex = selectedBarrierIndex;
+    }
+
+    function onKeyDown(e) {
+      const key = e.key.toLowerCase();
+
+      if (key === ' ') {
+        e.preventDefault();
+        toggleSimulation();
+      } else if (key === 'r') {
+        resetSimulation();
+      } else if (key === 'b') {
+        spawnBarrier();
+      } else if (key === 's') {
+        toggleShield();
+      } else if (selectedBarrierIndex >= 0) {
+        const barrier = barriers[selectedBarrierIndex];
+        if (!barrier) return;
+
+        if (e.key === 'ArrowLeft') barrier.position.x -= 2;
+        if (e.key === 'ArrowRight') barrier.position.x += 2;
+        if (e.key === 'ArrowUp') barrier.position.z -= 2;
+        if (e.key === 'ArrowDown') barrier.position.z += 2;
+
+        const th = terrainHeightAt(barrier.position.x, barrier.position.z);
+        barrier.position.y = th + 1.5;
+      }
+
+      syncState();
+      updateHUD();
+    }
+
+    function spawnBarrier() {
+      if (state.barrierTokens <= 0) return;
+      const y = terrainHeightAt(0, 15) + 1.5;
+      makeBarrier(new THREE.Vector3(0, y, 15));
+      state.barrierTokens--;
+      state.barrierCount = barriers.length;
+      updateBarrierSelection();
+    }
+
+    function toggleShield() {
+      ensureShield();
+
+      if (!state.shieldActive) {
+        state.shieldActive = true;
+        state.shieldHP = 3;
+        shieldMesh.visible = true;
+      } else {
+        state.shieldActive = false;
+        state.shieldHP = 0;
+        shieldMesh.visible = false;
+      }
+    }
+
+    function toggleSimulation() {
+      if (state.status === 'COMPLETE') return;
+
+      state.simulationRunning = !state.simulationRunning;
+      if (state.simulationRunning) {
+        state.status = 'RUNNING';
+      } else {
+        state.status = state.simulationTime > 0 ? 'PAUSED' : 'READY';
+      }
+      updateHUD();
+    }
+
+    function resetSimulation() {
+      state.simulationRunning = false;
+      state.simulationTime = 0;
+      state.score = 0;
+      state.bouldersCollected = 0;
+      state.storkHits = 0;
+      state.storkAlive = true;
+      state.shieldActive = false;
+      state.shieldHP = 0;
+      state.barrierTokens = 2;
+      state.status = 'READY';
+
+      for (let i = barriers.length - 1; i >= 3; i--) {
+        scene.remove(barriers[i]);
+        barriers.splice(i, 1);
+      }
+
+      const barrierPositions = [
+        new THREE.Vector3(-12, 10, -2),
+        new THREE.Vector3(10, 6, 8),
+        new THREE.Vector3(0, 2, 14)
+      ];
+
+      for (let i = 0; i < 3; i++) {
+        barriers[i].position.copy(barrierPositions[i]);
+        barriers[i].material.color.set(0x8b5a2b);
+        const th = terrainHeightAt(barriers[i].position.x, barriers[i].position.z);
+        barriers[i].position.y = th + 1.5;
+      }
+
+      selectedBarrierIndex = -1;
+      updateBarrierSelection();
+
+      boulders.forEach((b, i) => {
+        const init = initialBoulderStates[i];
+        b.mesh.visible = true;
+        b.active = true;
+        b.collected = false;
+        b.hitStorkCooldown = 0;
+        b.mesh.position.copy(init.position);
+        b.velocity.copy(init.velocity);
+      });
+
+      if (shieldMesh) shieldMesh.visible = false;
+
+      state.barrierCount = barriers.length;
+      syncState();
+      updateHUD();
+    }
+
+    function evaluateCompletion() {
+      const remaining = boulders.filter(b => b.active).length;
+      state.bouldersRemaining = remaining;
+
+      if (!state.storkAlive || remaining === 0) {
+        state.simulationRunning = false;
+        state.status = 'COMPLETE';
+      } else if (state.simulationRunning) {
+        state.status = 'RUNNING';
+      } else if (state.simulationTime > 0) {
+        state.status = 'PAUSED';
+      } else {
+        state.status = 'READY';
+      }
+    }
+
+    function syncState() {
+      state.boulderPositions = boulders.filter(b => b.active).map(b => ({
+        x: Number(b.mesh.position.x.toFixed(2)),
+        y: Number(b.mesh.position.y.toFixed(2)),
+        z: Number(b.mesh.position.z.toFixed(2))
+      }));
+
+      state.simulationTime = Number(state.simulationTime.toFixed(1));
+      state.barrierCount = barriers.length;
+      state.selectedBarrierIndex = selectedBarrierIndex;
+      state.storkModelLoaded = storkLoaded;
+      evaluateCompletion();
+      window.__3D_STATE__ = state;
+    }
+
+    function updateHUD() {
+      hud.score.textContent = `Score: ${state.score}`;
+      hud.time.textContent = `Time: ${state.simulationTime.toFixed(1)}s`;
+      hud.boulders.textContent = `Boulders Remaining: ${state.bouldersRemaining}`;
+      hud.shield.textContent = `Shield HP: ${state.shieldActive ? state.shieldHP : 0}/3`;
+      hud.barrierTokens.textContent = `Barrier Tokens: ${state.barrierTokens}`;
+      hud.status.textContent = `Status: ${state.status}`;
+    }
+
+    function animate() {
+      requestAnimationFrame(animate);
+      const dtRaw = clock.getDelta();
+      const dt = Math.min(dtRaw, 0.05);
+      const elapsed = clock.elapsedTime;
+
+      if (state.simulationRunning && state.status !== 'COMPLETE') {
+        state.simulationTime += dt;
+        updateBoulders(dt);
+      }
+
+      updateStork(dt, elapsed);
+      controls.update();
+      syncState();
+      updateHUD();
+      renderer.render(scene, camera);
+    }
+
+    function onResize() {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    }
+
+    // Initialize terrain-aligned heights for barriers after terrain exists
+    setTimeout(() => {
+      barriers.forEach(barrier => {
+        barrier.position.y = terrainHeightAt(barrier.position.x, barrier.position.z) + 1.5;
+      });
+      if (safeZone) {
+        safeZone.position.y = terrainHeightAt(safeZone.position.x, safeZone.position.z) + 0.1;
+      }
+    }, 0);
+  </script>
+</body>
+</html>

@@ -1,0 +1,531 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>3D Stock Market Landscape</title>
+  <style>
+    html, body {
+      margin: 0;
+      overflow: hidden;
+      background: #0a0a1a;
+      font-family: Arial, sans-serif;
+      color: white;
+    }
+
+    canvas {
+      display: block;
+    }
+
+    .hud {
+      position: absolute;
+      z-index: 10;
+      background: rgba(10, 10, 26, 0.72);
+      color: white;
+      padding: 10px 14px;
+      border-radius: 8px;
+      border: 1px solid rgba(255,255,255,0.12);
+      backdrop-filter: blur(4px);
+      font-size: 14px;
+      user-select: none;
+    }
+
+    #marketIndexHUD {
+      top: 12px;
+      left: 12px;
+    }
+
+    #statusHUD {
+      top: 12px;
+      right: 12px;
+      text-align: right;
+    }
+
+    #simulationHUD {
+      bottom: 12px;
+      left: 50%;
+      transform: translateX(-50%);
+      min-width: 160px;
+      text-align: center;
+      font-weight: bold;
+      letter-spacing: 1px;
+    }
+
+    #simulationHUD.live {
+      color: #44ff88;
+    }
+
+    #simulationHUD.paused {
+      color: #ff5555;
+    }
+
+    #controlsBar {
+      position: absolute;
+      top: 12px;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 11;
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      justify-content: center;
+      max-width: 90vw;
+    }
+
+    .sector-btn {
+      background: rgba(20, 20, 40, 0.85);
+      color: white;
+      border: 1px solid rgba(255,255,255,0.15);
+      border-radius: 6px;
+      padding: 8px 12px;
+      cursor: pointer;
+      transition: all 0.2s ease;
+    }
+
+    .sector-btn:hover,
+    .sector-btn.active {
+      background: rgba(70, 90, 140, 0.9);
+      border-color: rgba(255,255,255,0.4);
+    }
+
+    #tooltip {
+      position: absolute;
+      z-index: 20;
+      pointer-events: none;
+      background: rgba(0, 0, 0, 0.82);
+      color: white;
+      padding: 8px 10px;
+      border-radius: 6px;
+      font-size: 13px;
+      border: 1px solid rgba(255,255,255,0.15);
+      display: none;
+      white-space: nowrap;
+    }
+  </style>
+</head>
+<body>
+  <div id="controlsBar"></div>
+
+  <div id="marketIndexHUD" class="hud">Market Index: --</div>
+  <div id="statusHUD" class="hud">
+    Filter: All<br />
+    Time: day
+  </div>
+  <div id="simulationHUD" class="hud paused">PAUSED</div>
+  <div id="tooltip"></div>
+
+  <script type="module">
+    import * as THREE from "https://unpkg.com/three@0.160.0/build/three.module.js";
+    import { OrbitControls } from "https://unpkg.com/three@0.160.0/examples/jsm/controls/OrbitControls.js";
+    import { GLTFLoader } from "https://unpkg.com/three@0.160.0/examples/jsm/loaders/GLTFLoader.js";
+
+    const SECTORS = [
+      { name: "Technology", color: 0x00ff88 },
+      { name: "Finance", color: 0xff4444 },
+      { name: "Healthcare", color: 0x4488ff },
+      { name: "Energy", color: 0xffaa00 },
+      { name: "Consumer", color: 0xff44ff }
+    ];
+
+    window.__3D_STATE__ = {
+      modelLoaded: false,
+      totalBars: 100,
+      activeFilter: "All",
+      simulationRunning: false,
+      crashTriggered: false,
+      recovered: false,
+      hoveredBarIndex: -1,
+      currentView: "default",
+      timeOfDay: "day",
+      marketIndex: 0,
+      barHeights: [],
+      sectorCounts: {
+        Technology: 20,
+        Finance: 20,
+        Healthcare: 20,
+        Energy: 20,
+        Consumer: 20
+      }
+    };
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0a0a1a);
+    scene.fog = new THREE.Fog(0x0a0a1a, 25, 70);
+
+    const camera = new THREE.PerspectiveCamera(
+      60,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      1000
+    );
+    camera.position.set(0, 15, 30);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    document.body.appendChild(renderer.domElement);
+
+    const ambientLight = new THREE.AmbientLight(0x334466, 0.5);
+    scene.add(ambientLight);
+
+    const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
+    directionalLight.position.set(10, 20, 10);
+    scene.add(directionalLight);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.target.set(0, 0, 0);
+
+    const gridHelper = new THREE.GridHelper(28, 14, 0x223344, 0x223344);
+    gridHelper.position.y = 0;
+    scene.add(gridHelper);
+
+    const bars = [];
+    const barGroup = new THREE.Group();
+    scene.add(barGroup);
+
+    const raycaster = new THREE.Raycaster();
+    const mouse = new THREE.Vector2();
+
+    const tooltip = document.getElementById("tooltip");
+    const marketIndexHUD = document.getElementById("marketIndexHUD");
+    const statusHUD = document.getElementById("statusHUD");
+    const simulationHUD = document.getElementById("simulationHUD");
+    const controlsBar = document.getElementById("controlsBar");
+
+    const cameraTargets = {
+      top: new THREE.Vector3(0, 40, 0.01),
+      side: new THREE.Vector3(40, 10, 0),
+      default: new THREE.Vector3(0, 15, 30)
+    };
+    let desiredCameraPosition = cameraTargets.default.clone();
+
+    const barGeometry = new THREE.BoxGeometry(1.2, 1, 1.2);
+
+    function createTerrain() {
+      const gridSize = 10;
+      const spacing = 2;
+      const start = -9;
+
+      for (let i = 0; i < 100; i++) {
+        const row = Math.floor(i / gridSize);
+        const col = i % gridSize;
+
+        const x = start + col * spacing;
+        const z = start + row * spacing;
+
+        const sectorIndex = Math.floor(i / 20);
+        const baseHeight = THREE.MathUtils.randFloat(1, 12);
+        const material = new THREE.MeshStandardMaterial({
+          color: SECTORS[sectorIndex].color,
+          transparent: true,
+          opacity: 1
+        });
+
+        const bar = new THREE.Mesh(barGeometry, material);
+        bar.castShadow = false;
+        bar.receiveShadow = true;
+
+        bar.scale.y = baseHeight;
+        bar.position.set(x, baseHeight / 2, z);
+
+        bar.userData = {
+          index: i,
+          sectorIndex,
+          baseHeight,
+          currentHeight: baseHeight,
+          targetHeight: baseHeight
+        };
+
+        bars.push(bar);
+        barGroup.add(bar);
+      }
+
+      updateStateBarHeights();
+      updateMarketIndex();
+    }
+
+    function updateBarVisual(bar, height) {
+      bar.userData.currentHeight = height;
+      bar.scale.y = height;
+      bar.position.y = height / 2;
+    }
+
+    function updateStateBarHeights() {
+      window.__3D_STATE__.barHeights = bars.map(b => Number(b.userData.currentHeight.toFixed(3)));
+    }
+
+    function updateMarketIndex() {
+      const active = window.__3D_STATE__.activeFilter;
+      const visibleBars = bars.filter(bar => {
+        if (active === "All") return true;
+        return SECTORS[bar.userData.sectorIndex].name === active;
+      });
+
+      const avg =
+        visibleBars.reduce((sum, b) => sum + b.userData.currentHeight, 0) /
+        Math.max(visibleBars.length, 1);
+
+      window.__3D_STATE__.marketIndex = Number(avg.toFixed(3));
+      marketIndexHUD.textContent = `Market Index: ${avg.toFixed(2)}`;
+    }
+
+    function updateStatusHUD() {
+      statusHUD.innerHTML = `
+        Filter: ${window.__3D_STATE__.activeFilter}<br />
+        Time: ${window.__3D_STATE__.timeOfDay}
+      `;
+    }
+
+    function updateSimulationHUD() {
+      if (window.__3D_STATE__.simulationRunning) {
+        simulationHUD.textContent = "LIVE";
+        simulationHUD.classList.add("live");
+        simulationHUD.classList.remove("paused");
+      } else {
+        simulationHUD.textContent = "PAUSED";
+        simulationHUD.classList.add("paused");
+        simulationHUD.classList.remove("live");
+      }
+    }
+
+    function applySectorFilter(filterName) {
+      window.__3D_STATE__.activeFilter = filterName;
+
+      bars.forEach(bar => {
+        const sectorName = SECTORS[bar.userData.sectorIndex].name;
+        bar.material.opacity = filterName === "All" || sectorName === filterName ? 1.0 : 0.2;
+      });
+
+      document.querySelectorAll(".sector-btn").forEach(btn => {
+        btn.classList.toggle("active", btn.dataset.filter === filterName);
+      });
+
+      updateMarketIndex();
+      updateStatusHUD();
+    }
+
+    function createFilterButtons() {
+      const allNames = ["All", ...SECTORS.map(s => s.name)];
+      allNames.forEach(name => {
+        const btn = document.createElement("button");
+        btn.className = "sector-btn";
+        btn.textContent = name;
+        btn.dataset.filter = name;
+        if (name === "All") btn.classList.add("active");
+        btn.addEventListener("click", () => applySectorFilter(name));
+        controlsBar.appendChild(btn);
+      });
+    }
+
+    function triggerCrash() {
+      window.__3D_STATE__.crashTriggered = true;
+      window.__3D_STATE__.recovered = false;
+      bars.forEach(bar => {
+        bar.userData.targetHeight = 0.5;
+      });
+    }
+
+    function triggerRecovery() {
+      window.__3D_STATE__.recovered = true;
+      window.__3D_STATE__.crashTriggered = false;
+      bars.forEach(bar => {
+        bar.userData.targetHeight = bar.userData.baseHeight;
+      });
+    }
+
+    function setCameraView(view) {
+      if (view === "top") {
+        desiredCameraPosition.copy(cameraTargets.top);
+        window.__3D_STATE__.currentView = "top";
+      } else if (view === "side") {
+        desiredCameraPosition.copy(cameraTargets.side);
+        window.__3D_STATE__.currentView = "side";
+      } else {
+        desiredCameraPosition.copy(cameraTargets.default);
+        window.__3D_STATE__.currentView = "default";
+      }
+    }
+
+    function cycleTimeOfDay() {
+      const current = window.__3D_STATE__.timeOfDay;
+      let next = "day";
+
+      if (current === "day") next = "sunset";
+      else if (current === "sunset") next = "night";
+
+      window.__3D_STATE__.timeOfDay = next;
+
+      if (next === "day") {
+        directionalLight.color.set(0xffffff);
+        directionalLight.intensity = 0.8;
+        ambientLight.color.set(0x334466);
+        ambientLight.intensity = 0.5;
+      } else if (next === "sunset") {
+        directionalLight.color.set(0xff6633);
+        directionalLight.intensity = 0.95;
+        ambientLight.color.set(0x553322);
+        ambientLight.intensity = 0.45;
+      } else {
+        directionalLight.color.set(0x2233aa);
+        directionalLight.intensity = 0.35;
+        ambientLight.color.set(0x1a2244);
+        ambientLight.intensity = 0.3;
+      }
+
+      updateStatusHUD();
+    }
+
+    function setupMouseInteraction() {
+      window.addEventListener("mousemove", (event) => {
+        mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+        mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+        raycaster.setFromCamera(mouse, camera);
+        const intersects = raycaster.intersectObjects(bars);
+
+        if (intersects.length > 0) {
+          const bar = intersects[0].object;
+          const index = bar.userData.index;
+          const sectorName = SECTORS[bar.userData.sectorIndex].name;
+          const height = bar.userData.currentHeight.toFixed(1);
+
+          window.__3D_STATE__.hoveredBarIndex = index;
+          tooltip.style.display = "block";
+          tooltip.style.left = `${event.clientX + 12}px`;
+          tooltip.style.top = `${event.clientY + 12}px`;
+          tooltip.innerHTML = `${sectorName}<br />Height: ${height}`;
+        } else {
+          window.__3D_STATE__.hoveredBarIndex = -1;
+          tooltip.style.display = "none";
+        }
+      });
+    }
+
+    function setupKeyboard() {
+      window.addEventListener("keydown", (e) => {
+        if (e.code === "Space") {
+          e.preventDefault();
+          window.__3D_STATE__.simulationRunning = !window.__3D_STATE__.simulationRunning;
+          updateSimulationHUD();
+        }
+
+        if (e.key === "c" || e.key === "C") {
+          triggerCrash();
+        }
+
+        if (e.key === "r" || e.key === "R") {
+          triggerRecovery();
+        }
+
+        if (e.key === "1") {
+          setCameraView("top");
+        }
+
+        if (e.key === "2") {
+          setCameraView("side");
+        }
+
+        if (e.key === "3") {
+          setCameraView("default");
+        }
+
+        if (e.key === "t" || e.key === "T") {
+          cycleTimeOfDay();
+        }
+      });
+    }
+
+    function loadAvatar() {
+      const loader = new GLTFLoader();
+      loader.load(
+        "facecap.glb",
+        (gltf) => {
+          const model = gltf.scene;
+          model.position.set(0, 0, -22);
+          model.scale.set(3, 3, 3);
+          scene.add(model);
+          window.__3D_STATE__.modelLoaded = true;
+        },
+        undefined,
+        (error) => {
+          console.warn("Failed to load facecap.glb", error);
+        }
+      );
+    }
+
+    function animateBars() {
+      const simRunning = window.__3D_STATE__.simulationRunning;
+
+      bars.forEach(bar => {
+        let target = bar.userData.targetHeight;
+
+        if (simRunning && !window.__3D_STATE__.crashTriggered && !window.__3D_STATE__.recovered) {
+          target = THREE.MathUtils.clamp(
+            bar.userData.currentHeight + THREE.MathUtils.randFloat(-0.05, 0.05),
+            0.5,
+            15
+          );
+          bar.userData.targetHeight = target;
+        }
+
+        const nextHeight = THREE.MathUtils.lerp(
+          bar.userData.currentHeight,
+          target,
+          (window.__3D_STATE__.crashTriggered || window.__3D_STATE__.recovered) ? 0.08 : 0.2
+        );
+
+        updateBarVisual(bar, nextHeight);
+      });
+
+      if (window.__3D_STATE__.crashTriggered) {
+        const done = bars.every(bar => Math.abs(bar.userData.currentHeight - 0.5) < 0.02);
+        if (done) {
+          bars.forEach(bar => updateBarVisual(bar, 0.5));
+        }
+      }
+
+      if (window.__3D_STATE__.recovered) {
+        const done = bars.every(bar => Math.abs(bar.userData.currentHeight - bar.userData.baseHeight) < 0.02);
+        if (done) {
+          bars.forEach(bar => updateBarVisual(bar, bar.userData.baseHeight));
+        }
+      }
+    }
+
+    function animateCamera() {
+      camera.position.lerp(desiredCameraPosition, 0.06);
+      camera.lookAt(0, 0, 0);
+    }
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      animateBars();
+      animateCamera();
+      controls.update();
+
+      updateStateBarHeights();
+      updateMarketIndex();
+
+      renderer.render(scene, camera);
+    }
+
+    window.addEventListener("resize", () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    createTerrain();
+    createFilterButtons();
+    setupMouseInteraction();
+    setupKeyboard();
+    updateStatusHUD();
+    updateSimulationHUD();
+    loadAvatar();
+    animate();
+  </script>
+</body>
+</html>

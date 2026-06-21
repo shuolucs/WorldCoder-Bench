@@ -1,0 +1,859 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Three.js 3D 刚体链 + Ragdoll</title>
+  <style>
+    html, body {
+      margin: 0;
+      overflow: hidden;
+      background: #0f1115;
+      color: #e8eef7;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    }
+    #hud {
+      position: fixed;
+      top: 12px;
+      left: 12px;
+      z-index: 10;
+      background: rgba(10, 15, 24, 0.72);
+      border: 1px solid rgba(255,255,255,0.12);
+      border-radius: 10px;
+      padding: 12px 14px;
+      min-width: 250px;
+      backdrop-filter: blur(6px);
+      box-shadow: 0 8px 24px rgba(0,0,0,0.25);
+    }
+    #hud .row { margin: 4px 0; font-size: 14px; }
+    #controlsPanel {
+      position: fixed;
+      top: 12px;
+      right: 12px;
+      z-index: 10;
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+      max-width: 45vw;
+    }
+    button {
+      border: 0;
+      border-radius: 8px;
+      padding: 10px 14px;
+      font-size: 14px;
+      background: #2d6cdf;
+      color: white;
+      cursor: pointer;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.22);
+    }
+    button:hover { filter: brightness(1.08); }
+    button:active { transform: translateY(1px); }
+    #hint {
+      position: fixed;
+      left: 12px;
+      bottom: 12px;
+      z-index: 10;
+      padding: 8px 12px;
+      border-radius: 8px;
+      background: rgba(10, 15, 24, 0.65);
+      border: 1px solid rgba(255,255,255,0.08);
+      font-size: 13px;
+      color: #d4dceb;
+    }
+  </style>
+</head>
+<body>
+  <div id="hud">
+    <div class="row">模拟时间: <span id="simTime">0.00</span>s</div>
+    <div class="row">链条末端 y: <span id="chainTipY">0.00</span></div>
+    <div class="row">Ragdoll 躯干 y: <span id="torsoY">0.00</span></div>
+    <div class="row">最大约束违反量: <span id="maxViolation">0.0000</span></div>
+  </div>
+
+  <div id="controlsPanel">
+    <button id="resetBtn">重置</button>
+    <button id="kickChainBtn">踢链条</button>
+    <button id="kickRagdollBtn">踢 Ragdoll</button>
+  </div>
+
+  <div id="hint">点击场景：左半边踢链条，右半边踢 Ragdoll；可拖动旋转视角。</div>
+
+  <script type="importmap">
+  { "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+  } }
+  </script>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+    // =========================
+    // 基础 Three.js 场景
+    // =========================
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x10141c);
+
+    const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.1, 200);
+    camera.position.set(0, 6, 18);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(innerWidth, innerHeight);
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    document.body.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.set(0, 4, 0);
+    controls.enableDamping = true;
+
+    scene.add(new THREE.AmbientLight(0xffffff, 0.65));
+
+    const dirLight = new THREE.DirectionalLight(0xffffff, 1.2);
+    dirLight.position.set(8, 14, 10);
+    scene.add(dirLight);
+
+    const fillLight = new THREE.DirectionalLight(0x99bbff, 0.45);
+    fillLight.position.set(-10, 8, -6);
+    scene.add(fillLight);
+
+    const grid = new THREE.GridHelper(30, 30, 0x446688, 0x334455);
+    grid.position.y = 0;
+    scene.add(grid);
+
+    const ground = new THREE.Mesh(
+      new THREE.PlaneGeometry(30, 30),
+      new THREE.MeshStandardMaterial({ color: 0x1b2430, roughness: 1.0, metalness: 0.0, side: THREE.DoubleSide, transparent: true, opacity: 0.22 })
+    );
+    ground.rotation.x = -Math.PI / 2;
+    ground.position.y = 0;
+    scene.add(ground);
+
+    // 中间分界辅助
+    const divider = new THREE.Mesh(
+      new THREE.BoxGeometry(0.04, 10, 0.04),
+      new THREE.MeshStandardMaterial({ color: 0x446688, emissive: 0x223344 })
+    );
+    divider.position.set(0, 5, 0);
+    scene.add(divider);
+
+    // =========================
+    // HUD
+    // =========================
+    const simTimeEl = document.getElementById('simTime');
+    const chainTipYEl = document.getElementById('chainTipY');
+    const torsoYEl = document.getElementById('torsoY');
+    const maxViolationEl = document.getElementById('maxViolation');
+    const resetBtn = document.getElementById('resetBtn');
+    const kickChainBtn = document.getElementById('kickChainBtn');
+    const kickRagdollBtn = document.getElementById('kickRagdollBtn');
+
+    // =========================
+    // 数学/物理工具
+    // =========================
+    const GRAVITY = new THREE.Vector3(0, -9.81, 0);
+    const DT = 1 / 60;
+    const SUBSTEPS = 1;
+    const ITERATIONS = 20;
+    const GROUND_RESTITUTION = 0.2;
+
+    const TEMP_V1 = new THREE.Vector3();
+    const TEMP_V2 = new THREE.Vector3();
+    const TEMP_V3 = new THREE.Vector3();
+    const TEMP_Q1 = new THREE.Quaternion();
+    const TEMP_Q2 = new THREE.Quaternion();
+
+    function clamp(v, a, b) {
+      return Math.max(a, Math.min(b, v));
+    }
+
+    function quatIntegrate(body, dt) {
+      const w = body.angularVelocity;
+      const q = body.quaternion;
+
+      const omega = new THREE.Quaternion(w.x, w.y, w.z, 0);
+      omega.multiply(q); // Quaternion(0,w) * q
+
+      q.x += 0.5 * dt * omega.x;
+      q.y += 0.5 * dt * omega.y;
+      q.z += 0.5 * dt * omega.z;
+      q.w += 0.5 * dt * omega.w;
+      q.normalize();
+    }
+
+    function rotateVecByQuat(v, q, out = new THREE.Vector3()) {
+      return out.copy(v).applyQuaternion(q);
+    }
+
+    function worldPoint(body, localPoint, out = new THREE.Vector3()) {
+      return out.copy(localPoint).applyQuaternion(body.quaternion).add(body.position);
+    }
+
+    function bodyPointVelocity(body, localPoint, out = new THREE.Vector3()) {
+      const r = TEMP_V1.copy(localPoint).applyQuaternion(body.quaternion);
+      return out.copy(body.linearVelocity).add(TEMP_V2.copy(body.angularVelocity).cross(r));
+    }
+
+    function applyImpulseAtWorldPoint(body, impulse, worldPt) {
+      if (body.invMass === 0) return;
+      body.linearVelocity.addScaledVector(impulse, body.invMass);
+      const r = TEMP_V1.copy(worldPt).sub(body.position);
+      const angImpulse = TEMP_V2.copy(r).cross(impulse);
+      body.angularVelocity.addScaledVector(angImpulse, body.angularFactor);
+    }
+
+    function createRigidBody({
+      mesh,
+      mass,
+      shape,
+      size,
+      radius = 0.1,
+      height = 0.5,
+      position = new THREE.Vector3(),
+      quaternion = new THREE.Quaternion(),
+      fixed = false,
+    }) {
+      const body = {
+        mesh,
+        mass: fixed ? Infinity : mass,
+        invMass: fixed ? 0 : 1 / mass,
+        shape,
+        size: size ? size.clone() : null,
+        radius,
+        height,
+        position: position.clone(),
+        prevPosition: position.clone(),
+        quaternion: quaternion.clone(),
+        prevQuaternion: quaternion.clone(),
+        linearVelocity: new THREE.Vector3(),
+        angularVelocity: new THREE.Vector3(),
+        fixed,
+        angularFactor: fixed ? 0 : 0.08,
+        restOffsetY: 0
+      };
+
+      if (shape === 'sphere') {
+        body.restOffsetY = radius;
+      } else if (shape === 'box') {
+        body.restOffsetY = size.y * 0.5;
+      } else if (shape === 'cylinder') {
+        body.restOffsetY = height * 0.5;
+      }
+
+      mesh.position.copy(body.position);
+      mesh.quaternion.copy(body.quaternion);
+      return body;
+    }
+
+    function syncMesh(body) {
+      body.mesh.position.copy(body.position);
+      body.mesh.quaternion.copy(body.quaternion);
+    }
+
+    function solveBallSocket(bodyA, localA, bodyB, localB, compliance = 0) {
+      const pA = worldPoint(bodyA, localA, TEMP_V1);
+      const pB = worldPoint(bodyB, localB, TEMP_V2);
+      const delta = TEMP_V3.copy(pB).sub(pA);
+      const dist = delta.length();
+      if (dist < 1e-8) return 0;
+
+      const n = delta.multiplyScalar(1 / dist);
+      const wA = bodyA.invMass;
+      const wB = bodyB.invMass;
+      const wSum = wA + wB + compliance;
+      if (wSum <= 1e-8) return dist;
+
+      const corr = dist / wSum;
+      if (wA > 0) bodyA.position.addScaledVector(n,  corr * wA);
+      if (wB > 0) bodyB.position.addScaledVector(n, -corr * wB);
+      return dist;
+    }
+
+    function solveAngleLimitBall(bodyParent, bodyChild, maxAngleRad, localAxisParent, localAxisChild) {
+      const axisP = TEMP_V1.copy(localAxisParent).applyQuaternion(bodyParent.quaternion).normalize();
+      const axisC = TEMP_V2.copy(localAxisChild).applyQuaternion(bodyChild.quaternion).normalize();
+      let dot = clamp(axisP.dot(axisC), -1, 1);
+      const angle = Math.acos(dot);
+      if (angle <= maxAngleRad) return angle - maxAngleRad;
+
+      const axis = TEMP_V3.copy(axisC).cross(axisP);
+      let len = axis.length();
+      if (len < 1e-6) {
+        axis.set(1, 0, 0);
+        len = 1;
+      }
+      axis.multiplyScalar(1 / len);
+
+      const correction = angle - maxAngleRad;
+      if (bodyChild.invMass > 0) {
+        TEMP_Q1.setFromAxisAngle(axis, correction * 0.35);
+        bodyChild.quaternion.premultiply(TEMP_Q1).normalize();
+      }
+      if (bodyParent.invMass > 0) {
+        TEMP_Q1.setFromAxisAngle(axis, -correction * 0.15);
+        bodyParent.quaternion.premultiply(TEMP_Q1).normalize();
+      }
+      return correction;
+    }
+
+    function solveHingeLimit(bodyParent, bodyChild, axisLocalParent, axisLocalChild, refLocalParent, refLocalChild, minRad, maxRad) {
+      const axisP = TEMP_V1.copy(axisLocalParent).applyQuaternion(bodyParent.quaternion).normalize();
+      const axisC = TEMP_V2.copy(axisLocalChild).applyQuaternion(bodyChild.quaternion).normalize();
+
+      const alignAxis = TEMP_V3.copy(axisC).cross(axisP);
+      const alignLen = alignAxis.length();
+      if (alignLen > 1e-6) {
+        alignAxis.multiplyScalar(1 / alignLen);
+        const alignAngle = Math.asin(clamp(alignLen, -1, 1));
+        if (bodyChild.invMass > 0) {
+          TEMP_Q1.setFromAxisAngle(alignAxis, alignAngle * 0.5);
+          bodyChild.quaternion.premultiply(TEMP_Q1).normalize();
+        }
+      }
+
+      const refP = new THREE.Vector3().copy(refLocalParent).applyQuaternion(bodyParent.quaternion);
+      const refC = new THREE.Vector3().copy(refLocalChild).applyQuaternion(bodyChild.quaternion);
+
+      refP.addScaledVector(axisP, -refP.dot(axisP)).normalize();
+      refC.addScaledVector(axisP, -refC.dot(axisP)).normalize();
+
+      const cross = new THREE.Vector3().crossVectors(refP, refC);
+      let angle = Math.atan2(cross.dot(axisP), refP.dot(refC));
+
+      let violation = 0;
+      if (angle < minRad) violation = angle - minRad;
+      else if (angle > maxRad) violation = angle - maxRad;
+      else return 0;
+
+      if (bodyChild.invMass > 0) {
+        TEMP_Q1.setFromAxisAngle(axisP, -violation * 0.45);
+        bodyChild.quaternion.premultiply(TEMP_Q1).normalize();
+      }
+      return Math.abs(violation);
+    }
+
+    function solveGround(body) {
+      const bottom = body.position.y - body.restOffsetY;
+      if (bottom < 0) {
+        body.position.y -= bottom;
+        if (body.linearVelocity.y < 0) {
+          body.linearVelocity.y *= -GROUND_RESTITUTION;
+        }
+        body.linearVelocity.x *= 0.98;
+        body.linearVelocity.z *= 0.98;
+        body.angularVelocity.multiplyScalar(0.985);
+      }
+    }
+
+    // =========================
+    // 可视材质/几何
+    // =========================
+    const goldMat = new THREE.MeshStandardMaterial({ color: 0xd4af37, metalness: 0.85, roughness: 0.25 });
+    const silverMat = new THREE.MeshStandardMaterial({ color: 0xc0c0c0, metalness: 0.9, roughness: 0.18 });
+
+    const skinMat = new THREE.MeshStandardMaterial({ color: 0xf2c6a0, roughness: 0.7 });
+    const torsoMat = new THREE.MeshStandardMaterial({ color: 0x3478f6, roughness: 0.6 });
+    const limbMat = new THREE.MeshStandardMaterial({ color: 0x8e98a8, roughness: 0.7 });
+
+    const jointMat = new THREE.MeshStandardMaterial({ color: 0xff6688, emissive: 0x441122 });
+    const chainGeo = new THREE.CylinderGeometry(0.1, 0.1, 0.5, 14);
+    const headGeo = new THREE.SphereGeometry(0.15, 20, 16);
+    const torsoGeo = new THREE.BoxGeometry(0.3, 0.5, 0.2);
+    const upperArmGeo = new THREE.CylinderGeometry(0.06, 0.06, 0.3, 14);
+    const lowerArmGeo = new THREE.CylinderGeometry(0.05, 0.05, 0.3, 14);
+    const upperLegGeo = new THREE.CylinderGeometry(0.08, 0.08, 0.4, 14);
+    const lowerLegGeo = new THREE.CylinderGeometry(0.06, 0.06, 0.4, 14);
+    const jointGeo = new THREE.SphereGeometry(0.055, 12, 10);
+
+    // =========================
+    // 物理对象容器
+    // =========================
+    let chainBodies = [];
+    let chainConstraints = [];
+    let ragdollBodies = {};
+    let ragdollConstraints = [];
+    let jointMarkers = [];
+
+    let simTime = 0;
+    let stats = {
+      maxViolation: 0,
+      avgViolation: 0,
+      totalEnergy: 0
+    };
+
+    function clearSimulation() {
+      [...chainBodies.map(b => b.mesh), ...Object.values(ragdollBodies).map(b => b.mesh), ...jointMarkers].forEach(obj => {
+        if (obj) scene.remove(obj);
+      });
+      chainBodies = [];
+      chainConstraints = [];
+      ragdollBodies = {};
+      ragdollConstraints = [];
+      jointMarkers = [];
+    }
+
+    // =========================
+    // 场景 1：链条
+    // =========================
+    function buildChain() {
+      const start = new THREE.Vector3(-3, 8, 0);
+      const spacing = 0.5;
+
+      for (let i = 0; i < 20; i++) {
+        const mesh = new THREE.Mesh(chainGeo, (i % 2 === 0) ? goldMat : silverMat);
+        scene.add(mesh);
+
+        const body = createRigidBody({
+          mesh,
+          mass: 0.5,
+          shape: 'cylinder',
+          radius: 0.1,
+          height: 0.5,
+          position: new THREE.Vector3(start.x, start.y - i * spacing, start.z),
+          quaternion: new THREE.Quaternion(),
+          fixed: i === 0
+        });
+
+        body.angularFactor = body.fixed ? 0 : 0.05;
+        chainBodies.push(body);
+      }
+
+      for (let i = 0; i < chainBodies.length - 1; i++) {
+        const a = chainBodies[i];
+        const b = chainBodies[i + 1];
+        chainConstraints.push({
+          type: 'ball',
+          bodyA: a,
+          bodyB: b,
+          localA: new THREE.Vector3(0, -0.25, 0),
+          localB: new THREE.Vector3(0,  0.25, 0),
+        });
+
+        const marker = new THREE.Mesh(jointGeo, jointMat);
+        scene.add(marker);
+        jointMarkers.push(marker);
+      }
+
+      const anchorMarker = new THREE.Mesh(jointGeo, new THREE.MeshStandardMaterial({ color: 0x66ffcc, emissive: 0x113322 }));
+      anchorMarker.position.copy(start).add(new THREE.Vector3(0, 0.25, 0));
+      scene.add(anchorMarker);
+      jointMarkers.push(anchorMarker);
+    }
+
+    // =========================
+    // 场景 2：Ragdoll
+    // =========================
+    function makeLimb(meshGeo, mat, mass, pos) {
+      const mesh = new THREE.Mesh(meshGeo, mat);
+      scene.add(mesh);
+      return createRigidBody({
+        mesh,
+        mass,
+        shape: 'cylinder',
+        radius: 0.06,
+        height: meshGeo.parameters.height,
+        position: pos,
+        quaternion: new THREE.Quaternion(),
+        fixed: false
+      });
+    }
+
+    function buildRagdoll() {
+      const origin = new THREE.Vector3(3, 6, 0);
+
+      ragdollBodies.head = createRigidBody({
+        mesh: new THREE.Mesh(headGeo, skinMat),
+        mass: 3,
+        shape: 'sphere',
+        radius: 0.15,
+        position: origin.clone().add(new THREE.Vector3(0, 0.55, 0))
+      });
+      scene.add(ragdollBodies.head.mesh);
+
+      ragdollBodies.torso = createRigidBody({
+        mesh: new THREE.Mesh(torsoGeo, torsoMat),
+        mass: 10,
+        shape: 'box',
+        size: new THREE.Vector3(0.3, 0.5, 0.2),
+        position: origin.clone()
+      });
+      scene.add(ragdollBodies.torso.mesh);
+
+      ragdollBodies.upperArmL = makeLimb(upperArmGeo, limbMat, 2, origin.clone().add(new THREE.Vector3(-0.33, 0.15, 0)));
+      ragdollBodies.upperArmR = makeLimb(upperArmGeo, limbMat, 2, origin.clone().add(new THREE.Vector3( 0.33, 0.15, 0)));
+      ragdollBodies.lowerArmL = makeLimb(lowerArmGeo, limbMat, 1.5, origin.clone().add(new THREE.Vector3(-0.33, -0.18, 0)));
+      ragdollBodies.lowerArmR = makeLimb(lowerArmGeo, limbMat, 1.5, origin.clone().add(new THREE.Vector3( 0.33, -0.18, 0)));
+      ragdollBodies.upperLegL = makeLimb(upperLegGeo, limbMat, 3, origin.clone().add(new THREE.Vector3(-0.12, -0.52, 0)));
+      ragdollBodies.upperLegR = makeLimb(upperLegGeo, limbMat, 3, origin.clone().add(new THREE.Vector3( 0.12, -0.52, 0)));
+      ragdollBodies.lowerLegL = makeLimb(lowerLegGeo, limbMat, 2, origin.clone().add(new THREE.Vector3(-0.12, -0.96, 0)));
+      ragdollBodies.lowerLegR = makeLimb(lowerLegGeo, limbMat, 2, origin.clone().add(new THREE.Vector3( 0.12, -0.96, 0)));
+
+      const c = ragdollConstraints;
+
+      c.push({
+        type: 'ballLimit',
+        bodyA: ragdollBodies.torso,
+        bodyB: ragdollBodies.head,
+        localA: new THREE.Vector3(0, 0.25, 0),
+        localB: new THREE.Vector3(0, -0.15, 0),
+        maxAngle: THREE.MathUtils.degToRad(30),
+        axisA: new THREE.Vector3(0, 1, 0),
+        axisB: new THREE.Vector3(0, -1, 0),
+      });
+
+      c.push({
+        type: 'ballLimit',
+        bodyA: ragdollBodies.torso,
+        bodyB: ragdollBodies.upperArmL,
+        localA: new THREE.Vector3(-0.18, 0.18, 0),
+        localB: new THREE.Vector3(0, 0.15, 0),
+        maxAngle: THREE.MathUtils.degToRad(90),
+        axisA: new THREE.Vector3(-1, 0, 0),
+        axisB: new THREE.Vector3(0, 1, 0),
+      });
+
+      c.push({
+        type: 'ballLimit',
+        bodyA: ragdollBodies.torso,
+        bodyB: ragdollBodies.upperArmR,
+        localA: new THREE.Vector3(0.18, 0.18, 0),
+        localB: new THREE.Vector3(0, 0.15, 0),
+        maxAngle: THREE.MathUtils.degToRad(90),
+        axisA: new THREE.Vector3(1, 0, 0),
+        axisB: new THREE.Vector3(0, 1, 0),
+      });
+
+      c.push({
+        type: 'hinge',
+        bodyA: ragdollBodies.upperArmL,
+        bodyB: ragdollBodies.lowerArmL,
+        localA: new THREE.Vector3(0, -0.15, 0),
+        localB: new THREE.Vector3(0, 0.15, 0),
+        axisA: new THREE.Vector3(0, 0, 1),
+        axisB: new THREE.Vector3(0, 0, 1),
+        refA: new THREE.Vector3(0, -1, 0),
+        refB: new THREE.Vector3(0, -1, 0),
+        minAngle: THREE.MathUtils.degToRad(0),
+        maxAngle: THREE.MathUtils.degToRad(150),
+      });
+
+      c.push({
+        type: 'hinge',
+        bodyA: ragdollBodies.upperArmR,
+        bodyB: ragdollBodies.lowerArmR,
+        localA: new THREE.Vector3(0, -0.15, 0),
+        localB: new THREE.Vector3(0, 0.15, 0),
+        axisA: new THREE.Vector3(0, 0, 1),
+        axisB: new THREE.Vector3(0, 0, 1),
+        refA: new THREE.Vector3(0, -1, 0),
+        refB: new THREE.Vector3(0, -1, 0),
+        minAngle: THREE.MathUtils.degToRad(0),
+        maxAngle: THREE.MathUtils.degToRad(150),
+      });
+
+      c.push({
+        type: 'ballLimit',
+        bodyA: ragdollBodies.torso,
+        bodyB: ragdollBodies.upperLegL,
+        localA: new THREE.Vector3(-0.10, -0.25, 0),
+        localB: new THREE.Vector3(0, 0.20, 0),
+        maxAngle: THREE.MathUtils.degToRad(60),
+        axisA: new THREE.Vector3(0, -1, 0),
+        axisB: new THREE.Vector3(0, 1, 0),
+      });
+
+      c.push({
+        type: 'ballLimit',
+        bodyA: ragdollBodies.torso,
+        bodyB: ragdollBodies.upperLegR,
+        localA: new THREE.Vector3(0.10, -0.25, 0),
+        localB: new THREE.Vector3(0, 0.20, 0),
+        maxAngle: THREE.MathUtils.degToRad(60),
+        axisA: new THREE.Vector3(0, -1, 0),
+        axisB: new THREE.Vector3(0, 1, 0),
+      });
+
+      c.push({
+        type: 'hinge',
+        bodyA: ragdollBodies.upperLegL,
+        bodyB: ragdollBodies.lowerLegL,
+        localA: new THREE.Vector3(0, -0.20, 0),
+        localB: new THREE.Vector3(0, 0.20, 0),
+        axisA: new THREE.Vector3(0, 0, 1),
+        axisB: new THREE.Vector3(0, 0, 1),
+        refA: new THREE.Vector3(0, -1, 0),
+        refB: new THREE.Vector3(0, -1, 0),
+        minAngle: THREE.MathUtils.degToRad(0),
+        maxAngle: THREE.MathUtils.degToRad(150),
+      });
+
+      c.push({
+        type: 'hinge',
+        bodyA: ragdollBodies.upperLegR,
+        bodyB: ragdollBodies.lowerLegR,
+        localA: new THREE.Vector3(0, -0.20, 0),
+        localB: new THREE.Vector3(0, 0.20, 0),
+        axisA: new THREE.Vector3(0, 0, 1),
+        axisB: new THREE.Vector3(0, 0, 1),
+        refA: new THREE.Vector3(0, -1, 0),
+        refB: new THREE.Vector3(0, -1, 0),
+        minAngle: THREE.MathUtils.degToRad(0),
+        maxAngle: THREE.MathUtils.degToRad(150),
+      });
+
+      for (let i = 0; i < c.length; i++) {
+        const marker = new THREE.Mesh(jointGeo, jointMat);
+        scene.add(marker);
+        jointMarkers.push(marker);
+      }
+    }
+
+    function resetSimulation() {
+      clearSimulation();
+      simTime = 0;
+      stats.maxViolation = 0;
+      stats.avgViolation = 0;
+      stats.totalEnergy = 0;
+      buildChain();
+      buildRagdoll();
+      updateHUD();
+      updateState();
+    }
+
+    // =========================
+    // 冲量
+    // =========================
+    function kickChain() {
+      const tip = chainBodies[chainBodies.length - 1];
+      if (!tip) return;
+      const dir = new THREE.Vector3((Math.random() * 2 - 1), 0, (Math.random() * 2 - 1));
+      if (dir.lengthSq() < 1e-6) dir.set(1, 0, 0);
+      dir.normalize().multiplyScalar(50); // 50 N·s
+      tip.linearVelocity.addScaledVector(dir, tip.invMass);
+      tip.angularVelocity.add(new THREE.Vector3(
+        (Math.random() - 0.5) * 2,
+        (Math.random() - 0.5) * 2,
+        (Math.random() - 0.5) * 2
+      ));
+    }
+
+    function kickRagdoll() {
+      const torso = ragdollBodies.torso;
+      if (!torso) return;
+      const dir = new THREE.Vector3(
+        Math.random() * 2 - 1,
+        Math.random() * 0.5 + 0.15,
+        Math.random() * 2 - 1
+      ).normalize().multiplyScalar(42);
+      torso.linearVelocity.addScaledVector(dir, torso.invMass);
+      torso.angularVelocity.add(new THREE.Vector3(
+        (Math.random() - 0.5) * 5,
+        (Math.random() - 0.5) * 4,
+        (Math.random() - 0.5) * 5
+      ));
+      ragdollBodies.head.linearVelocity.addScaledVector(dir, ragdollBodies.head.invMass * 0.4);
+    }
+
+    // =========================
+    // 物理主循环
+    // =========================
+    function integrateBodies(bodies, dt) {
+      for (const body of bodies) {
+        body.prevPosition.copy(body.position);
+        body.prevQuaternion.copy(body.quaternion);
+
+        if (body.invMass === 0) continue;
+        body.linearVelocity.addScaledVector(GRAVITY, dt);
+        body.position.addScaledVector(body.linearVelocity, dt);
+
+        quatIntegrate(body, dt);
+
+        body.linearVelocity.multiplyScalar(0.999);
+        body.angularVelocity.multiplyScalar(0.995);
+      }
+    }
+
+    function allBodiesArray() {
+      return [...chainBodies, ...Object.values(ragdollBodies)];
+    }
+
+    function solveConstraints(dt) {
+      let maxViolation = 0;
+      let sumViolation = 0;
+      let countViolation = 0;
+
+      // 固定链条顶端
+      if (chainBodies.length) {
+        chainBodies[0].position.set(-3, 8, 0);
+        chainBodies[0].quaternion.identity();
+        chainBodies[0].linearVelocity.set(0, 0, 0);
+        chainBodies[0].angularVelocity.set(0, 0, 0);
+      }
+
+      for (let iter = 0; iter < ITERATIONS; iter++) {
+        if (chainBodies.length) {
+          chainBodies[0].position.set(-3, 8, 0);
+          chainBodies[0].quaternion.identity();
+        }
+
+        for (const c of chainConstraints) {
+          const v = solveBallSocket(c.bodyA, c.localA, c.bodyB, c.localB);
+          maxViolation = Math.max(maxViolation, v);
+          sumViolation += v;
+          countViolation++;
+        }
+
+        for (const c of ragdollConstraints) {
+          const v0 = solveBallSocket(c.bodyA, c.localA, c.bodyB, c.localB);
+          maxViolation = Math.max(maxViolation, v0);
+          sumViolation += v0;
+          countViolation++;
+
+          if (c.type === 'ballLimit') {
+            const v1 = Math.abs(solveAngleLimitBall(c.bodyA, c.bodyB, c.maxAngle, c.axisA, c.axisB));
+            maxViolation = Math.max(maxViolation, v1);
+            sumViolation += v1;
+            countViolation++;
+          } else if (c.type === 'hinge') {
+            const v1 = solveHingeLimit(c.bodyA, c.bodyB, c.axisA, c.axisB, c.refA, c.refB, c.minAngle, c.maxAngle);
+            maxViolation = Math.max(maxViolation, v1);
+            sumViolation += v1;
+            countViolation++;
+          }
+        }
+
+        for (const body of Object.values(ragdollBodies)) {
+          solveGround(body);
+        }
+        for (const body of chainBodies) {
+          solveGround(body);
+        }
+      }
+
+      for (const body of allBodiesArray()) {
+        if (body.invMass === 0) continue;
+        body.linearVelocity.copy(body.position).sub(body.prevPosition).multiplyScalar(1 / dt);
+      }
+
+      stats.maxViolation = maxViolation;
+      stats.avgViolation = countViolation > 0 ? sumViolation / countViolation : 0;
+    }
+
+    function updateJointMarkers() {
+      let idx = 0;
+      for (const c of chainConstraints) {
+        const p = worldPoint(c.bodyA, c.localA, TEMP_V1);
+        jointMarkers[idx++].position.copy(p);
+      }
+      idx++; // 跳过链条锚点球
+
+      for (const c of ragdollConstraints) {
+        const p = worldPoint(c.bodyA, c.localA, TEMP_V1);
+        jointMarkers[idx++].position.copy(p);
+      }
+    }
+
+    function computeEnergy() {
+      let total = 0;
+      for (const body of allBodiesArray()) {
+        if (!Number.isFinite(body.mass)) continue;
+        total += 0.5 * body.mass * body.linearVelocity.lengthSq() + body.mass * 9.81 * Math.max(body.position.y, 0);
+      }
+      stats.totalEnergy = total;
+    }
+
+    function step(dt) {
+      const bodies = allBodiesArray();
+      integrateBodies(bodies, dt);
+      solveConstraints(dt);
+      for (const body of bodies) syncMesh(body);
+      updateJointMarkers();
+      computeEnergy();
+      simTime += dt;
+    }
+
+    function updateHUD() {
+      const chainTip = chainBodies[chainBodies.length - 1];
+      const torso = ragdollBodies.torso;
+
+      simTimeEl.textContent = simTime.toFixed(2);
+      chainTipYEl.textContent = chainTip ? chainTip.position.y.toFixed(3) : '0.000';
+      torsoYEl.textContent = torso ? torso.position.y.toFixed(3) : '0.000';
+      maxViolationEl.textContent = stats.maxViolation.toFixed(4);
+    }
+
+    function updateState() {
+      const chainTip = chainBodies[chainBodies.length - 1];
+      const torso = ragdollBodies.torso;
+
+      window.__3D_STATE__ = {
+        simTime,
+        chain: chainBodies.map(b => ({
+          x: b.position.x, y: b.position.y, z: b.position.z,
+          vx: b.linearVelocity.x, vy: b.linearVelocity.y, vz: b.linearVelocity.z
+        })),
+        chainTipY: chainTip ? chainTip.position.y : 0,
+        ragdoll: {
+          head: ragdollBodies.head ? { x: ragdollBodies.head.position.x, y: ragdollBodies.head.position.y, z: ragdollBodies.head.position.z } : null,
+          torso: torso ? { x: torso.position.x, y: torso.position.y, z: torso.position.z } : null,
+          limbs: [
+            ragdollBodies.upperArmL, ragdollBodies.upperArmR,
+            ragdollBodies.lowerArmL, ragdollBodies.lowerArmR,
+            ragdollBodies.upperLegL, ragdollBodies.upperLegR,
+            ragdollBodies.lowerLegL, ragdollBodies.lowerLegR,
+          ].map(b => ({ x: b.position.x, y: b.position.y, z: b.position.z }))
+        },
+        torsoY: torso ? torso.position.y : 0,
+        maxConstraintViolation: stats.maxViolation,
+        avgConstraintViolation: stats.avgViolation,
+        totalEnergy: stats.totalEnergy
+      };
+    }
+
+    // =========================
+    // 交互
+    // =========================
+    resetBtn.addEventListener('click', resetSimulation);
+    kickChainBtn.addEventListener('click', kickChain);
+    kickRagdollBtn.addEventListener('click', kickRagdoll);
+
+    renderer.domElement.addEventListener('pointerdown', (e) => {
+      if (e.clientX < innerWidth * 0.5) kickChain();
+      else kickRagdoll();
+    });
+
+    window.addEventListener('resize', () => {
+      camera.aspect = innerWidth / innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(innerWidth, innerHeight);
+    });
+
+    // =========================
+    // 启动
+    // =========================
+    resetSimulation();
+
+    const clock = new THREE.Clock();
+    let accumulator = 0;
+
+    function animate() {
+      requestAnimationFrame(animate);
+      const frameDt = Math.min(0.033, clock.getDelta());
+      accumulator += frameDt;
+
+      while (accumulator >= DT) {
+        for (let i = 0; i < SUBSTEPS; i++) step(DT / SUBSTEPS);
+        accumulator -= DT;
+      }
+
+      controls.update();
+      updateHUD();
+      updateState();
+      renderer.render(scene, camera);
+    }
+
+    animate();
+  </script>
+</body>
+</html>

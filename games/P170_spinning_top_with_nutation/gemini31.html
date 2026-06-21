@@ -1,0 +1,471 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Spinning Top Nutation Simulation</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #000;
+            font-family: monospace;
+        }
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+        }
+        #hud {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background-color: rgba(0, 0, 0, 0.7);
+            color: #fff;
+            padding: 15px;
+            border-radius: 5px;
+            pointer-events: none;
+            min-width: 250px;
+            line-height: 1.5;
+            border: 1px solid #444;
+        }
+        #controls {
+            position: absolute;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            background-color: rgba(0, 0, 0, 0.7);
+            padding: 15px;
+            border-radius: 5px;
+            display: flex;
+            gap: 15px;
+            align-items: center;
+            color: white;
+            border: 1px solid #444;
+        }
+        button {
+            background-color: #444;
+            color: white;
+            border: 1px solid #666;
+            padding: 8px 15px;
+            cursor: pointer;
+            font-family: monospace;
+            border-radius: 3px;
+        }
+        button:hover {
+            background-color: #666;
+        }
+        input[type=range] {
+            vertical-align: middle;
+        }
+        .fallen-text {
+            color: #ff4444;
+            font-weight: bold;
+            display: none;
+            margin-top: 10px;
+            text-align: center;
+            border: 1px solid #ff4444;
+            padding: 5px;
+        }
+    </style>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.158.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.158.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="canvas-container"></div>
+    
+    <div id="hud">
+        <div>Time: <span id="hud-time">0.00</span> s</div>
+        <div>Spin Rate: <span id="hud-omega3">0.00</span> rad/s</div>
+        <div>Tilt Angle: <span id="hud-theta">0.00</span> rad</div>
+        <div>Precession: <span id="hud-phi">0.00</span> rad</div>
+        <div>Energy: <span id="hud-energy">0.00</span> J</div>
+        <div>Nutation Range: [<span id="hud-thetamin">0.00</span>, <span id="hud-thetamax">0.00</span>] rad</div>
+        <div id="hud-fallen" class="fallen-text">TOP FALLEN</div>
+    </div>
+
+    <div id="controls">
+        <button id="btn-start">Start</button>
+        <button id="btn-reset">Reset</button>
+        <button id="btn-damping">Damping: ON</button>
+        <button id="btn-impulse">Impulse</button>
+        <div>
+            <label for="slider-speed">Speed:</label>
+            <input type="range" id="slider-speed" min="0.1" max="3.0" step="0.1" value="1.0">
+            <span id="speed-val">1.0x</span>
+        </div>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+        // --- State Management ---
+        window.__3D_STATE__ = {
+            simRunning: false,
+            time: 0,
+            theta: 0.3,
+            thetaMin: 0.3,
+            thetaMax: 0.3,
+            phi: 0,
+            psi: 0,
+            omega3: 50,
+            energy: 0,
+            initialEnergy: 0,
+            modelLoaded: false,
+            dampingEnabled: true,
+            timeScale: 1.0,
+            topFallen: false
+        };
+
+        // Physics Constants
+        const I1 = 0.5;
+        const I3 = 0.1;
+        const m = 1.0;
+        const g = 9.81;
+        const d = 0.5;
+        const dampingCoeff = 0.01;
+        const fixedDt = 1 / 240;
+
+        // Physics State Vector: [theta, phi, psi, theta_dot, phi_dot, omega3]
+        let physState = [0.3, 0, 0, 0, 0, 50];
+
+        // --- Three.js Setup ---
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+        camera.position.set(0, 5, 8);
+        camera.lookAt(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        container.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.target.set(0, 0.5, 0);
+
+        // Lights
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+        dirLight.position.set(5, 10, 5);
+        dirLight.castShadow = true;
+        dirLight.shadow.mapSize.width = 2048;
+        dirLight.shadow.mapSize.height = 2048;
+        dirLight.shadow.camera.near = 0.5;
+        dirLight.shadow.camera.far = 25;
+        dirLight.shadow.camera.left = -10;
+        dirLight.shadow.camera.right = 10;
+        dirLight.shadow.camera.top = 10;
+        dirLight.shadow.camera.bottom = -10;
+        scene.add(dirLight);
+
+        // Ground
+        const groundGeo = new THREE.PlaneGeometry(50, 50);
+        const groundMat = new THREE.MeshStandardMaterial({ color: 0x444444, roughness: 0.8 });
+        const ground = new THREE.Mesh(groundGeo, groundMat);
+        ground.rotation.x = -Math.PI / 2;
+        ground.receiveShadow = true;
+        scene.add(ground);
+
+        const gridHelper = new THREE.GridHelper(50, 50, 0x666666, 0x222222);
+        gridHelper.position.y = 0.01;
+        scene.add(gridHelper);
+
+        // Top Hierarchy
+        // Precession (around Y) -> Nutation (around X) -> Spin (around local Y)
+        const precessionGroup = new THREE.Group();
+        const nutationGroup = new THREE.Group();
+        const spinGroup = new THREE.Group();
+
+        scene.add(precessionGroup);
+        precessionGroup.add(nutationGroup);
+        nutationGroup.add(spinGroup);
+
+        // Visual Enhancements
+        // 1. Red Line (Symmetry Axis)
+        const axisGeo = new THREE.BufferGeometry().setFromPoints([
+            new THREE.Vector3(0, 0, 0),
+            new THREE.Vector3(0, 2, 0)
+        ]);
+        const axisMat = new THREE.LineBasicMaterial({ color: 0xff0000, depthTest: false });
+        const axisLine = new THREE.Line(axisGeo, axisMat);
+        nutationGroup.add(axisLine);
+
+        // 2. Yellow Trail
+        const maxTrailPoints = 500;
+        const trailPoints = [];
+        const trailGeo = new THREE.BufferGeometry();
+        const trailMat = new THREE.PointsMaterial({ color: 0xffff00, size: 0.05, sizeAttenuation: true });
+        const trail = new THREE.Points(trailGeo, trailMat);
+        scene.add(trail);
+        const tipLocalPos = new THREE.Vector3(0, 1.5, 0); // Conceptual tip for trail
+
+        // Load Model
+        const loader = new GLTFLoader();
+        loader.load('https://raw.githubusercontent.com/mrdoob/three.js/master/examples/models/gltf/PrimaryIonDrive.glb', (gltf) => {
+            const model = gltf.scene;
+            
+            // Enable shadows
+            model.traverse((child) => {
+                if (child.isMesh) {
+                    child.castShadow = true;
+                    child.receiveShadow = true;
+                }
+            });
+
+            // Scale and center
+            const box = new THREE.Box3().setFromObject(model);
+            const size = box.getSize(new THREE.Vector3());
+            const center = box.getCenter(new THREE.Vector3());
+            
+            const maxDim = Math.max(size.x, size.y, size.z);
+            const scale = 1.0 / maxDim;
+            model.scale.setScalar(scale);
+
+            // Position so base is at origin
+            model.position.set(-center.x * scale, -box.min.y * scale, -center.z * scale);
+            
+            spinGroup.add(model);
+            window.__3D_STATE__.modelLoaded = true;
+            
+            // Set initial visual state
+            updateTransforms();
+            calculateEnergy();
+            window.__3D_STATE__.initialEnergy = window.__3D_STATE__.energy;
+            updateHUD();
+        });
+
+        // --- Physics Implementation ---
+
+        function getDerivatives(s) {
+            const th = s[0];
+            const ph = s[1];
+            const ps = s[2];
+            const th_d = s[3];
+            const ph_d = s[4];
+            const om3 = s[5];
+
+            const sin_th = Math.sin(th);
+            const cos_th = Math.cos(th);
+            const sin_th_sq = Math.max(sin_th * sin_th, 1e-10); // Prevent div by zero
+
+            // Damping on spin
+            const om3_d = window.__3D_STATE__.dampingEnabled ? -dampingCoeff * om3 : 0;
+
+            // Nutation acceleration (theta_ddot)
+            const th_dd = (ph_d * ph_d * sin_th * cos_th) - ((I3 / I1) * om3 * ph_d * sin_th) + ((m * g * d / I1) * sin_th);
+
+            // Precession acceleration (phi_ddot)
+            const ph_dd = (I3 * om3 * th_d * sin_th - 2 * I1 * ph_d * th_d * sin_th * cos_th - I3 * om3_d * cos_th) / (I1 * sin_th_sq);
+
+            // Spin angle derivative (psi_dot)
+            const ps_d = om3 - ph_d * cos_th;
+
+            return [th_d, ph_d, ps_d, th_dd, ph_dd, om3_d];
+        }
+
+        function rk4Step(dt) {
+            const k1 = getDerivatives(physState);
+            const s2 = physState.map((v, i) => v + 0.5 * dt * k1[i]);
+            
+            const k2 = getDerivatives(s2);
+            const s3 = physState.map((v, i) => v + 0.5 * dt * k2[i]);
+            
+            const k3 = getDerivatives(s3);
+            const s4 = physState.map((v, i) => v + dt * k3[i]);
+            
+            const k4 = getDerivatives(s4);
+            
+            for (let i = 0; i < 6; i++) {
+                physState[i] += (dt / 6) * (k1[i] + 2 * k2[i] + 2 * k3[i] + k4[i]);
+            }
+
+            // Normalize angles
+            physState[1] = physState[1] % (2 * Math.PI);
+            physState[2] = physState[2] % (2 * Math.PI);
+        }
+
+        function calculateEnergy() {
+            const th = physState[0];
+            const th_d = physState[3];
+            const ph_d = physState[4];
+            const om3 = physState[5];
+            
+            const sin_th = Math.sin(th);
+            const cos_th = Math.cos(th);
+
+            const T = 0.5 * I1 * (th_d * th_d + ph_d * ph_d * sin_th * sin_th) + 0.5 * I3 * om3 * om3;
+            const V = m * g * d * cos_th;
+            
+            window.__3D_STATE__.energy = T + V;
+        }
+
+        function resetSimulation() {
+            physState = [0.3, 0, 0, 0, 0, 50];
+            window.__3D_STATE__.simRunning = false;
+            window.__3D_STATE__.time = 0;
+            window.__3D_STATE__.thetaMin = 0.3;
+            window.__3D_STATE__.thetaMax = 0.3;
+            window.__3D_STATE__.topFallen = false;
+            
+            groundMat.color.setHex(0x444444);
+            document.getElementById('hud-fallen').style.display = 'none';
+            document.getElementById('btn-start').innerText = 'Start';
+            
+            trailPoints.length = 0;
+            trailGeo.setFromPoints(trailPoints);
+            
+            updateTransforms();
+            calculateEnergy();
+            window.__3D_STATE__.initialEnergy = window.__3D_STATE__.energy;
+            updateHUD();
+        }
+
+        function updateTransforms() {
+            const state = window.__3D_STATE__;
+            state.theta = physState[0];
+            state.phi = physState[1];
+            state.psi = physState[2];
+            state.omega3 = physState[5];
+
+            precessionGroup.rotation.y = state.phi;
+            nutationGroup.rotation.x = state.theta;
+            spinGroup.rotation.y = state.psi;
+
+            // Update Trail
+            if (state.simRunning && !state.topFallen) {
+                const tipWorld = new THREE.Vector3();
+                nutationGroup.localToWorld(tipWorld.copy(tipLocalPos));
+                trailPoints.push(tipWorld);
+                if (trailPoints.length > maxTrailPoints) {
+                    trailPoints.shift();
+                }
+                trailGeo.setFromPoints(trailPoints);
+            }
+        }
+
+        // --- UI & Interaction ---
+        
+        const btnStart = document.getElementById('btn-start');
+        const btnReset = document.getElementById('btn-reset');
+        const btnDamping = document.getElementById('btn-damping');
+        const btnImpulse = document.getElementById('btn-impulse');
+        const sliderSpeed = document.getElementById('slider-speed');
+        const speedVal = document.getElementById('speed-val');
+
+        function toggleSim() {
+            if (window.__3D_STATE__.topFallen) return;
+            window.__3D_STATE__.simRunning = !window.__3D_STATE__.simRunning;
+            btnStart.innerText = window.__3D_STATE__.simRunning ? 'Pause' : 'Start';
+        }
+
+        btnStart.addEventListener('click', toggleSim);
+        btnReset.addEventListener('click', resetSimulation);
+        
+        btnDamping.addEventListener('click', () => {
+            window.__3D_STATE__.dampingEnabled = !window.__3D_STATE__.dampingEnabled;
+            btnDamping.innerText = window.__3D_STATE__.dampingEnabled ? 'Damping: ON' : 'Damping: OFF';
+        });
+
+        btnImpulse.addEventListener('click', () => {
+            if (!window.__3D_STATE__.topFallen) {
+                physState[3] += 5.0; // Add to theta_dot
+            }
+        });
+
+        sliderSpeed.addEventListener('input', (e) => {
+            window.__3D_STATE__.timeScale = parseFloat(e.target.value);
+            speedVal.innerText = window.__3D_STATE__.timeScale.toFixed(1) + 'x';
+        });
+
+        window.addEventListener('keydown', (e) => {
+            if (e.code === 'Space') {
+                toggleSim();
+                e.preventDefault();
+            } else if (e.code === 'KeyR') {
+                resetSimulation();
+            }
+        });
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        function updateHUD() {
+            const state = window.__3D_STATE__;
+            document.getElementById('hud-time').innerText = state.time.toFixed(2);
+            document.getElementById('hud-omega3').innerText = state.omega3.toFixed(2);
+            document.getElementById('hud-theta').innerText = state.theta.toFixed(3);
+            document.getElementById('hud-phi').innerText = state.phi.toFixed(2);
+            document.getElementById('hud-energy').innerText = state.energy.toFixed(3);
+            document.getElementById('hud-thetamin').innerText = state.thetaMin.toFixed(3);
+            document.getElementById('hud-thetamax').innerText = state.thetaMax.toFixed(3);
+        }
+
+        // --- Main Loop ---
+        
+        let lastTime = performance.now();
+        let accumulator = 0;
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const currentTime = performance.now();
+            let frameTime = (currentTime - lastTime) / 1000;
+            lastTime = currentTime;
+
+            if (frameTime > 0.1) frameTime = 0.1; // Prevent spiral of death
+
+            const state = window.__3D_STATE__;
+
+            if (state.simRunning && !state.topFallen && state.modelLoaded) {
+                accumulator += frameTime * state.timeScale;
+
+                while (accumulator >= fixedDt) {
+                    rk4Step(fixedDt);
+                    state.time += fixedDt;
+                    accumulator -= fixedDt;
+
+                    // Track nutation range
+                    if (physState[0] < state.thetaMin) state.thetaMin = physState[0];
+                    if (physState[0] > state.thetaMax) state.thetaMax = physState[0];
+
+                    // Check fall condition
+                    if (physState[0] > Math.PI / 2) {
+                        state.topFallen = true;
+                        state.simRunning = false;
+                        btnStart.innerText = 'Start';
+                        groundMat.color.setHex(0xaa0000);
+                        document.getElementById('hud-fallen').style.display = 'block';
+                        break;
+                    }
+                }
+
+                calculateEnergy();
+                updateTransforms();
+                updateHUD();
+            }
+
+            controls.update();
+            renderer.render(scene, camera);
+        }
+
+        animate();
+    </script>
+</body>
+</html>

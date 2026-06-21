@@ -1,0 +1,486 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>L-System Nefertiti</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #1a1a2e;
+            font-family: sans-serif;
+            user-select: none;
+        }
+        #hud {
+            position: absolute;
+            top: 15px;
+            left: 15px;
+            color: white;
+            background: rgba(0, 0, 0, 0.6);
+            padding: 15px;
+            border-radius: 8px;
+            pointer-events: none;
+        }
+        #hud div {
+            margin-bottom: 5px;
+        }
+        #hud div:last-child {
+            margin-bottom: 0;
+        }
+        #export-container {
+            position: absolute;
+            top: 15px;
+            right: 15px;
+            display: flex;
+            flex-direction: column;
+            align-items: flex-end;
+        }
+        button {
+            background: rgba(0, 0, 0, 0.6);
+            color: white;
+            border: 1px solid rgba(255, 255, 255, 0.5);
+            padding: 8px 15px;
+            cursor: pointer;
+            border-radius: 5px;
+            font-family: sans-serif;
+            font-size: 14px;
+            transition: background 0.2s;
+        }
+        button:hover {
+            background: rgba(255, 255, 255, 0.2);
+        }
+        #stats-display {
+            margin-top: 10px;
+            color: white;
+            background: rgba(0, 0, 0, 0.6);
+            padding: 15px;
+            border-radius: 8px;
+            text-align: right;
+            display: none;
+            line-height: 1.5;
+        }
+    </style>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="hud">
+        <div id="hud-gen">Generation: 0/5</div>
+        <div id="hud-seg">Segments: 0</div>
+    </div>
+    <div id="export-container">
+        <button id="export-btn">Export Stats</button>
+        <div id="stats-display"></div>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+        // --- State Management ---
+        window.__3D_STATE__ = {
+            modelLoaded: false,
+            generation: 0,
+            totalSegments: 0,
+            plantCount: 6,
+            colorMode: 'green',
+            leavesEnabled: false,
+            leafCount: 0,
+            windEnabled: false,
+            lastClickedPlant: -1,
+            growthAnimating: false,
+            cameraDistance: 8,
+            axiom: 'F',
+            segmentRadius: 0.03,
+            branchAngle: 25,
+            statsExported: false
+        };
+
+        const state = window.__3D_STATE__;
+
+        // --- Scene Setup ---
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color('#1a1a2e');
+
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.set(0, 3, 8);
+        camera.lookAt(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        document.body.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.target.set(0, 1, 0);
+
+        // Lights
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+        dirLight.position.set(5, 10, 5);
+        scene.add(dirLight);
+
+        // Ground
+        const groundGeo = new THREE.PlaneGeometry(20, 20);
+        const groundMat = new THREE.MeshStandardMaterial({ color: '#0d3b0d', roughness: 0.8 });
+        const ground = new THREE.Mesh(groundGeo, groundMat);
+        ground.rotation.x = -Math.PI / 2;
+        scene.add(ground);
+
+        // --- Nefertiti Model ---
+        const loader = new GLTFLoader();
+        loader.load('Nefertiti.glb', (gltf) => {
+            const model = gltf.scene;
+            model.scale.set(0.02, 0.02, 0.02);
+            model.position.set(0, 0, 0);
+            
+            model.traverse((child) => {
+                if (child.isMesh) {
+                    child.material.emissive = new THREE.Color('#3d2b1f');
+                    child.material.emissiveIntensity = 0.3;
+                }
+            });
+            
+            scene.add(model);
+            state.modelLoaded = true;
+        }, undefined, (error) => {
+            console.warn('Could not load Nefertiti.glb. Ensure the file exists in the same directory.', error);
+        });
+
+        // --- L-System Logic ---
+        const L_RULES = { 'F': 'FF+[+F-F-F]-[-F+F+F]' };
+        const SEG_LENGTH = 0.15;
+        const ANGLE_RAD = THREE.MathUtils.degToRad(25);
+
+        function generateLString(gen) {
+            let str = 'F';
+            for (let i = 0; i < gen; i++) {
+                let nextStr = '';
+                for (let j = 0; j < str.length; j++) {
+                    nextStr += L_RULES[str[j]] || str[j];
+                }
+                str = nextStr;
+            }
+            return str;
+        }
+
+        function parseLSystem(str) {
+            const segments = [];
+            const leaves = [];
+            const stack = [];
+            let pos = new THREE.Vector3(0, 0, 0);
+            let rot = new THREE.Quaternion();
+            const zAxis = new THREE.Vector3(0, 0, 1);
+            const yAxis = new THREE.Vector3(0, 1, 0);
+
+            for (let i = 0; i < str.length; i++) {
+                const char = str[i];
+                if (char === 'F') {
+                    const matrix = new THREE.Matrix4();
+                    matrix.compose(pos, rot, new THREE.Vector3(1, 1, 1));
+                    segments.push({ matrix });
+
+                    const dir = yAxis.clone().applyQuaternion(rot);
+                    pos.add(dir.multiplyScalar(SEG_LENGTH));
+
+                    // Leaf logic: at the end of a branch
+                    if (i === str.length - 1 || str[i+1] === ']') {
+                        const leafMatrix = new THREE.Matrix4();
+                        leafMatrix.setPosition(pos);
+                        leaves.push({ matrix: leafMatrix });
+                    }
+                } else if (char === '+') {
+                    rot.multiply(new THREE.Quaternion().setFromAxisAngle(zAxis, ANGLE_RAD));
+                } else if (char === '-') {
+                    rot.multiply(new THREE.Quaternion().setFromAxisAngle(zAxis, -ANGLE_RAD));
+                } else if (char === '[') {
+                    stack.push({ pos: pos.clone(), rot: rot.clone() });
+                } else if (char === ']') {
+                    const s = stack.pop();
+                    pos.copy(s.pos);
+                    rot.copy(s.rot);
+                }
+            }
+            return { segments, leaves };
+        }
+
+        // --- Plant Generation ---
+        const plantGroups = [];
+        const seedAngles = [0, 60, 120, 180, 240, 300];
+        const seedRadius = 2.5;
+
+        // Geometries
+        const cylinderGeo = new THREE.CylinderGeometry(0.03, 0.03, SEG_LENGTH, 8);
+        cylinderGeo.translate(0, SEG_LENGTH / 2, 0); // Origin at base
+        const sphereGeo = new THREE.SphereGeometry(0.04, 8, 8);
+
+        // Materials
+        const trunkMat = new THREE.MeshStandardMaterial({ roughness: 0.9 });
+        const leafMat = new THREE.MeshStandardMaterial({ color: '#4a7c2f', roughness: 0.8 });
+
+        // Initialize groups
+        for (let i = 0; i < 6; i++) {
+            const group = new THREE.Group();
+            const angle = THREE.MathUtils.degToRad(seedAngles[i]);
+            group.position.set(seedRadius * Math.cos(angle), 0, seedRadius * Math.sin(angle));
+            scene.add(group);
+            plantGroups.push({ group, segMesh: null, leafMesh: null, segData: [], leafData: [] });
+        }
+
+        let growthStartTime = 0;
+        const GROWTH_DURATION = 2.0;
+
+        function updateColors() {
+            plantGroups.forEach(plant => {
+                if (!plant.segMesh) return;
+                const count = plant.segData.length;
+                for (let i = 0; i < count; i++) {
+                    const color = new THREE.Color();
+                    if (state.colorMode === 'green') {
+                        color.setHex(0x2d5a1e);
+                        // Deterministic random variation based on index
+                        const variation = (Math.sin(i * 12.34) * 0.05);
+                        const hsl = {};
+                        color.getHSL(hsl);
+                        color.setHSL(hsl.h + variation, hsl.s, hsl.l + variation * 2);
+                    } else {
+                        if (i > count * 0.7) {
+                            color.setHex(0xFF6347); // Tip
+                        } else {
+                            color.setHex(0x8B4513); // Trunk
+                        }
+                    }
+                    plant.segMesh.setColorAt(i, color);
+                }
+                plant.segMesh.instanceColor.needsUpdate = true;
+            });
+        }
+
+        function buildPlants() {
+            // Clear existing
+            plantGroups.forEach(plant => {
+                if (plant.segMesh) {
+                    plant.group.remove(plant.segMesh);
+                    plant.segMesh.dispose();
+                    plant.segMesh = null;
+                }
+                if (plant.leafMesh) {
+                    plant.group.remove(plant.leafMesh);
+                    plant.leafMesh.dispose();
+                    plant.leafMesh = null;
+                }
+                plant.segData = [];
+                plant.leafData = [];
+            });
+
+            if (state.generation === 0) {
+                state.axiom = 'F';
+                state.totalSegments = 0;
+                state.leafCount = 0;
+                state.growthAnimating = false;
+                updateHUD();
+                return;
+            }
+
+            state.axiom = generateLString(state.generation);
+            const parsed = parseLSystem(state.axiom);
+            
+            const fCount = (state.axiom.match(/F/g) || []).length;
+            state.totalSegments = fCount * 6;
+
+            plantGroups.forEach(plant => {
+                plant.segData = parsed.segments;
+                plant.leafData = parsed.leaves;
+
+                // Segments InstancedMesh
+                const segMesh = new THREE.InstancedMesh(cylinderGeo, trunkMat.clone(), plant.segData.length);
+                segMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+                plant.segData.forEach((data, i) => {
+                    segMesh.setMatrixAt(i, data.matrix);
+                });
+                segMesh.count = 0; // Start hidden
+                plant.group.add(segMesh);
+                plant.segMesh = segMesh;
+
+                // Leaves InstancedMesh
+                const leafMesh = new THREE.InstancedMesh(sphereGeo, leafMat, plant.leafData.length);
+                plant.leafData.forEach((data, i) => {
+                    leafMesh.setMatrixAt(i, data.matrix);
+                });
+                leafMesh.count = 0;
+                leafMesh.visible = state.leavesEnabled;
+                plant.group.add(leafMesh);
+                plant.leafMesh = leafMesh;
+            });
+
+            updateColors();
+            
+            state.growthAnimating = true;
+            growthStartTime = clock.getElapsedTime();
+            updateHUD();
+        }
+
+        function updateLeavesVisibility() {
+            let count = 0;
+            plantGroups.forEach(plant => {
+                if (plant.leafMesh) {
+                    plant.leafMesh.visible = state.leavesEnabled;
+                    if (state.leavesEnabled) count += plant.leafMesh.count;
+                }
+            });
+            state.leafCount = state.leavesEnabled ? count : 0;
+        }
+
+        // --- Interactions ---
+        window.addEventListener('keydown', (e) => {
+            if (e.code === 'Space') {
+                if (state.generation < 5) {
+                    state.generation++;
+                    buildPlants();
+                }
+            } else if (e.key.toLowerCase() === 'r') {
+                state.generation = 0;
+                buildPlants();
+            } else if (e.key.toLowerCase() === 'c') {
+                state.colorMode = state.colorMode === 'green' ? 'autumn' : 'green';
+                updateColors();
+                updateHUD();
+            } else if (e.key.toLowerCase() === 'l') {
+                state.leavesEnabled = !state.leavesEnabled;
+                updateLeavesVisibility();
+                updateHUD();
+            } else if (e.key.toLowerCase() === 'w') {
+                state.windEnabled = !state.windEnabled;
+                if (!state.windEnabled) {
+                    plantGroups.forEach(p => p.group.rotation.z = 0);
+                }
+                updateHUD();
+            }
+        });
+
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+
+        window.addEventListener('click', (e) => {
+            if (e.target.tagName === 'BUTTON' || e.target.closest('#hud') || e.target.closest('#export-container')) return;
+
+            mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+            raycaster.setFromCamera(mouse, camera);
+
+            const meshes = plantGroups.map(p => p.segMesh).filter(m => m !== null);
+            const intersects = raycaster.intersectObjects(meshes);
+
+            if (intersects.length > 0) {
+                const hitMesh = intersects[0].object;
+                const plantIndex = plantGroups.findIndex(p => p.segMesh === hitMesh);
+                
+                if (plantIndex !== -1) {
+                    state.lastClickedPlant = plantIndex;
+                    
+                    const mat = hitMesh.material;
+                    const origEmissive = mat.emissive.getHex();
+                    mat.emissive.setHex(0xffff00);
+                    
+                    if (hitMesh.userData.timeout) clearTimeout(hitMesh.userData.timeout);
+                    
+                    hitMesh.userData.timeout = setTimeout(() => {
+                        mat.emissive.setHex(origEmissive);
+                    }, 1500);
+                }
+            }
+        });
+
+        document.getElementById('export-btn').addEventListener('click', () => {
+            state.statsExported = true;
+            const display = document.getElementById('stats-display');
+            display.style.display = 'block';
+            display.innerHTML = `
+                Generation: ${state.generation}/5<br>
+                Total Segments: ${state.totalSegments}<br>
+                Color Mode: ${state.colorMode}<br>
+                Leaves: ${state.leavesEnabled ? 'On' : 'Off'}<br>
+                Wind: ${state.windEnabled ? 'On' : 'Off'}
+            `;
+            console.log("Exported State:", JSON.parse(JSON.stringify(state)));
+        });
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        function updateHUD() {
+            document.getElementById('hud-gen').innerText = `Generation: ${state.generation}/5`;
+            document.getElementById('hud-seg').innerText = `Segments: ${state.totalSegments}`;
+        }
+
+        // --- Render Loop ---
+        const clock = new THREE.Clock();
+
+        function animate() {
+            requestAnimationFrame(animate);
+            
+            const time = clock.getElapsedTime();
+
+            controls.update();
+            
+            // Ensure no NaN in camera distance
+            const dist = camera.position.distanceTo(controls.target);
+            state.cameraDistance = isNaN(dist) ? 8 : dist;
+
+            // Growth Animation
+            if (state.growthAnimating) {
+                const elapsed = time - growthStartTime;
+                let progress = elapsed / GROWTH_DURATION;
+                
+                if (progress >= 1.0) {
+                    progress = 1.0;
+                    state.growthAnimating = false;
+                }
+
+                let currentLeaves = 0;
+                plantGroups.forEach(plant => {
+                    if (plant.segMesh) {
+                        plant.segMesh.count = Math.floor(progress * plant.segData.length);
+                        plant.segMesh.instanceMatrix.needsUpdate = true;
+                    }
+                    if (plant.leafMesh) {
+                        plant.leafMesh.count = Math.floor(progress * plant.leafData.length);
+                        plant.leafMesh.instanceMatrix.needsUpdate = true;
+                        if (state.leavesEnabled) currentLeaves += plant.leafMesh.count;
+                    }
+                });
+                state.leafCount = currentLeaves;
+            }
+
+            // Wind Animation
+            if (state.windEnabled) {
+                const sway = Math.sin(time * 2) * 0.05;
+                plantGroups.forEach(plant => {
+                    plant.group.rotation.z = sway;
+                });
+            }
+
+            renderer.render(scene, camera);
+        }
+
+        // Init
+        buildPlants();
+        animate();
+
+    </script>
+</body>
+</html>

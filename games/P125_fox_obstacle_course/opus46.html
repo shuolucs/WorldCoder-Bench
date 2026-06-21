@@ -1,0 +1,690 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Fox Parkour - Timed Obstacle Run</title>
+<script type="importmap">
+{ "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+} }
+</script>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { overflow: hidden; background: #000; font-family: 'Segoe UI', Arial, sans-serif; }
+canvas { display: block; }
+#hud {
+    position: absolute; top: 15px; left: 15px;
+    background: rgba(0,0,0,0.75); color: #fff;
+    padding: 15px 20px; border-radius: 12px;
+    font-size: 14px; line-height: 1.8;
+    min-width: 220px;
+    border: 1px solid rgba(255,255,255,0.15);
+    backdrop-filter: blur(10px);
+}
+#hud .title { font-size: 18px; font-weight: bold; color: #ff9944; margin-bottom: 8px; text-align: center; border-bottom: 1px solid rgba(255,255,255,0.2); padding-bottom: 6px; }
+#hud .row { display: flex; justify-content: space-between; }
+#hud .label { color: #aaa; }
+#hud .value { color: #fff; font-weight: bold; }
+#hud #timer { color: #ffdd44; font-size: 22px; text-align: center; display: block; margin: 5px 0; }
+#hud #loadStatus { color: #66ff66; }
+#instructions {
+    position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%);
+    background: rgba(0,0,0,0.7); color: #fff; padding: 12px 24px;
+    border-radius: 10px; font-size: 13px; text-align: center;
+    border: 1px solid rgba(255,255,255,0.15);
+}
+#instructions kbd { background: rgba(255,255,255,0.2); padding: 2px 8px; border-radius: 4px; margin: 0 2px; }
+#finishOverlay {
+    display: none; position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+    background: rgba(0,0,0,0.7); justify-content: center; align-items: center;
+    flex-direction: column; color: #fff; font-size: 24px;
+}
+#finishOverlay.show { display: flex; }
+#finishOverlay .big { font-size: 48px; font-weight: bold; color: #ffdd44; margin-bottom: 10px; }
+#finishOverlay .detail { font-size: 18px; color: #ccc; margin: 5px 0; }
+#finishOverlay .restart { margin-top: 20px; padding: 12px 30px; font-size: 18px; cursor: pointer; background: #ff9944; border: none; color: #fff; border-radius: 8px; }
+</style>
+</head>
+<body>
+<div id="hud">
+    <div class="title">🦊 Fox Parkour</div>
+    <div id="timer">00:00.000</div>
+    <div class="row"><span class="label">Obstacles:</span><span class="value" id="obstaclesCleared">0 / 10</span></div>
+    <div class="row"><span class="label">Collisions:</span><span class="value" id="collisionCount">0</span></div>
+    <div class="row"><span class="label">Speed:</span><span class="value" id="speed">0.00</span></div>
+    <div class="row"><span class="label">Status:</span><span class="value" id="loadStatus">Loading...</span></div>
+</div>
+<div id="instructions">
+    <kbd>W</kbd> / <kbd>↑</kbd> Forward &nbsp; <kbd>S</kbd> / <kbd>↓</kbd> Backward &nbsp; <kbd>Space</kbd> Jump
+</div>
+<div id="finishOverlay">
+    <div class="big" id="finishTitle">🏆 Finished!</div>
+    <div class="detail" id="finishTime"></div>
+    <div class="detail" id="finishPenalty"></div>
+    <div class="detail" id="finishTotal"></div>
+    <button class="restart" onclick="location.reload()">Restart</button>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+// Global state
+window.__3D_STATE__ = {
+    modelLoaded: false,
+    timer: 0,
+    obstaclesCleared: 0,
+    collisions: 0,
+    speed: 0,
+    foxPosition: { x: 0, y: 0, z: 0 },
+    isJumping: false,
+    gameStarted: false,
+    gameFinished: false
+};
+
+// Scene setup
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x87ceeb);
+scene.fog = new THREE.Fog(0x87ceeb, 60, 130);
+
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 200);
+camera.position.set(0, 3, 8);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+
+// Lights
+const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
+scene.add(ambientLight);
+
+const dirLight = new THREE.DirectionalLight(0xffffff, 1.2);
+dirLight.position.set(10, 20, 10);
+dirLight.castShadow = true;
+dirLight.shadow.mapSize.set(2048, 2048);
+dirLight.shadow.camera.left = -60;
+dirLight.shadow.camera.right = 60;
+dirLight.shadow.camera.top = 60;
+dirLight.shadow.camera.bottom = -60;
+dirLight.shadow.camera.near = 0.1;
+dirLight.shadow.camera.far = 100;
+scene.add(dirLight);
+
+const hemiLight = new THREE.HemisphereLight(0x87ceeb, 0x556633, 0.4);
+scene.add(hemiLight);
+
+// Ground / Track
+const trackLength = 120;
+const trackWidth = 6;
+
+const groundGeo = new THREE.PlaneGeometry(trackWidth, trackLength);
+const groundMat = new THREE.MeshStandardMaterial({ color: 0x8B7355, roughness: 0.9 });
+const ground = new THREE.Mesh(groundGeo, groundMat);
+ground.rotation.x = -Math.PI / 2;
+ground.position.set(0, 0, -trackLength / 2 + 5);
+ground.receiveShadow = true;
+scene.add(ground);
+
+// Side grass
+const grassGeo = new THREE.PlaneGeometry(30, trackLength);
+const grassMat = new THREE.MeshStandardMaterial({ color: 0x4a7c3f, roughness: 1 });
+const grassLeft = new THREE.Mesh(grassGeo, grassMat);
+grassLeft.rotation.x = -Math.PI / 2;
+grassLeft.position.set(-trackWidth / 2 - 15, -0.01, -trackLength / 2 + 5);
+grassLeft.receiveShadow = true;
+scene.add(grassLeft);
+
+const grassRight = new THREE.Mesh(grassGeo, grassMat);
+grassRight.rotation.x = -Math.PI / 2;
+grassRight.position.set(trackWidth / 2 + 15, -0.01, -trackLength / 2 + 5);
+grassRight.receiveShadow = true;
+scene.add(grassRight);
+
+// Track lane markings
+const laneGeo = new THREE.PlaneGeometry(0.1, trackLength);
+const laneMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.5 });
+for (let x of [-trackWidth / 2, trackWidth / 2]) {
+    const lane = new THREE.Mesh(laneGeo, laneMat);
+    lane.rotation.x = -Math.PI / 2;
+    lane.position.set(x, 0.01, -trackLength / 2 + 5);
+    scene.add(lane);
+}
+
+// Decorations - Trees
+function createTree(x, z) {
+    const group = new THREE.Group();
+    const trunkGeo = new THREE.CylinderGeometry(0.15, 0.2, 1.5, 8);
+    const trunkMat = new THREE.MeshStandardMaterial({ color: 0x8B4513 });
+    const trunk = new THREE.Mesh(trunkGeo, trunkMat);
+    trunk.position.y = 0.75;
+    trunk.castShadow = true;
+    group.add(trunk);
+
+    const leavesGeo = new THREE.SphereGeometry(0.8, 8, 8);
+    const leavesMat = new THREE.MeshStandardMaterial({ color: 0x2d6b2d });
+    const leaves = new THREE.Mesh(leavesGeo, leavesMat);
+    leaves.position.y = 2;
+    leaves.castShadow = true;
+    group.add(leaves);
+
+    group.position.set(x, 0, z);
+    const s = 0.8 + Math.random() * 0.6;
+    group.scale.set(s, s, s);
+    scene.add(group);
+}
+
+for (let i = 0; i < 30; i++) {
+    const side = Math.random() > 0.5 ? 1 : -1;
+    const x = side * (trackWidth / 2 + 2 + Math.random() * 8);
+    const z = -Math.random() * trackLength + 5;
+    createTree(x, z);
+}
+
+// Fence decorations along sides
+function createFencePost(x, z) {
+    const postGeo = new THREE.CylinderGeometry(0.05, 0.05, 1, 6);
+    const postMat = new THREE.MeshStandardMaterial({ color: 0xdeb887 });
+    const post = new THREE.Mesh(postGeo, postMat);
+    post.position.set(x, 0.5, z);
+    post.castShadow = true;
+    scene.add(post);
+}
+
+for (let i = 0; i < trackLength; i += 3) {
+    createFencePost(-trackWidth / 2 - 0.3, -i + 5);
+    createFencePost(trackWidth / 2 + 0.3, -i + 5);
+}
+
+// Fence rails
+for (let side of [-1, 1]) {
+    const railGeo = new THREE.BoxGeometry(0.05, 0.05, trackLength);
+    const railMat = new THREE.MeshStandardMaterial({ color: 0xdeb887 });
+    for (let h of [0.35, 0.7]) {
+        const rail = new THREE.Mesh(railGeo, railMat);
+        rail.position.set(side * (trackWidth / 2 + 0.3), h, -trackLength / 2 + 5);
+        scene.add(rail);
+    }
+}
+
+// Start and Finish lines
+const startLineGeo = new THREE.PlaneGeometry(trackWidth, 0.3);
+const startLineMat = new THREE.MeshStandardMaterial({ color: 0x00ff00, side: THREE.DoubleSide });
+const startLine = new THREE.Mesh(startLineGeo, startLineMat);
+startLine.rotation.x = -Math.PI / 2;
+startLine.position.set(0, 0.02, 2);
+scene.add(startLine);
+
+// Obstacles
+const obstacles = [];
+const obstacleStartZ = -5;
+const obstacleSpacing = 10;
+
+for (let i = 0; i < 10; i++) {
+    const z = obstacleStartZ - i * obstacleSpacing;
+    const isHurdle = (i % 2 === 0); // 1st,3rd,5th,7th,9th (0-indexed: 0,2,4,6,8) are hurdles
+    
+    const obstacle = {
+        type: isHurdle ? 'hurdle' : 'tunnel',
+        z: z,
+        group: new THREE.Group(),
+        cleared: false,
+        collided: false,
+        flashTimer: 0,
+        originalMaterials: [],
+        meshes: []
+    };
+
+    if (isHurdle) {
+        // Hurdle - horizontal bar at waist height
+        const poleGeo = new THREE.CylinderGeometry(0.06, 0.06, 1.2, 8);
+        const poleMat = new THREE.MeshStandardMaterial({ color: 0xffffff });
+        
+        const leftPole = new THREE.Mesh(poleGeo, poleMat.clone());
+        leftPole.position.set(-1.2, 0.6, 0);
+        leftPole.castShadow = true;
+        obstacle.group.add(leftPole);
+        obstacle.meshes.push(leftPole);
+        obstacle.originalMaterials.push(leftPole.material.color.clone());
+
+        const rightPole = new THREE.Mesh(poleGeo, poleMat.clone());
+        rightPole.position.set(1.2, 0.6, 0);
+        rightPole.castShadow = true;
+        obstacle.group.add(rightPole);
+        obstacle.meshes.push(rightPole);
+        obstacle.originalMaterials.push(rightPole.material.color.clone());
+
+        // Horizontal bar with red-white stripes
+        const barGeo = new THREE.BoxGeometry(2.8, 0.12, 0.12);
+        const barMat = new THREE.MeshStandardMaterial({ color: 0xff3333 });
+        const bar = new THREE.Mesh(barGeo, barMat.clone());
+        bar.position.set(0, 0.55, 0);
+        bar.castShadow = true;
+        obstacle.group.add(bar);
+        obstacle.meshes.push(bar);
+        obstacle.originalMaterials.push(bar.material.color.clone());
+
+        // Second bar (white)
+        const bar2Geo = new THREE.BoxGeometry(2.8, 0.08, 0.08);
+        const bar2Mat = new THREE.MeshStandardMaterial({ color: 0xffffff });
+        const bar2 = new THREE.Mesh(bar2Geo, bar2Mat.clone());
+        bar2.position.set(0, 0.35, 0);
+        bar2.castShadow = true;
+        obstacle.group.add(bar2);
+        obstacle.meshes.push(bar2);
+        obstacle.originalMaterials.push(bar2.material.color.clone());
+
+        // AABB for hurdle
+        obstacle.bbox = new THREE.Box3(
+            new THREE.Vector3(-1.4, 0.2, z - 0.15),
+            new THREE.Vector3(1.4, 0.7, z + 0.15)
+        );
+    } else {
+        // Tunnel - low arch/frame
+        const frameMat = new THREE.MeshStandardMaterial({ color: 0x3366cc });
+        
+        // Left wall
+        const wallGeo = new THREE.BoxGeometry(0.2, 1.2, 1.0);
+        const leftWall = new THREE.Mesh(wallGeo, frameMat.clone());
+        leftWall.position.set(-1.5, 0.6, 0);
+        leftWall.castShadow = true;
+        obstacle.group.add(leftWall);
+        obstacle.meshes.push(leftWall);
+        obstacle.originalMaterials.push(leftWall.material.color.clone());
+
+        const rightWall = new THREE.Mesh(wallGeo, frameMat.clone());
+        rightWall.position.set(1.5, 0.6, 0);
+        rightWall.castShadow = true;
+        obstacle.group.add(rightWall);
+        obstacle.meshes.push(rightWall);
+        obstacle.originalMaterials.push(rightWall.material.color.clone());
+
+        // Top beam (low ceiling)
+        const topGeo = new THREE.BoxGeometry(3.2, 0.2, 1.0);
+        const topBeam = new THREE.Mesh(topGeo, frameMat.clone());
+        topBeam.position.set(0, 0.75, 0);
+        topBeam.castShadow = true;
+        obstacle.group.add(topBeam);
+        obstacle.meshes.push(topBeam);
+        obstacle.originalMaterials.push(topBeam.material.color.clone());
+
+        // Decorative arch top
+        const archGeo = new THREE.BoxGeometry(3.2, 0.5, 0.15);
+        const archMat = new THREE.MeshStandardMaterial({ color: 0x2255aa });
+        const archFront = new THREE.Mesh(archGeo, archMat.clone());
+        archFront.position.set(0, 1.1, 0.5);
+        obstacle.group.add(archFront);
+        obstacle.meshes.push(archFront);
+        obstacle.originalMaterials.push(archFront.material.color.clone());
+
+        const archBack = new THREE.Mesh(archGeo, archMat.clone());
+        archBack.position.set(0, 1.1, -0.5);
+        obstacle.group.add(archBack);
+        obstacle.meshes.push(archBack);
+        obstacle.originalMaterials.push(archBack.material.color.clone());
+
+        // AABB for tunnel top (collision if not crouching)
+        obstacle.bbox = new THREE.Box3(
+            new THREE.Vector3(-1.6, 0.5, z - 0.5),
+            new THREE.Vector3(1.6, 1.3, z + 0.5)
+        );
+    }
+
+    // Number label
+    const numZ = isHurdle ? 0.2 : 0.6;
+    
+    obstacle.group.position.set(0, 0, z);
+    scene.add(obstacle.group);
+    obstacles.push(obstacle);
+}
+
+// Finish line
+const finishZ = obstacleStartZ - 9 * obstacleSpacing - 5;
+const finishLineGeo = new THREE.PlaneGeometry(trackWidth, 0.5);
+const finishLineMat = new THREE.MeshStandardMaterial({ color: 0xff0000, side: THREE.DoubleSide });
+const finishLine = new THREE.Mesh(finishLineGeo, finishLineMat);
+finishLine.rotation.x = -Math.PI / 2;
+finishLine.position.set(0, 0.02, finishZ);
+scene.add(finishLine);
+
+// Finish arch
+const finishArchGroup = new THREE.Group();
+const archPoleGeo = new THREE.CylinderGeometry(0.1, 0.1, 3, 8);
+const archPoleMat = new THREE.MeshStandardMaterial({ color: 0xcc0000 });
+const fLeftPole = new THREE.Mesh(archPoleGeo, archPoleMat);
+fLeftPole.position.set(-trackWidth / 2, 1.5, finishZ);
+scene.add(fLeftPole);
+const fRightPole = new THREE.Mesh(archPoleGeo, archPoleMat);
+fRightPole.position.set(trackWidth / 2, 1.5, finishZ);
+scene.add(fRightPole);
+const finishTopGeo = new THREE.BoxGeometry(trackWidth + 0.2, 0.2, 0.2);
+const finishTopMat = new THREE.MeshStandardMaterial({ color: 0xcc0000 });
+const finishTop = new THREE.Mesh(finishTopGeo, finishTopMat);
+finishTop.position.set(0, 3, finishZ);
+scene.add(finishTop);
+
+// Fox model
+let fox = null;
+let mixer = null;
+let animations = {};
+let currentAction = null;
+let foxScale = 0.015;
+
+const loader = new GLTFLoader();
+loader.load('assets/Fox.glb', (gltf) => {
+    fox = gltf.scene;
+    fox.scale.set(foxScale, foxScale, foxScale);
+    fox.position.set(0, 0, 3);
+    fox.rotation.y = Math.PI; // Face forward (-Z)
+    fox.traverse((child) => {
+        if (child.isMesh) {
+            child.castShadow = true;
+            child.receiveShadow = true;
+        }
+    });
+    scene.add(fox);
+
+    // Animation setup
+    mixer = new THREE.AnimationMixer(fox);
+    gltf.animations.forEach((clip) => {
+        animations[clip.name] = mixer.clipAction(clip);
+    });
+
+    // Start with idle
+    playAnimation('Survey');
+
+    window.__3D_STATE__.modelLoaded = true;
+    document.getElementById('loadStatus').textContent = 'Ready!';
+    document.getElementById('loadStatus').style.color = '#66ff66';
+}, (progress) => {
+    const pct = progress.total ? Math.round(progress.loaded / progress.total * 100) : '...';
+    document.getElementById('loadStatus').textContent = `Loading ${pct}%`;
+}, (error) => {
+    console.error('Error loading Fox model:', error);
+    document.getElementById('loadStatus').textContent = 'Error!';
+    document.getElementById('loadStatus').style.color = '#ff4444';
+});
+
+function playAnimation(name) {
+    if (!animations[name]) return;
+    if (currentAction === animations[name]) return;
+    
+    const newAction = animations[name];
+    if (currentAction) {
+        currentAction.fadeOut(0.2);
+    }
+    newAction.reset().fadeIn(0.2).play();
+    currentAction = newAction;
+}
+
+// Input handling
+const keys = {};
+window.addEventListener('keydown', (e) => {
+    keys[e.code] = true;
+    if (e.code === 'Space') e.preventDefault();
+    if (e.code === 'ArrowUp' || e.code === 'ArrowDown') e.preventDefault();
+});
+window.addEventListener('keyup', (e) => {
+    keys[e.code] = false;
+});
+
+// Game state
+let gameTimer = 0;
+let penaltyTime = 0;
+let gameStarted = false;
+let gameFinished = false;
+let isJumping = false;
+let jumpVelocity = 0;
+let jumpY = 0;
+let isCrouching = false;
+let foxSpeed = 0;
+const maxSpeed = 8;
+const acceleration = 12;
+const deceleration = 10;
+let moveDirection = 0;
+let collisionCount = 0;
+let obstaclesCleared = 0;
+
+// Fox bounding box
+function getFoxBBox() {
+    if (!fox) return null;
+    const pos = fox.position;
+    const halfW = 0.4;
+    const height = isCrouching ? 0.4 : 0.9;
+    const halfD = 0.3;
+    return new THREE.Box3(
+        new THREE.Vector3(pos.x - halfW, pos.y, pos.z - halfD),
+        new THREE.Vector3(pos.x + halfW, pos.y + height, pos.z + halfD)
+    );
+}
+
+// Clock
+const clock = new THREE.Clock();
+
+// HUD elements
+const timerEl = document.getElementById('timer');
+const obstaclesClearedEl = document.getElementById('obstaclesCleared');
+const collisionCountEl = document.getElementById('collisionCount');
+const speedEl = document.getElementById('speed');
+
+function formatTime(seconds) {
+    const mins = Math.floor(seconds / 60);
+    const secs = Math.floor(seconds % 60);
+    const ms = Math.floor((seconds % 1) * 1000);
+    return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}.${String(ms).padStart(3, '0')}`;
+}
+
+function finishGame() {
+    gameFinished = true;
+    window.__3D_STATE__.gameFinished = true;
+    
+    const totalTime = gameTimer + penaltyTime;
+    document.getElementById('finishTime').textContent = `Time: ${formatTime(gameTimer)}`;
+    document.getElementById('finishPenalty').textContent = `Penalty: +${penaltyTime.toFixed(1)}s (${collisionCount} collisions)`;
+    document.getElementById('finishTotal').textContent = `Total: ${formatTime(totalTime)}`;
+    document.getElementById('finishOverlay').classList.add('show');
+}
+
+// Animation loop
+function animate() {
+    requestAnimationFrame(animate);
+    const delta = clock.getDelta();
+    const dt = Math.min(delta, 0.05);
+
+    if (mixer) mixer.update(dt);
+
+    if (fox && !gameFinished) {
+        // Input
+        moveDirection = 0;
+        if (keys['ArrowUp'] || keys['KeyW']) moveDirection = -1;
+        if (keys['ArrowDown'] || keys['KeyS']) moveDirection = 1;
+
+        // Start game on first move
+        if (moveDirection !== 0 && !gameStarted) {
+            gameStarted = true;
+            window.__3D_STATE__.gameStarted = true;
+        }
+
+        // Timer
+        if (gameStarted && !gameFinished) {
+            gameTimer += dt;
+        }
+
+        // Speed
+        if (moveDirection !== 0) {
+            foxSpeed += acceleration * dt;
+            if (foxSpeed > maxSpeed) foxSpeed = maxSpeed;
+        } else {
+            foxSpeed -= deceleration * dt;
+            if (foxSpeed < 0) foxSpeed = 0;
+        }
+
+        // Move fox
+        if (foxSpeed > 0) {
+            fox.position.z += moveDirection * foxSpeed * dt;
+            // Clamp to track
+            const minZ = finishZ - 5;
+            const maxZ = 5;
+            fox.position.z = Math.max(minZ, Math.min(maxZ, fox.position.z));
+            
+            // Face direction
+            if (moveDirection === -1) {
+                fox.rotation.y = Math.PI;
+            } else if (moveDirection === 1) {
+                fox.rotation.y = 0;
+            }
+        }
+
+        // Jump
+        if ((keys['Space']) && !isJumping && !isCrouching) {
+            isJumping = true;
+            jumpVelocity = 5.5;
+            window.__3D_STATE__.isJumping = true;
+        }
+
+        if (isJumping) {
+            jumpVelocity -= 18 * dt;
+            jumpY += jumpVelocity * dt;
+            if (jumpY <= 0) {
+                jumpY = 0;
+                isJumping = false;
+                jumpVelocity = 0;
+                window.__3D_STATE__.isJumping = false;
+            }
+            fox.position.y = jumpY;
+        }
+
+        // Auto-crouch near tunnels
+        let shouldCrouch = false;
+        for (const obs of obstacles) {
+            if (obs.type === 'tunnel') {
+                const dist = Math.abs(fox.position.z - obs.z);
+                if (dist < 1.5 && !isJumping) {
+                    shouldCrouch = true;
+                    break;
+                }
+            }
+        }
+
+        if (shouldCrouch && !isCrouching) {
+            isCrouching = true;
+            fox.scale.y = foxScale * 0.5;
+        } else if (!shouldCrouch && isCrouching) {
+            isCrouching = false;
+            fox.scale.y = foxScale;
+        }
+
+        // Animation selection
+        if (isJumping) {
+            playAnimation('Survey');
+        } else if (foxSpeed > 0.5) {
+            playAnimation('Run');
+        } else {
+            playAnimation('Survey');
+        }
+
+        // Collision detection
+        const foxBox = getFoxBBox();
+        if (foxBox) {
+            for (const obs of obstacles) {
+                if (obs.flashTimer > 0) {
+                    obs.flashTimer -= dt;
+                    if (obs.flashTimer <= 0) {
+                        // Restore colors
+                        obs.meshes.forEach((mesh, idx) => {
+                            mesh.material.color.copy(obs.originalMaterials[idx]);
+                        });
+                    }
+                }
+
+                // Check collision
+                if (foxBox.intersectsBox(obs.bbox)) {
+                    let shouldCollide = false;
+                    
+                    if (obs.type === 'hurdle' && !isJumping) {
+                        // Collide if not jumping high enough
+                        if (fox.position.y < 0.5) {
+                            shouldCollide = true;
+                        }
+                    } else if (obs.type === 'tunnel' && !isCrouching) {
+                        shouldCollide = true;
+                    }
+
+                    if (shouldCollide && !obs.collided) {
+                        obs.collided = true;
+                        collisionCount++;
+                        penaltyTime += 2;
+                        window.__3D_STATE__.collisions = collisionCount;
+                        
+                        // Flash red
+                        obs.flashTimer = 0.5;
+                        obs.meshes.forEach((mesh) => {
+                            mesh.material.color.set(0xff0000);
+                        });
+                    }
+                } else {
+                    // Reset collision flag when fox leaves the obstacle area
+                    if (obs.collided) {
+                        const dist = Math.abs(fox.position.z - obs.z);
+                        if (dist > 1.5) {
+                            obs.collided = false;
+                        }
+                    }
+                }
+
+                // Check cleared
+                if (!obs.cleared && fox.position.z < obs.z - 1.0) {
+                    obs.cleared = true;
+                    obstaclesCleared++;
+                    window.__3D_STATE__.obstaclesCleared = obstaclesCleared;
+                }
+            }
+        }
+
+        // Check finish
+        if (obstaclesCleared >= 10 && fox.position.z <= finishZ + 1 && !gameFinished) {
+            finishGame();
+        }
+
+        // Camera follow
+        const camTargetX = fox.position.x;
+        const camTargetY = fox.position.y + 3;
+        const camTargetZ = fox.position.z + 6;
+        camera.position.lerp(new THREE.Vector3(camTargetX, camTargetY, camTargetZ), 5 * dt);
+        camera.lookAt(fox.position.x, fox.position.y + 0.5, fox.position.z);
+
+        // Update state
+        window.__3D_STATE__.timer = gameTimer;
+        window.__3D_STATE__.speed = foxSpeed;
+        window.__3D_STATE__.foxPosition = {
+            x: fox.position.x,
+            y: fox.position.y,
+            z: fox.position.z
+        };
+    }
+
+    // Update HUD
+    const totalTime = gameTimer + penaltyTime;
+    timerEl.textContent = formatTime(totalTime);
+    obstaclesClearedEl.textContent = `${obstaclesCleared} / 10`;
+    collisionCountEl.textContent = collisionCount;
+    speedEl.textContent = foxSpeed.toFixed(2);
+
+    renderer.render(scene, camera);
+}
+
+animate();
+
+// Resize
+window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+});
+</script>
+</body>
+</html>

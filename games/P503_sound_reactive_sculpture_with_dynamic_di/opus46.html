@@ -1,0 +1,514 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3D Sound-Reactive Sculpture</title>
+<style>
+body { margin: 0; overflow: hidden; background: #000; }
+canvas { display: block; }
+.hud {
+    position: fixed;
+    color: white;
+    font-family: monospace;
+    font-size: 14px;
+    background: rgba(0, 0, 0, 0.6);
+    padding: 8px;
+    border-radius: 4px;
+    pointer-events: none;
+    z-index: 100;
+}
+#hud-difficulty { top: 10px; left: 10px; }
+#hud-particles { top: 10px; right: 10px; }
+#hud-fps { bottom: 10px; left: 10px; }
+#hud-status { bottom: 10px; left: 50%; transform: translateX(-50%); }
+</style>
+</head>
+<body>
+
+<div id="hud-difficulty" class="hud">Difficulty: 1</div>
+<div id="hud-particles" class="hud">Particles: 0</div>
+<div id="hud-fps" class="hud">FPS: 0</div>
+<div id="hud-status" class="hud">Status: PLAYING</div>
+
+<script type="importmap">
+{
+    "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+    }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+// Scene setup
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x000000);
+scene.fog = new THREE.Fog(0x000000, 1, 50);
+
+const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 100);
+camera.position.set(0, 3, 8);
+camera.lookAt(0, 0, 0);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.shadowMap.enabled = true;
+document.body.appendChild(renderer.domElement);
+
+// Lights
+const dirLight = new THREE.DirectionalLight(0xffffff, 1.5);
+dirLight.position.set(5, 10, 5);
+scene.add(dirLight);
+
+const ambientLight = new THREE.AmbientLight(0x331155, 0.4);
+scene.add(ambientLight);
+
+// Ground plane
+const groundGeo = new THREE.CircleGeometry(6, 64);
+const groundMat = new THREE.MeshStandardMaterial({
+    color: 0x1a0033,
+    metalness: 0.9,
+    roughness: 0.1
+});
+const ground = new THREE.Mesh(groundGeo, groundMat);
+ground.rotation.x = -Math.PI / 2;
+ground.receiveShadow = true;
+scene.add(ground);
+
+// OrbitControls
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.autoRotate = false;
+controls.autoRotateSpeed = 2.0;
+controls.enableDamping = true;
+controls.target.set(0, 1, 0);
+
+// State
+const state = {
+    difficultyLevel: 1,
+    isPaused: false,
+    autoRotate: false,
+    fishCount: 8,
+    selectedFishIndex: -1,
+    frequencyBands: new Array(8).fill(0),
+    averageFrequency: 0,
+    fishPositions: Array.from({ length: 8 }, () => ({ x: 0, y: 0, z: 0 })),
+    activeParticles: 0,
+    performanceMode: false,
+    elapsedTime: 0,
+    modelLoaded: false,
+    fishScales: new Array(8).fill(1),
+    totalResets: 0
+};
+window.__3D_STATE__ = state;
+
+// Fish array
+const fishObjects = [];
+const fishBasePositions = [];
+const fishBaseRotations = [];
+const FISH_COUNT = 8;
+const CIRCLE_RADIUS = 3;
+const BASE_Y = 1.0;
+
+// Compute base positions
+for (let i = 0; i < FISH_COUNT; i++) {
+    const angle = (i / FISH_COUNT) * Math.PI * 2;
+    const x = Math.cos(angle) * CIRCLE_RADIUS;
+    const z = Math.sin(angle) * CIRCLE_RADIUS;
+    fishBasePositions.push(new THREE.Vector3(x, BASE_Y, z));
+    fishBaseRotations.push(angle);
+}
+
+// Particle system
+const MAX_PARTICLES = 500;
+const particles = [];
+const particleGeometry = new THREE.SphereGeometry(0.03, 4, 4);
+const particleMaterial = new THREE.MeshBasicMaterial({ color: 0x6699ff, transparent: true });
+const particlePool = [];
+
+for (let i = 0; i < MAX_PARTICLES; i++) {
+    const mesh = new THREE.Mesh(particleGeometry, particleMaterial.clone());
+    mesh.visible = false;
+    scene.add(mesh);
+    particlePool.push({
+        mesh: mesh,
+        velocity: new THREE.Vector3(),
+        lifetime: 0,
+        maxLifetime: 2,
+        active: false
+    });
+}
+
+// Load fish model
+const loader = new GLTFLoader();
+let fishModelTemplate = null;
+
+loader.load(
+    '._BarramundiFish.glb',
+    (gltf) => {
+        fishModelTemplate = gltf.scene;
+        
+        for (let i = 0; i < FISH_COUNT; i++) {
+            const fishClone = fishModelTemplate.clone();
+            fishClone.userData.index = i;
+            
+            const pos = fishBasePositions[i];
+            fishClone.position.copy(pos);
+            
+            // Face outward
+            fishClone.rotation.y = fishBaseRotations[i] + Math.PI / 2;
+            
+            // Make materials support emissive
+            fishClone.traverse((child) => {
+                if (child.isMesh) {
+                    if (child.material) {
+                        child.material = child.material.clone();
+                        child.material.emissive = new THREE.Color(0x000000);
+                        child.material.emissiveIntensity = 0;
+                    }
+                }
+            });
+            
+            scene.add(fishClone);
+            fishObjects.push(fishClone);
+        }
+        
+        state.modelLoaded = true;
+        console.log('Fish model loaded successfully');
+    },
+    (progress) => {
+        console.log('Loading...', (progress.loaded / progress.total * 100).toFixed(1) + '%');
+    },
+    (error) => {
+        console.error('Error loading fish model:', error);
+        // Create placeholder fish
+        for (let i = 0; i < FISH_COUNT; i++) {
+            const geo = new THREE.ConeGeometry(0.3, 1, 8);
+            geo.rotateZ(-Math.PI / 2);
+            const mat = new THREE.MeshStandardMaterial({
+                color: new THREE.Color().setHSL(i / 8, 0.8, 0.5),
+                emissive: new THREE.Color(0x000000),
+                emissiveIntensity: 0,
+                metalness: 0.5,
+                roughness: 0.3
+            });
+            const mesh = new THREE.Mesh(geo, mat);
+            mesh.userData.index = i;
+            
+            const pos = fishBasePositions[i];
+            mesh.position.copy(pos);
+            mesh.rotation.y = fishBaseRotations[i];
+            
+            scene.add(mesh);
+            fishObjects.push(mesh);
+        }
+        state.modelLoaded = true;
+    }
+);
+
+// Raycaster for clicking
+const raycaster = new THREE.Raycaster();
+const mouse = new THREE.Vector2();
+
+renderer.domElement.addEventListener('click', (event) => {
+    mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+    mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+    
+    raycaster.setFromCamera(mouse, camera);
+    
+    const allMeshes = [];
+    fishObjects.forEach((fish) => {
+        fish.traverse((child) => {
+            if (child.isMesh) {
+                child.userData.fishParent = fish;
+                allMeshes.push(child);
+            }
+        });
+    });
+    
+    const intersects = raycaster.intersectObjects(allMeshes, false);
+    
+    if (intersects.length > 0) {
+        const hitMesh = intersects[0].object;
+        const fishParent = hitMesh.userData.fishParent || hitMesh;
+        const idx = fishParent.userData.index;
+        
+        if (idx !== undefined) {
+            if (state.selectedFishIndex === idx) {
+                state.selectedFishIndex = -1;
+            } else {
+                state.selectedFishIndex = idx;
+            }
+        }
+    } else {
+        state.selectedFishIndex = -1;
+    }
+});
+
+// Keyboard controls
+document.addEventListener('keydown', (event) => {
+    const key = event.key;
+    
+    if (key >= '1' && key <= '5') {
+        state.difficultyLevel = parseInt(key);
+    } else if (key === ' ' || key === 'Space') {
+        event.preventDefault();
+        state.isPaused = !state.isPaused;
+    } else if (key === 'r' || key === 'R') {
+        resetScene();
+    } else if (key === 'a' || key === 'A') {
+        state.autoRotate = !state.autoRotate;
+        controls.autoRotate = state.autoRotate;
+    } else if (key === 'p' || key === 'P') {
+        state.performanceMode = !state.performanceMode;
+        updateFishVisibility();
+    }
+});
+
+function resetScene() {
+    state.totalResets++;
+    state.difficultyLevel = 1;
+    state.selectedFishIndex = -1;
+    state.isPaused = false;
+    state.performanceMode = false;
+    
+    fishObjects.forEach((fish, i) => {
+        fish.position.copy(fishBasePositions[i]);
+        fish.scale.set(1, 1, 1);
+        fish.rotation.y = fishBaseRotations[i] + (fishModelTemplate ? Math.PI / 2 : 0);
+        fish.visible = true;
+        
+        fish.traverse((child) => {
+            if (child.isMesh && child.material) {
+                child.material.emissive.set(0x000000);
+                child.material.emissiveIntensity = 0;
+            }
+        });
+    });
+    
+    state.fishCount = 8;
+    
+    // Deactivate all particles
+    particlePool.forEach(p => {
+        p.active = false;
+        p.mesh.visible = false;
+    });
+}
+
+function updateFishVisibility() {
+    let visibleCount = 0;
+    fishObjects.forEach((fish, i) => {
+        if (state.performanceMode) {
+            fish.visible = (i % 2 === 0);
+        } else {
+            fish.visible = true;
+        }
+        if (fish.visible) visibleCount++;
+    });
+    state.fishCount = visibleCount;
+}
+
+// Spawn particle
+function spawnParticle(position) {
+    for (let i = 0; i < particlePool.length; i++) {
+        const p = particlePool[i];
+        if (!p.active) {
+            p.active = true;
+            p.mesh.visible = true;
+            p.mesh.position.copy(position);
+            p.velocity.set(
+                (Math.random() - 0.5) * 0.5,
+                0.3 + Math.random() * 0.5,
+                (Math.random() - 0.5) * 0.5
+            );
+            p.lifetime = 0;
+            p.maxLifetime = 2;
+            p.mesh.material.opacity = 1;
+            return;
+        }
+    }
+}
+
+// FPS tracking
+let frameCount = 0;
+let fpsTime = 0;
+let currentFPS = 0;
+
+// Animation
+const clock = new THREE.Clock();
+let simulationTime = 0;
+
+function animate() {
+    requestAnimationFrame(animate);
+    
+    const delta = clock.getDelta();
+    
+    // FPS
+    frameCount++;
+    fpsTime += delta;
+    if (fpsTime >= 1.0) {
+        currentFPS = Math.round(frameCount / fpsTime);
+        frameCount = 0;
+        fpsTime = 0;
+    }
+    
+    // Update elapsed time
+    if (!state.isPaused) {
+        simulationTime += delta;
+        state.elapsedTime = simulationTime;
+    }
+    
+    const time = state.elapsedTime;
+    
+    // Simulated frequency bands
+    for (let i = 0; i < 8; i++) {
+        if (!state.isPaused) {
+            state.frequencyBands[i] = 0.5 + 0.5 * Math.sin(time * (1.0 + i * 0.3) + i * Math.PI / 4);
+        }
+    }
+    
+    state.averageFrequency = state.frequencyBands.reduce((a, b) => a + b, 0) / 8;
+    
+    // Update fish
+    fishObjects.forEach((fish, i) => {
+        if (!fish.visible) return;
+        
+        let freq = state.frequencyBands[i];
+        
+        // Double amplitude for selected fish
+        if (state.selectedFishIndex === i) {
+            freq = Math.min(freq * 2, 1.0);
+        }
+        
+        const basePos = fishBasePositions[i];
+        const level = state.difficultyLevel;
+        
+        // Level 1+: Bob up/down
+        const bobAmount = freq * 0.5;
+        fish.position.x = basePos.x;
+        fish.position.y = basePos.y + bobAmount;
+        fish.position.z = basePos.z;
+        
+        // Level 2+: Scale
+        let scaleVal = 1.0;
+        if (level >= 2) {
+            scaleVal = 1.0 + freq * 0.3;
+        }
+        fish.scale.set(scaleVal, scaleVal, scaleVal);
+        state.fishScales[i] = scaleVal;
+        
+        // Level 3+: Rotate around Y
+        if (level >= 3) {
+            const baseRot = fishBaseRotations[i] + (fishModelTemplate ? Math.PI / 2 : 0);
+            fish.rotation.y = baseRot + freq * Math.PI;
+        } else {
+            fish.rotation.y = fishBaseRotations[i] + (fishModelTemplate ? Math.PI / 2 : 0);
+        }
+        
+        // Level 4+: Emissive color
+        if (level >= 4) {
+            fish.traverse((child) => {
+                if (child.isMesh && child.material) {
+                    const r = ((0x3366ff >> 16) & 0xff) / 255 * freq;
+                    const g = ((0x3366ff >> 8) & 0xff) / 255 * freq;
+                    const b = (0x3366ff & 0xff) / 255 * freq;
+                    child.material.emissive.setRGB(r, g, b);
+                    child.material.emissiveIntensity = 1;
+                }
+            });
+        } else {
+            fish.traverse((child) => {
+                if (child.isMesh && child.material) {
+                    child.material.emissive.set(0x000000);
+                    child.material.emissiveIntensity = 0;
+                }
+            });
+        }
+        
+        // Highlight selected fish
+        if (state.selectedFishIndex === i) {
+            fish.traverse((child) => {
+                if (child.isMesh && child.material) {
+                    const pulse = 0.3 + 0.3 * Math.sin(time * 5);
+                    child.material.emissive.setRGB(pulse, pulse * 0.5, 0);
+                    child.material.emissiveIntensity = 1;
+                }
+            });
+        }
+        
+        // Level 5: Particle trails
+        if (level >= 5 && !state.isPaused && Math.random() < 0.3) {
+            spawnParticle(fish.position.clone());
+        }
+        
+        // Update fish positions in state
+        state.fishPositions[i] = {
+            x: fish.position.x,
+            y: fish.position.y,
+            z: fish.position.z
+        };
+    });
+    
+    // Update particles
+    let activeCount = 0;
+    particlePool.forEach(p => {
+        if (p.active) {
+            p.lifetime += delta;
+            if (p.lifetime >= p.maxLifetime) {
+                p.active = false;
+                p.mesh.visible = false;
+                return;
+            }
+            
+            p.mesh.position.add(p.velocity.clone().multiplyScalar(delta));
+            const t = p.lifetime / p.maxLifetime;
+            p.mesh.material.opacity = 1.0 - t;
+            
+            // Color shift
+            const hue = (t * 0.3 + 0.6) % 1.0;
+            p.mesh.material.color.setHSL(hue, 0.8, 0.6);
+            
+            activeCount++;
+        }
+    });
+    
+    // Deactivate particles if not level 5
+    if (state.difficultyLevel < 5) {
+        particlePool.forEach(p => {
+            if (p.active) {
+                p.lifetime += delta * 3; // Fade out faster
+                if (p.lifetime >= p.maxLifetime) {
+                    p.active = false;
+                    p.mesh.visible = false;
+                }
+            }
+        });
+    }
+    
+    state.activeParticles = activeCount;
+    
+    // Update HUD
+    document.getElementById('hud-difficulty').textContent = `Difficulty: ${state.difficultyLevel}`;
+    document.getElementById('hud-particles').textContent = `Particles: ${activeCount}`;
+    document.getElementById('hud-fps').textContent = `FPS: ${currentFPS}`;
+    document.getElementById('hud-status').textContent = `Status: ${state.isPaused ? 'PAUSED' : 'PLAYING'}`;
+    
+    controls.update();
+    renderer.render(scene, camera);
+}
+
+// Handle resize
+window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+animate();
+</script>
+</body>
+</html>

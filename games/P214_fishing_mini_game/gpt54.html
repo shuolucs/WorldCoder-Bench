@@ -1,0 +1,731 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Three.js Fishing Mini-Game</title>
+  <style>
+    html, body {
+      margin: 0;
+      overflow: hidden;
+      width: 100%;
+      height: 100%;
+      font-family: Arial, sans-serif;
+      background: #87CEEB;
+    }
+
+    #ui {
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      color: white;
+      text-shadow: 0 1px 3px rgba(0,0,0,0.7);
+      font-weight: bold;
+    }
+
+    #score-display {
+      position: absolute;
+      top: 16px;
+      left: 16px;
+      font-size: 24px;
+    }
+
+    #fish-count {
+      position: absolute;
+      top: 16px;
+      right: 16px;
+      font-size: 24px;
+    }
+
+    #status-text {
+      position: absolute;
+      top: 70px;
+      left: 50%;
+      transform: translateX(-50%);
+      font-size: 32px;
+      color: #fff176;
+      min-width: 240px;
+      text-align: center;
+    }
+
+    #reel-bar-container {
+      position: absolute;
+      bottom: 30px;
+      left: 50%;
+      transform: translateX(-50%);
+      width: 320px;
+      height: 24px;
+      border: 2px solid white;
+      background: rgba(0,0,0,0.35);
+      display: none;
+      border-radius: 8px;
+      overflow: hidden;
+    }
+
+    #reel-bar-fill {
+      width: 0%;
+      height: 100%;
+      background: linear-gradient(90deg, #43a047, #7cff72);
+    }
+
+    #reset-btn {
+      position: absolute;
+      bottom: 20px;
+      right: 20px;
+      padding: 10px 16px;
+      border: none;
+      border-radius: 8px;
+      background: #ffffff;
+      color: #222;
+      font-weight: bold;
+      cursor: pointer;
+      pointer-events: auto;
+      box-shadow: 0 3px 8px rgba(0,0,0,0.25);
+    }
+
+    #help-text {
+      position: absolute;
+      bottom: 20px;
+      left: 20px;
+      font-size: 16px;
+      color: white;
+    }
+  </style>
+</head>
+<body>
+  <div id="ui">
+    <div id="score-display">Score: 0</div>
+    <div id="fish-count">Fish Remaining: 5</div>
+    <div id="status-text">Press SPACE to Cast</div>
+    <div id="reel-bar-container">
+      <div id="reel-bar-fill"></div>
+    </div>
+    <button id="reset-btn">Reset Game</button>
+    <div id="help-text">SPACE = Cast, R = Reel</div>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
+    import { GLTFLoader } from 'https://unpkg.com/three@0.160.0/examples/jsm/loaders/GLTFLoader.js';
+
+    let scene, camera, renderer, clock;
+    let water, dock, horse, rod, bobber, line;
+    let waterBasePositions = null;
+    let mixer = null;
+    let horseCelebrate = false;
+    let horseCelebrateTimer = 0;
+    let horseAnimations = [];
+    let activeHorseAction = null;
+
+    const fishes = [];
+    const fishGroup = new THREE.Group();
+
+    const rodBase = new THREE.Vector3(-2, 2.5, 0);
+    const rodHeight = 3;
+    const rodAngleDeg = 45;
+    const rodAngleRad = THREE.MathUtils.degToRad(rodAngleDeg);
+
+    let rodTipWorld = new THREE.Vector3();
+    let currentTargetFish = null;
+    let biteTimer = 0;
+    let respawnTimer = 0;
+    let castTravel = null;
+
+    const scoreDisplay = document.getElementById('score-display');
+    const fishCountDisplay = document.getElementById('fish-count');
+    const statusText = document.getElementById('status-text');
+    const reelBarContainer = document.getElementById('reel-bar-container');
+    const reelBarFill = document.getElementById('reel-bar-fill');
+    const resetBtn = document.getElementById('reset-btn');
+
+    const state = {
+      gameState: 'idle',
+      score: 0,
+      fishCount: 0,
+      bobberPosition: { x: 0, y: 0, z: 0 },
+      reelProgress: 0,
+      castCount: 0,
+      horseRotation: 0,
+      rodAngle: rodAngleDeg,
+      lineLength: 0,
+      fishPositions: [],
+      waterAnimating: true,
+      timeInState: 0,
+      totalCatches: 0,
+      missCount: 0
+    };
+
+    window.__3D_STATE__ = state;
+
+    init();
+    animate();
+
+    function init() {
+      scene = new THREE.Scene();
+      scene.background = new THREE.Color('#87CEEB');
+
+      camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 500);
+      camera.position.set(0, 5, 10);
+      camera.lookAt(0, 1.5, 0);
+
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+      document.body.appendChild(renderer.domElement);
+
+      clock = new THREE.Clock();
+
+      const ambient = new THREE.AmbientLight(0xffffff, 0.4);
+      scene.add(ambient);
+
+      const dirLight = new THREE.DirectionalLight(0xffffff, 1.1);
+      dirLight.position.set(5, 10, 5);
+      scene.add(dirLight);
+
+      createWater();
+      createDock();
+      createRodAndLine();
+      createBobber();
+
+      scene.add(fishGroup);
+      spawnInitialFish(5);
+      loadHorse();
+
+      updateRodTipWorld();
+      updateFishingLine();
+      updateUI();
+      syncState();
+
+      window.addEventListener('resize', onResize);
+      window.addEventListener('keydown', onKeyDown);
+      resetBtn.addEventListener('click', resetGame);
+    }
+
+    function createWater() {
+      const geometry = new THREE.PlaneGeometry(100, 100, 100, 100);
+      geometry.rotateX(-Math.PI / 2);
+
+      waterBasePositions = new Float32Array(geometry.attributes.position.array.length);
+      waterBasePositions.set(geometry.attributes.position.array);
+
+      const material = new THREE.MeshPhongMaterial({
+        color: 0x3399ff,
+        transparent: true,
+        opacity: 0.65,
+        side: THREE.DoubleSide
+      });
+
+      water = new THREE.Mesh(geometry, material);
+      water.position.y = 0;
+      scene.add(water);
+    }
+
+    function createDock() {
+      dock = new THREE.Group();
+
+      const woodMat = new THREE.MeshPhongMaterial({ color: 0x8b5a2b });
+      const platform = new THREE.Mesh(
+        new THREE.BoxGeometry(10, 0.3, 4),
+        woodMat
+      );
+      platform.position.set(0, 1.5, 0);
+      dock.add(platform);
+
+      const legGeo = new THREE.CylinderGeometry(0.18, 0.18, 3, 16);
+      const legPositions = [
+        [-4.2, 0, -1.5],
+        [4.2, 0, -1.5],
+        [-4.2, 0, 1.5],
+        [4.2, 0, 1.5]
+      ];
+
+      legPositions.forEach(([x, y, z]) => {
+        const leg = new THREE.Mesh(legGeo, woodMat);
+        leg.position.set(x, 0, z);
+        dock.add(leg);
+      });
+
+      scene.add(dock);
+    }
+
+    function createRodAndLine() {
+      const rodMat = new THREE.MeshPhongMaterial({ color: 0x333333 });
+      rod = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.05, 0.05, rodHeight, 8),
+        rodMat
+      );
+
+      rod.position.copy(rodBase);
+      rod.rotation.z = -rodAngleRad;
+      scene.add(rod);
+
+      const lineMat = new THREE.LineBasicMaterial({ color: 0xffffff });
+      const lineGeo = new THREE.BufferGeometry().setFromPoints([
+        new THREE.Vector3(),
+        new THREE.Vector3()
+      ]);
+      line = new THREE.Line(lineGeo, lineMat);
+      scene.add(line);
+    }
+
+    function createBobber() {
+      bobber = new THREE.Mesh(
+        new THREE.SphereGeometry(0.1, 16, 16),
+        new THREE.MeshPhongMaterial({ color: 0xff3333 })
+      );
+      bobber.position.set(-4, 0, -3);
+      scene.add(bobber);
+    }
+
+    function createFish(x, z) {
+      const fishGeo = new THREE.SphereGeometry(1, 16, 12);
+      const fishMat = new THREE.MeshPhongMaterial({ color: 0xff9933 });
+      const fish = new THREE.Mesh(fishGeo, fishMat);
+      fish.scale.set(0.3, 0.15, 0.1);
+
+      fish.position.set(x, -0.5, z);
+
+      fish.userData = {
+        centerX: x,
+        centerZ: z,
+        radius: THREE.MathUtils.randFloat(1.5, 4),
+        speed: THREE.MathUtils.randFloat(0.5, 1.2),
+        phase: Math.random() * Math.PI * 2,
+        mode: Math.random() < 0.5 ? 'circle' : 'figure8',
+        targetBobber: false,
+        alive: true,
+        escapeTimer: 0
+      };
+
+      fishGroup.add(fish);
+      fishes.push(fish);
+    }
+
+    function spawnInitialFish(count) {
+      for (let i = 0; i < count; i++) {
+        createFish(
+          THREE.MathUtils.randFloat(-15, 15),
+          THREE.MathUtils.randFloat(-20, -3)
+        );
+      }
+    }
+
+    function loadHorse() {
+      const loader = new GLTFLoader();
+      loader.load(
+        'horse.glb',
+        (gltf) => {
+          horse = gltf.scene;
+          horse.position.set(3, 1.8, 0);
+          horse.scale.set(0.5, 0.5, 0.5);
+          horse.rotation.y = Math.PI; // face toward water / negative z
+          scene.add(horse);
+
+          horseAnimations = gltf.animations || [];
+          if (horseAnimations.length > 0) {
+            mixer = new THREE.AnimationMixer(horse);
+            activeHorseAction = mixer.clipAction(horseAnimations[0]);
+            activeHorseAction.play();
+          }
+        },
+        undefined,
+        () => {
+          const fallback = new THREE.Mesh(
+            new THREE.BoxGeometry(1, 1, 2),
+            new THREE.MeshPhongMaterial({ color: 0x8b4513 })
+          );
+          fallback.position.set(3, 1.8, 0);
+          fallback.rotation.y = Math.PI;
+          scene.add(fallback);
+          horse = fallback;
+        }
+      );
+    }
+
+    function updateRodTipWorld() {
+      const localTip = new THREE.Vector3(0, rodHeight / 2, 0);
+      rod.updateMatrixWorld();
+      rodTipWorld.copy(localTip.applyMatrix4(rod.matrixWorld));
+    }
+
+    function updateFishingLine() {
+      updateRodTipWorld();
+
+      const points = [rodTipWorld.clone(), bobber.position.clone()];
+      line.geometry.dispose();
+      line.geometry = new THREE.BufferGeometry().setFromPoints(points);
+
+      const len = rodTipWorld.distanceTo(bobber.position);
+      state.lineLength = Number.isFinite(len) ? len : 0;
+    }
+
+    function setGameState(newState, message = '') {
+      state.gameState = newState;
+      state.timeInState = 0;
+      if (message) statusText.textContent = message;
+      updateUI();
+    }
+
+    function castLine() {
+      if (!(state.gameState === 'idle' || state.gameState === 'waiting')) return;
+
+      state.castCount++;
+      state.reelProgress = 0;
+      reelBarFill.style.width = '0%';
+      reelBarContainer.style.display = 'none';
+      currentTargetFish = null;
+      biteTimer = 0;
+
+      const target = new THREE.Vector3(
+        THREE.MathUtils.randFloat(-20, 20),
+        0,
+        THREE.MathUtils.randFloat(-20, -5)
+      );
+
+      castTravel = {
+        from: bobber.position.clone(),
+        to: target,
+        t: 0
+      };
+
+      setGameState('casting', 'Casting...');
+    }
+
+    function beginWaiting() {
+      bobber.position.y = 0;
+      setGameState('waiting', 'Waiting for a bite...');
+      fishes.forEach(f => {
+        if (f.userData.alive) {
+          f.userData.targetBobber = Math.random() < 0.7;
+        }
+      });
+    }
+
+    function triggerBite(fish) {
+      currentTargetFish = fish;
+      biteTimer = 0;
+      setGameState('bite', 'FISH ON!');
+    }
+
+    function startReeling() {
+      if (state.gameState !== 'bite' && state.gameState !== 'reeling') return;
+      if (!currentTargetFish || !currentTargetFish.userData.alive) return;
+
+      if (state.gameState === 'bite') {
+        setGameState('reeling', 'Reeling...');
+        reelBarContainer.style.display = 'block';
+      }
+
+      if (Math.random() < 0.2) {
+        missFish('Line snapped!');
+        return;
+      }
+
+      state.reelProgress = Math.min(100, state.reelProgress + 10);
+      reelBarFill.style.width = `${state.reelProgress}%`;
+
+      if (state.reelProgress >= 100) {
+        catchFish(currentTargetFish);
+      }
+    }
+
+    function catchFish(fish) {
+      if (!fish || !fish.userData.alive) return;
+
+      fish.userData.alive = false;
+      fishGroup.remove(fish);
+      const idx = fishes.indexOf(fish);
+      if (idx >= 0) fishes.splice(idx, 1);
+
+      state.score += 1;
+      state.totalCatches = state.score;
+      state.fishCount = fishes.length;
+      reelBarContainer.style.display = 'none';
+      reelBarFill.style.width = '0%';
+      state.reelProgress = 0;
+      currentTargetFish = null;
+
+      celebrateHorse();
+      setGameState('caught', 'Caught a fish!');
+
+      setTimeout(() => {
+        if (state.gameState === 'caught') {
+          setGameState('idle', 'Press SPACE to Cast');
+        }
+      }, 2000);
+    }
+
+    function missFish(reason = 'Missed!') {
+      state.missCount += 1;
+      state.reelProgress = 0;
+      reelBarFill.style.width = '0%';
+      reelBarContainer.style.display = 'none';
+
+      if (currentTargetFish && currentTargetFish.userData.alive) {
+        currentTargetFish.userData.targetBobber = false;
+        currentTargetFish.userData.escapeTimer = 2;
+      }
+
+      currentTargetFish = null;
+      setGameState('missed', reason);
+
+      setTimeout(() => {
+        if (state.gameState === 'missed') {
+          setGameState('idle', 'Press SPACE to Cast');
+        }
+      }, 2000);
+    }
+
+    function celebrateHorse() {
+      if (!horse) return;
+
+      if (mixer && horseAnimations.length > 1) {
+        if (activeHorseAction) activeHorseAction.stop();
+        activeHorseAction = mixer.clipAction(horseAnimations[1]);
+        activeHorseAction.reset();
+        activeHorseAction.setLoop(THREE.LoopOnce, 1);
+        activeHorseAction.clampWhenFinished = true;
+        activeHorseAction.play();
+      } else {
+        horseCelebrate = true;
+        horseCelebrateTimer = 0;
+      }
+    }
+
+    function resetGame() {
+      while (fishes.length) {
+        const fish = fishes.pop();
+        fishGroup.remove(fish);
+      }
+
+      spawnInitialFish(5);
+
+      state.score = 0;
+      state.totalCatches = 0;
+      state.missCount = 0;
+      state.castCount = 0;
+      state.reelProgress = 0;
+      currentTargetFish = null;
+      biteTimer = 0;
+      respawnTimer = 0;
+      castTravel = null;
+
+      bobber.position.set(-4, 0, -3);
+      reelBarContainer.style.display = 'none';
+      reelBarFill.style.width = '0%';
+      setGameState('idle', 'Press SPACE to Cast');
+      updateFishingLine();
+      updateUI();
+      syncState();
+    }
+
+    function updateWater(elapsed) {
+      const pos = water.geometry.attributes.position;
+      for (let i = 0; i < pos.count; i++) {
+        const ix = i * 3;
+        const x = waterBasePositions[ix];
+        const z = waterBasePositions[ix + 2];
+        pos.array[ix + 1] =
+          Math.sin(elapsed * 1.5 + x * 0.2) * 0.08 +
+          Math.cos(elapsed * 1.2 + z * 0.25) * 0.05;
+      }
+      pos.needsUpdate = true;
+      water.geometry.computeVertexNormals();
+    }
+
+    function updateFish(delta, elapsed) {
+      for (const fish of fishes) {
+        if (!fish.userData.alive) continue;
+
+        if (fish.userData.escapeTimer > 0) {
+          fish.userData.escapeTimer -= delta;
+          fish.position.z -= delta * 3;
+          fish.position.x += Math.sin(elapsed * 4 + fish.id) * delta;
+          fish.position.y = -0.5 + Math.sin(elapsed * 3 + fish.userData.phase) * 0.2;
+          continue;
+        }
+
+        if (state.gameState === 'waiting' || state.gameState === 'bite' || state.gameState === 'reeling') {
+          if (fish.userData.targetBobber) {
+            const dir = new THREE.Vector3().subVectors(bobber.position, fish.position);
+            dir.y = 0;
+            if (dir.lengthSq() > 0.0001) {
+              dir.normalize();
+              fish.position.addScaledVector(dir, delta * 1.2);
+            }
+            fish.position.y = -0.5 + Math.sin(elapsed * 3 + fish.userData.phase) * 0.2;
+            fish.lookAt(fish.position.x + dir.x, fish.position.y, fish.position.z + dir.z);
+            continue;
+          }
+        }
+
+        const t = elapsed * fish.userData.speed + fish.userData.phase;
+        if (fish.userData.mode === 'circle') {
+          fish.position.x = fish.userData.centerX + Math.cos(t) * fish.userData.radius;
+          fish.position.z = fish.userData.centerZ + Math.sin(t) * fish.userData.radius;
+        } else {
+          fish.position.x = fish.userData.centerX + Math.sin(t) * fish.userData.radius;
+          fish.position.z = fish.userData.centerZ + Math.sin(t * 2) * (fish.userData.radius * 0.5);
+        }
+
+        fish.position.y = -0.5 + Math.sin(elapsed * 3 + fish.userData.phase) * 0.2;
+      }
+    }
+
+    function updateCasting(delta) {
+      if (!castTravel) return;
+      castTravel.t += delta * 1.5;
+      const t = Math.min(castTravel.t, 1);
+      bobber.position.lerpVectors(castTravel.from, castTravel.to, t);
+      bobber.position.y = Math.sin(t * Math.PI) * 1.5;
+
+      if (t >= 1) {
+        bobber.position.copy(castTravel.to);
+        bobber.position.y = 0;
+        castTravel = null;
+        beginWaiting();
+      }
+    }
+
+    function updateBite(delta, elapsed) {
+      biteTimer += delta;
+      bobber.position.y = -0.15 + Math.sin(elapsed * 10) * 0.15;
+      if (biteTimer >= 3) {
+        missFish('Too slow!');
+      }
+    }
+
+    function updateWaiting(delta) {
+      bobber.position.y = Math.sin(clock.elapsedTime * 4) * 0.03;
+
+      for (const fish of fishes) {
+        if (!fish.userData.alive) continue;
+        const d = fish.position.distanceTo(bobber.position);
+        if (d <= 2.0) {
+          if (Math.random() < 0.6 * delta) {
+            triggerBite(fish);
+            break;
+          }
+        }
+      }
+    }
+
+    function updateRespawn(delta) {
+      if (fishes.length < 3) {
+        respawnTimer += delta;
+        if (respawnTimer >= 5) {
+          while (fishes.length < 5) {
+            createFish(
+              THREE.MathUtils.randFloat(-15, 15),
+              THREE.MathUtils.randFloat(-20, -3)
+            );
+          }
+          respawnTimer = 0;
+        }
+      } else {
+        respawnTimer = 0;
+      }
+    }
+
+    function updateHorse(delta) {
+      if (mixer) mixer.update(delta);
+
+      if (horseCelebrate && horse) {
+        horseCelebrateTimer += delta;
+        horse.rotation.y += delta * Math.PI * 2;
+        if (horseCelebrateTimer >= 1) {
+          horseCelebrate = false;
+          horseCelebrateTimer = 0;
+        }
+      }
+    }
+
+    function updateUI() {
+      scoreDisplay.textContent = `Score: ${state.score}`;
+      fishCountDisplay.textContent = `Fish Remaining: ${fishes.length}`;
+
+      if (state.gameState !== 'reeling') {
+        if (state.gameState !== 'bite' && state.gameState !== 'caught' && state.gameState !== 'missed' && state.gameState !== 'casting' && state.gameState !== 'waiting') {
+          statusText.textContent = 'Press SPACE to Cast';
+        }
+      }
+    }
+
+    function syncState() {
+      state.fishCount = fishes.length;
+      state.bobberPosition = safeVec(bobber.position);
+      state.fishPositions = fishes.map(f => safeVec(f.position));
+      state.horseRotation = horse ? safeNum(horse.rotation.y) : 0;
+      state.rodAngle = rodAngleDeg;
+      state.waterAnimating = true;
+    }
+
+    function safeNum(v) {
+      return Number.isFinite(v) ? v : 0;
+    }
+
+    function safeVec(v) {
+      return {
+        x: safeNum(v.x),
+        y: safeNum(v.y),
+        z: safeNum(v.z)
+      };
+    }
+
+    function onKeyDown(e) {
+      if (e.code === 'Space') {
+        e.preventDefault();
+        castLine();
+      } else if (e.key.toLowerCase() === 'r') {
+        startReeling();
+      }
+    }
+
+    function onResize() {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    }
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      const delta = Math.min(clock.getDelta(), 0.05);
+      const elapsed = clock.elapsedTime;
+      state.timeInState += delta;
+
+      updateWater(elapsed);
+      updateFish(delta, elapsed);
+      updateHorse(delta);
+      updateRespawn(delta);
+
+      switch (state.gameState) {
+        case 'casting':
+          updateCasting(delta);
+          break;
+        case 'waiting':
+          updateWaiting(delta);
+          break;
+        case 'bite':
+          updateBite(delta, elapsed);
+          break;
+        case 'reeling':
+          bobber.position.y = -0.15 + Math.sin(elapsed * 12) * 0.15;
+          break;
+        case 'idle':
+        case 'caught':
+        case 'missed':
+        default:
+          if (bobber.position.y < 0.001 && bobber.position.y > -0.001) bobber.position.y = 0;
+          break;
+      }
+
+      updateFishingLine();
+      syncState();
+      updateUI();
+
+      renderer.render(scene, camera);
+    }
+  </script>
+</body>
+</html>

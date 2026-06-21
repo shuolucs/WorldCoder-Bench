@@ -1,0 +1,434 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Audio Spectrum Visualizer</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #1a1a2e;
+            font-family: sans-serif;
+        }
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+        }
+        #hud {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            background: rgba(0, 0, 0, 0.7);
+            color: white;
+            padding: 15px;
+            border-radius: 8px;
+            width: 250px;
+            z-index: 100;
+            box-sizing: border-box;
+        }
+        #hud h3 {
+            margin-top: 0;
+            margin-bottom: 10px;
+            font-size: 16px;
+            text-align: center;
+        }
+        .hud-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+            font-size: 14px;
+        }
+        button {
+            background: #4a4e69;
+            color: white;
+            border: none;
+            padding: 5px 10px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+        }
+        button:hover {
+            background: #9a8c98;
+        }
+        button:active {
+            background: #c9ada7;
+        }
+        .btn-group {
+            display: flex;
+            gap: 5px;
+        }
+    </style>
+    <!-- Load Three.js and dependencies -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/GLTFLoader.js"></script>
+</head>
+<body>
+    <div id="canvas-container"></div>
+    
+    <div id="hud">
+        <h3>Visualizer Config</h3>
+        
+        <div class="hud-row">
+            <span>Color Scheme:</span>
+            <span id="label-color">rainbow</span>
+        </div>
+        <div class="hud-row">
+            <button id="btn-cycle-color" style="width: 100%;">Cycle Color Scheme</button>
+        </div>
+        
+        <div class="hud-row" style="margin-top: 15px;">
+            <span>Height Mult:</span>
+            <span id="label-height">5.0</span>
+        </div>
+        <div class="hud-row">
+            <button id="btn-decrease-height">-1.0</button>
+            <button id="btn-increase-height">+1.0</button>
+        </div>
+        
+        <div class="hud-row" style="margin-top: 15px;">
+            <span>Simulation:</span>
+            <button id="btn-toggle-sim">Toggle (Space)</button>
+        </div>
+        
+        <div class="hud-row" style="margin-top: 15px; border-top: 1px solid #555; padding-top: 10px;">
+            <span>Undo Stack: <span id="label-undo-count">0</span></span>
+            <span>Redo Stack: <span id="label-redo-count">0</span></span>
+        </div>
+        <div class="hud-row">
+            <button id="btn-undo">Undo (Ctrl+Z)</button>
+            <button id="btn-redo">Redo (Ctrl+Y)</button>
+        </div>
+    </div>
+
+    <script>
+        // --- State Management ---
+        window.__3D_STATE__ = {
+            sceneReady: false,
+            barCount: 32,
+            heightMultiplier: 5.0,
+            fishRotationSpeed: 0.5,
+            colorScheme: 'rainbow',
+            simulationActive: true,
+            undoStackSize: 0,
+            redoStackSize: 0,
+            fishY: 3,
+            avgAmplitude: 0,
+            fishModelLoaded: false,
+            frameCount: 0,
+            maxBarHeight: 0.1
+        };
+
+        // --- Configuration & History ---
+        let config = {
+            heightMultiplier: 5.0,
+            fishRotationSpeed: 0.5,
+            colorScheme: 'rainbow',
+            barCount: 32,
+            simulationActive: true
+        };
+
+        let undoStack = [];
+        let redoStack = [];
+        const MAX_HISTORY = 20;
+
+        function saveState() {
+            undoStack.push(JSON.parse(JSON.stringify(config)));
+            if (undoStack.length > MAX_HISTORY) {
+                undoStack.shift();
+            }
+            redoStack = [];
+        }
+
+        function updateConfig(newProps) {
+            saveState();
+            Object.assign(config, newProps);
+            applyConfig();
+        }
+
+        function undo() {
+            if (undoStack.length === 0) return;
+            redoStack.push(JSON.parse(JSON.stringify(config)));
+            config = undoStack.pop();
+            applyConfig();
+        }
+
+        function redo() {
+            if (redoStack.length === 0) return;
+            undoStack.push(JSON.parse(JSON.stringify(config)));
+            config = redoStack.pop();
+            applyConfig();
+        }
+
+        function applyConfig() {
+            updateUI();
+            updateBarColors();
+            
+            // Update global state
+            window.__3D_STATE__.heightMultiplier = config.heightMultiplier;
+            window.__3D_STATE__.fishRotationSpeed = config.fishRotationSpeed;
+            window.__3D_STATE__.colorScheme = config.colorScheme;
+            window.__3D_STATE__.barCount = config.barCount;
+            window.__3D_STATE__.simulationActive = config.simulationActive;
+        }
+
+        // --- Three.js Setup ---
+        let scene, camera, renderer, controls;
+        let bars = [];
+        let fishModel = null;
+        let clock = new THREE.Clock();
+
+        function init() {
+            const container = document.getElementById('canvas-container');
+
+            // Scene
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color('#1a1a2e');
+
+            // Camera
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.position.set(0, 5, 15);
+            camera.lookAt(0, 0, 0);
+
+            // Renderer
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(window.devicePixelRatio);
+            container.appendChild(renderer.domElement);
+
+            // Controls
+            controls = new THREE.OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+            controls.dampingFactor = 0.05;
+
+            // Lights
+            const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+            scene.add(ambientLight);
+
+            const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
+            directionalLight.position.set(5, 10, 5);
+            scene.add(directionalLight);
+
+            // Objects
+            createBars();
+            loadFishModel();
+
+            // Events
+            window.addEventListener('resize', onWindowResize);
+            setupUIEvents();
+            setupKeyboardEvents();
+
+            // Initial UI update
+            updateUI();
+
+            // Start loop
+            window.__3D_STATE__.sceneReady = true;
+            animate();
+        }
+
+        function createBars() {
+            // Base geometry with height 1, translated so origin is at bottom
+            const geometry = new THREE.BoxGeometry(0.4, 1, 0.4);
+            geometry.translate(0, 0.5, 0);
+
+            const startX = -8;
+            const endX = 8;
+            const range = endX - startX;
+            const step = range / (config.barCount - 1);
+
+            for (let i = 0; i < config.barCount; i++) {
+                const material = new THREE.MeshStandardMaterial({ color: 0xffffff });
+                const bar = new THREE.Mesh(geometry, material);
+                
+                bar.position.x = startX + (i * step);
+                bar.position.y = 0;
+                bar.position.z = 0;
+                
+                bar.scale.y = 0.1; // Base height
+                
+                scene.add(bar);
+                bars.push(bar);
+            }
+            
+            updateBarColors();
+        }
+
+        function updateBarColors() {
+            for (let i = 0; i < bars.length; i++) {
+                const t = i / (bars.length - 1); // 0 to 1
+                let hue;
+                
+                switch (config.colorScheme) {
+                    case 'cool':
+                        // 0.5 to 0.75 (Cyan to Purple)
+                        hue = 0.5 + t * 0.25;
+                        break;
+                    case 'warm':
+                        // 0.0 to 0.15 (Red to Yellow)
+                        hue = 0.0 + t * 0.15;
+                        break;
+                    case 'rainbow':
+                    default:
+                        // 0.66 to 0.0 (Blue to Red)
+                        hue = 0.66 - t * 0.66;
+                        break;
+                }
+                
+                bars[i].material.color.setHSL(hue, 1.0, 0.5);
+            }
+        }
+
+        function loadFishModel() {
+            const loader = new THREE.GLTFLoader();
+            loader.load(
+                '._BarramundiFish.glb',
+                function (gltf) {
+                    fishModel = gltf.scene;
+                    fishModel.position.set(0, 3, 0);
+                    fishModel.scale.set(2, 2, 2);
+                    scene.add(fishModel);
+                    window.__3D_STATE__.fishModelLoaded = true;
+                },
+                undefined,
+                function (error) {
+                    console.warn('Could not load fish model. Visualizer will run without it.', error);
+                    window.__3D_STATE__.fishModelLoaded = false;
+                }
+            );
+        }
+
+        function simulateAudioData(time) {
+            const data = [];
+            for (let i = 0; i < config.barCount; i++) {
+                data.push(Math.abs(Math.sin(time * (i + 1) * 0.1)));
+            }
+            return data;
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        // --- UI & Interaction ---
+        function updateUI() {
+            document.getElementById('label-color').textContent = config.colorScheme;
+            document.getElementById('label-height').textContent = config.heightMultiplier.toFixed(1);
+            document.getElementById('label-undo-count').textContent = undoStack.length;
+            document.getElementById('label-redo-count').textContent = redoStack.length;
+            
+            const simBtn = document.getElementById('btn-toggle-sim');
+            simBtn.textContent = config.simulationActive ? 'Pause Sim (Space)' : 'Resume Sim (Space)';
+            simBtn.style.background = config.simulationActive ? '#4a4e69' : '#9a8c98';
+        }
+
+        function setupUIEvents() {
+            document.getElementById('btn-increase-height').addEventListener('click', () => {
+                let newHeight = Math.min(10.0, config.heightMultiplier + 1.0);
+                if (newHeight !== config.heightMultiplier) updateConfig({ heightMultiplier: newHeight });
+            });
+
+            document.getElementById('btn-decrease-height').addEventListener('click', () => {
+                let newHeight = Math.max(1.0, config.heightMultiplier - 1.0);
+                if (newHeight !== config.heightMultiplier) updateConfig({ heightMultiplier: newHeight });
+            });
+
+            document.getElementById('btn-cycle-color').addEventListener('click', () => {
+                const schemes = ['rainbow', 'cool', 'warm'];
+                let idx = schemes.indexOf(config.colorScheme);
+                let nextScheme = schemes[(idx + 1) % schemes.length];
+                updateConfig({ colorScheme: nextScheme });
+            });
+
+            document.getElementById('btn-toggle-sim').addEventListener('click', () => {
+                updateConfig({ simulationActive: !config.simulationActive });
+            });
+
+            document.getElementById('btn-undo').addEventListener('click', undo);
+            document.getElementById('btn-redo').addEventListener('click', redo);
+        }
+
+        function setupKeyboardEvents() {
+            window.addEventListener('keydown', (e) => {
+                if (e.ctrlKey && e.key.toLowerCase() === 'z') {
+                    e.preventDefault();
+                    undo();
+                } else if (e.ctrlKey && e.key.toLowerCase() === 'y') {
+                    e.preventDefault();
+                    redo();
+                } else if (e.code === 'Space') {
+                    e.preventDefault();
+                    updateConfig({ simulationActive: !config.simulationActive });
+                }
+            });
+        }
+
+        // --- Animation Loop ---
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const delta = clock.getDelta();
+            const time = clock.getElapsedTime();
+
+            let avgAmplitude = 0;
+            let maxScaleY = 0.1;
+
+            if (config.simulationActive) {
+                const audioData = simulateAudioData(time);
+                let sum = 0;
+
+                for (let i = 0; i < bars.length; i++) {
+                    const val = audioData[i];
+                    sum += val;
+                    
+                    // Target scale
+                    const targetScaleY = 0.1 + val * config.heightMultiplier;
+                    
+                    // Smooth transition
+                    bars[i].scale.y += (targetScaleY - bars[i].scale.y) * 0.2;
+                    
+                    if (bars[i].scale.y > maxScaleY) {
+                        maxScaleY = bars[i].scale.y;
+                    }
+                }
+                avgAmplitude = sum / config.barCount;
+            } else {
+                // If paused, smoothly return bars to base height
+                for (let i = 0; i < bars.length; i++) {
+                    bars[i].scale.y += (0.1 - bars[i].scale.y) * 0.1;
+                    if (bars[i].scale.y > maxScaleY) maxScaleY = bars[i].scale.y;
+                }
+            }
+
+            // Update Fish
+            let currentFishY = 3;
+            if (fishModel) {
+                fishModel.rotation.y += config.fishRotationSpeed * delta;
+                
+                // Smooth bobbing
+                const targetFishY = 3 + avgAmplitude * 2;
+                fishModel.position.y += (targetFishY - fishModel.position.y) * 0.1;
+                currentFishY = fishModel.position.y;
+            }
+
+            controls.update();
+            renderer.render(scene, camera);
+
+            // Update Global State
+            window.__3D_STATE__.frameCount++;
+            window.__3D_STATE__.avgAmplitude = avgAmplitude;
+            window.__3D_STATE__.fishY = currentFishY;
+            window.__3D_STATE__.maxBarHeight = maxScaleY;
+            window.__3D_STATE__.undoStackSize = undoStack.length;
+            window.__3D_STATE__.redoStackSize = redoStack.length;
+        }
+
+        // Start application
+        init();
+    </script>
+</body>
+</html>

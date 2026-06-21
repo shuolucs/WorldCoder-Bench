@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Gyroscope Precession Simulation</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #000;
+        }
+        #debugOverlay {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(0, 0, 0, 0.75);
+            color: #00ff00;
+            padding: 15px;
+            font-family: monospace;
+            font-size: 14px;
+            border-radius: 5px;
+            pointer-events: none;
+            user-select: none;
+            z-index: 100;
+            line-height: 1.5;
+        }
+        #debugOverlay button {
+            pointer-events: auto;
+            margin-top: 10px;
+            background: #444;
+            color: white;
+            border: 1px solid #888;
+            padding: 5px 10px;
+            cursor: pointer;
+            font-family: monospace;
+        }
+        #debugOverlay button:hover {
+            background: #666;
+        }
+        .controls-help {
+            margin-top: 15px;
+            color: #aaa;
+            font-size: 12px;
+            border-top: 1px solid #555;
+            padding-top: 10px;
+        }
+    </style>
+    <!-- Import maps polyfill -->
+    <script async src="https://unpkg.com/es-module-shims@1.8.0/dist/es-module-shims.js"></script>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+
+    <div id="debugOverlay">
+        <div>Spin Speed (ω_s): <span id="dbgSpinSpeed"></span> rad/s</div>
+        <div>Mass (m): <span id="dbgMass"></span> kg</div>
+        <div>Precession Rate (ω_p): <span id="dbgPrecessionRate"></span> rad/s</div>
+        <div>Precession Angle: <span id="dbgPrecessionAngle"></span>°</div>
+        <div>Nutation Angle: <span id="dbgNutation"></span> rad</div>
+        <div>Gravity (g): <span id="dbgGravity"></span> m/s²</div>
+        <div>Kinetic Energy: <span id="dbgEnergy"></span> J</div>
+        <div>Paused: <span id="dbgPaused"></span></div>
+        <div>Sim Time: <span id="dbgSimTime"></span> s</div>
+        <button id="btnGravity">Toggle Gravity</button>
+        
+        <div class="controls-help">
+            [↑/↓] Spin Speed | [←/→] Mass<br>
+            [Space] Pause | [D] Toggle Debug | [R] Reset
+        </div>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+        // 1. Initialize State
+        window.__3D_STATE__ = {
+            spinSpeed: 50,
+            mass: 2.0,
+            gravity: 9.81,
+            precessionRate: 0,
+            precessionAngle: 0,
+            nutationAngle: 0,
+            paused: false,
+            debugVisible: true,
+            simTime: 0,
+            energy: 625,
+            robotLoaded: false,
+            discRotation: 0,
+            frameCount: 0
+        };
+
+        // Physics Constants
+        const d = 2.0; // distance from pivot to center of mass
+        const I = 0.5; // moment of inertia of flywheel
+
+        // Initial computation
+        window.__3D_STATE__.precessionRate = (window.__3D_STATE__.mass * window.__3D_STATE__.gravity * d) / (I * window.__3D_STATE__.spinSpeed);
+
+        // 2. Scene Setup
+        const scene = new THREE.Scene();
+        
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.set(0, 5, 10);
+        camera.lookAt(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        document.body.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.target.set(0, 2, 0);
+
+        // Lighting
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+        dirLight.position.set(5, 10, 5);
+        scene.add(dirLight);
+
+        // Ground & Grid
+        const groundGeo = new THREE.PlaneGeometry(50, 50);
+        const groundMat = new THREE.MeshStandardMaterial({ color: 0x888888, side: THREE.DoubleSide });
+        const ground = new THREE.Mesh(groundGeo, groundMat);
+        ground.rotation.x = -Math.PI / 2;
+        scene.add(ground);
+
+        const gridHelper = new THREE.GridHelper(50, 50);
+        scene.add(gridHelper);
+
+        // 3. Gyroscope Assembly
+        const gyroGroup = new THREE.Group();
+        scene.add(gyroGroup);
+
+        // Pillar
+        const pillarGeo = new THREE.CylinderGeometry(0.05, 0.05, 3, 16);
+        const pillarMat = new THREE.MeshStandardMaterial({ color: 0xaaaaaa });
+        const pillar = new THREE.Mesh(pillarGeo, pillarMat);
+        pillar.position.y = 1.5;
+        gyroGroup.add(pillar);
+
+        // Pivot Point
+        const pivotGeo = new THREE.SphereGeometry(0.1, 16, 16);
+        const pivotMat = new THREE.MeshStandardMaterial({ color: 0xff0000 });
+        const pivot = new THREE.Mesh(pivotGeo, pivotMat);
+        pivot.position.y = 3;
+        gyroGroup.add(pivot);
+
+        // Pivot Group (handles precession and nutation)
+        const pivotGroup = new THREE.Group();
+        pivotGroup.position.y = 3;
+        gyroGroup.add(pivotGroup);
+
+        // Arm
+        const armGeo = new THREE.CylinderGeometry(0.05, 0.05, 4, 16);
+        const armMat = new THREE.MeshStandardMaterial({ color: 0x3366ff, metalness: 0.8, roughness: 0.2 });
+        const arm = new THREE.Mesh(armGeo, armMat);
+        arm.rotation.z = Math.PI / 2;
+        arm.position.x = 2; // Center of 4-unit arm is at x=2
+        pivotGroup.add(arm);
+
+        // Disc Group (handles spin)
+        const discGroup = new THREE.Group();
+        discGroup.position.x = 4; // End of the arm
+        pivotGroup.add(discGroup);
+
+        // Disc (Flywheel)
+        const discGeo = new THREE.TorusGeometry(0.8, 0.15, 16, 64);
+        const discMat = new THREE.MeshStandardMaterial({ color: 0xffd700, metalness: 0.6, roughness: 0.3 });
+        const disc = new THREE.Mesh(discGeo, discMat);
+        disc.rotation.y = Math.PI / 2; // Align torus to spin around X axis
+        discGroup.add(disc);
+
+        // Load Robot Model
+        const loader = new GLTFLoader();
+        // Using a standard three.js example model as 'robot.glb'
+        loader.load('https://unpkg.com/three@0.160.0/examples/models/gltf/RobotExpressive/RobotExpressive.glb', function (gltf) {
+            const robot = gltf.scene;
+            robot.scale.set(0.5, 0.5, 0.5);
+            // Place on top of the disc (disc radius is 0.8, plus some margin)
+            robot.position.set(4, 0.95, 0); 
+            robot.rotation.y = Math.PI / 2; // Face outward
+            
+            // Add to pivotGroup so it precesses but doesn't spin wildly with the disc
+            pivotGroup.add(robot);
+            
+            window.__3D_STATE__.robotLoaded = true;
+        }, undefined, function (error) {
+            console.error('Error loading robot model:', error);
+        });
+
+        // 4. Interactions
+        window.addEventListener('keydown', (e) => {
+            const state = window.__3D_STATE__;
+            switch(e.code) {
+                case 'ArrowUp':
+                    state.spinSpeed = Math.min(200, state.spinSpeed + 10);
+                    break;
+                case 'ArrowDown':
+                    state.spinSpeed = Math.max(10, state.spinSpeed - 10);
+                    break;
+                case 'ArrowLeft':
+                    state.mass = Math.max(0.5, state.mass - 0.5);
+                    break;
+                case 'ArrowRight':
+                    state.mass = Math.min(5.0, state.mass + 0.5);
+                    break;
+                case 'Space':
+                    state.paused = !state.paused;
+                    break;
+                case 'KeyD':
+                    state.debugVisible = !state.debugVisible;
+                    document.getElementById('debugOverlay').style.display = state.debugVisible ? 'block' : 'none';
+                    break;
+                case 'KeyR':
+                    state.spinSpeed = 50;
+                    state.mass = 2.0;
+                    state.gravity = 9.81;
+                    state.precessionAngle = 0;
+                    state.simTime = 0;
+                    state.discRotation = 0;
+                    break;
+            }
+            state.energy = 0.5 * I * state.spinSpeed * state.spinSpeed;
+        });
+
+        document.getElementById('btnGravity').addEventListener('click', () => {
+            const state = window.__3D_STATE__;
+            state.gravity = state.gravity > 0 ? 0 : 9.81;
+        });
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // DOM Elements for fast updates
+        const elSpinSpeed = document.getElementById('dbgSpinSpeed');
+        const elMass = document.getElementById('dbgMass');
+        const elPrecessionRate = document.getElementById('dbgPrecessionRate');
+        const elPrecessionAngle = document.getElementById('dbgPrecessionAngle');
+        const elNutation = document.getElementById('dbgNutation');
+        const elGravity = document.getElementById('dbgGravity');
+        const elEnergy = document.getElementById('dbgEnergy');
+        const elPaused = document.getElementById('dbgPaused');
+        const elSimTime = document.getElementById('dbgSimTime');
+
+        // 5. Animation Loop
+        const clock = new THREE.Clock();
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const delta = clock.getDelta();
+            const state = window.__3D_STATE__;
+
+            if (!state.paused) {
+                state.simTime += delta;
+                
+                // Physics calculations
+                if (state.spinSpeed > 0) {
+                    state.precessionRate = (state.mass * state.gravity * d) / (I * state.spinSpeed);
+                } else {
+                    state.precessionRate = 0;
+                }
+
+                state.precessionAngle += state.precessionRate * delta;
+                state.discRotation += state.spinSpeed * delta;
+                
+                // Nutation: amplitude 0.05 rad, frequency 2 Hz
+                state.nutationAngle = 0.05 * Math.sin(2 * Math.PI * 2 * state.simTime);
+                
+                // Update Energy
+                state.energy = 0.5 * I * state.spinSpeed * state.spinSpeed;
+            }
+
+            // Apply Transforms
+            pivotGroup.rotation.y = state.precessionAngle;
+            pivotGroup.rotation.z = state.nutationAngle;
+            discGroup.rotation.x = state.discRotation;
+
+            // Update DOM
+            if (state.debugVisible) {
+                elSpinSpeed.innerText = state.spinSpeed.toFixed(0);
+                elMass.innerText = state.mass.toFixed(1);
+                elPrecessionRate.innerText = state.precessionRate.toFixed(4);
+                elPrecessionAngle.innerText = ((state.precessionAngle * 180) / Math.PI % 360).toFixed(2);
+                elNutation.innerText = state.nutationAngle.toFixed(4);
+                elGravity.innerText = state.gravity.toFixed(2);
+                elEnergy.innerText = state.energy.toFixed(2);
+                elPaused.innerText = state.paused.toString();
+                elSimTime.innerText = state.simTime.toFixed(2);
+            }
+
+            state.frameCount++;
+            controls.update();
+            renderer.render(scene, camera);
+        }
+
+        animate();
+    </script>
+</body>
+</html>

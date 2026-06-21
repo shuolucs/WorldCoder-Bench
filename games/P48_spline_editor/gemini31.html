@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Three.js Spline Editor</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #1a1a1a;
+            font-family: sans-serif;
+        }
+        #ui-container {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(0, 0, 0, 0.8);
+            color: white;
+            padding: 15px;
+            border-radius: 8px;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            user-select: none;
+            pointer-events: auto;
+            z-index: 10;
+        }
+        .control-group {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 10px;
+        }
+        button, select, input[type="range"] {
+            cursor: pointer;
+        }
+        button {
+            background: #4488ff;
+            color: white;
+            border: none;
+            padding: 5px 10px;
+            border-radius: 4px;
+        }
+        button:hover {
+            background: #5599ff;
+        }
+        button:disabled {
+            background: #555;
+            cursor: not-allowed;
+        }
+    </style>
+    <script type="importmap">
+    { "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+    } }
+    </script>
+</head>
+<body>
+    <div id="ui-container">
+        <div class="control-group">
+            <label for="curveType">曲线类型:</label>
+            <select id="curveType">
+                <option value="catmullrom">CatmullRom</option>
+                <option value="bezier">Bezier</option>
+            </select>
+        </div>
+        <div class="control-group">
+            <label for="tubeRadius">管道半径:</label>
+            <input type="range" id="tubeRadius" min="0.05" max="1.0" step="0.05" value="0.2">
+        </div>
+        <div class="control-group">
+            <button id="addPoint">添加控制点 (t=0.5)</button>
+            <button id="removePoint">移除末尾点</button>
+        </div>
+        <div class="control-group">
+            <label for="showPolygon">显示控制多边形:</label>
+            <input type="checkbox" id="showPolygon" checked>
+        </div>
+        <div class="control-group">
+            <span>曲线弧长:</span>
+            <span id="curveLength">0.00</span>
+        </div>
+        <button id="exportBtn">导出控制点 (JSON)</button>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { TransformControls } from 'three/addons/controls/TransformControls.js';
+
+        // Scene setup
+        const scene = new THREE.Scene();
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+        camera.position.set(0, 10, 15);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        document.body.appendChild(renderer.domElement);
+
+        // Lights
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+        scene.add(ambientLight);
+        const directionalLight = new THREE.DirectionalLight(0xffffff, 1.0);
+        directionalLight.position.set(5, 10, 5);
+        scene.add(directionalLight);
+
+        // Grid
+        const gridHelper = new THREE.GridHelper(10, 10);
+        scene.add(gridHelper);
+
+        // Controls
+        const orbitControls = new OrbitControls(camera, renderer.domElement);
+        const transformControl = new TransformControls(camera, renderer.domElement);
+        scene.add(transformControl);
+
+        transformControl.addEventListener('dragging-changed', function (event) {
+            orbitControls.enabled = !event.value;
+        });
+        transformControl.addEventListener('change', () => {
+            updateGeometry();
+        });
+
+        // State variables
+        let pointMeshes = [];
+        let curve = null;
+        let tubeMesh = null;
+        let polygonMesh = null;
+        
+        const initialPositions = [
+            new THREE.Vector3(-5, 0, 0),
+            new THREE.Vector3(-3, 3, 2),
+            new THREE.Vector3(-1, -2, -1),
+            new THREE.Vector3(1, 4, 1),
+            new THREE.Vector3(3, -1, -2),
+            new THREE.Vector3(5, 2, 0)
+        ];
+
+        const pointGeometry = new THREE.SphereGeometry(0.3, 16, 16);
+        const pointMaterial = new THREE.MeshStandardMaterial({ color: 0xff0000 });
+        const tubeMaterial = new THREE.MeshStandardMaterial({ color: 0x4488ff, metalness: 0.3, roughness: 0.5 });
+        const polygonMaterial = new THREE.LineBasicMaterial({ color: 0xffffff, opacity: 0.5, transparent: true });
+
+        // UI Elements
+        const uiTubeRadius = document.getElementById('tubeRadius');
+        const uiAddPoint = document.getElementById('addPoint');
+        const uiRemovePoint = document.getElementById('removePoint');
+        const uiCurveType = document.getElementById('curveType');
+        const uiShowPolygon = document.getElementById('showPolygon');
+        const uiCurveLength = document.getElementById('curveLength');
+        const uiExportBtn = document.getElementById('exportBtn');
+
+        function createPointMesh(position) {
+            const mesh = new THREE.Mesh(pointGeometry, pointMaterial);
+            mesh.position.copy(position);
+            scene.add(mesh);
+            return mesh;
+        }
+
+        function init() {
+            initialPositions.forEach(pos => {
+                pointMeshes.push(createPointMesh(pos));
+            });
+            updateGeometry();
+        }
+
+        function updateGeometry() {
+            const positions = pointMeshes.map(m => m.position);
+            const type = uiCurveType.value;
+            const radius = parseFloat(uiTubeRadius.value);
+
+            // 1. Update Curve
+            if (type === 'catmullrom') {
+                curve = new THREE.CatmullRomCurve3(positions);
+            } else if (type === 'bezier') {
+                curve = new THREE.CurvePath();
+                for (let i = 0; i < positions.length - 3; i += 3) {
+                    curve.add(new THREE.CubicBezierCurve3(
+                        positions[i],
+                        positions[i + 1],
+                        positions[i + 2],
+                        positions[i + 3]
+                    ));
+                }
+                if (curve.curves.length === 0) {
+                    // Fallback if not enough points for a single bezier
+                    curve = new THREE.CatmullRomCurve3(positions);
+                }
+            }
+
+            // 2. Update Tube
+            if (tubeMesh) {
+                scene.remove(tubeMesh);
+                tubeMesh.geometry.dispose();
+            }
+            
+            try {
+                const tubeGeo = new THREE.TubeGeometry(curve, 200, radius, 12, false);
+                tubeMesh = new THREE.Mesh(tubeGeo, tubeMaterial);
+                scene.add(tubeMesh);
+            } catch (e) {
+                // Handle potential errors if curve generation fails
+            }
+
+            // 3. Update Polygon
+            if (polygonMesh) {
+                scene.remove(polygonMesh);
+                polygonMesh.geometry.dispose();
+            }
+            if (uiShowPolygon.checked) {
+                const polyGeo = new THREE.BufferGeometry().setFromPoints(positions);
+                polygonMesh = new THREE.LineLoop(polyGeo, polygonMaterial);
+                scene.add(polygonMesh);
+            }
+
+            // 4. Update Length UI
+            if (curve) {
+                uiCurveLength.textContent = curve.getLength().toFixed(2);
+            }
+
+            // Update remove button state
+            uiRemovePoint.disabled = pointMeshes.length <= 2;
+        }
+
+        // Interaction - Raycasting
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+
+        window.addEventListener('pointerdown', (event) => {
+            if (event.target.closest('#ui-container')) return;
+
+            mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+            raycaster.setFromCamera(mouse, camera);
+            const intersects = raycaster.intersectObjects(pointMeshes);
+
+            if (intersects.length > 0) {
+                transformControl.attach(intersects[0].object);
+            } else if (!transformControl.dragging) {
+                transformControl.detach();
+            }
+        });
+
+        // UI Event Listeners
+        uiTubeRadius.addEventListener('input', updateGeometry);
+        
+        uiCurveType.addEventListener('change', updateGeometry);
+        
+        uiShowPolygon.addEventListener('change', updateGeometry);
+
+        uiAddPoint.addEventListener('click', () => {
+            if (!curve) return;
+            const midPoint = curve.getPointAt(0.5);
+            const newMesh = createPointMesh(midPoint);
+            const insertIndex = Math.floor(pointMeshes.length / 2);
+            pointMeshes.splice(insertIndex, 0, newMesh);
+            updateGeometry();
+        });
+
+        uiRemovePoint.addEventListener('click', () => {
+            if (pointMeshes.length > 2) {
+                const removedMesh = pointMeshes.pop();
+                if (transformControl.object === removedMesh) {
+                    transformControl.detach();
+                }
+                scene.remove(removedMesh);
+                removedMesh.geometry.dispose();
+                updateGeometry();
+            }
+        });
+
+        uiExportBtn.addEventListener('click', () => {
+            const pointsData = pointMeshes.map(m => ({
+                x: Number(m.position.x.toFixed(2)),
+                y: Number(m.position.y.toFixed(2)),
+                z: Number(m.position.z.toFixed(2))
+            }));
+            navigator.clipboard.writeText(JSON.stringify(pointsData, null, 2)).then(() => {
+                const originalText = uiExportBtn.textContent;
+                uiExportBtn.textContent = "已复制!";
+                setTimeout(() => uiExportBtn.textContent = originalText, 1500);
+            });
+        });
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        init();
+
+        // Animation Loop & State Exposure
+        function animate() {
+            requestAnimationFrame(animate);
+            
+            window.__3D_STATE__ = {
+                pointCount: pointMeshes.length,
+                points: pointMeshes.map(m => ({
+                    x: Number(m.position.x.toFixed(2)),
+                    y: Number(m.position.y.toFixed(2)),
+                    z: Number(m.position.z.toFixed(2))
+                })),
+                curveType: uiCurveType.value,
+                tubeRadius: parseFloat(uiTubeRadius.value),
+                curveLength: curve ? Number(curve.getLength().toFixed(2)) : 0,
+                showPolygon: uiShowPolygon.checked
+            };
+
+            renderer.render(scene, camera);
+        }
+
+        animate();
+    </script>
+</body>
+</html>

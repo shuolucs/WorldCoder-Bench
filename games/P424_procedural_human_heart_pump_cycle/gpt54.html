@@ -1,0 +1,545 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>3D Heart Pump Cycle Simulation</title>
+  <style>
+    html, body {
+      margin: 0;
+      overflow: hidden;
+      width: 100%;
+      height: 100%;
+      background: #0a0a2e;
+      font-family: Arial, sans-serif;
+      color: #fff;
+    }
+
+    #hud {
+      position: absolute;
+      top: 16px;
+      left: 16px;
+      z-index: 10;
+      background: rgba(10, 10, 30, 0.75);
+      border: 1px solid rgba(255,255,255,0.15);
+      border-radius: 10px;
+      padding: 12px 14px;
+      min-width: 220px;
+      backdrop-filter: blur(6px);
+    }
+
+    #infoPanel {
+      position: absolute;
+      top: 16px;
+      right: 16px;
+      z-index: 10;
+      width: 260px;
+      min-height: 120px;
+      background: rgba(10, 10, 30, 0.75);
+      border: 1px solid rgba(255,255,255,0.15);
+      border-radius: 10px;
+      padding: 12px 14px;
+      backdrop-filter: blur(6px);
+    }
+
+    #controlsBar {
+      position: absolute;
+      bottom: 20px;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 10;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      background: rgba(10, 10, 30, 0.8);
+      border: 1px solid rgba(255,255,255,0.15);
+      border-radius: 14px;
+      padding: 12px 16px;
+      backdrop-filter: blur(6px);
+    }
+
+    button, input[type="range"] {
+      cursor: pointer;
+    }
+
+    button {
+      background: #1e2a78;
+      color: white;
+      border: none;
+      border-radius: 8px;
+      padding: 10px 14px;
+      font-size: 14px;
+    }
+
+    button:hover {
+      background: #2d3aa0;
+    }
+
+    .label {
+      font-size: 13px;
+      opacity: 0.85;
+    }
+
+    .value {
+      font-weight: bold;
+      color: #ffd166;
+    }
+
+    #speedValue {
+      min-width: 42px;
+      display: inline-block;
+      text-align: right;
+    }
+  </style>
+</head>
+<body>
+  <div id="hud">
+    <div><span class="label">Phase:</span> <span class="value" id="phaseDisplay">0 - Diastole</span></div>
+    <div><span class="label">Cycle Count:</span> <span class="value" id="cycleDisplay">0</span></div>
+    <div><span class="label">BPM:</span> <span class="value" id="bpmDisplay">72</span></div>
+    <div><span class="label">Active Particles:</span> <span class="value" id="particleDisplay">0</span></div>
+  </div>
+
+  <div id="infoPanel">
+    <div class="value" style="margin-bottom:8px;">Selected Chamber</div>
+    <div id="infoContent">Click a chamber to inspect it.</div>
+  </div>
+
+  <div id="controlsBar">
+    <button id="playPauseBtn">Play</button>
+    <button id="stepBtn">Step</button>
+    <label for="speedSlider">Speed</label>
+    <input id="speedSlider" type="range" min="0.5" max="3.0" step="0.1" value="1.0" />
+    <span id="speedValue" class="value">1.0x</span>
+  </div>
+
+  <script type="module">
+    import * as THREE from "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js";
+    import { OrbitControls } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js";
+    import { GLTFLoader } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/GLTFLoader.js";
+
+    const PHASES = [
+      { name: "Diastole", duration: 1.5 },
+      { name: "Atrial Systole", duration: 0.8 },
+      { name: "Ventricular Systole", duration: 0.8 },
+      { name: "Isovolumetric Relaxation", duration: 0.6 }
+    ];
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0a0a2e);
+
+    const camera = new THREE.PerspectiveCamera(
+      60,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      100
+    );
+    camera.position.set(0, 2, 6);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    document.body.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.target.set(0, 0.8, 0);
+
+    const ambientLight = new THREE.AmbientLight(0x404060, 0.5);
+    scene.add(ambientLight);
+
+    const directionalLight = new THREE.DirectionalLight(0xffffff, 1.0);
+    directionalLight.position.set(5, 10, 5);
+    scene.add(directionalLight);
+
+    const raycaster = new THREE.Raycaster();
+    const mouse = new THREE.Vector2();
+
+    const heartGroup = new THREE.Group();
+    scene.add(heartGroup);
+
+    const redMat = new THREE.MeshStandardMaterial({ color: 0xcc2233, roughness: 0.45, metalness: 0.1 });
+    const blueMat = new THREE.MeshStandardMaterial({ color: 0x2255cc, roughness: 0.45, metalness: 0.1 });
+    const valveMat = new THREE.MeshStandardMaterial({ color: 0xd8c7a1, roughness: 0.7 });
+
+    const chamberMeshes = [];
+    let selectedMesh = null;
+
+    function createChamber(name, geometry, material, position) {
+      const mat = material.clone();
+      mat.emissive = new THREE.Color(0x000000);
+      const mesh = new THREE.Mesh(geometry, mat);
+      mesh.position.copy(position);
+      mesh.userData = {
+        chamberName: name,
+        baseScale: new THREE.Vector3(1, 1, 1)
+      };
+      heartGroup.add(mesh);
+      chamberMeshes.push(mesh);
+      return mesh;
+    }
+
+    function createTube(start, end, radius = 0.08, material = valveMat) {
+      const direction = new THREE.Vector3().subVectors(end, start);
+      const length = direction.length();
+      const geometry = new THREE.CylinderGeometry(radius, radius, length, 16);
+      const mesh = new THREE.Mesh(geometry, material.clone());
+      const midpoint = new THREE.Vector3().addVectors(start, end).multiplyScalar(0.5);
+      mesh.position.copy(midpoint);
+      mesh.quaternion.setFromUnitVectors(
+        new THREE.Vector3(0, 1, 0),
+        direction.clone().normalize()
+      );
+      heartGroup.add(mesh);
+      return mesh;
+    }
+
+    const leftAtrium = createChamber(
+      "Left Atrium",
+      new THREE.SphereGeometry(0.5, 32, 32),
+      redMat,
+      new THREE.Vector3(-0.6, 1.2, 0)
+    );
+
+    const rightAtrium = createChamber(
+      "Right Atrium",
+      new THREE.SphereGeometry(0.5, 32, 32),
+      blueMat,
+      new THREE.Vector3(0.6, 1.2, 0)
+    );
+
+    const leftVentricle = createChamber(
+      "Left Ventricle",
+      new THREE.SphereGeometry(0.7, 32, 32),
+      redMat,
+      new THREE.Vector3(-0.5, -0.2, 0)
+    );
+
+    const rightVentricle = createChamber(
+      "Right Ventricle",
+      new THREE.SphereGeometry(0.65, 32, 32),
+      blueMat,
+      new THREE.Vector3(0.5, -0.2, 0)
+    );
+
+    const aorta = createChamber(
+      "Aorta",
+      new THREE.CylinderGeometry(0.15, 0.15, 1.5, 24),
+      redMat,
+      new THREE.Vector3(-0.3, 2.5, 0)
+    );
+
+    const pulmonaryArtery = createChamber(
+      "Pulmonary Artery",
+      new THREE.CylinderGeometry(0.12, 0.12, 1.2, 24),
+      blueMat,
+      new THREE.Vector3(0.3, 2.3, 0)
+    );
+
+    createTube(new THREE.Vector3(-0.6, 0.8, 0), new THREE.Vector3(-0.5, 0.45, 0), 0.07);
+    createTube(new THREE.Vector3(0.6, 0.8, 0), new THREE.Vector3(0.5, 0.42, 0), 0.07);
+    createTube(new THREE.Vector3(-0.45, 0.5, 0), new THREE.Vector3(-0.3, 1.75, 0), 0.07);
+    createTube(new THREE.Vector3(0.45, 0.45, 0), new THREE.Vector3(0.3, 1.7, 0), 0.06);
+
+    const floorGrid = new THREE.GridHelper(20, 20, 0x223355, 0x112244);
+    floorGrid.position.y = -2.2;
+    scene.add(floorGrid);
+
+    let modelLoaded = false;
+    const gltfLoader = new GLTFLoader();
+    gltfLoader.load(
+      "https://threejs.org/examples/models/gltf/DragonAttenuation/glTF/DragonAttenuation.gltf",
+      (gltf) => {
+        const model = gltf.scene;
+        model.scale.set(0.5, 0.5, 0.5);
+        model.position.set(3, -1, 0);
+        model.traverse((child) => {
+          if (child.isMesh) {
+            child.material = child.material.clone();
+            child.material.color = new THREE.Color(0xaa4444);
+            child.material.transparent = true;
+            child.material.opacity = 0.6;
+          }
+        });
+        scene.add(model);
+        modelLoaded = true;
+      },
+      undefined,
+      () => {
+        modelLoaded = false;
+      }
+    );
+
+    const bloodParticles = [];
+    const particleGeometry = new THREE.SphereGeometry(0.03, 10, 10);
+
+    function spawnParticle(color, start, end, speed = 1.5) {
+      const material = new THREE.MeshStandardMaterial({
+        color,
+        emissive: color,
+        emissiveIntensity: 0.25
+      });
+      const mesh = new THREE.Mesh(particleGeometry, material);
+      mesh.position.copy(start);
+      scene.add(mesh);
+      bloodParticles.push({
+        mesh,
+        start: start.clone(),
+        end: end.clone(),
+        t: 0,
+        speed
+      });
+    }
+
+    function updateParticles(dt) {
+      for (let i = bloodParticles.length - 1; i >= 0; i--) {
+        const p = bloodParticles[i];
+        const dist = p.start.distanceTo(p.end);
+        p.t += (dt * p.speed) / Math.max(dist, 0.001);
+        if (p.t >= 1) {
+          scene.remove(p.mesh);
+          p.mesh.geometry.dispose?.();
+          p.mesh.material.dispose?.();
+          bloodParticles.splice(i, 1);
+        } else {
+          p.mesh.position.lerpVectors(p.start, p.end, p.t);
+        }
+      }
+    }
+
+    let currentPhase = 0;
+    let phaseTime = 0;
+    let cycleCount = 0;
+    let isPlaying = false;
+    let speedMultiplier = 1.0;
+    const baseBPM = 72;
+    let bpm = baseBPM * speedMultiplier;
+    let particleSpawnAccumulator = 0;
+
+    function applyHeartState() {
+      const t = phaseTime / PHASES[currentPhase].duration;
+
+      let atriaScale = 1.0;
+      let ventriclesScale = 1.0;
+      let vesselPulse = 1.0;
+
+      if (currentPhase === 0) {
+        atriaScale = 1.0;
+        ventriclesScale = 1.0;
+        vesselPulse = 1.0;
+      } else if (currentPhase === 1) {
+        atriaScale = THREE.MathUtils.lerp(1.0, 0.7, t);
+        ventriclesScale = THREE.MathUtils.lerp(1.0, 1.15, t);
+      } else if (currentPhase === 2) {
+        atriaScale = THREE.MathUtils.lerp(0.7, 1.0, t);
+        ventriclesScale = THREE.MathUtils.lerp(1.15, 0.65, t);
+        vesselPulse = THREE.MathUtils.lerp(1.0, 1.3, Math.sin(t * Math.PI));
+      } else if (currentPhase === 3) {
+        atriaScale = THREE.MathUtils.lerp(1.0, 1.0, t);
+        ventriclesScale = THREE.MathUtils.lerp(0.65, 1.0, t);
+        vesselPulse = THREE.MathUtils.lerp(1.1, 1.0, t);
+      }
+
+      leftAtrium.scale.setScalar(atriaScale);
+      rightAtrium.scale.setScalar(atriaScale);
+      leftVentricle.scale.setScalar(ventriclesScale);
+      rightVentricle.scale.setScalar(ventriclesScale);
+      aorta.scale.set(vesselPulse, 1, vesselPulse);
+      pulmonaryArtery.scale.set(vesselPulse, 1, vesselPulse);
+    }
+
+    function nextPhase() {
+      currentPhase++;
+      phaseTime = 0;
+      particleSpawnAccumulator = 0;
+      if (currentPhase > 3) {
+        currentPhase = 0;
+        cycleCount++;
+      }
+      applyHeartState();
+      updateHUD();
+    }
+
+    function setPhase(index) {
+      currentPhase = index;
+      phaseTime = 0;
+      particleSpawnAccumulator = 0;
+      applyHeartState();
+      updateHUD();
+    }
+
+    function resetCycle() {
+      isPlaying = false;
+      currentPhase = 0;
+      phaseTime = 0;
+      cycleCount = 0;
+      particleSpawnAccumulator = 0;
+      clearParticles();
+      applyHeartState();
+      updateHUD();
+      updateButtons();
+    }
+
+    function clearParticles() {
+      for (const p of bloodParticles) {
+        scene.remove(p.mesh);
+        p.mesh.geometry.dispose?.();
+        p.mesh.material.dispose?.();
+      }
+      bloodParticles.length = 0;
+    }
+
+    function spawnPhaseParticles(dt) {
+      particleSpawnAccumulator += dt;
+      const interval = 0.12 / speedMultiplier;
+
+      while (particleSpawnAccumulator >= interval) {
+        particleSpawnAccumulator -= interval;
+
+        if (currentPhase === 1) {
+          spawnParticle(0xff4444, leftAtrium.position, leftVentricle.position, 1.8 * speedMultiplier);
+          spawnParticle(0x4488ff, rightAtrium.position, rightVentricle.position, 1.8 * speedMultiplier);
+        }
+
+        if (currentPhase === 2) {
+          spawnParticle(0xff4444, leftVentricle.position, new THREE.Vector3(-0.3, 3.2, 0), 2.2 * speedMultiplier);
+          spawnParticle(0x4488ff, rightVentricle.position, new THREE.Vector3(0.3, 2.9, 0), 2.2 * speedMultiplier);
+        }
+      }
+    }
+
+    function updateHUD() {
+      bpm = baseBPM * speedMultiplier;
+      document.getElementById("phaseDisplay").textContent = `${currentPhase} - ${PHASES[currentPhase].name}`;
+      document.getElementById("cycleDisplay").textContent = cycleCount;
+      document.getElementById("bpmDisplay").textContent = bpm.toFixed(1);
+      document.getElementById("particleDisplay").textContent = bloodParticles.length;
+      document.getElementById("speedValue").textContent = `${speedMultiplier.toFixed(1)}x`;
+
+      window.__3D_STATE__ = {
+        modelLoaded,
+        currentPhase,
+        phaseName: PHASES[currentPhase].name,
+        isPlaying,
+        speedMultiplier,
+        cycleCount,
+        bpm,
+        leftVentricleScale: leftVentricle.scale.x,
+        rightAtriumScale: rightAtrium.scale.x,
+        activeParticleCount: bloodParticles.length,
+        selectedChamber: selectedMesh ? selectedMesh.userData.chamberName : null,
+        aortaPulseScale: aorta.scale.x,
+        phaseTime
+      };
+    }
+
+    function updateButtons() {
+      document.getElementById("playPauseBtn").textContent = isPlaying ? "Pause" : "Play";
+    }
+
+    function updateInfoPanel(mesh = null) {
+      const info = document.getElementById("infoContent");
+      if (!mesh) {
+        info.innerHTML = "Click a chamber to inspect it.";
+        return;
+      }
+      info.innerHTML = `
+        <div><span class="label">Name:</span> <span class="value">${mesh.userData.chamberName}</span></div>
+        <div><span class="label">Scale:</span> <span class="value">${mesh.scale.x.toFixed(2)}, ${mesh.scale.y.toFixed(2)}, ${mesh.scale.z.toFixed(2)}</span></div>
+        <div><span class="label">Position:</span> <span class="value">${mesh.position.x.toFixed(2)}, ${mesh.position.y.toFixed(2)}, ${mesh.position.z.toFixed(2)}</span></div>
+      `;
+    }
+
+    function clearHighlights() {
+      for (const mesh of chamberMeshes) {
+        if (mesh.material && mesh.material.emissive) {
+          mesh.material.emissive.setHex(0x000000);
+        }
+      }
+    }
+
+    function onPointerClick(event) {
+      mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+      mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+      raycaster.setFromCamera(mouse, camera);
+      const intersects = raycaster.intersectObjects(chamberMeshes, false);
+
+      if (intersects.length > 0) {
+        clearHighlights();
+        selectedMesh = intersects[0].object;
+        selectedMesh.material.emissive.setHex(0xffff00);
+        updateInfoPanel(selectedMesh);
+      }
+      updateHUD();
+    }
+
+    document.getElementById("playPauseBtn").addEventListener("click", () => {
+      isPlaying = !isPlaying;
+      updateButtons();
+      updateHUD();
+    });
+
+    document.getElementById("stepBtn").addEventListener("click", () => {
+      if (!isPlaying) nextPhase();
+    });
+
+    document.getElementById("speedSlider").addEventListener("input", (e) => {
+      speedMultiplier = parseFloat(e.target.value);
+      updateHUD();
+    });
+
+    window.addEventListener("keydown", (e) => {
+      const key = e.key.toLowerCase();
+      if (key === "r") {
+        resetCycle();
+      }
+      if (!isPlaying) {
+        if (key === "1") setPhase(0);
+        if (key === "2") setPhase(1);
+        if (key === "3") setPhase(2);
+        if (key === "4") setPhase(3);
+      }
+    });
+
+    renderer.domElement.addEventListener("click", onPointerClick);
+
+    window.addEventListener("resize", () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    const clock = new THREE.Clock();
+
+    function animate() {
+      requestAnimationFrame(animate);
+      const dtRaw = clock.getDelta();
+      const dt = dtRaw * speedMultiplier;
+
+      controls.update();
+
+      if (isPlaying) {
+        phaseTime += dt;
+        spawnPhaseParticles(dtRaw);
+        if (phaseTime >= PHASES[currentPhase].duration) {
+          nextPhase();
+        }
+        applyHeartState();
+      }
+
+      updateParticles(dtRaw);
+      if (selectedMesh) updateInfoPanel(selectedMesh);
+      updateHUD();
+      renderer.render(scene, camera);
+    }
+
+    applyHeartState();
+    updateButtons();
+    updateHUD();
+    updateInfoPanel();
+    animate();
+  </script>
+</body>
+</html>

@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>3D Planetary Orbit Simulator</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      background: #000;
+      font-family: Arial, sans-serif;
+    }
+
+    canvas {
+      display: block;
+    }
+
+    #uiPanel {
+      position: fixed;
+      top: 12px;
+      left: 12px;
+      z-index: 10;
+      background: rgba(20, 20, 30, 0.78);
+      color: white;
+      padding: 14px;
+      border-radius: 10px;
+      min-width: 230px;
+      box-shadow: 0 4px 18px rgba(0,0,0,0.35);
+      backdrop-filter: blur(4px);
+    }
+
+    #uiPanel h3 {
+      margin: 0 0 10px 0;
+      font-size: 16px;
+      font-weight: 600;
+    }
+
+    #uiPanel .row {
+      margin-bottom: 10px;
+    }
+
+    #uiPanel button,
+    #uiPanel input[type="range"] {
+      width: 100%;
+      box-sizing: border-box;
+    }
+
+    #uiPanel button {
+      background: #2f5fff;
+      border: none;
+      color: white;
+      padding: 9px 10px;
+      margin-bottom: 8px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 14px;
+    }
+
+    #uiPanel button:hover {
+      background: #4d78ff;
+    }
+
+    #uiPanel .stat {
+      font-size: 14px;
+      margin: 4px 0;
+    }
+
+    #speedLabel {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 4px;
+      font-size: 14px;
+    }
+  </style>
+</head>
+<body>
+  <div id="uiPanel">
+    <h3>Orbit Simulator</h3>
+    <button id="addPlanetBtn">Add Planet</button>
+    <button id="undoBtn">Undo</button>
+    <button id="redoBtn">Redo</button>
+    <button id="pauseBtn">Pause</button>
+
+    <div class="row">
+      <div id="speedLabel">
+        <span>Speed</span>
+        <span id="speedDisplay">1.0</span>
+      </div>
+      <input id="speedSlider" type="range" min="0.1" max="3.0" step="0.1" value="1.0" />
+    </div>
+
+    <div id="planetCount" class="stat">Planets: 1</div>
+    <div id="undoStackSize" class="stat">Undo Stack: 0</div>
+    <div id="redoStackSize" class="stat">Redo Stack: 0</div>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js';
+    import { OrbitControls } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js';
+    import { GLTFLoader } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/GLTFLoader.js';
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x000000);
+
+    const camera = new THREE.PerspectiveCamera(
+      60,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      1000
+    );
+    camera.position.set(0, 30, 50);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    document.body.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.set(0, 0, 0);
+    controls.enableDamping = true;
+
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+    scene.add(ambientLight);
+
+    const sunLight = new THREE.PointLight(0xFFDD44, 2, 300);
+    sunLight.position.set(0, 0, 0);
+    scene.add(sunLight);
+
+    const sunGeo = new THREE.SphereGeometry(3, 32, 32);
+    const sunMat = new THREE.MeshStandardMaterial({
+      color: 0xFFD84D,
+      emissive: 0xFFBB22,
+      emissiveIntensity: 1.5
+    });
+    const sun = new THREE.Mesh(sunGeo, sunMat);
+    sun.position.set(0, 0, 0);
+    scene.add(sun);
+
+    const starGeo = new THREE.SphereGeometry(0.12, 6, 6);
+    const starMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
+    for (let i = 0; i < 250; i++) {
+      const star = new THREE.Mesh(starGeo, starMat);
+      const radius = 120 + Math.random() * 180;
+      const theta = Math.random() * Math.PI * 2;
+      const phi = Math.acos(2 * Math.random() - 1);
+      star.position.set(
+        radius * Math.sin(phi) * Math.cos(theta),
+        radius * Math.cos(phi),
+        radius * Math.sin(phi) * Math.sin(theta)
+      );
+      scene.add(star);
+    }
+
+    let lantern = null;
+    let lanternLoaded = false;
+    const gltfLoader = new GLTFLoader();
+    gltfLoader.load(
+      '._Lantern.glb',
+      (gltf) => {
+        lantern = gltf.scene;
+        lantern.position.set(20, 0, 0);
+        lantern.scale.set(2, 2, 2);
+        scene.add(lantern);
+        lanternLoaded = true;
+      },
+      undefined,
+      (err) => {
+        console.warn('Failed to load ._Lantern.glb', err);
+      }
+    );
+
+    const planets = [];
+    const undoStack = [];
+    const redoStack = [];
+    let nextPlanetIndex = 0;
+    let isPaused = false;
+    let speedMultiplier = 1.0;
+    let frameCount = 0;
+
+    const addPlanetBtn = document.getElementById('addPlanetBtn');
+    const undoBtn = document.getElementById('undoBtn');
+    const redoBtn = document.getElementById('redoBtn');
+    const pauseBtn = document.getElementById('pauseBtn');
+    const speedSlider = document.getElementById('speedSlider');
+    const speedDisplay = document.getElementById('speedDisplay');
+    const planetCountEl = document.getElementById('planetCount');
+    const undoStackSizeEl = document.getElementById('undoStackSize');
+    const redoStackSizeEl = document.getElementById('redoStackSize');
+
+    function createOrbitRing(distance, color = 0xffffff) {
+      const segments = 128;
+      const points = [];
+      for (let i = 0; i <= segments; i++) {
+        const a = (i / segments) * Math.PI * 2;
+        points.push(new THREE.Vector3(
+          Math.cos(a) * distance,
+          0,
+          Math.sin(a) * distance
+        ));
+      }
+      const geometry = new THREE.BufferGeometry().setFromPoints(points);
+      const material = new THREE.LineBasicMaterial({
+        color,
+        transparent: true,
+        opacity: 0.25
+      });
+      return new THREE.LineLoop(geometry, material);
+    }
+
+    function createPlanetRecord({ index, distance, speed, angle, color, radius }) {
+      const geometry = new THREE.SphereGeometry(radius, 24, 24);
+      const material = new THREE.MeshStandardMaterial({
+        color,
+        roughness: 0.8,
+        metalness: 0.1
+      });
+      const mesh = new THREE.Mesh(geometry, material);
+      mesh.position.set(
+        distance * Math.cos(angle),
+        0,
+        distance * Math.sin(angle)
+      );
+
+      const ring = createOrbitRing(distance, color);
+
+      scene.add(mesh);
+      scene.add(ring);
+
+      return {
+        index,
+        distance,
+        speed,
+        angle,
+        color,
+        radius,
+        mesh,
+        ring
+      };
+    }
+
+    function addPlanetFromProps(props, isUserAction = true) {
+      const planet = createPlanetRecord(props);
+      planets.push(planet);
+
+      if (isUserAction && props.index !== 0) {
+        undoStack.push({
+          type: 'add',
+          props: {
+            index: planet.index,
+            distance: planet.distance,
+            speed: planet.speed,
+            angle: planet.angle,
+            color: planet.color,
+            radius: planet.radius
+          }
+        });
+        redoStack.length = 0;
+      }
+
+      updateHUD();
+      return planet;
+    }
+
+    function removePlanetByIndex(index) {
+      const idx = planets.findIndex(p => p.index === index);
+      if (idx === -1) return null;
+
+      const planet = planets[idx];
+      scene.remove(planet.mesh);
+      scene.remove(planet.ring);
+      planet.mesh.geometry.dispose();
+      planet.mesh.material.dispose();
+      planet.ring.geometry.dispose();
+      planet.ring.material.dispose();
+
+      planets.splice(idx, 1);
+      updateHUD();
+      return planet;
+    }
+
+    function addRandomPlanet() {
+      const distance = 8 + Math.random() * (35 - 8);
+      const radius = 0.5 + Math.random() * 1.0;
+      const speed = 0.1 / Math.sqrt(distance);
+      const angle = Math.random() * Math.PI * 2;
+      const color = new THREE.Color(Math.random(), Math.random(), Math.random()).getHex();
+
+      const props = {
+        index: nextPlanetIndex++,
+        distance,
+        speed,
+        angle,
+        color,
+        radius
+      };
+
+      addPlanetFromProps(props, true);
+    }
+
+    function undoAction() {
+      if (undoStack.length === 0) return;
+
+      const action = undoStack[undoStack.length - 1];
+      if (action.type === 'add') {
+        if (action.props.index === 0) return;
+
+        const removed = removePlanetByIndex(action.props.index);
+        if (removed) {
+          undoStack.pop();
+          redoStack.push({
+            type: 'add',
+            props: {
+              index: removed.index,
+              distance: removed.distance,
+              speed: removed.speed,
+              angle: removed.angle,
+              color: removed.color,
+              radius: removed.radius
+            }
+          });
+        }
+      }
+
+      updateHUD();
+    }
+
+    function redoAction() {
+      if (redoStack.length === 0) return;
+
+      const action = redoStack.pop();
+      if (action.type === 'add') {
+        addPlanetFromProps(action.props, false);
+        undoStack.push({
+          type: 'add',
+          props: { ...action.props }
+        });
+      }
+
+      updateHUD();
+    }
+
+    function updateHUD() {
+      planetCountEl.textContent = `Planets: ${planets.length}`;
+      undoStackSizeEl.textContent = `Undo Stack: ${undoStack.length}`;
+      redoStackSizeEl.textContent = `Redo Stack: ${redoStack.length}`;
+      speedDisplay.textContent = speedMultiplier.toFixed(1);
+    }
+
+    addPlanetBtn.addEventListener('click', addRandomPlanet);
+    undoBtn.addEventListener('click', undoAction);
+    redoBtn.addEventListener('click', redoAction);
+
+    pauseBtn.addEventListener('click', () => {
+      isPaused = !isPaused;
+      pauseBtn.textContent = isPaused ? 'Resume' : 'Pause';
+      updateHUD();
+    });
+
+    speedSlider.addEventListener('input', (e) => {
+      speedMultiplier = parseFloat(e.target.value);
+      updateHUD();
+    });
+
+    // Default planet index 0
+    addPlanetFromProps({
+      index: nextPlanetIndex++,
+      distance: 15,
+      speed: 0.02,
+      angle: 0,
+      color: 0x3366ff,
+      radius: 1
+    }, false);
+
+    window.__3D_STATE__ = {
+      planetCount: planets.length,
+      isPaused,
+      speedMultiplier,
+      undoStackSize: undoStack.length,
+      redoStackSize: redoStack.length,
+      lanternLoaded,
+      lanternRotationY: 0,
+      planets: [],
+      totalOrbitalEnergy: 0,
+      frameCount
+    };
+
+    function updateState() {
+      const statePlanets = planets.map(p => ({
+        index: p.index,
+        distance: p.distance,
+        speed: p.speed,
+        angle: p.angle,
+        color: p.color
+      }));
+
+      const totalOrbitalEnergy = planets.reduce((sum, p) => {
+        return sum + 0.5 * p.speed * p.speed * p.distance;
+      }, 0);
+
+      window.__3D_STATE__.planetCount = planets.length;
+      window.__3D_STATE__.isPaused = isPaused;
+      window.__3D_STATE__.speedMultiplier = speedMultiplier;
+      window.__3D_STATE__.undoStackSize = undoStack.length;
+      window.__3D_STATE__.redoStackSize = redoStack.length;
+      window.__3D_STATE__.lanternLoaded = lanternLoaded;
+      window.__3D_STATE__.lanternRotationY = lantern ? lantern.rotation.y : 0;
+      window.__3D_STATE__.planets = statePlanets;
+      window.__3D_STATE__.totalOrbitalEnergy = totalOrbitalEnergy;
+      window.__3D_STATE__.frameCount = frameCount;
+    }
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      controls.update();
+
+      if (!isPaused) {
+        frameCount++;
+
+        for (const planet of planets) {
+          planet.angle = (planet.angle + planet.speed * speedMultiplier) % (Math.PI * 2);
+          if (planet.angle < 0) planet.angle += Math.PI * 2;
+
+          planet.mesh.position.x = planet.distance * Math.cos(planet.angle);
+          planet.mesh.position.z = planet.distance * Math.sin(planet.angle);
+        }
+
+        if (lantern) {
+          lantern.rotation.y += 0.01;
+          lantern.rotation.y %= (Math.PI * 2);
+        }
+      }
+
+      updateState();
+      renderer.render(scene, camera);
+    }
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    updateHUD();
+    animate();
+  </script>
+</body>
+</html>

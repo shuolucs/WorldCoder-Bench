@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Double Spring-Mass System</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #1a1a2e;
+            font-family: monospace;
+            user-select: none;
+        }
+        canvas {
+            display: block;
+        }
+        #hud {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            color: #ffffff;
+            background: rgba(0, 0, 0, 0.6);
+            padding: 15px;
+            border-radius: 8px;
+            pointer-events: none;
+            line-height: 1.5;
+            font-size: 14px;
+        }
+        #instructions {
+            position: absolute;
+            bottom: 10px;
+            left: 10px;
+            color: #aaaaaa;
+            background: rgba(0, 0, 0, 0.6);
+            padding: 10px;
+            border-radius: 8px;
+            pointer-events: none;
+            font-size: 12px;
+            line-height: 1.4;
+        }
+    </style>
+</head>
+<body>
+    <div id="hud"></div>
+    <div id="instructions">
+        Drag spheres to move<br>
+        [R] Reset<br>
+        [G] Toggle Gravity<br>
+        [Space] Pause/Resume<br>
+        [1] Impulse Mass A (+5 m/s)<br>
+        [2] Impulse Mass B (-5 m/s)<br>
+        [D] Toggle Damping
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script>
+        // --- Scene Setup ---
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x1a1a2e);
+
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+        camera.position.set(0, 0, 12);
+        camera.lookAt(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        document.body.appendChild(renderer.domElement);
+
+        const ambientLight = new THREE.AmbientLight(0x404040, 0.6);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+        dirLight.position.set(5, 10, 7);
+        scene.add(dirLight);
+
+        // --- Physics Parameters ---
+        const anchorY = 4.0;
+        const m1 = 1.0;
+        const m2 = 1.5;
+        const k1 = 20.0;
+        const k2 = 15.0;
+        const L1 = 2.0;
+        const L2 = 2.0;
+        const dampingCoeff = 0.05;
+        const dt = 1 / 60;
+
+        // --- State Variables ---
+        let y1 = 2.0;
+        let y2 = 0.0;
+        let v1 = 0.0;
+        let v2 = 0.0;
+        
+        let gravityOn = true;
+        let paused = false;
+        let dampingOn = true;
+        let draggingA = false;
+        let draggingB = false;
+        let simTime = 0;
+
+        window.__3D_STATE__ = {};
+
+        // --- Objects ---
+        // Anchor
+        const anchorGeo = new THREE.BoxGeometry(0.4, 0.4, 0.4);
+        const anchorMat = new THREE.MeshPhongMaterial({ color: 0x888888 });
+        const anchor = new THREE.Mesh(anchorGeo, anchorMat);
+        anchor.position.set(0, anchorY, 0);
+        scene.add(anchor);
+
+        // Mass A
+        const sphereGeo = new THREE.SphereGeometry(0.3, 32, 32);
+        const matA = new THREE.MeshPhongMaterial({ color: 0xff0000 });
+        const meshA = new THREE.Mesh(sphereGeo, matA);
+        scene.add(meshA);
+
+        // Mass B
+        const matB = new THREE.MeshPhongMaterial({ color: 0x0000ff });
+        const meshB = new THREE.Mesh(sphereGeo, matB);
+        scene.add(meshB);
+
+        // Springs
+        const springSegments = 20;
+        const springWidth = 0.2;
+
+        function createSpringGeometry() {
+            const points = new Float32Array((springSegments + 1) * 3);
+            const geometry = new THREE.BufferGeometry();
+            geometry.setAttribute('position', new THREE.BufferAttribute(points, 3));
+            return geometry;
+        }
+
+        function updateSpringGeometry(geometry, startY, endY) {
+            const positions = geometry.attributes.position.array;
+            const dy = (endY - startY) / springSegments;
+            for (let i = 0; i <= springSegments; i++) {
+                let x = 0;
+                if (i > 0 && i < springSegments) {
+                    x = (i % 2 === 0) ? springWidth : -springWidth;
+                }
+                positions[i * 3] = x;
+                positions[i * 3 + 1] = startY + i * dy;
+                positions[i * 3 + 2] = 0;
+            }
+            geometry.attributes.position.needsUpdate = true;
+        }
+
+        const geoSpring1 = createSpringGeometry();
+        const matSpring1 = new THREE.LineBasicMaterial({ color: 0xffff00 });
+        const lineSpring1 = new THREE.Line(geoSpring1, matSpring1);
+        scene.add(lineSpring1);
+
+        const geoSpring2 = createSpringGeometry();
+        const matSpring2 = new THREE.LineBasicMaterial({ color: 0x00ff00 });
+        const lineSpring2 = new THREE.Line(geoSpring2, matSpring2);
+        scene.add(lineSpring2);
+
+        // --- Interaction ---
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+        const dragPlane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0);
+        const intersectPoint = new THREE.Vector3();
+        let dragOffset = 0;
+
+        window.addEventListener('mousedown', (e) => {
+            mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+            raycaster.setFromCamera(mouse, camera);
+            
+            const intersects = raycaster.intersectObjects([meshA, meshB]);
+            if (intersects.length > 0) {
+                const obj = intersects[0].object;
+                raycaster.ray.intersectPlane(dragPlane, intersectPoint);
+                dragOffset = obj.position.y - intersectPoint.y;
+                
+                if (obj === meshA) {
+                    draggingA = true;
+                    v1 = 0;
+                } else if (obj === meshB) {
+                    draggingB = true;
+                    v2 = 0;
+                }
+            }
+        });
+
+        window.addEventListener('mousemove', (e) => {
+            if (!draggingA && !draggingB) return;
+            
+            mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+            raycaster.setFromCamera(mouse, camera);
+            raycaster.ray.intersectPlane(dragPlane, intersectPoint);
+            
+            if (draggingA) {
+                y1 = intersectPoint.y + dragOffset;
+                v1 = 0;
+            }
+            if (draggingB) {
+                y2 = intersectPoint.y + dragOffset;
+                v2 = 0;
+            }
+        });
+
+        window.addEventListener('mouseup', () => {
+            draggingA = false;
+            draggingB = false;
+        });
+
+        window.addEventListener('keydown', (e) => {
+            switch(e.key.toLowerCase()) {
+                case 'r':
+                    y1 = 2.0;
+                    y2 = 0.0;
+                    v1 = 0.0;
+                    v2 = 0.0;
+                    break;
+                case 'g':
+                    gravityOn = !gravityOn;
+                    break;
+                case ' ':
+                    paused = !paused;
+                    break;
+                case '1':
+                    v1 += 5.0;
+                    break;
+                case '2':
+                    v2 -= 5.0;
+                    break;
+                case 'd':
+                    dampingOn = !dampingOn;
+                    break;
+            }
+        });
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // --- Main Loop ---
+        const hudElement = document.getElementById('hud');
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            // Physics Step
+            if (!paused) {
+                const g = gravityOn ? 9.81 : 0;
+                const damp = dampingOn ? dampingCoeff : 0;
+
+                const len1 = anchorY - y1;
+                const len2 = y1 - y2;
+
+                const F1_spring = k1 * (len1 - L1);
+                const F2_spring = k2 * (len2 - L2);
+
+                const F1_total = F1_spring - F2_spring - m1 * g;
+                const F2_total = F2_spring - m2 * g;
+
+                if (!draggingA) {
+                    v1 += (F1_total / m1) * dt;
+                    v1 *= (1 - damp * dt);
+                    y1 += v1 * dt;
+                }
+
+                if (!draggingB) {
+                    v2 += (F2_total / m2) * dt;
+                    v2 *= (1 - damp * dt);
+                    y2 += v2 * dt;
+                }
+
+                simTime += dt;
+            }
+
+            // Update Visuals
+            meshA.position.y = y1;
+            meshB.position.y = y2;
+            
+            updateSpringGeometry(geoSpring1, anchorY, y1);
+            updateSpringGeometry(geoSpring2, y1, y2);
+
+            // Calculate Energy
+            const g = gravityOn ? 9.81 : 0;
+            const len1 = anchorY - y1;
+            const len2 = y1 - y2;
+            
+            const ke1 = 0.5 * m1 * v1 * v1;
+            const ke2 = 0.5 * m2 * v2 * v2;
+            const pe_s1 = 0.5 * k1 * Math.pow(len1 - L1, 2);
+            const pe_s2 = 0.5 * k2 * Math.pow(len2 - L2, 2);
+            const pe_g1 = m1 * g * y1;
+            const pe_g2 = m2 * g * y2;
+            const totalEnergy = ke1 + ke2 + pe_s1 + pe_s2 + pe_g1 + pe_g2;
+
+            // Update HUD
+            hudElement.innerHTML = `
+                Mass A Y: ${y1.toFixed(2)}<br>
+                Mass B Y: ${y2.toFixed(2)}<br>
+                Vel A: ${v1.toFixed(2)}<br>
+                Vel B: ${v2.toFixed(2)}<br>
+                Total Energy: ${totalEnergy.toFixed(2)}<br>
+                Gravity: ${gravityOn ? 'ON' : 'OFF'}<br>
+                Paused: ${paused ? 'YES' : 'NO'}<br>
+                Damping: ${dampingOn ? 'ON' : 'OFF'}
+            `;
+
+            // Update State Object
+            window.__3D_STATE__ = {
+                massA_y: y1,
+                massB_y: y2,
+                velA: v1,
+                velB: v2,
+                spring1_length: len1,
+                spring2_length: len2,
+                totalEnergy: totalEnergy,
+                gravityOn: gravityOn,
+                paused: paused,
+                dampingOn: dampingOn,
+                draggingA: draggingA,
+                draggingB: draggingB,
+                simTime: simTime,
+                massA_mass: m1,
+                massB_mass: m2,
+                k1: k1,
+                k2: k2
+            };
+
+            renderer.render(scene, camera);
+        }
+
+        animate();
+    </script>
+</body>
+</html>

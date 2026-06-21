@@ -1,0 +1,472 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Ski Downhill</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #000;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            user-select: none;
+        }
+        #game-container {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100vw;
+            height: 100vh;
+        }
+        #ui-layer {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+            color: white;
+            text-shadow: 1px 1px 2px black;
+        }
+        .hud-element {
+            position: absolute;
+            font-size: 20px;
+            font-weight: bold;
+            background: rgba(0, 0, 0, 0.4);
+            padding: 5px 10px;
+            border-radius: 5px;
+        }
+        #hud-speed { top: 20px; left: 20px; }
+        #hud-timer { top: 20px; left: 50%; transform: translateX(-50%); font-size: 24px; }
+        #hud-score { top: 20px; right: 20px; }
+        #hud-gates { bottom: 20px; left: 50%; transform: translateX(-50%); }
+        #hud-collisions { bottom: 20px; right: 20px; color: #ff6666; }
+        
+        .screen {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            background: rgba(0, 0, 0, 0.6);
+            display: none;
+        }
+        .screen h1 { font-size: 48px; margin-bottom: 10px; }
+        .screen p { font-size: 24px; margin-bottom: 20px; }
+        .blink { animation: blinker 1s linear infinite; }
+        @keyframes blinker { 50% { opacity: 0; } }
+        
+        #screen-ready { display: flex; }
+    </style>
+    <!-- Import maps polyfill -->
+    <script async src="https://unpkg.com/es-module-shims@1.8.0/dist/es-module-shims.js"></script>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="game-container"></div>
+    
+    <div id="ui-layer">
+        <div id="hud-speed" class="hud-element">Speed: 0.00</div>
+        <div id="hud-timer" class="hud-element">00:00.00</div>
+        <div id="hud-score" class="hud-element">Score: 0</div>
+        <div id="hud-gates" class="hud-element">Gates: 0/20</div>
+        <div id="hud-collisions" class="hud-element">Collisions: 0/5</div>
+
+        <div id="screen-ready" class="screen">
+            <h1>Ski Downhill</h1>
+            <p class="blink">Press SPACE to Start</p>
+            <p style="font-size: 16px; color: #ccc;">Controls: Left/Right Arrows or A/D to steer. P to Pause. R to Reset.</p>
+        </div>
+        
+        <div id="screen-paused" class="screen">
+            <h1>PAUSED</h1>
+            <p class="blink">Press P to Resume</p>
+        </div>
+        
+        <div id="screen-finished" class="screen">
+            <h1>FINISH!</h1>
+            <p id="finish-stats"></p>
+            <p class="blink">Press R to Restart</p>
+        </div>
+        
+        <div id="screen-crashed" class="screen">
+            <h1 style="color: #ff4444;">CRASHED!</h1>
+            <p>Too many collisions!</p>
+            <p class="blink">Press R to Restart</p>
+        </div>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+        // --- State Management ---
+        window.__3D_STATE__ = {
+            gameState: 'ready', // ready, playing, paused, finished, crashed
+            speed: 0,
+            score: 0,
+            gatesPassed: 0,
+            gatesMissed: 0,
+            totalGates: 20,
+            collisions: 0,
+            playerX: 0,
+            playerZ: 0,
+            elapsedTime: 0,
+            skierLoaded: false,
+            obstacleCount: 10
+        };
+
+        // --- Constants ---
+        const ACCEL = 0.02;
+        const MAX_SPEED = 2.0;
+        const FRICTION = 0.998;
+        const LATERAL_SPEED = 0.15;
+        const SLOPE_ANGLE = 15 * Math.PI / 180;
+        const FINISH_Z = -450;
+        const MAX_COLLISIONS = 5;
+
+        // --- Scene Setup ---
+        const container = document.getElementById('game-container');
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x87CEEB); // Light blue sky
+        scene.fog = new THREE.FogExp2(0x87CEEB, 0.002);
+
+        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+        
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.shadowMap.enabled = true;
+        container.appendChild(renderer.domElement);
+
+        // Lights
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+        dirLight.position.set(50, 100, 50);
+        dirLight.castShadow = true;
+        dirLight.shadow.camera.top = 100;
+        dirLight.shadow.camera.bottom = -100;
+        dirLight.shadow.camera.left = -50;
+        dirLight.shadow.camera.right = 50;
+        scene.add(dirLight);
+
+        // Helper function for slope Y
+        function getSlopeY(z) {
+            return z * Math.tan(SLOPE_ANGLE);
+        }
+
+        // Terrain
+        const terrainGeom = new THREE.PlaneGeometry(100, 600);
+        const terrainMat = new THREE.MeshStandardMaterial({ color: 0xf0f8ff, roughness: 0.8 });
+        const terrain = new THREE.Mesh(terrainGeom, terrainMat);
+        terrain.rotation.x = -Math.PI / 2; // Flat
+        terrain.rotation.x += SLOPE_ANGLE; // Tilt
+        terrain.position.z = -250;
+        terrain.position.y = getSlopeY(-250);
+        terrain.receiveShadow = true;
+        scene.add(terrain);
+
+        // Player
+        const playerGroup = new THREE.Group();
+        scene.add(playerGroup);
+        
+        // Fallback box while loading
+        const fallbackGeom = new THREE.BoxGeometry(0.8, 1.5, 0.8);
+        const fallbackMat = new THREE.MeshStandardMaterial({ color: 0x0000ff });
+        const fallbackMesh = new THREE.Mesh(fallbackGeom, fallbackMat);
+        fallbackMesh.position.y = 0.75;
+        playerGroup.add(fallbackMesh);
+
+        const loader = new GLTFLoader();
+        loader.load('https://raw.githubusercontent.com/mrdoob/three.js/master/examples/models/gltf/Soldier.glb', (gltf) => {
+            const model = gltf.scene;
+            model.scale.set(0.9, 0.9, 0.9);
+            model.rotation.y = Math.PI; // Face -Z
+            
+            model.traverse((child) => {
+                if (child.isMesh) {
+                    child.castShadow = true;
+                    child.receiveShadow = true;
+                }
+            });
+
+            playerGroup.remove(fallbackMesh);
+            playerGroup.add(model);
+            window.__3D_STATE__.skierLoaded = true;
+        });
+
+        // Obstacles & Gates
+        const gates = [];
+        const trees = [];
+        
+        function createEnvironment() {
+            // Gates
+            const gateGeom = new THREE.CylinderGeometry(0.15, 0.15, 3);
+            const gateMat = new THREE.MeshStandardMaterial({ color: 0xff0000 });
+            
+            for (let i = 1; i <= window.__3D_STATE__.totalGates; i++) {
+                const z = -i * 20;
+                const y = getSlopeY(z);
+                
+                const leftPole = new THREE.Mesh(gateGeom, gateMat);
+                leftPole.position.set(-3, y + 1.5, z);
+                leftPole.castShadow = true;
+                scene.add(leftPole);
+
+                const rightPole = new THREE.Mesh(gateGeom, gateMat);
+                rightPole.position.set(3, y + 1.5, z);
+                rightPole.castShadow = true;
+                scene.add(rightPole);
+
+                gates.push({ z: z, leftX: -3, rightX: 3, status: 'pending', leftMesh: leftPole, rightMesh: rightPole });
+            }
+
+            // Trees
+            const trunkGeom = new THREE.CylinderGeometry(0.2, 0.2, 1);
+            const trunkMat = new THREE.MeshStandardMaterial({ color: 0x8B4513 });
+            const leavesGeom = new THREE.ConeGeometry(1.2, 2.5);
+            const leavesMat = new THREE.MeshStandardMaterial({ color: 0x228B22 });
+
+            for (let i = 0; i < window.__3D_STATE__.obstacleCount; i++) {
+                const z = -20 - Math.random() * 400;
+                let x = (Math.random() - 0.5) * 28;
+                
+                // Avoid placing exactly on gate paths
+                if (Math.abs(x) < 4 && z % 20 > -5 && z % 20 < 5) {
+                    x += (x > 0 ? 5 : -5);
+                }
+
+                const y = getSlopeY(z);
+
+                const treeGroup = new THREE.Group();
+                const trunk = new THREE.Mesh(trunkGeom, trunkMat);
+                trunk.position.y = 0.5;
+                trunk.castShadow = true;
+                
+                const leaves = new THREE.Mesh(leavesGeom, leavesMat);
+                leaves.position.y = 2.25;
+                leaves.castShadow = true;
+                
+                treeGroup.add(trunk);
+                treeGroup.add(leaves);
+                treeGroup.position.set(x, y, z);
+                scene.add(treeGroup);
+                
+                trees.push({ x: x, z: z, radius: 1.0 });
+            }
+
+            // Finish Line
+            const finishGeom = new THREE.PlaneGeometry(40, 2);
+            const finishMat = new THREE.MeshBasicMaterial({ color: 0xffff00, side: THREE.DoubleSide });
+            const finishLine = new THREE.Mesh(finishGeom, finishMat);
+            finishLine.position.set(0, getSlopeY(FINISH_Z) + 0.05, FINISH_Z);
+            finishLine.rotation.x = -Math.PI / 2 + SLOPE_ANGLE;
+            scene.add(finishLine);
+        }
+
+        createEnvironment();
+
+        // --- Input Handling ---
+        const keys = { ArrowLeft: false, ArrowRight: false, a: false, d: false };
+
+        window.addEventListener('keydown', (e) => {
+            if (keys.hasOwnProperty(e.key)) keys[e.key] = true;
+            
+            const state = window.__3D_STATE__;
+            if (e.code === 'Space' && state.gameState === 'ready') {
+                state.gameState = 'playing';
+                updateScreens();
+            }
+            if (e.code === 'KeyP') {
+                if (state.gameState === 'playing') state.gameState = 'paused';
+                else if (state.gameState === 'paused') state.gameState = 'playing';
+                updateScreens();
+            }
+            if (e.code === 'KeyR') {
+                resetGame();
+            }
+        });
+
+        window.addEventListener('keyup', (e) => {
+            if (keys.hasOwnProperty(e.key)) keys[e.key] = false;
+        });
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // --- Game Logic ---
+        const clock = new THREE.Clock();
+        let invincibilityFrames = 0;
+
+        function resetGame() {
+            const state = window.__3D_STATE__;
+            state.gameState = 'ready';
+            state.speed = 0;
+            state.score = 0;
+            state.gatesPassed = 0;
+            state.gatesMissed = 0;
+            state.collisions = 0;
+            state.playerX = 0;
+            state.playerZ = 0;
+            state.elapsedTime = 0;
+            invincibilityFrames = 0;
+            playerGroup.visible = true;
+
+            gates.forEach(g => {
+                g.status = 'pending';
+                g.leftMesh.material.color.setHex(0xff0000);
+                g.rightMesh.material.color.setHex(0xff0000);
+            });
+
+            updateScreens();
+        }
+
+        function updateScreens() {
+            const state = window.__3D_STATE__.gameState;
+            document.getElementById('screen-ready').style.display = state === 'ready' ? 'flex' : 'none';
+            document.getElementById('screen-paused').style.display = state === 'paused' ? 'flex' : 'none';
+            document.getElementById('screen-finished').style.display = state === 'finished' ? 'flex' : 'none';
+            document.getElementById('screen-crashed').style.display = state === 'crashed' ? 'flex' : 'none';
+
+            if (state === 'finished') {
+                const timeStr = formatTime(window.__3D_STATE__.elapsedTime);
+                document.getElementById('finish-stats').innerHTML = 
+                    `Time: ${timeStr}<br>Score: ${window.__3D_STATE__.score}<br>Gates: ${window.__3D_STATE__.gatesPassed}/${window.__3D_STATE__.totalGates}`;
+            }
+        }
+
+        function formatTime(seconds) {
+            const m = Math.floor(seconds / 60);
+            const s = Math.floor(seconds % 60);
+            const ms = Math.floor((seconds % 1) * 100);
+            return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}.${ms.toString().padStart(2, '0')}`;
+        }
+
+        function updateHUD() {
+            const state = window.__3D_STATE__;
+            document.getElementById('hud-speed').innerText = `Speed: ${(state.speed * 60).toFixed(1)}`; // Scale for display
+            document.getElementById('hud-timer').innerText = formatTime(state.elapsedTime);
+            document.getElementById('hud-score').innerText = `Score: ${state.score}`;
+            document.getElementById('hud-gates').innerText = `Gates: ${state.gatesPassed}/${state.totalGates}`;
+            document.getElementById('hud-collisions').innerText = `Collisions: ${state.collisions}/${MAX_COLLISIONS}`;
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            
+            const delta = clock.getDelta();
+            const state = window.__3D_STATE__;
+
+            if (state.gameState === 'playing') {
+                state.elapsedTime += delta;
+
+                // Physics
+                state.speed += ACCEL;
+                if (state.speed > MAX_SPEED) state.speed = MAX_SPEED;
+                state.speed *= FRICTION;
+                
+                state.playerZ -= state.speed;
+
+                // Lateral movement
+                if (keys.ArrowLeft || keys.a) state.playerX -= LATERAL_SPEED;
+                if (keys.ArrowRight || keys.d) state.playerX += LATERAL_SPEED;
+                
+                // Clamp X
+                state.playerX = Math.max(-15, Math.min(15, state.playerX));
+
+                // Update Player Position
+                playerGroup.position.set(state.playerX, getSlopeY(state.playerZ), state.playerZ);
+
+                // Invincibility blink
+                if (invincibilityFrames > 0) {
+                    invincibilityFrames--;
+                    playerGroup.visible = (invincibilityFrames % 10 < 5);
+                } else {
+                    playerGroup.visible = true;
+                }
+
+                // Tree Collisions
+                if (invincibilityFrames === 0) {
+                    for (let tree of trees) {
+                        // Simple 2D distance check in XZ plane
+                        const dist = Math.hypot(state.playerX - tree.x, state.playerZ - tree.z);
+                        if (dist < 1.5) { // Player radius ~0.5 + Tree radius ~1.0
+                            state.speed *= 0.5;
+                            state.collisions++;
+                            invincibilityFrames = 60;
+                            
+                            if (state.collisions >= MAX_COLLISIONS) {
+                                state.gameState = 'crashed';
+                                updateScreens();
+                            }
+                            break;
+                        }
+                    }
+                }
+
+                // Gate Logic
+                for (let gate of gates) {
+                    if (gate.status === 'pending' && state.playerZ < gate.z) {
+                        if (state.playerX > gate.leftX && state.playerX < gate.rightX) {
+                            gate.status = 'passed';
+                            state.gatesPassed++;
+                            state.score += 50;
+                            gate.leftMesh.material.color.setHex(0x00ff00);
+                            gate.rightMesh.material.color.setHex(0x00ff00);
+                        } else {
+                            gate.status = 'missed';
+                            state.gatesMissed++;
+                            gate.leftMesh.material.color.setHex(0x555555);
+                            gate.rightMesh.material.color.setHex(0x555555);
+                        }
+                    }
+                }
+
+                // Finish Line
+                if (state.playerZ < FINISH_Z) {
+                    state.gameState = 'finished';
+                    updateScreens();
+                }
+            } else if (state.gameState === 'ready') {
+                // Keep player at start
+                playerGroup.position.set(0, 0, 0);
+            }
+
+            // Camera Follow
+            const targetCamX = state.playerX;
+            const targetCamZ = state.playerZ + 12;
+            const targetCamY = getSlopeY(state.playerZ) + 6;
+
+            // Smooth camera movement
+            camera.position.x += (targetCamX - camera.position.x) * 0.1;
+            camera.position.y += (targetCamY - camera.position.y) * 0.1;
+            camera.position.z += (targetCamZ - camera.position.z) * 0.1;
+            
+            camera.lookAt(state.playerX, getSlopeY(state.playerZ) - 2, state.playerZ - 10);
+
+            updateHUD();
+            renderer.render(scene, camera);
+        }
+
+        // Start loop
+        clock.start();
+        animate();
+    </script>
+</body>
+</html>

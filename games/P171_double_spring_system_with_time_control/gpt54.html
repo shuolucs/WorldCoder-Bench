@@ -1,0 +1,419 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>3D Double Spring Physics Simulation</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      font-family: Arial, sans-serif;
+      background: #87CEEB;
+    }
+
+    #ui {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      z-index: 10;
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    button {
+      padding: 10px 14px;
+      border: none;
+      border-radius: 6px;
+      background: rgba(255,255,255,0.9);
+      cursor: pointer;
+      font-size: 14px;
+      box-shadow: 0 2px 6px rgba(0,0,0,0.2);
+    }
+
+    button:hover {
+      background: white;
+    }
+
+    #hud {
+      position: absolute;
+      top: 12px;
+      right: 12px;
+      z-index: 10;
+      min-width: 240px;
+      padding: 12px 14px;
+      color: #111;
+      background: rgba(255,255,255,0.88);
+      border-radius: 8px;
+      line-height: 1.5;
+      font-size: 14px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+      white-space: pre-line;
+    }
+  </style>
+</head>
+<body>
+  <div id="ui">
+    <button id="btn-pause">Pause/Resume</button>
+    <button id="btn-slow">Slow Motion</button>
+    <button id="btn-normal">Normal Speed</button>
+    <button id="btn-reset">Reset</button>
+  </div>
+
+  <div id="hud">Loading...</div>
+
+  <script type="module">
+    import * as THREE from "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js";
+    import { GLTFLoader } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/GLTFLoader.js";
+
+    // Scene
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x87CEEB);
+
+    // Camera
+    const camera = new THREE.PerspectiveCamera(
+      60,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      1000
+    );
+    camera.position.set(0, 3, 10);
+    camera.lookAt(0, 0, 0);
+
+    // Renderer
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    document.body.appendChild(renderer.domElement);
+
+    // Lights
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
+    scene.add(ambientLight);
+
+    const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+    dirLight.position.set(5, 10, 5);
+    scene.add(dirLight);
+
+    // Ground
+    const groundGeo = new THREE.PlaneGeometry(50, 50);
+    const groundMat = new THREE.MeshStandardMaterial({
+      color: 0x808080,
+      side: THREE.DoubleSide
+    });
+    const ground = new THREE.Mesh(groundGeo, groundMat);
+    ground.rotation.x = -Math.PI / 2;
+    ground.position.y = 0;
+    scene.add(ground);
+
+    // Grid
+    const grid = new THREE.GridHelper(50, 50, 0x444444, 0x888888);
+    grid.position.y = 0.001;
+    scene.add(grid);
+
+    // Model loading
+    let mixer = null;
+    const loader = new GLTFLoader();
+
+    loader.load(
+      "Michelle.glb",
+      (gltf) => {
+        const model = gltf.scene;
+        model.scale.setScalar(0.015);
+        model.position.set(0, 0, -3);
+        scene.add(model);
+
+        if (gltf.animations && gltf.animations.length > 0) {
+          mixer = new THREE.AnimationMixer(model);
+          mixer.clipAction(gltf.animations[0]).play();
+        }
+
+        window.__3D_STATE__.modelLoaded = true;
+      },
+      undefined,
+      (err) => {
+        console.warn("Failed to load Michelle.glb:", err);
+      }
+    );
+
+    // Physics constants
+    const g = 9.81;
+    const fixedBaseDt = 1 / 60;
+
+    const anchorPos = new THREE.Vector3(-4, 6, 0);
+
+    const massA = {
+      mass: 2.0,
+      radius: 0.4,
+      initialY: 4,
+      y: 4,
+      vy: 0,
+      color: 0x2266ff
+    };
+
+    const massB = {
+      mass: 1.5,
+      radius: 0.4,
+      initialY: 2,
+      y: 2,
+      vy: 0,
+      color: 0x22aa44
+    };
+
+    const spring1 = {
+      restLength: 1.5,
+      k: 30,
+      damping: 0.3
+    };
+
+    const spring2 = {
+      restLength: 1.5,
+      k: 20,
+      damping: 0.2
+    };
+
+    // Visuals
+    const anchorMesh = new THREE.Mesh(
+      new THREE.SphereGeometry(0.2, 24, 24),
+      new THREE.MeshStandardMaterial({ color: 0xff3333 })
+    );
+    anchorMesh.position.copy(anchorPos);
+    scene.add(anchorMesh);
+
+    const massAMesh = new THREE.Mesh(
+      new THREE.SphereGeometry(massA.radius, 32, 32),
+      new THREE.MeshStandardMaterial({ color: massA.color })
+    );
+    scene.add(massAMesh);
+
+    const massBMesh = new THREE.Mesh(
+      new THREE.SphereGeometry(massB.radius, 32, 32),
+      new THREE.MeshStandardMaterial({ color: massB.color })
+    );
+    scene.add(massBMesh);
+
+    const springMaterial = new THREE.LineBasicMaterial({ color: 0xffffff });
+
+    const spring1Geometry = new THREE.BufferGeometry().setFromPoints([
+      new THREE.Vector3(),
+      new THREE.Vector3()
+    ]);
+    const spring1Line = new THREE.Line(spring1Geometry, springMaterial);
+    scene.add(spring1Line);
+
+    const spring2Geometry = new THREE.BufferGeometry().setFromPoints([
+      new THREE.Vector3(),
+      new THREE.Vector3()
+    ]);
+    const spring2Line = new THREE.Line(spring2Geometry, springMaterial);
+    scene.add(spring2Line);
+
+    // State
+    window.__3D_STATE__ = {
+      paused: false,
+      timeScale: 1.0,
+      massA_y: massA.y,
+      massB_y: massB.y,
+      massA_vy: massA.vy,
+      massB_vy: massB.vy,
+      totalEnergy: 0,
+      simTime: 0,
+      modelLoaded: false,
+      impulseAppliedA: 0,
+      impulseAppliedB: 0,
+      resetCount: 0
+    };
+
+    const hud = document.getElementById("hud");
+
+    function clampMass(mass, upperY, lowerY) {
+      if (mass.y > upperY) {
+        mass.y = upperY;
+        if (mass.vy > 0) mass.vy = 0;
+      }
+      if (mass.y < lowerY) {
+        mass.y = lowerY;
+        if (mass.vy < 0) mass.vy = 0;
+      }
+    }
+
+    function resetSimulation() {
+      massA.y = massA.initialY;
+      massA.vy = 0;
+      massB.y = massB.initialY;
+      massB.vy = 0;
+      window.__3D_STATE__.simTime = 0;
+      window.__3D_STATE__.resetCount++;
+      updateVisuals();
+      updateStateAndHUD();
+    }
+
+    function applyImpulseA(deltaV) {
+      massA.vy += deltaV;
+      window.__3D_STATE__.impulseAppliedA++;
+    }
+
+    function applyImpulseB(deltaV) {
+      massB.vy += deltaV;
+      window.__3D_STATE__.impulseAppliedB++;
+    }
+
+    function updateVisuals() {
+      massAMesh.position.set(anchorPos.x, massA.y, anchorPos.z);
+      massBMesh.position.set(anchorPos.x, massB.y, anchorPos.z);
+
+      spring1Geometry.setFromPoints([
+        new THREE.Vector3(anchorPos.x, anchorPos.y, anchorPos.z),
+        new THREE.Vector3(anchorPos.x, massA.y, anchorPos.z)
+      ]);
+      spring2Geometry.setFromPoints([
+        new THREE.Vector3(anchorPos.x, massA.y, anchorPos.z),
+        new THREE.Vector3(anchorPos.x, massB.y, anchorPos.z)
+      ]);
+    }
+
+    function computeEnergy() {
+      const ke =
+        0.5 * massA.mass * massA.vy * massA.vy +
+        0.5 * massB.mass * massB.vy * massB.vy;
+
+      const peGravity =
+        massA.mass * g * massA.y +
+        massB.mass * g * massB.y;
+
+      const len1 = anchorPos.y - massA.y;
+      const len2 = massA.y - massB.y;
+
+      const x1 = len1 - spring1.restLength;
+      const x2 = len2 - spring2.restLength;
+
+      const peSpring =
+        0.5 * spring1.k * x1 * x1 +
+        0.5 * spring2.k * x2 * x2;
+
+      return ke + peGravity + peSpring;
+    }
+
+    function updateStateAndHUD() {
+      window.__3D_STATE__.paused = window.__3D_STATE__.paused;
+      window.__3D_STATE__.timeScale = window.__3D_STATE__.timeScale;
+      window.__3D_STATE__.massA_y = massA.y;
+      window.__3D_STATE__.massB_y = massB.y;
+      window.__3D_STATE__.massA_vy = massA.vy;
+      window.__3D_STATE__.massB_vy = massB.vy;
+      window.__3D_STATE__.totalEnergy = computeEnergy();
+
+      hud.textContent =
+`Time Scale: ${window.__3D_STATE__.timeScale.toFixed(2)}
+Mass A y: ${massA.y.toFixed(2)}
+Mass B y: ${massB.y.toFixed(2)}
+Total Energy: ${window.__3D_STATE__.totalEnergy.toFixed(2)}
+Simulation Time: ${window.__3D_STATE__.simTime.toFixed(2)} s`;
+    }
+
+    function physicsStep(dt) {
+      // Spring 1 between anchor and A
+      const len1 = anchorPos.y - massA.y;
+      const stretch1 = len1 - spring1.restLength;
+      const relVel1 = massA.vy;
+      const forceSpring1OnA = spring1.k * stretch1 - spring1.damping * relVel1;
+
+      // Spring 2 between A and B
+      const len2 = massA.y - massB.y;
+      const stretch2 = len2 - spring2.restLength;
+      const relVel2 = massB.vy - massA.vy;
+      const forceSpring2OnB = spring2.k * stretch2 - spring2.damping * relVel2;
+      const forceSpring2OnA = -forceSpring2OnB;
+
+      // Net forces
+      const forceA = forceSpring1OnA + forceSpring2OnA - massA.mass * g;
+      const forceB = forceSpring2OnB - massB.mass * g;
+
+      // Semi-implicit Euler
+      const ayA = forceA / massA.mass;
+      const ayB = forceB / massB.mass;
+
+      massA.vy += ayA * dt;
+      massB.vy += ayB * dt;
+
+      massA.y += massA.vy * dt;
+      massB.y += massB.vy * dt;
+
+      // Constraints
+      clampMass(massA, anchorPos.y, -5);
+      clampMass(massB, massA.y, -5);
+    }
+
+    // UI
+    document.getElementById("btn-pause").addEventListener("click", () => {
+      window.__3D_STATE__.paused = !window.__3D_STATE__.paused;
+    });
+
+    document.getElementById("btn-slow").addEventListener("click", () => {
+      window.__3D_STATE__.timeScale = 0.25;
+    });
+
+    document.getElementById("btn-normal").addEventListener("click", () => {
+      window.__3D_STATE__.timeScale = 1.0;
+    });
+
+    document.getElementById("btn-reset").addEventListener("click", resetSimulation);
+
+    window.addEventListener("keydown", (e) => {
+      const key = e.key.toLowerCase();
+
+      if (key === "d") {
+        applyImpulseA(-5);
+      } else if (key === "u") {
+        applyImpulseB(5);
+      } else if (key === "r") {
+        resetSimulation();
+      }
+    });
+
+    // Animation loop
+    const clock = new THREE.Clock();
+    let accumulator = 0;
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      const realDelta = Math.min(clock.getDelta(), 0.05);
+
+      if (mixer) {
+        mixer.update(realDelta);
+      }
+
+      if (!window.__3D_STATE__.paused) {
+        const scaledDelta = realDelta * window.__3D_STATE__.timeScale;
+        accumulator += scaledDelta;
+
+        const stepDt = fixedBaseDt;
+
+        while (accumulator >= stepDt) {
+          physicsStep(stepDt);
+          window.__3D_STATE__.simTime += stepDt;
+          accumulator -= stepDt;
+        }
+      }
+
+      updateVisuals();
+      updateStateAndHUD();
+      renderer.render(scene, camera);
+    }
+
+    // Initial setup
+    updateVisuals();
+    updateStateAndHUD();
+    animate();
+
+    // Resize
+    window.addEventListener("resize", () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,476 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Heart Pump Cycle Visualization</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #0a0a2e;
+            color: #ffffff;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            user-select: none;
+        }
+        canvas {
+            display: block;
+            width: 100vw;
+            height: 100vh;
+        }
+        #control-panel {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            background: rgba(10, 10, 46, 0.85);
+            padding: 20px;
+            border-radius: 12px;
+            border: 1px solid #3333cc;
+            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.5);
+            width: 280px;
+            z-index: 10;
+        }
+        #phase-label {
+            position: absolute;
+            top: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            font-size: 32px;
+            font-weight: bold;
+            text-transform: uppercase;
+            letter-spacing: 2px;
+            text-shadow: 0 2px 4px rgba(0,0,0,0.8);
+            pointer-events: none;
+            z-index: 10;
+            background: rgba(0,0,0,0.5);
+            padding: 10px 20px;
+            border-radius: 8px;
+        }
+        .panel-row {
+            margin-bottom: 15px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .panel-row:last-child {
+            margin-bottom: 0;
+        }
+        button {
+            background: #3333cc;
+            color: white;
+            border: none;
+            padding: 8px 12px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-weight: bold;
+            transition: background 0.2s;
+            flex: 1;
+            margin: 0 4px;
+        }
+        button:hover {
+            background: #5555ff;
+        }
+        button:disabled {
+            background: #444;
+            color: #888;
+            cursor: not-allowed;
+        }
+        input[type=range] {
+            width: 100%;
+            margin-top: 5px;
+        }
+        .info-text {
+            font-size: 14px;
+            color: #aaa;
+            margin-top: 5px;
+        }
+        .stat-box {
+            background: rgba(255,255,255,0.1);
+            padding: 10px;
+            border-radius: 6px;
+            margin-bottom: 15px;
+        }
+        .stat-box div {
+            margin-bottom: 5px;
+        }
+        .stat-box div:last-child {
+            margin-bottom: 0;
+        }
+        .hotkeys {
+            font-size: 11px;
+            color: #666;
+            margin-top: 15px;
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="phase-label">Loading...</div>
+
+    <div id="control-panel">
+        <div class="stat-box">
+            <div id="cycle-count">Cycles: 0</div>
+            <div id="bpm-display">BPM: 0.0</div>
+            <div id="parrot-info">Parrot: Loading...</div>
+        </div>
+
+        <div class="panel-row">
+            <button id="btn-play-pause">Play</button>
+            <button id="btn-next-phase">Next Phase</button>
+        </div>
+        
+        <div class="panel-row">
+            <div style="width: 100%;">
+                <label for="slider-speed">Speed: <span id="speed-val">1.0</span>x</label>
+                <input type="range" id="slider-speed" min="0.5" max="3.0" step="0.1" value="1.0">
+            </div>
+        </div>
+
+        <div class="panel-row">
+            <button id="btn-reset">Reset</button>
+        </div>
+
+        <div class="panel-row">
+            <button id="btn-save">Save State</button>
+            <button id="btn-load">Load State</button>
+        </div>
+
+        <div class="hotkeys">
+            Hotkeys: [Space] Play/Pause, [N] Next, [R] Reset, [S] Save, [L] Load
+        </div>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js';
+        import { GLTFLoader } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/GLTFLoader.js';
+
+        // --- State Management ---
+        window.__3D_STATE__ = {
+            currentPhase: 0,
+            phaseName: 'DIASTOLE_RIGHT',
+            isPlaying: false,
+            speedMultiplier: 1.0,
+            cycleCount: 0,
+            bpm: 7.5,
+            parrotPosition: { x: 0, y: 0, z: 0 },
+            parrotChamber: 'RA',
+            chamberScales: { RA: 1, RV: 1, LA: 1, LV: 1 },
+            savedStateExists: !!localStorage.getItem('heartPumpState'),
+            phaseProgress: 0,
+            parrotLoaded: false
+        };
+
+        const phaseNames = ['DIASTOLE_RIGHT', 'SYSTOLE_RIGHT', 'LUNG_TRANSIT', 'SYSTOLE_LEFT'];
+        const phaseDuration = 2.0; // seconds per phase at 1x speed
+
+        // Target scales for the END of each phase [RA, RV, LA, LV]
+        // 1.0 = Relaxed, 1.3 = Expanded (Filled), 0.7 = Contracted (Empty)
+        const scaleTargets = [
+            [1.3, 1.0, 1.0, 0.7], // End P0: RA filled, LV emptied
+            [0.7, 1.3, 1.0, 1.0], // End P1: RA emptied, RV filled
+            [1.0, 0.7, 1.3, 1.0], // End P2: RV emptied, LA filled
+            [1.0, 1.0, 0.7, 1.3]  // End P3: LA emptied, LV filled
+        ];
+
+        // --- Scene Setup ---
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x0a0a2e);
+
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+        camera.position.set(0, 2, 8);
+        camera.lookAt(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        document.body.appendChild(renderer.domElement);
+
+        // --- Lighting ---
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+        dirLight.position.set(5, 10, 5);
+        scene.add(dirLight);
+
+        // --- Chambers (Spheres) ---
+        const sphereGeo = new THREE.SphereGeometry(1, 32, 32);
+        
+        const createChamber = (color, radius, pos) => {
+            const mat = new THREE.MeshPhongMaterial({ 
+                color: color, 
+                transparent: true, 
+                opacity: 0.4,
+                shininess: 100
+            });
+            const mesh = new THREE.Mesh(sphereGeo, mat);
+            mesh.position.copy(pos);
+            mesh.userData.baseRadius = radius;
+            mesh.scale.setScalar(radius);
+            scene.add(mesh);
+            return mesh;
+        };
+
+        const posRA = new THREE.Vector3(-2, 1.5, 0);
+        const posRV = new THREE.Vector3(-2, -1.5, 0);
+        const posLA = new THREE.Vector3(2, 1.5, 0);
+        const posLV = new THREE.Vector3(2, -1.5, 0);
+
+        const meshRA = createChamber(0xcc3333, 0.8, posRA);
+        const meshRV = createChamber(0x991111, 1.0, posRV);
+        const meshLA = createChamber(0x3333cc, 0.8, posLA);
+        const meshLV = createChamber(0x111199, 1.0, posLV);
+
+        // --- Paths (Tubes) ---
+        // P0: LV -> RA (Body Transit)
+        const curve3 = new THREE.CatmullRomCurve3([
+            posLV, new THREE.Vector3(0, -3, 3), posRA
+        ]);
+        // P1: RA -> RV
+        const curve0 = new THREE.CatmullRomCurve3([
+            posRA, new THREE.Vector3(-2.5, 0, 1), posRV
+        ]);
+        // P2: RV -> LA (Lung Transit)
+        const curve1 = new THREE.CatmullRomCurve3([
+            posRV, new THREE.Vector3(0, 2, -3), posLA
+        ]);
+        // P3: LA -> LV
+        const curve2 = new THREE.CatmullRomCurve3([
+            posLA, new THREE.Vector3(2.5, 0, 1), posLV
+        ]);
+
+        const curves = [curve3, curve0, curve1, curve2]; // Mapped to phases 0, 1, 2, 3
+
+        const tubeMat = new THREE.MeshPhongMaterial({ color: 0xff6688, transparent: true, opacity: 0.3 });
+        curves.forEach(curve => {
+            const tubeGeo = new THREE.TubeGeometry(curve, 64, 0.08, 8, false);
+            scene.add(new THREE.Mesh(tubeGeo, tubeMat));
+        });
+
+        // --- Parrot Model ---
+        let parrot, mixer;
+        const loader = new GLTFLoader();
+        loader.load('https://cdn.jsdelivr.net/npm/three@0.160.0/examples/models/gltf/Parrot.glb', (gltf) => {
+            parrot = gltf.scene;
+            parrot.scale.setScalar(0.01);
+            scene.add(parrot);
+            
+            mixer = new THREE.AnimationMixer(parrot);
+            const action = mixer.clipAction(gltf.animations[0]);
+            action.play();
+            
+            window.__3D_STATE__.parrotLoaded = true;
+            
+            // Initial position
+            parrot.position.copy(posRA);
+        });
+
+        // --- UI Elements ---
+        const ui = {
+            phaseLabel: document.getElementById('phase-label'),
+            cycleCount: document.getElementById('cycle-count'),
+            bpmDisplay: document.getElementById('bpm-display'),
+            parrotInfo: document.getElementById('parrot-info'),
+            btnPlayPause: document.getElementById('btn-play-pause'),
+            btnNextPhase: document.getElementById('btn-next-phase'),
+            btnReset: document.getElementById('btn-reset'),
+            btnSave: document.getElementById('btn-save'),
+            btnLoad: document.getElementById('btn-load'),
+            sliderSpeed: document.getElementById('slider-speed'),
+            speedVal: document.getElementById('speed-val')
+        };
+
+        // --- Interaction Logic ---
+        const togglePlay = () => {
+            window.__3D_STATE__.isPlaying = !window.__3D_STATE__.isPlaying;
+            updateUI();
+        };
+
+        const nextPhase = () => {
+            const state = window.__3D_STATE__;
+            if (state.isPlaying) return;
+            state.currentPhase = (state.currentPhase + 1) % 4;
+            state.phaseProgress = 0;
+            if (state.currentPhase === 0) state.cycleCount++;
+            updateSceneState();
+            updateUI();
+        };
+
+        const resetState = () => {
+            const state = window.__3D_STATE__;
+            state.currentPhase = 0;
+            state.phaseProgress = 0;
+            state.cycleCount = 0;
+            state.isPlaying = false;
+            updateSceneState();
+            updateUI();
+        };
+
+        const saveState = () => {
+            const state = window.__3D_STATE__;
+            const saveData = {
+                currentPhase: state.currentPhase,
+                phaseProgress: state.phaseProgress,
+                isPlaying: state.isPlaying,
+                speedMultiplier: state.speedMultiplier,
+                cycleCount: state.cycleCount
+            };
+            localStorage.setItem('heartPumpState', JSON.stringify(saveData));
+            state.savedStateExists = true;
+            updateUI();
+        };
+
+        const loadState = () => {
+            const data = localStorage.getItem('heartPumpState');
+            if (data) {
+                const parsed = JSON.parse(data);
+                const state = window.__3D_STATE__;
+                state.currentPhase = parsed.currentPhase;
+                state.phaseProgress = parsed.phaseProgress;
+                state.isPlaying = parsed.isPlaying;
+                state.speedMultiplier = parsed.speedMultiplier;
+                state.cycleCount = parsed.cycleCount;
+                
+                ui.sliderSpeed.value = state.speedMultiplier;
+                ui.speedVal.innerText = state.speedMultiplier.toFixed(1);
+                
+                updateSceneState();
+                updateUI();
+            }
+        };
+
+        // --- Event Listeners ---
+        ui.btnPlayPause.addEventListener('click', togglePlay);
+        ui.btnNextPhase.addEventListener('click', nextPhase);
+        ui.btnReset.addEventListener('click', resetState);
+        ui.btnSave.addEventListener('click', saveState);
+        ui.btnLoad.addEventListener('click', loadState);
+        
+        ui.sliderSpeed.addEventListener('input', (e) => {
+            const val = parseFloat(e.target.value);
+            window.__3D_STATE__.speedMultiplier = val;
+            ui.speedVal.innerText = val.toFixed(1);
+            updateUI();
+        });
+
+        window.addEventListener('keydown', (e) => {
+            switch(e.key.toLowerCase()) {
+                case ' ': e.preventDefault(); togglePlay(); break;
+                case 'n': nextPhase(); break;
+                case 'r': resetState(); break;
+                case 's': saveState(); break;
+                case 'l': loadState(); break;
+            }
+        });
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // --- Core Update Logic ---
+        const updateSceneState = () => {
+            const state = window.__3D_STATE__;
+            state.phaseName = phaseNames[state.currentPhase];
+            
+            // Calculate BPM
+            const totalCycleTime = (phaseDuration * 4) / state.speedMultiplier;
+            state.bpm = 60 / totalCycleTime;
+
+            // Interpolate Scales
+            const prevPhase = (state.currentPhase + 3) % 4;
+            const startScales = scaleTargets[prevPhase];
+            const endScales = scaleTargets[state.currentPhase];
+            const p = state.phaseProgress;
+
+            const curScales = [
+                THREE.MathUtils.lerp(startScales[0], endScales[0], p),
+                THREE.MathUtils.lerp(startScales[1], endScales[1], p),
+                THREE.MathUtils.lerp(startScales[2], endScales[2], p),
+                THREE.MathUtils.lerp(startScales[3], endScales[3], p)
+            ];
+
+            meshRA.scale.setScalar(meshRA.userData.baseRadius * curScales[0]);
+            meshRV.scale.setScalar(meshRV.userData.baseRadius * curScales[1]);
+            meshLA.scale.setScalar(meshLA.userData.baseRadius * curScales[2]);
+            meshLV.scale.setScalar(meshLV.userData.baseRadius * curScales[3]);
+
+            state.chamberScales = { RA: curScales[0], RV: curScales[1], LA: curScales[2], LV: curScales[3] };
+
+            // Update Parrot
+            if (parrot && state.parrotLoaded) {
+                const activeCurve = curves[state.currentPhase];
+                const pos = activeCurve.getPointAt(p);
+                parrot.position.copy(pos);
+
+                // Look ahead slightly on the curve
+                const lookAheadP = Math.min(p + 0.01, 1.0);
+                const lookAtPos = activeCurve.getPointAt(lookAheadP);
+                if (p < 0.99) {
+                    parrot.lookAt(lookAtPos);
+                }
+
+                state.parrotPosition = { x: pos.x, y: pos.y, z: pos.z };
+
+                // Determine Chamber String
+                const transitions = [
+                    { start: 'LV', end: 'RA', transit: 'TRANSIT_LV_RA' },
+                    { start: 'RA', end: 'RV', transit: 'TRANSIT_RA_RV' },
+                    { start: 'RV', end: 'LA', transit: 'TRANSIT_RV_LA' },
+                    { start: 'LA', end: 'LV', transit: 'TRANSIT_LA_LV' }
+                ];
+                const tInfo = transitions[state.currentPhase];
+                if (p < 0.1) state.parrotChamber = tInfo.start;
+                else if (p > 0.9) state.parrotChamber = tInfo.end;
+                else state.parrotChamber = tInfo.transit;
+            }
+        };
+
+        const updateUI = () => {
+            const state = window.__3D_STATE__;
+            ui.phaseLabel.innerText = `Phase ${state.currentPhase}: ${state.phaseName}`;
+            ui.cycleCount.innerText = `Cycles: ${state.cycleCount}`;
+            ui.bpmDisplay.innerText = `BPM: ${state.bpm.toFixed(1)}`;
+            ui.parrotInfo.innerText = `Parrot: ${state.parrotLoaded ? state.parrotChamber : 'Loading...'}`;
+            
+            ui.btnPlayPause.innerText = state.isPlaying ? 'Pause' : 'Play';
+            ui.btnNextPhase.disabled = state.isPlaying;
+            ui.btnLoad.disabled = !state.savedStateExists;
+        };
+
+        // --- Animation Loop ---
+        const clock = new THREE.Clock();
+
+        function animate() {
+            requestAnimationFrame(animate);
+            const delta = clock.getDelta();
+            const state = window.__3D_STATE__;
+
+            if (mixer && state.isPlaying) {
+                mixer.update(delta * state.speedMultiplier);
+            }
+
+            if (state.isPlaying) {
+                state.phaseProgress += (delta * state.speedMultiplier) / phaseDuration;
+                if (state.phaseProgress >= 1.0) {
+                    state.phaseProgress = 0;
+                    state.currentPhase = (state.currentPhase + 1) % 4;
+                    if (state.currentPhase === 0) state.cycleCount++;
+                }
+            }
+
+            updateSceneState();
+            updateUI();
+
+            renderer.render(scene, camera);
+        }
+
+        // Initialize
+        updateUI();
+        animate();
+
+    </script>
+</body>
+</html>

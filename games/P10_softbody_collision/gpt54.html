@@ -1,0 +1,645 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Three.js 3D Soft Body - 双弹性球碰撞</title>
+  <style>
+    html, body {
+      margin: 0;
+      height: 100%;
+      overflow: hidden;
+      background: #111;
+      font-family: Arial, Helvetica, sans-serif;
+      color: #fff;
+    }
+    #app {
+      width: 100%;
+      height: 100%;
+      position: relative;
+    }
+    #hud {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      z-index: 10;
+      background: rgba(0,0,0,0.55);
+      padding: 12px 14px;
+      border-radius: 8px;
+      font-size: 13px;
+      line-height: 1.55;
+      min-width: 280px;
+      backdrop-filter: blur(4px);
+    }
+    #hud .row {
+      margin: 2px 0;
+    }
+    #controlsPanel {
+      position: absolute;
+      top: 12px;
+      right: 12px;
+      z-index: 10;
+      background: rgba(0,0,0,0.55);
+      padding: 12px;
+      border-radius: 8px;
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      backdrop-filter: blur(4px);
+    }
+    button {
+      background: #2a2a2a;
+      border: 1px solid #555;
+      color: #fff;
+      padding: 8px 12px;
+      border-radius: 6px;
+      cursor: pointer;
+    }
+    button:hover {
+      background: #3a3a3a;
+    }
+    label {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      user-select: none;
+      font-size: 13px;
+    }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <div id="hud">
+      <div class="row">球A质心: <span id="posA">-</span></div>
+      <div class="row">球B质心: <span id="posB">-</span></div>
+      <div class="row">球A体积比: <span id="volRatioA">-</span></div>
+      <div class="row">球B体积比: <span id="volRatioB">-</span></div>
+      <div class="row">模拟时间: <span id="simTime">0.000</span> s</div>
+    </div>
+
+    <div id="controlsPanel">
+      <button id="resetBtn">重置</button>
+      <button id="pushBtn">施加冲量</button>
+      <label><input type="checkbox" id="springToggle" checked />显示径向弹簧</label>
+    </div>
+  </div>
+
+  <script type="importmap">
+  { "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+  } }
+  </script>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+    const DT = 0.002;
+    const SUBSTEPS = 5;
+    const GRAVITY = new THREE.Vector3(0, -9.81, 0);
+    const NODE_MASS = 0.01;
+    const RADIAL_K = 500;
+    const SURFACE_K = 300;
+    const DAMPING = 5.0;
+    const CONTACT_K = 1000;
+    const CONTACT_DIST = 0.1;
+    const PRESSURE_COEFF = 200;
+    const GROUND_RESTITUTION = 0.3;
+
+    let renderer, scene, camera, controls;
+    let clock;
+    let bodyA, bodyB;
+    let simTime = 0;
+    let groundContacts = 0;
+
+    const tempV1 = new THREE.Vector3();
+    const tempV2 = new THREE.Vector3();
+    const tempV3 = new THREE.Vector3();
+    const tempV4 = new THREE.Vector3();
+
+    init();
+    resetSimulation();
+    animate();
+
+    function init() {
+      const app = document.getElementById('app');
+
+      scene = new THREE.Scene();
+      scene.background = new THREE.Color(0x111111);
+
+      camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.01, 100);
+      camera.position.set(0, 4.5, 12);
+
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+      app.appendChild(renderer.domElement);
+
+      controls = new OrbitControls(camera, renderer.domElement);
+      controls.target.set(0, 2.5, 0);
+      controls.enableDamping = true;
+
+      clock = new THREE.Clock();
+
+      const ambient = new THREE.AmbientLight(0xffffff, 0.55);
+      scene.add(ambient);
+
+      const dir = new THREE.DirectionalLight(0xffffff, 1.2);
+      dir.position.set(5, 10, 6);
+      scene.add(dir);
+
+      const groundGroup = new THREE.Group();
+      const grid = new THREE.GridHelper(20, 20, 0x888888, 0x444444);
+      groundGroup.add(grid);
+
+      const groundGeom = new THREE.PlaneGeometry(20, 20);
+      const groundMat = new THREE.MeshStandardMaterial({
+        color: 0x777777,
+        transparent: true,
+        opacity: 0.18,
+        side: THREE.DoubleSide
+      });
+      const ground = new THREE.Mesh(groundGeom, groundMat);
+      ground.rotation.x = -Math.PI / 2;
+      ground.position.y = 0;
+      groundGroup.add(ground);
+      scene.add(groundGroup);
+
+      document.getElementById('resetBtn').addEventListener('click', resetSimulation);
+      document.getElementById('pushBtn').addEventListener('click', () => {
+        if (!bodyA) return;
+        applyImpulse(bodyA, new THREE.Vector3(3.0, 0.0, 0.0));
+      });
+      document.getElementById('springToggle').addEventListener('change', (e) => {
+        const visible = e.target.checked;
+        if (bodyA?.radialLines) bodyA.radialLines.visible = visible;
+        if (bodyB?.radialLines) bodyB.radialLines.visible = visible;
+      });
+
+      window.addEventListener('resize', onResize);
+    }
+
+    function onResize() {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    }
+
+    function makeNode(pos) {
+      return {
+        pos: pos.clone(),
+        prev: pos.clone(),
+        force: new THREE.Vector3(),
+        mass: NODE_MASS
+      };
+    }
+
+    function getVelocity(node) {
+      return tempV1.copy(node.pos).sub(node.prev).multiplyScalar(1 / DT);
+    }
+
+    function applyImpulse(body, impulse) {
+      const dv = impulse.clone().multiplyScalar(1 / NODE_MASS);
+      for (const node of body.nodes) {
+        const vel = tempV2.copy(node.pos).sub(node.prev).multiplyScalar(1 / DT);
+        vel.add(dv);
+        node.prev.copy(node.pos).sub(vel.multiplyScalar(DT));
+      }
+    }
+
+    function buildSurfaceEdges(positionAttr, indexAttr) {
+      const edgeSet = new Set();
+      const edges = [];
+      const triCount = indexAttr ? indexAttr.count / 3 : positionAttr.count / 3;
+
+      function addEdge(a, b) {
+        const i = Math.min(a, b);
+        const j = Math.max(a, b);
+        const key = `${i}_${j}`;
+        if (!edgeSet.has(key)) {
+          edgeSet.add(key);
+          edges.push([i, j]);
+        }
+      }
+
+      for (let t = 0; t < triCount; t++) {
+        let a, b, c;
+        if (indexAttr) {
+          a = indexAttr.getX(t * 3);
+          b = indexAttr.getX(t * 3 + 1);
+          c = indexAttr.getX(t * 3 + 2);
+        } else {
+          a = t * 3;
+          b = t * 3 + 1;
+          c = t * 3 + 2;
+        }
+        addEdge(a, b);
+        addEdge(b, c);
+        addEdge(c, a);
+      }
+      return edges;
+    }
+
+    function createSoftBody(color, centerPosition) {
+      const baseGeom = new THREE.IcosahedronGeometry(1.0, 2);
+      const geom = baseGeom.toNonIndexed();
+      geom.computeVertexNormals();
+
+      const posAttr = geom.attributes.position;
+      const uniqueMap = new Map();
+      const uniquePositions = [];
+      const remap = [];
+
+      for (let i = 0; i < posAttr.count; i++) {
+        const x = posAttr.getX(i);
+        const y = posAttr.getY(i);
+        const z = posAttr.getZ(i);
+        const key = `${x.toFixed(6)},${y.toFixed(6)},${z.toFixed(6)}`;
+        let idx = uniqueMap.get(key);
+        if (idx === undefined) {
+          idx = uniquePositions.length;
+          uniqueMap.set(key, idx);
+          uniquePositions.push(new THREE.Vector3(x, y, z));
+        }
+        remap.push(idx);
+      }
+
+      const surfaceNodes = uniquePositions.map(p => makeNode(p.clone().add(centerPosition)));
+      const centerNode = makeNode(centerPosition.clone());
+      const nodes = [...surfaceNodes, centerNode];
+      const centerIndex = nodes.length - 1;
+
+      const springs = [];
+      for (let i = 0; i < surfaceNodes.length; i++) {
+        const rest = surfaceNodes[i].pos.distanceTo(centerNode.pos);
+        springs.push({
+          i,
+          j: centerIndex,
+          k: RADIAL_K,
+          d: DAMPING,
+          restLength: rest,
+          radial: true
+        });
+      }
+
+      const indexed = new THREE.IcosahedronGeometry(1.0, 2);
+      const edges = buildSurfaceEdges(indexed.attributes.position, indexed.index);
+      for (const [i, j] of edges) {
+        const pi = indexed.attributes.position;
+        const a = new THREE.Vector3(pi.getX(i), pi.getY(i), pi.getZ(i)).add(centerPosition);
+        const b = new THREE.Vector3(pi.getX(j), pi.getY(j), pi.getZ(j)).add(centerPosition);
+        springs.push({
+          i,
+          j,
+          k: SURFACE_K,
+          d: DAMPING,
+          restLength: a.distanceTo(b),
+          radial: false
+        });
+      }
+
+      const renderGeom = geom.clone();
+      const material = new THREE.MeshStandardMaterial({
+        color,
+        transparent: true,
+        opacity: 0.7,
+        roughness: 0.4,
+        metalness: 0.0,
+        side: THREE.DoubleSide
+      });
+      const mesh = new THREE.Mesh(renderGeom, material);
+      scene.add(mesh);
+
+      const centerMarker = new THREE.Mesh(
+        new THREE.SphereGeometry(0.06, 12, 12),
+        new THREE.MeshStandardMaterial({ color: 0xffffff })
+      );
+      scene.add(centerMarker);
+
+      const radialPositions = new Float32Array(surfaceNodes.length * 2 * 3);
+      const radialGeom = new THREE.BufferGeometry();
+      radialGeom.setAttribute('position', new THREE.BufferAttribute(radialPositions, 3));
+      const radialLines = new THREE.LineSegments(
+        radialGeom,
+        new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.35 })
+      );
+      scene.add(radialLines);
+
+      const body = {
+        nodes,
+        surfaceCount: surfaceNodes.length,
+        centerIndex,
+        springs,
+        mesh,
+        renderGeom,
+        remap,
+        centerMarker,
+        radialLines,
+        initialCenter: centerPosition.clone(),
+        initialVolume: 0,
+        avgRadius: 1,
+        volumeRatio: 1,
+        center: centerPosition.clone(),
+        speed: 0
+      };
+
+      updateBodyDerived(body);
+      body.initialVolume = approximateVolume(body);
+
+      return body;
+    }
+
+    function removeBody(body) {
+      if (!body) return;
+      scene.remove(body.mesh);
+      scene.remove(body.centerMarker);
+      scene.remove(body.radialLines);
+      body.mesh.geometry.dispose();
+      body.mesh.material.dispose();
+      body.centerMarker.geometry.dispose();
+      body.centerMarker.material.dispose();
+      body.radialLines.geometry.dispose();
+      body.radialLines.material.dispose();
+    }
+
+    function resetSimulation() {
+      removeBody(bodyA);
+      removeBody(bodyB);
+
+      bodyA = createSoftBody(0xff3333, new THREE.Vector3(-1.5, 5, 0));
+      bodyB = createSoftBody(0x3366ff, new THREE.Vector3(1.5, 6, 0));
+
+      const visible = document.getElementById('springToggle').checked;
+      bodyA.radialLines.visible = visible;
+      bodyB.radialLines.visible = visible;
+
+      simTime = 0;
+      groundContacts = 0;
+      clock.getDelta();
+      updateHUD();
+      updateExposedState();
+    }
+
+    function clearForces(body) {
+      for (const node of body.nodes) {
+        node.force.copy(GRAVITY).multiplyScalar(node.mass);
+      }
+    }
+
+    function applySpringForces(body) {
+      for (const s of body.springs) {
+        const ni = body.nodes[s.i];
+        const nj = body.nodes[s.j];
+
+        tempV1.copy(nj.pos).sub(ni.pos);
+        const len = tempV1.length();
+        if (len < 1e-8) continue;
+        const dir = tempV1.multiplyScalar(1 / len);
+
+        const vi = getVelocity(ni).clone();
+        const vj = getVelocity(nj).clone();
+        const relVel = tempV2.copy(vj).sub(vi);
+        const relAlong = relVel.dot(dir);
+
+        const fs = s.k * (len - s.restLength);
+        const fd = s.d * relAlong;
+        const fmag = fs + fd;
+
+        tempV3.copy(dir).multiplyScalar(fmag);
+        ni.force.add(tempV3);
+        nj.force.sub(tempV3);
+      }
+    }
+
+    function approximateVolume(body) {
+      const center = computeCentroid(body);
+      let rSum = 0;
+      for (let i = 0; i < body.surfaceCount; i++) {
+        rSum += body.nodes[i].pos.distanceTo(center);
+      }
+      const rAvg = rSum / body.surfaceCount;
+      return (4 / 3) * Math.PI * rAvg * rAvg * rAvg;
+    }
+
+    function computeCentroid(body) {
+      const c = new THREE.Vector3();
+      for (let i = 0; i < body.surfaceCount; i++) {
+        c.add(body.nodes[i].pos);
+      }
+      c.multiplyScalar(1 / body.surfaceCount);
+      return c;
+    }
+
+    function applyPressure(body) {
+      const center = computeCentroid(body);
+      const V = approximateVolume(body);
+      if (V < body.initialVolume * 0.7) {
+        const ratio = (body.initialVolume - V) / body.initialVolume;
+        for (let i = 0; i < body.surfaceCount; i++) {
+          const node = body.nodes[i];
+          tempV1.copy(node.pos).sub(center);
+          const len = tempV1.length();
+          if (len > 1e-8) {
+            tempV1.multiplyScalar(1 / len);
+            tempV2.copy(tempV1).multiplyScalar(PRESSURE_COEFF * ratio);
+            node.force.add(tempV2);
+          }
+        }
+      }
+    }
+
+    function applyBodyBodyContacts(body1, body2) {
+      for (let i = 0; i < body1.surfaceCount; i++) {
+        const n1 = body1.nodes[i];
+        for (let j = 0; j < body2.surfaceCount; j++) {
+          const n2 = body2.nodes[j];
+          tempV1.copy(n2.pos).sub(n1.pos);
+          const dist = tempV1.length();
+          if (dist > 1e-8 && dist < CONTACT_DIST) {
+            const dir = tempV1.multiplyScalar(1 / dist);
+            const f = CONTACT_K * (CONTACT_DIST - dist);
+            tempV2.copy(dir).multiplyScalar(f);
+            n1.force.add(tempV2.clone().multiplyScalar(-1));
+            n2.force.add(tempV2);
+          }
+        }
+      }
+    }
+
+    function integrateVerlet(body) {
+      for (const node of body.nodes) {
+        const current = node.pos.clone();
+        const accel = node.force.clone().multiplyScalar(1 / node.mass);
+        const next = node.pos.clone()
+          .multiplyScalar(2)
+          .sub(node.prev)
+          .add(accel.multiplyScalar(DT * DT));
+
+        node.pos.copy(next);
+        node.prev.copy(current);
+      }
+    }
+
+    function solveGroundContacts(body) {
+      let contacts = 0;
+      for (let i = 0; i < body.surfaceCount; i++) {
+        const node = body.nodes[i];
+        if (node.pos.y < 0) {
+          let vy = (node.pos.y - node.prev.y) / DT;
+          node.pos.y = 0;
+          vy = -vy * GROUND_RESTITUTION;
+          node.prev.y = node.pos.y - vy * DT;
+          contacts++;
+        }
+      }
+      return contacts;
+    }
+
+    function updateBodyGeometry(body) {
+      const attr = body.renderGeom.attributes.position;
+      for (let i = 0; i < body.remap.length; i++) {
+        const nodeIndex = body.remap[i];
+        const p = body.nodes[nodeIndex].pos;
+        attr.setXYZ(i, p.x, p.y, p.z);
+      }
+      attr.needsUpdate = true;
+      body.renderGeom.computeVertexNormals();
+
+      const cnode = body.nodes[body.centerIndex].pos;
+      body.centerMarker.position.copy(cnode);
+
+      const linePos = body.radialLines.geometry.attributes.position;
+      for (let i = 0; i < body.surfaceCount; i++) {
+        const p = body.nodes[i].pos;
+        linePos.setXYZ(i * 2, cnode.x, cnode.y, cnode.z);
+        linePos.setXYZ(i * 2 + 1, p.x, p.y, p.z);
+      }
+      linePos.needsUpdate = true;
+    }
+
+    function updateBodyDerived(body) {
+      body.center.copy(computeCentroid(body));
+      let rSum = 0;
+      let vSum = new THREE.Vector3();
+      for (let i = 0; i < body.surfaceCount; i++) {
+        rSum += body.nodes[i].pos.distanceTo(body.center);
+        vSum.add(getVelocity(body.nodes[i]));
+      }
+      body.avgRadius = rSum / body.surfaceCount;
+      const volume = (4 / 3) * Math.PI * body.avgRadius * body.avgRadius * body.avgRadius;
+      body.volumeRatio = volume / body.initialVolume || 1;
+      body.speed = vSum.multiplyScalar(1 / body.surfaceCount).length();
+
+      body.nodes[body.centerIndex].pos.copy(body.center);
+      const centerVel = vSum.multiplyScalar(0);
+      for (let i = 0; i < body.surfaceCount; i++) centerVel.add(getVelocity(body.nodes[i]));
+      centerVel.multiplyScalar(1 / body.surfaceCount);
+      body.nodes[body.centerIndex].prev.copy(body.nodes[body.centerIndex].pos).sub(centerVel.multiplyScalar(DT));
+    }
+
+    function computeTotalEnergy() {
+      let E = 0;
+      for (const body of [bodyA, bodyB]) {
+        for (const node of body.nodes) {
+          const v = getVelocity(node).length();
+          E += 0.5 * node.mass * v * v;
+          E += node.mass * 9.81 * node.pos.y;
+        }
+        for (const s of body.springs) {
+          const ni = body.nodes[s.i];
+          const nj = body.nodes[s.j];
+          const len = ni.pos.distanceTo(nj.pos);
+          const x = len - s.restLength;
+          E += 0.5 * s.k * x * x;
+        }
+      }
+      return E;
+    }
+
+    function sampleNodes(body, count = 25) {
+      const out = [];
+      const step = Math.max(1, Math.floor(body.surfaceCount / count));
+      for (let i = 0; i < body.surfaceCount && out.length < count; i += step) {
+        const p = body.nodes[i].pos;
+        out.push({ x: p.x, y: p.y, z: p.z });
+      }
+      return out;
+    }
+
+    function updateHUD() {
+      document.getElementById('posA').textContent =
+        `(${bodyA.center.x.toFixed(2)}, ${bodyA.center.y.toFixed(2)}, ${bodyA.center.z.toFixed(2)})`;
+      document.getElementById('posB').textContent =
+        `(${bodyB.center.x.toFixed(2)}, ${bodyB.center.y.toFixed(2)}, ${bodyB.center.z.toFixed(2)})`;
+      document.getElementById('volRatioA').textContent = bodyA.volumeRatio.toFixed(3);
+      document.getElementById('volRatioB').textContent = bodyB.volumeRatio.toFixed(3);
+      document.getElementById('simTime').textContent = simTime.toFixed(3);
+    }
+
+    function updateExposedState() {
+      window.__3D_STATE__ = {
+        simTime,
+        bodyA: {
+          center: { x: bodyA.center.x, y: bodyA.center.y, z: bodyA.center.z },
+          avgRadius: bodyA.avgRadius,
+          volumeRatio: bodyA.volumeRatio,
+          speed: bodyA.speed,
+          nodeCount: bodyA.nodes.length,
+          nodes: sampleNodes(bodyA, 25)
+        },
+        bodyB: {
+          center: { x: bodyB.center.x, y: bodyB.center.y, z: bodyB.center.z },
+          avgRadius: bodyB.avgRadius,
+          volumeRatio: bodyB.volumeRatio,
+          speed: bodyB.speed,
+          nodeCount: bodyB.nodes.length,
+          nodes: sampleNodes(bodyB, 25)
+        },
+        totalEnergy: computeTotalEnergy(),
+        groundContacts
+      };
+    }
+
+    function stepSimulation() {
+      groundContacts = 0;
+
+      for (let s = 0; s < SUBSTEPS; s++) {
+        clearForces(bodyA);
+        clearForces(bodyB);
+
+        applySpringForces(bodyA);
+        applySpringForces(bodyB);
+
+        applyPressure(bodyA);
+        applyPressure(bodyB);
+
+        applyBodyBodyContacts(bodyA, bodyB);
+
+        integrateVerlet(bodyA);
+        integrateVerlet(bodyB);
+
+        groundContacts += solveGroundContacts(bodyA);
+        groundContacts += solveGroundContacts(bodyB);
+
+        updateBodyDerived(bodyA);
+        updateBodyDerived(bodyB);
+
+        simTime += DT;
+      }
+
+      updateBodyGeometry(bodyA);
+      updateBodyGeometry(bodyB);
+      updateHUD();
+      updateExposedState();
+    }
+
+    function animate() {
+      requestAnimationFrame(animate);
+      controls.update();
+      stepSimulation();
+      renderer.render(scene, camera);
+    }
+  </script>
+</body>
+</html>

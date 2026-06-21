@@ -1,0 +1,521 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Binary Star System Simulator</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #000005;
+            color: #eee;
+            font-family: 'Courier New', Courier, monospace;
+            user-select: none;
+        }
+        canvas {
+            display: block;
+        }
+        #ui-layer {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            pointer-events: none;
+        }
+        .panel {
+            background: rgba(0, 5, 20, 0.85);
+            border: 1px solid #336699;
+            border-radius: 6px;
+            padding: 15px;
+            pointer-events: auto;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.5);
+            width: 260px;
+        }
+        h2 {
+            margin: 0 0 12px 0;
+            font-size: 16px;
+            color: #66aaff;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            border-bottom: 1px solid #336699;
+            padding-bottom: 5px;
+        }
+        .control-group {
+            margin-bottom: 12px;
+        }
+        .control-group label {
+            display: flex;
+            justify-content: space-between;
+            font-size: 12px;
+            margin-bottom: 4px;
+        }
+        input[type=range] {
+            width: 100%;
+            cursor: pointer;
+        }
+        .instructions {
+            margin-top: 15px;
+            font-size: 11px;
+            color: #88aadd;
+            line-height: 1.6;
+            background: rgba(0,0,0,0.3);
+            padding: 8px;
+            border-radius: 4px;
+        }
+        .key {
+            color: #fff;
+            background: #336699;
+            padding: 1px 4px;
+            border-radius: 3px;
+            font-weight: bold;
+        }
+        #hud div {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 6px;
+            font-size: 13px;
+        }
+        .val {
+            color: #55ff55;
+            font-weight: bold;
+        }
+    </style>
+    <script type="importmap">
+    { "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+    } }
+    </script>
+</head>
+<body>
+
+    <div id="ui-layer">
+        <div class="panel" id="controls">
+            <h2>System Parameters</h2>
+            <div class="control-group">
+                <label><span>Star A Mass</span> <span id="val-mass-a">100</span></label>
+                <input type="range" id="slider-mass-a" min="20" max="200" step="10" value="100">
+            </div>
+            <div class="control-group">
+                <label><span>Star B Mass</span> <span id="val-mass-b">60</span></label>
+                <input type="range" id="slider-mass-b" min="20" max="200" step="10" value="60">
+            </div>
+            <div class="control-group">
+                <label><span>Separation</span> <span id="val-sep">15</span></label>
+                <input type="range" id="slider-separation" min="5" max="30" step="1" value="15">
+            </div>
+            <div class="instructions">
+                <span class="key">R</span> Reset Orbits<br>
+                <span class="key">Space</span> Pause / Play<br>
+                <span class="key">P</span> Toggle Planet<br>
+                <span class="key">T</span> Toggle Trails<br>
+                <em>Drag to rotate, scroll to zoom.</em>
+            </div>
+        </div>
+
+        <div class="panel" id="hud">
+            <h2>Telemetry</h2>
+            <div>Star A Mass: <span class="val" id="hud-mass-a">100</span></div>
+            <div>Star B Mass: <span class="val" id="hud-mass-b">60</span></div>
+            <div>Separation: <span class="val" id="hud-sep">15.00</span></div>
+            <div>Total Energy: <span class="val" id="hud-energy">0.00</span></div>
+            <div>Energy Drift: <span class="val" id="hud-drift">0.0000</span>%</div>
+            <div>Planet: <span class="val" id="hud-planet">OFF</span></div>
+        </div>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        // --- Global State & Constants ---
+        const G = 1;
+        const DT = 0.005;
+        const SUBSTEPS = 4;
+        const MAX_TRAIL_POINTS = 500;
+
+        let massA = 100;
+        let massB = 60;
+        let massP = 0.1;
+        let initialSeparation = 15;
+
+        let isPaused = false;
+        let planetEnabled = false;
+        let trailsEnabled = true;
+        let frameCount = 0;
+        let initialEnergy = 0;
+        
+        let prevAngleA = 0;
+        let accumulatedAngleA = 0;
+        let orbitCount = 0;
+
+        // State vector: [xA,yA,zA, vxA,vyA,vzA, xB,yB,zB, vxB,vyB,vzB, xP,yP,zP, vxP,vyP,vzP]
+        const state = new Float64Array(18);
+
+        // --- Three.js Setup ---
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x000005);
+
+        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.set(0, 30, 40);
+        camera.lookAt(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        document.body.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.05;
+
+        // --- Scene Objects ---
+        // Starfield
+        const starsGeom = new THREE.BufferGeometry();
+        const starsPos = [];
+        for (let i = 0; i < 2000; i++) {
+            let r = 100 + Math.random() * 100;
+            let theta = Math.random() * 2 * Math.PI;
+            let phi = Math.acos(2 * Math.random() - 1);
+            starsPos.push(
+                r * Math.sin(phi) * Math.cos(theta),
+                r * Math.sin(phi) * Math.sin(theta),
+                r * Math.cos(phi)
+            );
+        }
+        starsGeom.setAttribute('position', new THREE.Float32BufferAttribute(starsPos, 3));
+        const starsMat = new THREE.PointsMaterial({ color: 0xffffff, size: 0.5 });
+        const starField = new THREE.Points(starsGeom, starsMat);
+        scene.add(starField);
+
+        // Star A (Orange Giant)
+        const matA = new THREE.MeshStandardMaterial({ emissive: 0xff6633, color: 0x000000 });
+        const meshA = new THREE.Mesh(new THREE.SphereGeometry(2.0, 32, 32), matA);
+        scene.add(meshA);
+        const lightA = new THREE.PointLight(0xff6633, 3, 80);
+        meshA.add(lightA);
+        const coronaA = new THREE.Mesh(
+            new THREE.SphereGeometry(3.0, 32, 32),
+            new THREE.MeshBasicMaterial({ color: 0xff6633, transparent: true, opacity: 0.15, blending: THREE.AdditiveBlending, depthWrite: false })
+        );
+        meshA.add(coronaA);
+
+        // Star B (Blue Dwarf)
+        const matB = new THREE.MeshStandardMaterial({ emissive: 0x6688ff, color: 0x000000 });
+        const meshB = new THREE.Mesh(new THREE.SphereGeometry(1.2, 32, 32), matB);
+        scene.add(meshB);
+        const lightB = new THREE.PointLight(0x6688ff, 2, 50);
+        meshB.add(lightB);
+        const coronaB = new THREE.Mesh(
+            new THREE.SphereGeometry(1.8, 32, 32),
+            new THREE.MeshBasicMaterial({ color: 0x6688ff, transparent: true, opacity: 0.15, blending: THREE.AdditiveBlending, depthWrite: false })
+        );
+        meshB.add(coronaB);
+
+        // Planet
+        const matP = new THREE.MeshStandardMaterial({ color: 0x44cc44, roughness: 0.8 });
+        const meshP = new THREE.Mesh(new THREE.SphereGeometry(0.3, 16, 16), matP);
+        meshP.visible = false;
+        scene.add(meshP);
+
+        // Trails
+        function createTrail(colorHex) {
+            const geom = new THREE.BufferGeometry();
+            const pos = new Float32Array(MAX_TRAIL_POINTS * 3);
+            const cols = new Float32Array(MAX_TRAIL_POINTS * 4);
+            const c = new THREE.Color(colorHex);
+            for (let i = 0; i < MAX_TRAIL_POINTS; i++) {
+                cols[i*4] = c.r; cols[i*4+1] = c.g; cols[i*4+2] = c.b;
+                cols[i*4+3] = i / MAX_TRAIL_POINTS; // Alpha fade
+            }
+            geom.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+            geom.setAttribute('color', new THREE.BufferAttribute(cols, 4));
+            const mat = new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, depthWrite: false });
+            const line = new THREE.Line(geom, mat);
+            scene.add(line);
+            return line;
+        }
+
+        const trailA = createTrail(0xff6633);
+        const trailB = createTrail(0x6688ff);
+        const trailP = createTrail(0x44cc44);
+        trailP.visible = false;
+
+        function resetTrail(trail, x, y, z) {
+            const pos = trail.geometry.attributes.position.array;
+            for (let i = 0; i < MAX_TRAIL_POINTS; i++) {
+                pos[i*3] = x; pos[i*3+1] = y; pos[i*3+2] = z;
+            }
+            trail.geometry.attributes.position.needsUpdate = true;
+        }
+
+        function updateTrail(trail, x, y, z) {
+            const pos = trail.geometry.attributes.position.array;
+            for (let i = 0; i < MAX_TRAIL_POINTS - 1; i++) {
+                pos[i*3] = pos[(i+1)*3];
+                pos[i*3+1] = pos[(i+1)*3+1];
+                pos[i*3+2] = pos[(i+1)*3+2];
+            }
+            pos[(MAX_TRAIL_POINTS-1)*3] = x;
+            pos[(MAX_TRAIL_POINTS-1)*3+1] = y;
+            pos[(MAX_TRAIL_POINTS-1)*3+2] = z;
+            trail.geometry.attributes.position.needsUpdate = true;
+        }
+
+        // --- Physics Engine ---
+        function calculateEnergy() {
+            const [xA,yA,zA, vxA,vyA,vzA, xB,yB,zB, vxB,vyB,vzB, xP,yP,zP, vxP,vyP,vzP] = state;
+            let ek = 0.5 * massA * (vxA**2 + vyA**2 + vzA**2) + 0.5 * massB * (vxB**2 + vyB**2 + vzB**2);
+            let ep = -G * massA * massB / Math.sqrt((xB-xA)**2 + (yB-yA)**2 + (zB-zA)**2);
+            
+            if (planetEnabled) {
+                ek += 0.5 * massP * (vxP**2 + vyP**2 + vzP**2);
+                ep -= G * massA * massP / Math.sqrt((xP-xA)**2 + (yP-yA)**2 + (zP-zA)**2);
+                ep -= G * massB * massP / Math.sqrt((xP-xB)**2 + (yP-yB)**2 + (zP-zB)**2);
+            }
+            return ek + ep;
+        }
+
+        function calculateAngularMomentumZ() {
+            const [xA,yA,zA, vxA,vyA,vzA, xB,yB,zB, vxB,vyB,vzB, xP,yP,zP, vxP,vyP,vzP] = state;
+            let lz = massA * (xA*vyA - yA*vxA) + massB * (xB*vyB - yB*vxB);
+            if (planetEnabled) lz += massP * (xP*vyP - yP*vxP);
+            return lz;
+        }
+
+        function getDerivatives(s) {
+            const [xA,yA,zA, vxA,vyA,vzA, xB,yB,zB, vxB,vyB,vzB, xP,yP,zP, vxP,vyP,vzP] = s;
+            const derivs = new Float64Array(18);
+            
+            // Velocities
+            derivs[0] = vxA; derivs[1] = vyA; derivs[2] = vzA;
+            derivs[6] = vxB; derivs[7] = vyB; derivs[8] = vzB;
+            derivs[12] = vxP; derivs[13] = vyP; derivs[14] = vzP;
+
+            let axA=0, ayA=0, azA=0, axB=0, ayB=0, azB=0, axP=0, ayP=0, azP=0;
+
+            // A-B
+            let dx = xB - xA, dy = yB - yA, dz = zB - zA;
+            let distSq = dx*dx + dy*dy + dz*dz;
+            let dist = Math.sqrt(distSq);
+            let f = G * massA * massB / distSq;
+            let fx = f * dx/dist, fy = f * dy/dist, fz = f * dz/dist;
+            axA += fx/massA; ayA += fy/massA; azA += fz/massA;
+            axB -= fx/massB; ayB -= fy/massB; azB -= fz/massB;
+
+            // Planet forces
+            if (planetEnabled) {
+                // A-P
+                dx = xP - xA; dy = yP - yA; dz = zP - zA;
+                distSq = dx*dx + dy*dy + dz*dz;
+                dist = Math.sqrt(distSq);
+                f = G * massA * massP / distSq;
+                fx = f * dx/dist; fy = f * dy/dist; fz = f * dz/dist;
+                axA += fx/massA; ayA += fy/massA; azA += fz/massA;
+                axP -= fx/massP; ayP -= fy/massP; azP -= fz/massP;
+
+                // B-P
+                dx = xP - xB; dy = yP - yB; dz = zP - zB;
+                distSq = dx*dx + dy*dy + dz*dz;
+                dist = Math.sqrt(distSq);
+                f = G * massB * massP / distSq;
+                fx = f * dx/dist; fy = f * dy/dist; fz = f * dz/dist;
+                axB += fx/massB; ayB += fy/massB; azB += fz/massB;
+                axP -= fx/massP; ayP -= fy/massP; azP -= fz/massP;
+            }
+
+            derivs[3] = axA; derivs[4] = ayA; derivs[5] = azA;
+            derivs[9] = axB; derivs[10] = ayB; derivs[11] = azB;
+            derivs[15] = axP; derivs[16] = ayP; derivs[17] = azP;
+
+            return derivs;
+        }
+
+        function rk4Step(dt) {
+            const k1 = getDerivatives(state);
+            
+            const s2 = new Float64Array(18);
+            for(let i=0; i<18; i++) s2[i] = state[i] + 0.5 * dt * k1[i];
+            const k2 = getDerivatives(s2);
+            
+            const s3 = new Float64Array(18);
+            for(let i=0; i<18; i++) s3[i] = state[i] + 0.5 * dt * k2[i];
+            const k3 = getDerivatives(s3);
+            
+            const s4 = new Float64Array(18);
+            for(let i=0; i<18; i++) s4[i] = state[i] + dt * k3[i];
+            const k4 = getDerivatives(s4);
+
+            for(let i=0; i<18; i++) {
+                state[i] += (dt / 6.0) * (k1[i] + 2*k2[i] + 2*k3[i] + k4[i]);
+            }
+        }
+
+        function initSystem() {
+            const d = initialSeparation;
+            const mTot = massA + massB;
+            const dA = d * massB / mTot;
+            const dB = d * massA / mTot;
+            
+            // Stable circular orbit velocities
+            const vFactor = Math.sqrt(G / (d * mTot));
+            const vA = massB * vFactor;
+            const vB = massA * vFactor;
+
+            // Reset state array
+            state.fill(0);
+            
+            // Star A (x-y plane)
+            state[0] = -dA; state[1] = 0; state[2] = 0;
+            state[3] = 0;   state[4] = -vA; state[5] = 0;
+            
+            // Star B (x-y plane)
+            state[6] = dB;  state[7] = 0; state[8] = 0;
+            state[9] = 0;   state[10] = vB; state[11] = 0;
+
+            // Planet (x-z plane for complex 3D dynamics)
+            if (planetEnabled) {
+                state[12] = 25; state[13] = 0; state[14] = 0;
+                state[15] = 0;  state[16] = 0; state[17] = 3;
+            }
+
+            resetTrail(trailA, state[0], state[1], state[2]);
+            resetTrail(trailB, state[6], state[7], state[8]);
+            if (planetEnabled) resetTrail(trailP, state[12], state[13], state[14]);
+
+            initialEnergy = calculateEnergy();
+            accumulatedAngleA = 0;
+            prevAngleA = Math.atan2(state[1], state[0]);
+            orbitCount = 0;
+        }
+
+        // --- UI & Controls ---
+        const sliderMassA = document.getElementById('slider-mass-a');
+        const sliderMassB = document.getElementById('slider-mass-b');
+        const sliderSep = document.getElementById('slider-separation');
+
+        function updateParamsFromUI() {
+            massA = parseFloat(sliderMassA.value);
+            massB = parseFloat(sliderMassB.value);
+            initialSeparation = parseFloat(sliderSep.value);
+            
+            document.getElementById('val-mass-a').innerText = massA;
+            document.getElementById('val-mass-b').innerText = massB;
+            document.getElementById('val-sep').innerText = initialSeparation;
+            
+            initSystem();
+        }
+
+        sliderMassA.addEventListener('input', updateParamsFromUI);
+        sliderMassB.addEventListener('input', updateParamsFromUI);
+        sliderSep.addEventListener('input', updateParamsFromUI);
+
+        window.addEventListener('keydown', (e) => {
+            const key = e.key.toLowerCase();
+            if (key === 'r') {
+                initSystem();
+            } else if (key === ' ') {
+                isPaused = !isPaused;
+            } else if (key === 'p') {
+                planetEnabled = !planetEnabled;
+                meshP.visible = planetEnabled;
+                trailP.visible = planetEnabled && trailsEnabled;
+                if (planetEnabled) {
+                    state[12] = 25; state[13] = 0; state[14] = 0;
+                    state[15] = 0;  state[16] = 0; state[17] = 3;
+                    resetTrail(trailP, 25, 0, 0);
+                }
+                initialEnergy = calculateEnergy(); // Recalculate baseline
+            } else if (key === 't') {
+                trailsEnabled = !trailsEnabled;
+                trailA.visible = trailsEnabled;
+                trailB.visible = trailsEnabled;
+                trailP.visible = planetEnabled && trailsEnabled;
+            }
+        });
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // --- Main Loop ---
+        initSystem();
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            if (!isPaused) {
+                for (let i = 0; i < SUBSTEPS; i++) {
+                    rk4Step(DT);
+                }
+                frameCount++;
+
+                // Update Meshes
+                meshA.position.set(state[0], state[1], state[2]);
+                meshB.position.set(state[6], state[7], state[8]);
+                if (planetEnabled) meshP.position.set(state[12], state[13], state[14]);
+
+                // Update Trails
+                if (frameCount % 2 === 0) { // Throttle trail updates slightly for performance
+                    updateTrail(trailA, state[0], state[1], state[2]);
+                    updateTrail(trailB, state[6], state[7], state[8]);
+                    if (planetEnabled) updateTrail(trailP, state[12], state[13], state[14]);
+                }
+
+                // Calculate Orbit Count
+                let currentAngleA = Math.atan2(state[1], state[0]);
+                let deltaAngle = currentAngleA - prevAngleA;
+                if (deltaAngle > Math.PI) deltaAngle -= 2 * Math.PI;
+                if (deltaAngle < -Math.PI) deltaAngle += 2 * Math.PI;
+                accumulatedAngleA += deltaAngle;
+                prevAngleA = currentAngleA;
+                orbitCount = Math.floor(Math.abs(accumulatedAngleA) / (2 * Math.PI));
+            }
+
+            controls.update();
+
+            // --- State Management & HUD ---
+            const currentSep = Math.sqrt((state[6]-state[0])**2 + (state[7]-state[1])**2 + (state[8]-state[2])**2);
+            const currentEnergy = calculateEnergy();
+            const drift = Math.abs(initialEnergy) > 0 ? Math.abs((currentEnergy - initialEnergy) / initialEnergy) * 100 : 0;
+            const lz = calculateAngularMomentumZ();
+
+            let isValid = true;
+            for(let i=0; i<18; i++) if(isNaN(state[i])) isValid = false;
+
+            window.__3D_STATE__ = {
+                massA: massA,
+                massB: massB,
+                separation: parseFloat(currentSep.toFixed(3)),
+                totalEnergy: parseFloat(currentEnergy.toFixed(4)),
+                energyDrift: parseFloat(drift.toFixed(4)),
+                angularMomentum: parseFloat(lz.toFixed(3)),
+                isPaused: isPaused,
+                planetEnabled: planetEnabled,
+                trailsEnabled: trailsEnabled,
+                frameCount: frameCount,
+                bodiesValid: isValid,
+                orbitCount: orbitCount
+            };
+
+            // Update HUD DOM
+            document.getElementById('hud-mass-a').innerText = massA;
+            document.getElementById('hud-mass-b').innerText = massB;
+            document.getElementById('hud-sep').innerText = currentSep.toFixed(2);
+            document.getElementById('hud-energy').innerText = currentEnergy.toFixed(2);
+            document.getElementById('hud-drift').innerText = drift.toFixed(4);
+            document.getElementById('hud-planet').innerText = planetEnabled ? 'ON' : 'OFF';
+            document.getElementById('hud-planet').style.color = planetEnabled ? '#55ff55' : '#ff5555';
+
+            renderer.render(scene, camera);
+        }
+
+        animate();
+    </script>
+</body>
+</html>

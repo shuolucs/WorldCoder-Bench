@@ -1,0 +1,521 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3D Audio Spectrum Visualizer</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { overflow: hidden; background: #0a0a1a; }
+  canvas { display: block; }
+  
+  #hud {
+    position: absolute;
+    top: 10px;
+    left: 10px;
+    color: white;
+    font-family: 'Courier New', monospace;
+    font-size: 14px;
+    background: rgba(0, 0, 0, 0.6);
+    padding: 15px;
+    border-radius: 8px;
+    line-height: 1.8;
+    pointer-events: none;
+    min-width: 260px;
+  }
+  
+  #hud .label {
+    color: #888;
+    font-size: 12px;
+  }
+  
+  #hud .value {
+    color: #0ff;
+    font-weight: bold;
+  }
+  
+  .controls {
+    position: absolute;
+    top: 10px;
+    right: 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  
+  .controls button {
+    padding: 10px 20px;
+    background: rgba(0, 255, 255, 0.15);
+    color: #0ff;
+    border: 1px solid rgba(0, 255, 255, 0.4);
+    border-radius: 6px;
+    cursor: pointer;
+    font-family: 'Courier New', monospace;
+    font-size: 13px;
+    transition: all 0.2s;
+  }
+  
+  .controls button:hover {
+    background: rgba(0, 255, 255, 0.3);
+    border-color: #0ff;
+  }
+  
+  #instructions {
+    position: absolute;
+    bottom: 10px;
+    left: 50%;
+    transform: translateX(-50%);
+    color: rgba(255,255,255,0.4);
+    font-family: 'Courier New', monospace;
+    font-size: 12px;
+    text-align: center;
+    pointer-events: none;
+  }
+</style>
+</head>
+<body>
+
+<div id="hud">
+  <div><span class="label">DIFFICULTY:</span> <span class="value" id="difficultyDisplay">1</span></div>
+  <div><span class="label">TIME:</span> <span class="value" id="timeDisplay">0</span><span class="label">s</span></div>
+  <div><span class="label">PARTICLES:</span> <span class="value" id="particleDisplay">100</span></div>
+  <div><span class="label">AVG HEIGHT:</span> <span class="value" id="avgHeightDisplay">0.00</span></div>
+  <div><span class="label">FPS:</span> <span class="value" id="fpsDisplay">0</span></div>
+</div>
+
+<div class="controls">
+  <button id="variantBtn">Next Variant</button>
+  <button id="pauseBtn">Toggle Pause</button>
+</div>
+
+<div id="instructions">
+  Keys 1-5: Set Difficulty | Space: Pause | R: Reset | Mouse: Orbit
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.163.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.163.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+// Scene setup
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0a0a1a);
+
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+camera.position.set(0, 3, 8);
+camera.lookAt(0, 0, 0);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.2;
+document.body.appendChild(renderer.domElement);
+
+// Lights
+const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+scene.add(ambientLight);
+
+const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
+directionalLight.position.set(5, 10, 7);
+directionalLight.castShadow = true;
+scene.add(directionalLight);
+
+// Add a subtle point light for extra visual interest
+const pointLight = new THREE.PointLight(0x00ffff, 0.3, 20);
+pointLight.position.set(0, 3, 0);
+scene.add(pointLight);
+
+// Controls
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.05;
+controls.target.set(0, 0, 0);
+
+// State
+let difficultyLevel = 1;
+let isPaused = false;
+let elapsedTime = 0;
+let lastTimestamp = performance.now();
+let difficultyTimer = 0;
+let variantIndex = 0;
+let shoeLoaded = false;
+let shoeModel = null;
+let materialVariants = [];
+let parser = null;
+
+// FPS tracking
+let fpsFrames = 0;
+let fpsTime = 0;
+let fpsValue = 0;
+
+// Spectrum bars
+const barCount = 64;
+const bars = [];
+const barRadius = 4;
+
+for (let i = 0; i < barCount; i++) {
+  const angle = (i / barCount) * Math.PI * 2;
+  const hue = i / barCount;
+  const color = new THREE.Color();
+  color.setHSL(hue, 0.8, 0.5);
+  
+  const geometry = new THREE.BoxGeometry(0.15, 1, 0.15);
+  // Shift geometry so bottom is at y=0
+  geometry.translate(0, 0.5, 0);
+  
+  const material = new THREE.MeshStandardMaterial({
+    color: color,
+    emissive: color.clone().multiplyScalar(0.3),
+    metalness: 0.3,
+    roughness: 0.6
+  });
+  
+  const bar = new THREE.Mesh(geometry, material);
+  bar.position.x = Math.cos(angle) * barRadius;
+  bar.position.z = Math.sin(angle) * barRadius;
+  bar.position.y = 0;
+  bar.lookAt(0, 0, 0);
+  // Reset rotation to just face outward but stand upright
+  bar.rotation.x = 0;
+  bar.rotation.z = 0;
+  
+  scene.add(bar);
+  bars.push(bar);
+}
+
+// Particle system
+const maxParticles = 500;
+const particleGeometry = new THREE.BufferGeometry();
+const particlePositions = new Float32Array(maxParticles * 3);
+const particleColors = new Float32Array(maxParticles * 3);
+
+for (let i = 0; i < maxParticles; i++) {
+  particlePositions[i * 3] = 0;
+  particlePositions[i * 3 + 1] = -100;
+  particlePositions[i * 3 + 2] = 0;
+  particleColors[i * 3] = 1;
+  particleColors[i * 3 + 1] = 1;
+  particleColors[i * 3 + 2] = 1;
+}
+
+particleGeometry.setAttribute('position', new THREE.BufferAttribute(particlePositions, 3));
+particleGeometry.setAttribute('color', new THREE.BufferAttribute(particleColors, 3));
+
+const particleMaterial = new THREE.PointsMaterial({
+  size: 0.05,
+  color: 0xffffff,
+  transparent: true,
+  opacity: 0.7,
+  blending: THREE.AdditiveBlending,
+  depthWrite: false
+});
+
+const particles = new THREE.Points(particleGeometry, particleMaterial);
+scene.add(particles);
+
+// Add a ground ring for visual reference
+const ringGeometry = new THREE.RingGeometry(3.8, 4.2, 64);
+const ringMaterial = new THREE.MeshBasicMaterial({
+  color: 0x111133,
+  side: THREE.DoubleSide,
+  transparent: true,
+  opacity: 0.3
+});
+const ring = new THREE.Mesh(ringGeometry, ringMaterial);
+ring.rotation.x = -Math.PI / 2;
+ring.position.y = -0.01;
+scene.add(ring);
+
+// Load shoe model
+const loader = new GLTFLoader();
+loader.load(
+  'https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/MaterialsVariantsShoe/glTF-Binary/MaterialsVariantsShoe.glb',
+  (gltf) => {
+    shoeModel = gltf.scene;
+    parser = gltf.parser;
+    
+    // Calculate bounding box and scale to fit within 2 units
+    const box = new THREE.Box3().setFromObject(shoeModel);
+    const size = new THREE.Vector3();
+    box.getSize(size);
+    const maxDim = Math.max(size.x, size.y, size.z);
+    const scale = 2 / maxDim;
+    shoeModel.scale.setScalar(scale);
+    
+    // Center the model
+    const center = new THREE.Vector3();
+    box.getCenter(center);
+    shoeModel.position.set(
+      -center.x * scale,
+      -center.y * scale,
+      -center.z * scale
+    );
+    
+    // Wrap in a group for rotation
+    const shoeGroup = new THREE.Group();
+    shoeGroup.add(shoeModel);
+    scene.add(shoeGroup);
+    shoeModel = shoeGroup;
+    
+    // Check for material variants
+    if (gltf.userData && gltf.userData.gltfExtensions && gltf.userData.gltfExtensions.KHR_materials_variants) {
+      const variantsExtension = gltf.userData.gltfExtensions.KHR_materials_variants;
+      materialVariants = variantsExtension.variants.map(v => v.name);
+    }
+    
+    // Also try to get variants from the functions approach
+    if (gltf.functions && gltf.functions.selectVariant) {
+      // Store the select function
+      window.__selectVariant = gltf.functions.selectVariant;
+    }
+    
+    shoeLoaded = true;
+    console.log('Shoe model loaded. Variants:', materialVariants);
+  },
+  (progress) => {
+    console.log('Loading:', (progress.loaded / progress.total * 100).toFixed(1) + '%');
+  },
+  (error) => {
+    console.warn('Could not load shoe model:', error);
+    // Create a placeholder shoe
+    const placeholderGeom = new THREE.TorusKnotGeometry(0.6, 0.2, 100, 16);
+    const placeholderMat = new THREE.MeshStandardMaterial({
+      color: 0xff6600,
+      metalness: 0.5,
+      roughness: 0.3
+    });
+    const placeholder = new THREE.Mesh(placeholderGeom, placeholderMat);
+    const group = new THREE.Group();
+    group.add(placeholder);
+    scene.add(group);
+    shoeModel = group;
+    shoeLoaded = true;
+  }
+);
+
+// Variant cycling
+function cycleVariant() {
+  if (materialVariants.length > 0) {
+    variantIndex = (variantIndex + 1) % materialVariants.length;
+    const variantName = materialVariants[variantIndex];
+    
+    if (window.__selectVariant) {
+      window.__selectVariant(shoeModel, variantName);
+    }
+    
+    // Try using parser approach
+    if (parser) {
+      shoeModel.traverse((child) => {
+        if (child.isMesh && child.userData.gltfExtensions && child.userData.gltfExtensions.KHR_materials_variants) {
+          const mappings = child.userData.gltfExtensions.KHR_materials_variants.mappings;
+          for (const mapping of mappings) {
+            if (mapping.variants && mapping.variants.includes(variantIndex)) {
+              if (mapping.material !== undefined) {
+                parser.getDependency('material', mapping.material).then((mat) => {
+                  child.material = mat;
+                  child.material.needsUpdate = true;
+                });
+              }
+            }
+          }
+        }
+      });
+    }
+  } else {
+    variantIndex = 0;
+  }
+}
+
+// UI elements
+const difficultyDisplay = document.getElementById('difficultyDisplay');
+const timeDisplay = document.getElementById('timeDisplay');
+const particleDisplay = document.getElementById('particleDisplay');
+const avgHeightDisplay = document.getElementById('avgHeightDisplay');
+const fpsDisplay = document.getElementById('fpsDisplay');
+const variantBtn = document.getElementById('variantBtn');
+const pauseBtn = document.getElementById('pauseBtn');
+
+variantBtn.addEventListener('click', cycleVariant);
+pauseBtn.addEventListener('click', () => { isPaused = !isPaused; });
+
+// Keyboard controls
+document.addEventListener('keydown', (e) => {
+  if (e.key >= '1' && e.key <= '5') {
+    difficultyLevel = parseInt(e.key);
+    difficultyTimer = 0;
+  } else if (e.key === 'r' || e.key === 'R') {
+    difficultyLevel = 1;
+    difficultyTimer = 0;
+    elapsedTime = 0;
+  } else if (e.key === ' ') {
+    e.preventDefault();
+    isPaused = !isPaused;
+  }
+});
+
+// Window resize
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// State object
+window.__3D_STATE__ = {
+  shoeLoaded: false,
+  shoeRotationY: 0,
+  difficultyLevel: 1,
+  elapsedTime: 0,
+  barCount: 64,
+  avgBarHeight: 0,
+  maxBarHeight: 0,
+  activeParticles: 100,
+  isPaused: false,
+  variantIndex: 0,
+  cameraDistance: 0,
+  heightMultiplier: 1,
+  fpsValue: 0,
+  barHeights: new Array(64).fill(0)
+};
+
+// Animation loop
+function animate() {
+  requestAnimationFrame(animate);
+  
+  const now = performance.now();
+  const rawDelta = (now - lastTimestamp) / 1000;
+  lastTimestamp = now;
+  
+  // FPS calculation
+  fpsFrames++;
+  fpsTime += rawDelta;
+  if (fpsTime >= 0.5) {
+    fpsValue = Math.round(fpsFrames / fpsTime);
+    fpsFrames = 0;
+    fpsTime = 0;
+  }
+  
+  const delta = isPaused ? 0 : Math.min(rawDelta, 0.1);
+  
+  if (!isPaused) {
+    elapsedTime += delta;
+    difficultyTimer += delta;
+    
+    // Auto difficulty increase every 10 seconds
+    if (difficultyTimer >= 10 && difficultyLevel < 5) {
+      difficultyLevel++;
+      difficultyTimer = 0;
+    }
+    if (difficultyTimer >= 10) {
+      difficultyTimer = 0;
+    }
+  }
+  
+  const heightMultiplier = difficultyLevel * 1.0;
+  const rotationSpeed = difficultyLevel * 0.5;
+  const activeParticleCount = difficultyLevel * 100;
+  
+  // Rotate shoe
+  if (shoeModel && !isPaused) {
+    shoeModel.rotation.y += rotationSpeed * delta;
+  }
+  
+  // Update spectrum bars
+  const time = elapsedTime;
+  let totalHeight = 0;
+  let maxHeight = 0;
+  const barHeights = [];
+  
+  for (let i = 0; i < barCount; i++) {
+    const bar = bars[i];
+    const scaleY = 0.2 + Math.abs(Math.sin(time * (1 + i * 0.1) + i * 0.3)) * heightMultiplier;
+    
+    bar.scale.y = scaleY;
+    bar.position.y = 0;
+    
+    // Update emissive intensity based on height
+    const intensity = scaleY / (heightMultiplier + 0.2);
+    const hue = i / barCount;
+    bar.material.emissive.setHSL(hue, 0.8, 0.2 + intensity * 0.3);
+    
+    totalHeight += scaleY;
+    if (scaleY > maxHeight) maxHeight = scaleY;
+    barHeights.push(scaleY);
+  }
+  
+  const avgHeight = totalHeight / barCount;
+  
+  // Update particles
+  const positions = particles.geometry.attributes.position.array;
+  
+  for (let i = 0; i < maxParticles; i++) {
+    if (i < activeParticleCount) {
+      const t = time * 0.5 + (i / activeParticleCount) * Math.PI * 2;
+      const spiralOffset = (i / activeParticleCount) * Math.PI * 6;
+      const radiusOsc = 2 + 1.5 * Math.sin(t * 0.7 + spiralOffset) + 0.5 * Math.sin(t * 1.3 + i * 0.1);
+      const angle = t + spiralOffset;
+      const yOsc = -2 + 6 * ((i / activeParticleCount + Math.sin(t * 0.3 + i * 0.05) * 0.1) % 1);
+      
+      positions[i * 3] = Math.cos(angle) * radiusOsc;
+      positions[i * 3 + 1] = yOsc;
+      positions[i * 3 + 2] = Math.sin(angle) * radiusOsc;
+    } else {
+      positions[i * 3] = 0;
+      positions[i * 3 + 1] = -100;
+      positions[i * 3 + 2] = 0;
+    }
+  }
+  
+  particles.geometry.attributes.position.needsUpdate = true;
+  
+  // Update point light color based on average height
+  const lightHue = (time * 0.1) % 1;
+  pointLight.color.setHSL(lightHue, 0.8, 0.5);
+  pointLight.intensity = 0.2 + avgHeight * 0.1;
+  
+  // Update controls
+  controls.update();
+  
+  // Camera distance
+  const cameraDistance = camera.position.length();
+  
+  // Update HUD
+  difficultyDisplay.textContent = difficultyLevel;
+  timeDisplay.textContent = Math.floor(elapsedTime);
+  particleDisplay.textContent = activeParticleCount;
+  avgHeightDisplay.textContent = avgHeight.toFixed(2);
+  fpsDisplay.textContent = fpsValue;
+  
+  // Update global state
+  window.__3D_STATE__.shoeLoaded = shoeLoaded;
+  window.__3D_STATE__.shoeRotationY = shoeModel ? shoeModel.rotation.y : 0;
+  window.__3D_STATE__.difficultyLevel = difficultyLevel;
+  window.__3D_STATE__.elapsedTime = elapsedTime;
+  window.__3D_STATE__.barCount = barCount;
+  window.__3D_STATE__.avgBarHeight = avgHeight;
+  window.__3D_STATE__.maxBarHeight = maxHeight;
+  window.__3D_STATE__.activeParticles = activeParticleCount;
+  window.__3D_STATE__.isPaused = isPaused;
+  window.__3D_STATE__.variantIndex = variantIndex;
+  window.__3D_STATE__.cameraDistance = cameraDistance;
+  window.__3D_STATE__.heightMultiplier = heightMultiplier;
+  window.__3D_STATE__.fpsValue = fpsValue;
+  window.__3D_STATE__.barHeights = barHeights;
+  
+  renderer.render(scene, camera);
+}
+
+animate();
+</script>
+</body>
+</html>

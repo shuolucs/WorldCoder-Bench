@@ -1,0 +1,506 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Interactive Abstract Particle Art</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { overflow: hidden; background: #0a0a1a; }
+  canvas { display: block; }
+  #hud {
+    position: absolute;
+    top: 10px;
+    left: 10px;
+    color: white;
+    background: rgba(0, 0, 0, 0.6);
+    padding: 10px;
+    font-family: monospace;
+    font-size: 14px;
+    line-height: 1.6;
+    border-radius: 5px;
+    pointer-events: none;
+    z-index: 100;
+  }
+  #hud div { margin: 2px 0; }
+</style>
+</head>
+<body>
+
+<div id="hud">
+  <div>Mode: <span id="mode-display">fountain</span></div>
+  <div>Particles: <span id="particle-count">0</span></div>
+  <div>Bursts: <span id="burst-count">0</span></div>
+  <div>Color Scheme: <span id="color-scheme">0</span></div>
+  <div>State: <span id="pause-state">PLAYING</span></div>
+  <div>FPS: <span id="fps-display">0</span></div>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.163.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.163.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// Initialize state immediately
+window.__3D_STATE__ = {
+  duckLoaded: false,
+  particleCount: 0,
+  mode: 'fountain',
+  paused: false,
+  burstCount: 0,
+  colorScheme: 0,
+  duckRotationY: 0,
+  hudVisible: true,
+  totalParticlesSpawned: 0,
+  elapsedTime: 0,
+  frameCount: 0
+};
+
+window.__duck__ = null;
+
+// Color palettes
+const colorPalettes = [
+  [new THREE.Color('#ff00ff'), new THREE.Color('#00ffff'), new THREE.Color('#ffd700'), new THREE.Color('#00ff00')],
+  [new THREE.Color('#ff0000'), new THREE.Color('#ff8800'), new THREE.Color('#ffff00'), new THREE.Color('#ffffff')],
+  [new THREE.Color('#0000ff'), new THREE.Color('#8800ff'), new THREE.Color('#ff00aa'), new THREE.Color('#ffffff')]
+];
+
+// Scene setup
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0a0a1a);
+
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+camera.position.set(0, 3, 8);
+camera.lookAt(0, 0, 0);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(window.devicePixelRatio);
+document.body.appendChild(renderer.domElement);
+
+// Lights
+const ambientLight = new THREE.AmbientLight(0x404060, 0.5);
+scene.add(ambientLight);
+
+const pointLight = new THREE.PointLight(0xffffff, 1.5);
+pointLight.position.set(5, 10, 5);
+scene.add(pointLight);
+
+// Load Duck
+const loader = new GLTFLoader();
+loader.load(
+  'Duck.glb',
+  (gltf) => {
+    const duck = gltf.scene;
+    // Calculate bounding box to center and scale
+    const box = new THREE.Box3().setFromObject(duck);
+    const size = new THREE.Vector3();
+    const center = new THREE.Vector3();
+    box.getSize(size);
+    box.getCenter(center);
+
+    // Scale to roughly 2 units tall
+    const scale = 2 / size.y;
+    duck.scale.setScalar(scale);
+
+    // Recalculate after scaling
+    box.setFromObject(duck);
+    box.getCenter(center);
+    duck.position.sub(center);
+
+    scene.add(duck);
+    window.__duck__ = duck;
+    window.__3D_STATE__.duckLoaded = true;
+  },
+  undefined,
+  (error) => {
+    console.error('Error loading Duck.glb:', error);
+    // Create a placeholder duck
+    const geo = new THREE.ConeGeometry(0.5, 2, 8);
+    const mat = new THREE.MeshStandardMaterial({ color: 0xffcc00 });
+    const placeholder = new THREE.Mesh(geo, mat);
+    scene.add(placeholder);
+    window.__duck__ = placeholder;
+    window.__3D_STATE__.duckLoaded = true;
+  }
+);
+
+// Particle system
+const PARTICLE_COUNT = 2000;
+const MAX_BURST_PARTICLES = 200;
+const TOTAL_PARTICLES = PARTICLE_COUNT + MAX_BURST_PARTICLES;
+
+const positions = new Float32Array(TOTAL_PARTICLES * 3);
+const colors = new Float32Array(TOTAL_PARTICLES * 3);
+const sizes = new Float32Array(TOTAL_PARTICLES);
+
+const velocities = new Float32Array(TOTAL_PARTICLES * 3);
+const lifetimes = new Float32Array(TOTAL_PARTICLES);
+const maxLifetimes = new Float32Array(TOTAL_PARTICLES);
+const particleActive = new Uint8Array(TOTAL_PARTICLES);
+const particleAngles = new Float32Array(TOTAL_PARTICLES); // for spiral
+
+const geometry = new THREE.BufferGeometry();
+geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+geometry.setAttribute('size', new THREE.BufferAttribute(sizes, 1));
+
+// Custom shader material for particles
+const particleMaterial = new THREE.ShaderMaterial({
+  uniforms: {
+    pointTexture: { value: createParticleTexture() }
+  },
+  vertexShader: `
+    attribute float size;
+    attribute vec3 color;
+    varying vec3 vColor;
+    varying float vAlpha;
+    void main() {
+      vColor = color;
+      vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+      gl_PointSize = size * (200.0 / -mvPosition.z);
+      gl_Position = projectionMatrix * mvPosition;
+    }
+  `,
+  fragmentShader: `
+    uniform sampler2D pointTexture;
+    varying vec3 vColor;
+    void main() {
+      vec2 uv = gl_PointCoord;
+      float dist = length(uv - vec2(0.5));
+      if (dist > 0.5) discard;
+      float alpha = 1.0 - smoothstep(0.2, 0.5, dist);
+      gl_FragColor = vec4(vColor, alpha);
+    }
+  `,
+  transparent: true,
+  depthWrite: false,
+  blending: THREE.AdditiveBlending
+});
+
+function createParticleTexture() {
+  const canvas = document.createElement('canvas');
+  canvas.width = 64;
+  canvas.height = 64;
+  const ctx = canvas.getContext('2d');
+  const gradient = ctx.createRadialGradient(32, 32, 0, 32, 32, 32);
+  gradient.addColorStop(0, 'rgba(255,255,255,1)');
+  gradient.addColorStop(0.3, 'rgba(255,255,255,0.8)');
+  gradient.addColorStop(1, 'rgba(255,255,255,0)');
+  ctx.fillStyle = gradient;
+  ctx.fillRect(0, 0, 64, 64);
+  const texture = new THREE.CanvasTexture(canvas);
+  return texture;
+}
+
+const points = new THREE.Points(geometry, particleMaterial);
+scene.add(points);
+
+// Initialize all particles
+function getRandomColor() {
+  const palette = colorPalettes[window.__3D_STATE__.colorScheme];
+  return palette[Math.floor(Math.random() * palette.length)];
+}
+
+function spawnParticle(index, isBurst = false) {
+  const mode = window.__3D_STATE__.mode;
+
+  // Random point within sphere of radius 1.5
+  const theta = Math.random() * Math.PI * 2;
+  const phi = Math.acos(2 * Math.random() - 1);
+  const r = Math.random() * 0.3; // spawn close to center
+  const sx = r * Math.sin(phi) * Math.cos(theta);
+  const sy = r * Math.sin(phi) * Math.sin(theta);
+  const sz = r * Math.cos(phi);
+
+  positions[index * 3] = sx;
+  positions[index * 3 + 1] = sy;
+  positions[index * 3 + 2] = sz;
+
+  const speed = 0.5 + Math.random() * 1.5;
+
+  if (mode === 'fountain') {
+    velocities[index * 3] = (Math.random() - 0.5) * 0.8;
+    velocities[index * 3 + 1] = 1.5 + Math.random() * 2.0;
+    velocities[index * 3 + 2] = (Math.random() - 0.5) * 0.8;
+  } else if (mode === 'vortex') {
+    const angle = Math.random() * Math.PI * 2;
+    velocities[index * 3] = Math.cos(angle) * speed;
+    velocities[index * 3 + 1] = (Math.random() - 0.5) * 0.3;
+    velocities[index * 3 + 2] = Math.sin(angle) * speed;
+    particleAngles[index] = angle;
+  } else if (mode === 'explosion') {
+    const dir = new THREE.Vector3(
+      Math.random() - 0.5,
+      Math.random() - 0.5,
+      Math.random() - 0.5
+    ).normalize().multiplyScalar(speed * 2);
+    velocities[index * 3] = dir.x;
+    velocities[index * 3 + 1] = dir.y;
+    velocities[index * 3 + 2] = dir.z;
+  }
+
+  if (isBurst) {
+    // Burst particles are faster
+    velocities[index * 3] *= 1.5;
+    velocities[index * 3 + 1] *= 1.5;
+    velocities[index * 3 + 2] *= 1.5;
+  }
+
+  const lifetime = 2 + Math.random() * 3;
+  lifetimes[index] = lifetime;
+  maxLifetimes[index] = lifetime;
+  particleActive[index] = 1;
+
+  const color = getRandomColor();
+  colors[index * 3] = color.r;
+  colors[index * 3 + 1] = color.g;
+  colors[index * 3 + 2] = color.b;
+
+  sizes[index] = 0.05 + Math.random() * 0.15;
+
+  window.__3D_STATE__.totalParticlesSpawned++;
+}
+
+// Initialize main particles
+for (let i = 0; i < PARTICLE_COUNT; i++) {
+  spawnParticle(i);
+  // Stagger initial lifetimes so they don't all die at once
+  lifetimes[i] = Math.random() * maxLifetimes[i];
+}
+
+// Burst particles start inactive
+for (let i = PARTICLE_COUNT; i < TOTAL_PARTICLES; i++) {
+  particleActive[i] = 0;
+  sizes[i] = 0;
+  positions[i * 3] = 0;
+  positions[i * 3 + 1] = -100;
+  positions[i * 3 + 2] = 0;
+}
+
+// Mouse tracking
+let mouseX = 0;
+let mouseY = 0;
+let targetDuckRotY = 0;
+
+document.addEventListener('mousemove', (e) => {
+  mouseX = (e.clientX / window.innerWidth) * 2 - 1;
+  mouseY = (e.clientY / window.innerHeight) * 2 - 1;
+  targetDuckRotY = mouseX * Math.PI * 0.5;
+});
+
+// Keyboard controls
+document.addEventListener('keydown', (e) => {
+  const key = e.key.toLowerCase();
+
+  if (key === '1') {
+    window.__3D_STATE__.mode = 'fountain';
+  } else if (key === '2') {
+    window.__3D_STATE__.mode = 'vortex';
+  } else if (key === '3') {
+    window.__3D_STATE__.mode = 'explosion';
+  } else if (key === ' ') {
+    e.preventDefault();
+    window.__3D_STATE__.paused = !window.__3D_STATE__.paused;
+  } else if (key === 'r') {
+    // Reset
+    window.__3D_STATE__.mode = 'fountain';
+    window.__3D_STATE__.burstCount = 0;
+    for (let i = 0; i < PARTICLE_COUNT; i++) {
+      spawnParticle(i);
+      lifetimes[i] = Math.random() * maxLifetimes[i];
+    }
+    for (let i = PARTICLE_COUNT; i < TOTAL_PARTICLES; i++) {
+      particleActive[i] = 0;
+      sizes[i] = 0;
+      positions[i * 3 + 1] = -100;
+    }
+  } else if (key === 'c') {
+    window.__3D_STATE__.colorScheme = (window.__3D_STATE__.colorScheme + 1) % 3;
+    // Update existing particle colors
+    for (let i = 0; i < TOTAL_PARTICLES; i++) {
+      if (particleActive[i]) {
+        const color = getRandomColor();
+        colors[i * 3] = color.r;
+        colors[i * 3 + 1] = color.g;
+        colors[i * 3 + 2] = color.b;
+      }
+    }
+  } else if (key === 'h') {
+    window.__3D_STATE__.hudVisible = !window.__3D_STATE__.hudVisible;
+    document.getElementById('hud').style.display = window.__3D_STATE__.hudVisible ? 'block' : 'none';
+  }
+});
+
+// Click for burst
+renderer.domElement.addEventListener('click', () => {
+  window.__3D_STATE__.burstCount++;
+
+  // Find inactive burst particle slots
+  let spawned = 0;
+  for (let i = PARTICLE_COUNT; i < TOTAL_PARTICLES && spawned < MAX_BURST_PARTICLES; i++) {
+    if (!particleActive[i]) {
+      spawnParticle(i, true);
+      // Random offset near duck
+      positions[i * 3] += (Math.random() - 0.5) * 1.0;
+      positions[i * 3 + 1] += Math.random() * 1.0;
+      positions[i * 3 + 2] += (Math.random() - 0.5) * 1.0;
+      spawned++;
+    }
+  }
+  // If not enough inactive slots, reuse from beginning of burst range
+  if (spawned < MAX_BURST_PARTICLES) {
+    for (let i = PARTICLE_COUNT; i < PARTICLE_COUNT + (MAX_BURST_PARTICLES - spawned); i++) {
+      spawnParticle(i, true);
+      positions[i * 3] += (Math.random() - 0.5) * 1.0;
+      positions[i * 3 + 1] += Math.random() * 1.0;
+      positions[i * 3 + 2] += (Math.random() - 0.5) * 1.0;
+    }
+  }
+});
+
+// Window resize
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// FPS tracking
+let fpsFrames = 0;
+let fpsTime = 0;
+let currentFPS = 0;
+
+// Animation
+const clock = new THREE.Clock();
+let lastTime = 0;
+
+function animate() {
+  requestAnimationFrame(animate);
+
+  const delta = clock.getDelta();
+  const state = window.__3D_STATE__;
+
+  // FPS calculation
+  fpsFrames++;
+  fpsTime += delta;
+  if (fpsTime >= 1.0) {
+    currentFPS = Math.round(fpsFrames / fpsTime);
+    fpsTime = 0;
+    fpsFrames = 0;
+  }
+
+  state.frameCount++;
+
+  // Duck rotation (always update, even when paused)
+  if (window.__duck__) {
+    const currentRotY = window.__duck__.rotation.y;
+    window.__duck__.rotation.y += (targetDuckRotY - currentRotY) * 0.05;
+    state.duckRotationY = window.__duck__.rotation.y;
+  }
+
+  if (!state.paused) {
+    state.elapsedTime += delta;
+
+    const mode = state.mode;
+
+    // Update particles
+    let aliveCount = 0;
+
+    for (let i = 0; i < TOTAL_PARTICLES; i++) {
+      if (!particleActive[i]) continue;
+
+      lifetimes[i] -= delta;
+
+      if (lifetimes[i] <= 0) {
+        if (i < PARTICLE_COUNT) {
+          // Respawn main particles
+          spawnParticle(i);
+        } else {
+          // Burst particles die
+          particleActive[i] = 0;
+          sizes[i] = 0;
+          positions[i * 3 + 1] = -100;
+        }
+        continue;
+      }
+
+      aliveCount++;
+
+      // Update position
+      const idx3 = i * 3;
+
+      if (mode === 'vortex' && i < PARTICLE_COUNT) {
+        // Add spiral motion
+        particleAngles[i] += delta * 2.0;
+        const dist = Math.sqrt(
+          positions[idx3] * positions[idx3] +
+          positions[idx3 + 2] * positions[idx3 + 2]
+        );
+        const angularForce = 2.0 / (1.0 + dist);
+        velocities[idx3] += (-Math.sin(particleAngles[i]) * angularForce - velocities[idx3] * 0.1) * delta;
+        velocities[idx3 + 2] += (Math.cos(particleAngles[i]) * angularForce - velocities[idx3 + 2] * 0.1) * delta;
+      }
+
+      // Gravity for fountain mode
+      if (mode === 'fountain') {
+        velocities[idx3 + 1] -= delta * 2.0;
+      }
+
+      positions[idx3] += velocities[idx3] * delta;
+      positions[idx3 + 1] += velocities[idx3 + 1] * delta;
+      positions[idx3 + 2] += velocities[idx3 + 2] * delta;
+
+      // Fade out based on remaining life
+      const lifeRatio = lifetimes[i] / maxLifetimes[i];
+      sizes[i] = (0.05 + Math.random() * 0.01) * lifeRatio + 0.02;
+
+      // Color intensity based on life
+      const palette = colorPalettes[state.colorScheme];
+      const baseColor = palette[i % palette.length];
+      colors[idx3] = baseColor.r * (0.5 + lifeRatio * 0.5);
+      colors[idx3 + 1] = baseColor.g * (0.5 + lifeRatio * 0.5);
+      colors[idx3 + 2] = baseColor.b * (0.5 + lifeRatio * 0.5);
+    }
+
+    state.particleCount = aliveCount;
+  } else {
+    // Count alive particles even when paused
+    let aliveCount = 0;
+    for (let i = 0; i < TOTAL_PARTICLES; i++) {
+      if (particleActive[i]) aliveCount++;
+    }
+    state.particleCount = aliveCount;
+  }
+
+  // Update buffer attributes
+  geometry.attributes.position.needsUpdate = true;
+  geometry.attributes.color.needsUpdate = true;
+  geometry.attributes.size.needsUpdate = true;
+
+  // Update HUD
+  if (state.hudVisible) {
+    document.getElementById('mode-display').textContent = state.mode;
+    document.getElementById('particle-count').textContent = state.particleCount;
+    document.getElementById('burst-count').textContent = state.burstCount;
+    document.getElementById('color-scheme').textContent = state.colorScheme;
+    document.getElementById('pause-state').textContent = state.paused ? 'PAUSED' : 'PLAYING';
+    document.getElementById('fps-display').textContent = currentFPS;
+  }
+
+  renderer.render(scene, camera);
+}
+
+animate();
+</script>
+</body>
+</html>

@@ -1,0 +1,560 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Three.js GPU 水面波动模拟</title>
+  <style>
+    html, body {
+      margin: 0;
+      height: 100%;
+      overflow: hidden;
+      background: #0b1220;
+      font-family: Arial, Helvetica, sans-serif;
+    }
+
+    #app {
+      width: 100%;
+      height: 100%;
+      position: relative;
+    }
+
+    #hud {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      z-index: 10;
+      color: #eaf4ff;
+      background: rgba(10, 18, 32, 0.65);
+      border: 1px solid rgba(255,255,255,0.15);
+      border-radius: 10px;
+      padding: 12px 14px;
+      min-width: 240px;
+      backdrop-filter: blur(6px);
+      box-shadow: 0 6px 20px rgba(0,0,0,0.25);
+      font-size: 14px;
+      line-height: 1.6;
+    }
+
+    #hud .title {
+      font-size: 15px;
+      font-weight: bold;
+      margin-bottom: 8px;
+      color: #ffffff;
+    }
+
+    #hud .row {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+    }
+
+    #controlsPanel {
+      margin-top: 10px;
+      padding-top: 10px;
+      border-top: 1px solid rgba(255,255,255,0.12);
+    }
+
+    #controlsPanel label {
+      display: block;
+      margin: 8px 0 4px;
+    }
+
+    #dampingSlider {
+      width: 100%;
+    }
+
+    .hint {
+      margin-top: 8px;
+      color: #b8d4ef;
+      font-size: 12px;
+    }
+  </style>
+
+  <script type="importmap">
+  { "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+  } }
+  </script>
+</head>
+<body>
+  <div id="app">
+    <div id="hud">
+      <div class="title">水面波动模拟</div>
+      <div class="row"><span>最大波高</span><span id="maxHeight">0.0000</span></div>
+      <div class="row"><span>波浪能量</span><span id="waveEnergy">0.0000</span></div>
+      <div class="row"><span>帧编号</span><span id="frameNum">0</span></div>
+
+      <div id="controlsPanel">
+        <label for="dampingSlider">阻尼 damping: <span id="dampingValueLabel">0.995</span></label>
+        <input id="dampingSlider" type="range" min="0.98" max="1.0" step="0.001" value="0.995" />
+
+        <label style="display:flex;align-items:center;gap:8px;margin-top:10px;">
+          <input id="windToggle" type="checkbox" />
+          <span>开启风力 (+x)</span>
+        </label>
+
+        <div class="hint">点击水面产生涟漪；拖动可旋转视角。</div>
+      </div>
+    </div>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+    const GRID_SIZE = 256;
+    const DT = 1 / 60;
+    const DX = 1 / GRID_SIZE;
+    const C = 2.0;
+    const VISCOSITY = 0.3;
+    const RIPPLE_RADIUS = 5;
+    const RIPPLE_AMPLITUDE = 0.3;
+
+    const app = document.getElementById('app');
+    const maxHeightEl = document.getElementById('maxHeight');
+    const waveEnergyEl = document.getElementById('waveEnergy');
+    const frameNumEl = document.getElementById('frameNum');
+    const dampingSlider = document.getElementById('dampingSlider');
+    const dampingValueLabel = document.getElementById('dampingValueLabel');
+    const windToggle = document.getElementById('windToggle');
+
+    let dampingValue = parseFloat(dampingSlider.value);
+    dampingValueLabel.textContent = dampingValue.toFixed(3);
+
+    dampingSlider.addEventListener('input', () => {
+      dampingValue = parseFloat(dampingSlider.value);
+      dampingValueLabel.textContent = dampingValue.toFixed(3);
+    });
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    app.appendChild(renderer.domElement);
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x87bfe8);
+
+    const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 200);
+    camera.position.set(0, 10, 14);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.target.set(0, 0, 0);
+
+    const ambient = new THREE.AmbientLight(0xffffff, 0.3);
+    scene.add(ambient);
+
+    const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+    dirLight.position.set(5, 10, 5);
+    scene.add(dirLight);
+
+    function createGradientEnvTexture() {
+      const canvas = document.createElement('canvas');
+      canvas.width = 256;
+      canvas.height = 256;
+      const ctx = canvas.getContext('2d');
+      const grad = ctx.createLinearGradient(0, 0, 0, 256);
+      grad.addColorStop(0, '#d8f1ff');
+      grad.addColorStop(0.55, '#9fd0f5');
+      grad.addColorStop(1, '#ffffff');
+      ctx.fillStyle = grad;
+      ctx.fillRect(0, 0, 256, 256);
+
+      const texture = new THREE.CanvasTexture(canvas);
+      texture.colorSpace = THREE.SRGBColorSpace;
+
+      const envScene = new THREE.Scene();
+      const envCamera = new THREE.PerspectiveCamera(90, 1, 0.1, 10);
+      envCamera.position.set(0, 0, 0.1);
+
+      const plane = new THREE.Mesh(
+        new THREE.PlaneGeometry(2, 2),
+        new THREE.MeshBasicMaterial({ map: texture })
+      );
+      envScene.add(plane);
+
+      const rt = new THREE.WebGLCubeRenderTarget(256, {
+        type: THREE.HalfFloatType,
+        generateMipmaps: true,
+        minFilter: THREE.LinearMipmapLinearFilter
+      });
+
+      const cubeCamera = new THREE.CubeCamera(0.1, 10, rt);
+      cubeCamera.update(renderer, envScene);
+
+      const pmrem = new THREE.PMREMGenerator(renderer);
+      pmrem.compileCubemapShader();
+      const envRT = pmrem.fromCubemap(rt.texture);
+
+      texture.dispose();
+      rt.dispose();
+      plane.geometry.dispose();
+      plane.material.dispose();
+      pmrem.dispose();
+
+      return envRT.texture;
+    }
+
+    const envMap = createGradientEnvTexture();
+    scene.environment = envMap;
+
+    const ground = new THREE.Mesh(
+      new THREE.PlaneGeometry(20, 20, 1, 1),
+      new THREE.MeshStandardMaterial({
+        color: 0x0b1b2e,
+        roughness: 0.95,
+        metalness: 0.0
+      })
+    );
+    ground.rotation.x = -Math.PI / 2;
+    ground.position.y = -1.5;
+    scene.add(ground);
+
+    const planeSize = 10;
+    const waterGeometry = new THREE.PlaneGeometry(planeSize, planeSize, GRID_SIZE - 1, GRID_SIZE - 1);
+    waterGeometry.rotateX(-Math.PI / 2);
+
+    const waterMaterial = new THREE.MeshPhysicalMaterial({
+      color: new THREE.Color('#1565C0'),
+      metalness: 0.1,
+      roughness: 0.05,
+      transmission: 0.0,
+      transparent: true,
+      opacity: 0.85,
+      envMap,
+      envMapIntensity: 1.0,
+      side: THREE.DoubleSide
+    });
+
+    const waterMesh = new THREE.Mesh(waterGeometry, waterMaterial);
+    scene.add(waterMesh);
+
+    const positions = waterGeometry.attributes.position.array;
+    const uvs = waterGeometry.attributes.uv.array;
+
+    const normalData = new Uint8Array(GRID_SIZE * GRID_SIZE * 4);
+    for (let i = 0; i < GRID_SIZE * GRID_SIZE; i++) {
+      normalData[i * 4 + 0] = 128;
+      normalData[i * 4 + 1] = 255;
+      normalData[i * 4 + 2] = 128;
+      normalData[i * 4 + 3] = 255;
+    }
+    const normalTexture = new THREE.DataTexture(normalData, GRID_SIZE, GRID_SIZE, THREE.RGBAFormat);
+    normalTexture.wrapS = THREE.ClampToEdgeWrapping;
+    normalTexture.wrapT = THREE.ClampToEdgeWrapping;
+    normalTexture.magFilter = THREE.LinearFilter;
+    normalTexture.minFilter = THREE.LinearFilter;
+    normalTexture.colorSpace = THREE.NoColorSpace;
+    normalTexture.needsUpdate = true;
+    waterMaterial.normalMap = normalTexture;
+    waterMaterial.normalScale.set(1.0, 1.0);
+
+    function createHeightTexture() {
+      const data = new Float32Array(GRID_SIZE * GRID_SIZE * 4);
+      const tex = new THREE.DataTexture(data, GRID_SIZE, GRID_SIZE, THREE.RGBAFormat, THREE.FloatType);
+      tex.wrapS = THREE.ClampToEdgeWrapping;
+      tex.wrapT = THREE.ClampToEdgeWrapping;
+      tex.magFilter = THREE.NearestFilter;
+      tex.minFilter = THREE.NearestFilter;
+      tex.needsUpdate = true;
+      return { texture: tex, data };
+    }
+
+    const currentHeightMap = createHeightTexture();
+    const previousHeightMap = createHeightTexture();
+
+    const gpuScene = new THREE.Scene();
+    const gpuCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+
+    const gpuQuad = new THREE.Mesh(
+      new THREE.PlaneGeometry(2, 2),
+      new THREE.ShaderMaterial({
+        uniforms: {
+          currentMap: { value: currentHeightMap.texture },
+          previousMap: { value: previousHeightMap.texture },
+          damping: { value: dampingValue },
+          dt: { value: DT },
+          dx: { value: DX },
+          c: { value: C },
+          viscosity: { value: VISCOSITY },
+          texelSize: { value: new THREE.Vector2(1 / GRID_SIZE, 1 / GRID_SIZE) },
+          windEnabled: { value: false }
+        },
+        vertexShader: `
+          varying vec2 vUv;
+          void main() {
+            vUv = uv;
+            gl_Position = vec4(position.xy, 0.0, 1.0);
+          }
+        `,
+        fragmentShader: `
+          precision highp float;
+          varying vec2 vUv;
+
+          uniform sampler2D currentMap;
+          uniform sampler2D previousMap;
+          uniform float damping;
+          uniform float dt;
+          uniform float dx;
+          uniform float c;
+          uniform float viscosity;
+          uniform vec2 texelSize;
+          uniform bool windEnabled;
+
+          void main() {
+            vec2 tx = texelSize;
+
+            float hC = texture2D(currentMap, vUv).r;
+            float hP = texture2D(previousMap, vUv).r;
+
+            float hL = texture2D(currentMap, vUv - vec2(tx.x, 0.0)).r;
+            float hR = texture2D(currentMap, vUv + vec2(tx.x, 0.0)).r;
+            float hD = texture2D(currentMap, vUv - vec2(0.0, tx.y)).r;
+            float hU = texture2D(currentMap, vUv + vec2(0.0, tx.y)).r;
+
+            float lap = (hL + hR + hD + hU - 4.0 * hC) / (dx * dx);
+            float hNew = 2.0 * hC - hP + (c * c) * (dt * dt) * lap;
+            hNew *= damping;
+
+            float avgN = 0.25 * (hL + hR + hD + hU);
+            hNew = hNew * (1.0 - viscosity) + avgN * viscosity;
+
+            if (windEnabled) {
+              hNew += 0.001 * hL;
+            }
+
+            gl_FragColor = vec4(hNew, 0.0, 0.0, 1.0);
+          }
+        `
+      })
+    );
+    gpuScene.add(gpuQuad);
+
+    const simTargetA = new THREE.WebGLRenderTarget(GRID_SIZE, GRID_SIZE, {
+      type: THREE.FloatType,
+      format: THREE.RGBAFormat,
+      depthBuffer: false,
+      stencilBuffer: false,
+      magFilter: THREE.NearestFilter,
+      minFilter: THREE.NearestFilter,
+      wrapS: THREE.ClampToEdgeWrapping,
+      wrapT: THREE.ClampToEdgeWrapping
+    });
+
+    const simTargetB = simTargetA.clone();
+
+    const readbackBuffer = new Float32Array(GRID_SIZE * GRID_SIZE * 4);
+
+    let rtCurrent = simTargetA;
+    let rtPrevious = simTargetB;
+
+    renderer.setRenderTarget(rtCurrent);
+    renderer.clearColor();
+    renderer.setRenderTarget(rtPrevious);
+    renderer.clearColor();
+    renderer.setRenderTarget(null);
+
+    function uploadCPUMapsToGPU() {
+      currentHeightMap.texture.needsUpdate = true;
+      previousHeightMap.texture.needsUpdate = true;
+    }
+
+    function cloneCurrentToPreviousCPU() {
+      previousHeightMap.data.set(currentHeightMap.data);
+      previousHeightMap.texture.needsUpdate = true;
+    }
+
+    function addRippleAtGrid(cx, cy) {
+      for (let y = Math.max(0, cy - RIPPLE_RADIUS); y <= Math.min(GRID_SIZE - 1, cy + RIPPLE_RADIUS); y++) {
+        for (let x = Math.max(0, cx - RIPPLE_RADIUS); x <= Math.min(GRID_SIZE - 1, cx + RIPPLE_RADIUS); x++) {
+          const dx = x - cx;
+          const dy = y - cy;
+          const d = Math.sqrt(dx * dx + dy * dy);
+          if (d < RIPPLE_RADIUS) {
+            const falloff = Math.cos(Math.PI * d / (2 * RIPPLE_RADIUS));
+            const v = RIPPLE_AMPLITUDE * falloff * falloff;
+            const idx = (y * GRID_SIZE + x) * 4;
+            currentHeightMap.data[idx] += v;
+          }
+        }
+      }
+      cloneCurrentToPreviousCPU();
+      uploadCPUMapsToGPU();
+      renderer.setRenderTarget(rtCurrent);
+      renderer.render(new THREE.Scene().add(new THREE.Mesh(
+        new THREE.PlaneGeometry(2, 2),
+        new THREE.MeshBasicMaterial({ map: currentHeightMap.texture })
+      )), gpuCamera);
+      renderer.setRenderTarget(rtPrevious);
+      renderer.render(new THREE.Scene().add(new THREE.Mesh(
+        new THREE.PlaneGeometry(2, 2),
+        new THREE.MeshBasicMaterial({ map: previousHeightMap.texture })
+      )), gpuCamera);
+      renderer.setRenderTarget(null);
+    }
+
+    const raycaster = new THREE.Raycaster();
+    const pointer = new THREE.Vector2();
+
+    function onPointerDown(event) {
+      const rect = renderer.domElement.getBoundingClientRect();
+      pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+      pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+
+      raycaster.setFromCamera(pointer, camera);
+      const hits = raycaster.intersectObject(waterMesh, false);
+      if (hits.length === 0) return;
+
+      const p = hits[0].point;
+      const local = waterMesh.worldToLocal(p.clone());
+
+      const u = THREE.MathUtils.clamp((local.x / planeSize) + 0.5, 0, 0.999999);
+      const v = THREE.MathUtils.clamp(0.5 - (local.z / planeSize), 0, 0.999999);
+
+      const gx = Math.floor(u * GRID_SIZE);
+      const gy = Math.floor(v * GRID_SIZE);
+
+      addRippleAtGrid(gx, gy);
+    }
+
+    renderer.domElement.addEventListener('pointerdown', onPointerDown);
+
+    function copyRTToRT(sourceRT, destRT) {
+      const copyScene = new THREE.Scene();
+      const copyMat = new THREE.MeshBasicMaterial({ map: sourceRT.texture });
+      const copyQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), copyMat);
+      copyScene.add(copyQuad);
+      renderer.setRenderTarget(destRT);
+      renderer.render(copyScene, gpuCamera);
+      renderer.setRenderTarget(null);
+      copyQuad.geometry.dispose();
+      copyMat.dispose();
+    }
+
+    let frameNum = 0;
+
+    function updateSimulation() {
+      gpuQuad.material.uniforms.currentMap.value = rtCurrent.texture;
+      gpuQuad.material.uniforms.previousMap.value = rtPrevious.texture;
+      gpuQuad.material.uniforms.damping.value = dampingValue;
+      gpuQuad.material.uniforms.windEnabled.value = windToggle.checked;
+
+      renderer.setRenderTarget(rtPrevious);
+      renderer.render(gpuScene, gpuCamera);
+      renderer.setRenderTarget(null);
+
+      const temp = rtCurrent;
+      rtCurrent = rtPrevious;
+      rtPrevious = temp;
+    }
+
+    function updateWaterMeshAndStats() {
+      renderer.readRenderTargetPixels(rtCurrent, 0, 0, GRID_SIZE, GRID_SIZE, readbackBuffer);
+
+      let maxAbs = 0;
+      let energy = 0;
+
+      for (let gy = 0; gy < GRID_SIZE; gy++) {
+        for (let gx = 0; gx < GRID_SIZE; gx++) {
+          const texIndex = (gy * GRID_SIZE + gx) * 4;
+          const h = readbackBuffer[texIndex];
+          const absH = Math.abs(h);
+          if (absH > maxAbs) maxAbs = absH;
+          energy += h * h;
+        }
+      }
+
+      const posAttr = waterGeometry.attributes.position;
+      const uvAttr = waterGeometry.attributes.uv;
+      const posArray = posAttr.array;
+      const uvArray = uvAttr.array;
+
+      for (let i = 0; i < posAttr.count; i++) {
+        const u = uvArray[i * 2 + 0];
+        const v = uvArray[i * 2 + 1];
+
+        let gx = Math.min(GRID_SIZE - 1, Math.max(0, Math.floor(u * (GRID_SIZE - 1))));
+        let gy = Math.min(GRID_SIZE - 1, Math.max(0, Math.floor(v * (GRID_SIZE - 1))));
+        const idx = (gy * GRID_SIZE + gx) * 4;
+        const h = readbackBuffer[idx];
+
+        posArray[i * 3 + 1] = h * 1.5;
+      }
+
+      posAttr.needsUpdate = true;
+      waterGeometry.computeVertexNormals();
+
+      for (let gy = 0; gy < GRID_SIZE; gy++) {
+        for (let gx = 0; gx < GRID_SIZE; gx++) {
+          const x0 = Math.max(0, gx - 1);
+          const x1 = Math.min(GRID_SIZE - 1, gx + 1);
+          const y0 = Math.max(0, gy - 1);
+          const y1 = Math.min(GRID_SIZE - 1, gy + 1);
+
+          const hL = readbackBuffer[(gy * GRID_SIZE + x0) * 4];
+          const hR = readbackBuffer[(gy * GRID_SIZE + x1) * 4];
+          const hD = readbackBuffer[(y0 * GRID_SIZE + gx) * 4];
+          const hU = readbackBuffer[(y1 * GRID_SIZE + gx) * 4];
+
+          const sx = (hR - hL) / (2 * DX);
+          const sy = (hU - hD) / (2 * DX);
+
+          const n = new THREE.Vector3(-sx, 1.0, -sy).normalize();
+
+          const idx = (gy * GRID_SIZE + gx) * 4;
+          normalData[idx + 0] = Math.round((n.x * 0.5 + 0.5) * 255);
+          normalData[idx + 1] = Math.round((n.y * 0.5 + 0.5) * 255);
+          normalData[idx + 2] = Math.round((n.z * 0.5 + 0.5) * 255);
+          normalData[idx + 3] = 255;
+        }
+      }
+
+      normalTexture.needsUpdate = true;
+
+      maxHeightEl.textContent = maxAbs.toFixed(4);
+      waveEnergyEl.textContent = energy.toFixed(4);
+      frameNumEl.textContent = frameNum.toString();
+
+      window.__3D_STATE__ = {
+        maxHeight: maxAbs,
+        waveEnergy: energy,
+        frameNum: frameNum,
+        dampingValue: dampingValue,
+        windEnabled: windToggle.checked,
+        gridSize: GRID_SIZE
+      };
+    }
+
+    function animate() {
+      requestAnimationFrame(animate);
+      controls.update();
+
+      updateSimulation();
+      updateWaterMeshAndStats();
+
+      renderer.render(scene, camera);
+      frameNum++;
+    }
+
+    window.__3D_STATE__ = {
+      maxHeight: 0,
+      waveEnergy: 0,
+      frameNum: 0,
+      dampingValue: dampingValue,
+      windEnabled: windToggle.checked,
+      gridSize: GRID_SIZE
+    };
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    animate();
+  </script>
+</body>
+</html>

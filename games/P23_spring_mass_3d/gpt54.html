@@ -1,0 +1,569 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Three.js 3D 软体块：10×10×10 弹簧质点网格</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      background: #0f1115;
+      color: #e6e6e6;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+    }
+    #ui {
+      position: fixed;
+      top: 12px;
+      left: 12px;
+      z-index: 10;
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+      background: rgba(0,0,0,0.35);
+      padding: 10px 12px;
+      border-radius: 10px;
+      backdrop-filter: blur(6px);
+    }
+    button {
+      border: 0;
+      border-radius: 8px;
+      padding: 8px 12px;
+      cursor: pointer;
+      background: #2b6ef2;
+      color: white;
+      font-weight: 600;
+    }
+    button.off {
+      background: #4b5563;
+    }
+    #info {
+      font-size: 13px;
+      line-height: 1.4;
+      white-space: pre-line;
+    }
+  </style>
+
+  <script type="importmap">
+  { "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+  } }
+  </script>
+</head>
+<body>
+  <div id="ui">
+    <button id="windBtn" class="off">Wind: OFF</button>
+    <div id="info"></div>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+    // =========================
+    // 基本参数
+    // =========================
+    const NX = 10, NY = 10, NZ = 10;
+    const NODE_COUNT = NX * NY * NZ;
+    const REST = 1.0;
+    const STIFFNESS = 500.0;
+    const DAMPING = 5.0;
+    const MASS = 1.0;
+    const GRAVITY = new THREE.Vector3(0, -9.81, 0);
+    const BOUNCE = 0.45;         // 地面反弹系数，明显反弹但不过分
+    const GROUND_Y = 0.0;
+    const WIND_FORCE = 14.0;
+    const SUBSTEPS = 4;
+    const FIXED_DT = 1 / 120;
+
+    // =========================
+    // Three.js 场景
+    // =========================
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x111318);
+
+    const camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 0.1, 500);
+    camera.position.set(18, 14, 22);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    document.body.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.set(4.5, 6, 4.5);
+    controls.enableDamping = true;
+
+    const ambient = new THREE.AmbientLight(0xffffff, 0.5);
+    scene.add(ambient);
+
+    const dir = new THREE.DirectionalLight(0xffffff, 1.15);
+    dir.position.set(10, 20, 12);
+    scene.add(dir);
+
+    const grid = new THREE.GridHelper(50, 50, 0x3b82f6, 0x374151);
+    grid.position.y = 0;
+    scene.add(grid);
+
+    const groundGeo = new THREE.PlaneGeometry(50, 50);
+    const groundMat = new THREE.MeshStandardMaterial({
+      color: 0x1f2937,
+      metalness: 0.05,
+      roughness: 0.95,
+      side: THREE.DoubleSide
+    });
+    const ground = new THREE.Mesh(groundGeo, groundMat);
+    ground.rotation.x = -Math.PI / 2;
+    ground.position.y = 0;
+    scene.add(ground);
+
+    // =========================
+    // 数据结构
+    // =========================
+    const positions = new Float32Array(NODE_COUNT * 3);
+    const prevPositions = new Float32Array(NODE_COUNT * 3);
+    const accelerations = new Float32Array(NODE_COUNT * 3);
+    const pinned = new Uint8Array(NODE_COUNT);
+
+    let windEnabled = false;
+    let simTime = 0;
+    let groundContacts = 0;
+    let maxStretch = 1.0;
+
+    // 初始整体平移：使质心 y 约在 5
+    // 网格 y 范围 [0,9]，质心 y=4.5，因此平移 0.5 -> 质心到 5
+    const initialOffset = new THREE.Vector3(-4.5, 0.5, -4.5);
+
+    function idx(i, j, k) {
+      return i + NX * (j + NY * k);
+    }
+
+    function setVec(arr, id, v) {
+      const o = id * 3;
+      arr[o] = v.x; arr[o + 1] = v.y; arr[o + 2] = v.z;
+    }
+
+    function getX(arr, id) { return arr[id * 3]; }
+    function getY(arr, id) { return arr[id * 3 + 1]; }
+    function getZ(arr, id) { return arr[id * 3 + 2]; }
+
+    function setXYZ(arr, id, x, y, z) {
+      const o = id * 3;
+      arr[o] = x; arr[o + 1] = y; arr[o + 2] = z;
+    }
+
+    function addXYZ(arr, id, x, y, z) {
+      const o = id * 3;
+      arr[o] += x; arr[o + 1] += y; arr[o + 2] += z;
+    }
+
+    function getVelocity(id, dt, out) {
+      const o = id * 3;
+      out.set(
+        (positions[o] - prevPositions[o]) / dt,
+        (positions[o + 1] - prevPositions[o + 1]) / dt,
+        (positions[o + 2] - prevPositions[o + 2]) / dt
+      );
+      return out;
+    }
+
+    // =========================
+    // 初始化节点
+    // =========================
+    for (let k = 0; k < NZ; k++) {
+      for (let j = 0; j < NY; j++) {
+        for (let i = 0; i < NX; i++) {
+          const id = idx(i, j, k);
+          const x = i * REST + initialOffset.x;
+          const y = j * REST + initialOffset.y;
+          const z = k * REST + initialOffset.z;
+          setXYZ(positions, id, x, y, z);
+          setXYZ(prevPositions, id, x, y, z);
+          setXYZ(accelerations, id, 0, 0, 0);
+        }
+      }
+    }
+
+    // 顶面四角 pinned
+    const pinnedCoords = [
+      [0, 9, 0],
+      [9, 9, 0],
+      [0, 9, 9],
+      [9, 9, 9]
+    ];
+    for (const [i, j, k] of pinnedCoords) {
+      pinned[idx(i, j, k)] = 1;
+    }
+
+    // =========================
+    // 弹簧构建
+    // 结构弹簧 + 所有长度 sqrt(2)、sqrt(3) 的晶格邻接
+    // 这覆盖所有面对角、体对角，并且不重复
+    // =========================
+    const springs = [];
+    const springSet = new Set();
+
+    function addSpring(a, b, restLen) {
+      const min = Math.min(a, b);
+      const max = Math.max(a, b);
+      const key = min + "_" + max;
+      if (springSet.has(key)) return;
+      springSet.add(key);
+      springs.push({ a, b, rest: restLen });
+    }
+
+    for (let k = 0; k < NZ; k++) {
+      for (let j = 0; j < NY; j++) {
+        for (let i = 0; i < NX; i++) {
+          const a = idx(i, j, k);
+
+          for (let dz = 0; dz <= 1; dz++) {
+            for (let dy = -1; dy <= 1; dy++) {
+              for (let dx = -1; dx <= 1; dx++) {
+                if (dx === 0 && dy === 0 && dz === 0) continue;
+
+                // 为避免重复，只连“半空间”方向
+                if (dz === 0) {
+                  if (dy < 0) continue;
+                  if (dy === 0 && dx <= 0) continue;
+                }
+
+                const ni = i + dx;
+                const nj = j + dy;
+                const nk = k + dz;
+                if (ni < 0 || ni >= NX || nj < 0 || nj >= NY || nk < 0 || nk >= NZ) continue;
+
+                const d2 = dx * dx + dy * dy + dz * dz;
+                if (d2 === 1 || d2 === 2 || d2 === 3) {
+                  const b = idx(ni, nj, nk);
+                  addSpring(a, b, Math.sqrt(d2) * REST);
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // =========================
+    // 渲染：节点球 + 弹簧线
+    // =========================
+    const sphereGeo = new THREE.SphereGeometry(0.12, 10, 10);
+    const sphereMat = new THREE.MeshStandardMaterial({
+      color: 0xffb703,
+      metalness: 0.1,
+      roughness: 0.6
+    });
+    const nodesMesh = new THREE.InstancedMesh(sphereGeo, sphereMat, NODE_COUNT);
+    nodesMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    scene.add(nodesMesh);
+
+    const pinGeo = new THREE.SphereGeometry(0.18, 12, 12);
+    const pinMat = new THREE.MeshStandardMaterial({ color: 0xef4444 });
+    const pinMesh = new THREE.InstancedMesh(pinGeo, pinMat, pinnedCoords.length);
+    scene.add(pinMesh);
+
+    const springPositions = new Float32Array(springs.length * 2 * 3);
+    const springGeo = new THREE.BufferGeometry();
+    springGeo.setAttribute('position', new THREE.BufferAttribute(springPositions, 3));
+    const springMat = new THREE.LineBasicMaterial({
+      color: 0x7dd3fc,
+      transparent: true,
+      opacity: 0.42
+    });
+    const springLines = new THREE.LineSegments(springGeo, springMat);
+    scene.add(springLines);
+
+    const tempObj = new THREE.Object3D();
+
+    function updateNodeInstances() {
+      for (let id = 0; id < NODE_COUNT; id++) {
+        tempObj.position.set(getX(positions, id), getY(positions, id), getZ(positions, id));
+        tempObj.updateMatrix();
+        nodesMesh.setMatrixAt(id, tempObj.matrix);
+      }
+      nodesMesh.instanceMatrix.needsUpdate = true;
+
+      for (let n = 0; n < pinnedCoords.length; n++) {
+        const [i, j, k] = pinnedCoords[n];
+        const id = idx(i, j, k);
+        tempObj.position.set(getX(positions, id), getY(positions, id), getZ(positions, id));
+        tempObj.updateMatrix();
+        pinMesh.setMatrixAt(n, tempObj.matrix);
+      }
+      pinMesh.instanceMatrix.needsUpdate = true;
+    }
+
+    function updateSpringLines() {
+      let p = 0;
+      for (let s = 0; s < springs.length; s++) {
+        const { a, b } = springs[s];
+        springPositions[p++] = getX(positions, a);
+        springPositions[p++] = getY(positions, a);
+        springPositions[p++] = getZ(positions, a);
+
+        springPositions[p++] = getX(positions, b);
+        springPositions[p++] = getY(positions, b);
+        springPositions[p++] = getZ(positions, b);
+      }
+      springGeo.attributes.position.needsUpdate = true;
+    }
+
+    // =========================
+    // 物理
+    // =========================
+    const va = new THREE.Vector3();
+    const vb = new THREE.Vector3();
+    const dirVec = new THREE.Vector3();
+
+    function clearAccelerations() {
+      for (let id = 0; id < NODE_COUNT; id++) {
+        const o = id * 3;
+        accelerations[o] = GRAVITY.x;
+        accelerations[o + 1] = GRAVITY.y;
+        accelerations[o + 2] = GRAVITY.z;
+
+        if (windEnabled) {
+          // 轻微随位置变化的风，主方向 +Z
+          const x = positions[o];
+          const y = positions[o + 1];
+          const z = positions[o + 2];
+          accelerations[o] += 0.8 * Math.sin(0.35 * y + 0.2 * simTime);
+          accelerations[o + 2] += WIND_FORCE * (1.0 + 0.15 * Math.sin(0.4 * x + 0.3 * y + 0.8 * simTime));
+        }
+      }
+
+      for (let id = 0; id < NODE_COUNT; id++) {
+        if (pinned[id]) {
+          setXYZ(accelerations, id, 0, 0, 0);
+        }
+      }
+    }
+
+    function applySpringForces(dt) {
+      maxStretch = 1.0;
+
+      for (let s = 0; s < springs.length; s++) {
+        const { a, b, rest } = springs[s];
+
+        const ax = getX(positions, a), ay = getY(positions, a), az = getZ(positions, a);
+        const bx = getX(positions, b), by = getY(positions, b), bz = getZ(positions, b);
+
+        let dx = bx - ax;
+        let dy = by - ay;
+        let dz = bz - az;
+        let len = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        if (len < 1e-8) len = 1e-8;
+
+        const nx = dx / len, ny = dy / len, nz = dz / len;
+
+        getVelocity(a, dt, va);
+        getVelocity(b, dt, vb);
+
+        const rvx = vb.x - va.x;
+        const rvy = vb.y - va.y;
+        const rvz = vb.z - va.z;
+        const relAlong = rvx * nx + rvy * ny + rvz * nz;
+
+        const fs = STIFFNESS * (len - rest);
+        const fd = DAMPING * relAlong;
+        const f = fs + fd;
+
+        const fx = f * nx;
+        const fy = f * ny;
+        const fz = f * nz;
+
+        if (!pinned[a]) addXYZ(accelerations, a,  fx / MASS,  fy / MASS,  fz / MASS);
+        if (!pinned[b]) addXYZ(accelerations, b, -fx / MASS, -fy / MASS, -fz / MASS);
+
+        const stretch = len / rest;
+        if (stretch > maxStretch) maxStretch = stretch;
+      }
+    }
+
+    function verletIntegrate(dt) {
+      const dt2 = dt * dt;
+      groundContacts = 0;
+
+      for (let id = 0; id < NODE_COUNT; id++) {
+        if (pinned[id]) continue;
+
+        const o = id * 3;
+
+        const x = positions[o];
+        const y = positions[o + 1];
+        const z = positions[o + 2];
+
+        const px = prevPositions[o];
+        const py = prevPositions[o + 1];
+        const pz = prevPositions[o + 2];
+
+        let nx = x + (x - px) + accelerations[o] * dt2;
+        let ny = y + (y - py) + accelerations[o + 1] * dt2;
+        let nz = z + (z - pz) + accelerations[o + 2] * dt2;
+
+        // 地面碰撞：基于 Verlet 等价速度反弹
+        if (ny < GROUND_Y) {
+          const vx = x - px;
+          const vy = y - py;
+          const vz = z - pz;
+
+          ny = GROUND_Y;
+
+          // 切向稍保留，法向反弹
+          const newVx = vx * 0.995;
+          const newVy = Math.abs(vy) * BOUNCE;
+          const newVz = vz * 0.995;
+
+          prevPositions[o] = nx - newVx;
+          prevPositions[o + 1] = ny - newVy;
+          prevPositions[o + 2] = nz - newVz;
+          positions[o] = nx;
+          positions[o + 1] = ny;
+          positions[o + 2] = nz;
+
+          groundContacts++;
+        } else {
+          prevPositions[o] = x;
+          prevPositions[o + 1] = y;
+          prevPositions[o + 2] = z;
+          positions[o] = nx;
+          positions[o + 1] = ny;
+          positions[o + 2] = nz;
+
+          if (ny <= GROUND_Y + 1e-4) groundContacts++;
+        }
+      }
+    }
+
+    function enforcePinned() {
+      for (const [i, j, k] of pinnedCoords) {
+        const id = idx(i, j, k);
+        const x = i * REST + initialOffset.x;
+        const y = j * REST + initialOffset.y;
+        const z = k * REST + initialOffset.z;
+        setXYZ(positions, id, x, y, z);
+        setXYZ(prevPositions, id, x, y, z);
+      }
+    }
+
+    function computeCenterOfMass() {
+      let sx = 0, sy = 0, sz = 0;
+      for (let id = 0; id < NODE_COUNT; id++) {
+        sx += getX(positions, id);
+        sy += getY(positions, id);
+        sz += getZ(positions, id);
+      }
+      return {
+        x: sx / NODE_COUNT,
+        y: sy / NODE_COUNT,
+        z: sz / NODE_COUNT
+      };
+    }
+
+    // =========================
+    // UI
+    // =========================
+    const windBtn = document.getElementById('windBtn');
+    const info = document.getElementById('info');
+
+    windBtn.addEventListener('click', () => {
+      windEnabled = !windEnabled;
+      windBtn.textContent = `Wind: ${windEnabled ? 'ON' : 'OFF'}`;
+      windBtn.className = windEnabled ? '' : 'off';
+    });
+
+    // =========================
+    // 状态暴露
+    // =========================
+    window.__3D_STATE__ = {
+      nodeCount: NODE_COUNT,
+      springCount: springs.length,
+      centerOfMass: computeCenterOfMass(),
+      maxStretch: 1.0,
+      groundContacts: 0,
+      windEnabled,
+      simTime: 0
+    };
+
+    function updateState() {
+      window.__3D_STATE__ = {
+        nodeCount: NODE_COUNT,
+        springCount: springs.length,
+        centerOfMass: computeCenterOfMass(),
+        maxStretch,
+        groundContacts,
+        windEnabled,
+        simTime
+      };
+
+      const s = window.__3D_STATE__;
+      info.textContent =
+        `nodes: ${s.nodeCount}\n` +
+        `springs: ${s.springCount}\n` +
+        `COM: (${s.centerOfMass.x.toFixed(2)}, ${s.centerOfMass.y.toFixed(2)}, ${s.centerOfMass.z.toFixed(2)})\n` +
+        `maxStretch: ${s.maxStretch.toFixed(3)}\n` +
+        `groundContacts: ${s.groundContacts}\n` +
+        `time: ${s.simTime.toFixed(2)}s`;
+    }
+
+    // =========================
+    // 动画循环
+    // =========================
+    let accumulator = 0;
+    let lastTime = performance.now() * 0.001;
+
+    function step(dt) {
+      clearAccelerations();
+      applySpringForces(dt);
+      verletIntegrate(dt);
+      enforcePinned();
+      simTime += dt;
+    }
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      const now = performance.now() * 0.001;
+      let frameDt = now - lastTime;
+      lastTime = now;
+      frameDt = Math.min(frameDt, 0.033);
+      accumulator += frameDt;
+
+      let iter = 0;
+      const maxIters = 12;
+      while (accumulator >= FIXED_DT && iter < maxIters) {
+        for (let s = 0; s < SUBSTEPS; s++) {
+          step(FIXED_DT / SUBSTEPS);
+        }
+        accumulator -= FIXED_DT;
+        iter++;
+      }
+
+      updateNodeInstances();
+      updateSpringLines();
+      updateState();
+
+      controls.update();
+      renderer.render(scene, camera);
+    }
+
+    updateNodeInstances();
+    updateSpringLines();
+    updateState();
+    animate();
+
+    // =========================
+    // 自适应
+    // =========================
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+  </script>
+</body>
+</html>

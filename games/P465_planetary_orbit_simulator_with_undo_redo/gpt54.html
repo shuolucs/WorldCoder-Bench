@@ -1,0 +1,465 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>3D Planetary Orbit Simulator</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      background: #050510;
+      font-family: Arial, sans-serif;
+      color: white;
+    }
+
+    canvas {
+      display: block;
+    }
+
+    #uiBar {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      z-index: 20;
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+
+    #hudPanel {
+      position: absolute;
+      top: 60px;
+      left: 10px;
+      z-index: 20;
+      background: rgba(10, 10, 25, 0.75);
+      border: 1px solid rgba(255,255,255,0.15);
+      border-radius: 8px;
+      padding: 10px 12px;
+      min-width: 220px;
+      line-height: 1.6;
+      backdrop-filter: blur(4px);
+    }
+
+    button, input[type="range"] {
+      background: rgba(20, 20, 40, 0.8);
+      color: white;
+      border: 1px solid rgba(255,255,255,0.2);
+      border-radius: 6px;
+      padding: 8px 12px;
+      font-size: 14px;
+    }
+
+    button {
+      cursor: pointer;
+    }
+
+    button:hover:not(:disabled) {
+      background: rgba(40, 40, 70, 0.9);
+    }
+
+    button:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
+
+    .sliderWrap {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      background: rgba(20, 20, 40, 0.8);
+      border: 1px solid rgba(255,255,255,0.2);
+      border-radius: 6px;
+      padding: 6px 10px;
+    }
+
+    label {
+      font-size: 14px;
+      white-space: nowrap;
+    }
+  </style>
+</head>
+<body>
+  <div id="uiBar">
+    <button id="addPlanetBtn">Add Planet</button>
+    <button id="removeLastBtn">Remove Last</button>
+    <button id="undoBtn" disabled>Undo</button>
+    <button id="redoBtn" disabled>Redo</button>
+    <button id="pauseBtn">Pause</button>
+    <div class="sliderWrap">
+      <label for="speedSlider">Speed</label>
+      <input id="speedSlider" type="range" min="0.1" max="5" step="0.1" value="1" />
+    </div>
+  </div>
+
+  <div id="hudPanel">
+    <div>Planet count: <span id="planetCount">0</span></div>
+    <div>Speed multiplier: <span id="speedDisplay">1.0</span></div>
+    <div>Status: <span id="simStatus">Running</span></div>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
+    import { OrbitControls } from 'https://unpkg.com/three@0.160.0/examples/jsm/controls/OrbitControls.js';
+    import { GLTFLoader } from 'https://unpkg.com/three@0.160.0/examples/jsm/loaders/GLTFLoader.js';
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x050510);
+
+    const camera = new THREE.PerspectiveCamera(
+      60,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      1000
+    );
+    camera.position.set(0, 30, 50);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    document.body.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.target.set(0, 0, 0);
+
+    const ambientLight = new THREE.AmbientLight(0x222244, 0.3);
+    scene.add(ambientLight);
+
+    const sunLight = new THREE.PointLight(0xffdd44, 2, 300);
+    sunLight.position.set(0, 0, 0);
+    scene.add(sunLight);
+
+    const sunGeometry = new THREE.SphereGeometry(3, 32, 32);
+    const sunMaterial = new THREE.MeshStandardMaterial({
+      color: 0xffdd44,
+      emissive: 0xffcc33,
+      emissiveIntensity: 1.5
+    });
+    const sun = new THREE.Mesh(sunGeometry, sunMaterial);
+    scene.add(sun);
+
+    const starCount = 500;
+    const starRadius = 200;
+    const starPositions = [];
+    for (let i = 0; i < starCount; i++) {
+      const u = Math.random();
+      const v = Math.random();
+      const theta = 2 * Math.PI * u;
+      const phi = Math.acos(2 * v - 1);
+      const r = starRadius * Math.cbrt(Math.random());
+      const x = r * Math.sin(phi) * Math.cos(theta);
+      const y = r * Math.cos(phi);
+      const z = r * Math.sin(phi) * Math.sin(theta);
+      starPositions.push(x, y, z);
+    }
+
+    const starGeometry = new THREE.BufferGeometry();
+    starGeometry.setAttribute(
+      'position',
+      new THREE.Float32BufferAttribute(starPositions, 3)
+    );
+    const starMaterial = new THREE.PointsMaterial({
+      color: 0xffffff,
+      size: 0.8,
+      sizeAttenuation: true
+    });
+    const stars = new THREE.Points(starGeometry, starMaterial);
+    scene.add(stars);
+
+    const planets = [];
+    let planetIdCounter = 1;
+
+    const historyStack = [];
+    const redoStack = [];
+
+    let isPaused = false;
+    let speedMultiplier = 1;
+
+    let station = null;
+    let stationLoaded = false;
+    let stationOrbitAngle = 0;
+    const stationOrbitRadius = 20;
+    const stationAngularSpeed = 0.003;
+
+    const addPlanetBtn = document.getElementById('addPlanetBtn');
+    const removeLastBtn = document.getElementById('removeLastBtn');
+    const undoBtn = document.getElementById('undoBtn');
+    const redoBtn = document.getElementById('redoBtn');
+    const pauseBtn = document.getElementById('pauseBtn');
+    const speedSlider = document.getElementById('speedSlider');
+
+    const planetCountSpan = document.getElementById('planetCount');
+    const speedDisplaySpan = document.getElementById('speedDisplay');
+    const simStatusSpan = document.getElementById('simStatus');
+
+    function createOrbitLine(radius, color = 0xffffff) {
+      const segments = 128;
+      const points = [];
+      for (let i = 0; i <= segments; i++) {
+        const a = (i / segments) * Math.PI * 2;
+        points.push(new THREE.Vector3(
+          radius * Math.cos(a),
+          0,
+          radius * Math.sin(a)
+        ));
+      }
+
+      const geometry = new THREE.BufferGeometry().setFromPoints(points);
+      const material = new THREE.LineDashedMaterial({
+        color,
+        dashSize: 0.6,
+        gapSize: 0.35,
+        transparent: true,
+        opacity: 0.65
+      });
+
+      const line = new THREE.LineLoop(geometry, material);
+      line.computeLineDistances();
+      return line;
+    }
+
+    function buildPlanetObject(data) {
+      const geometry = new THREE.SphereGeometry(data.radius, 24, 24);
+      const material = new THREE.MeshStandardMaterial({
+        color: data.color
+      });
+      const mesh = new THREE.Mesh(geometry, material);
+      mesh.position.set(
+        data.orbitalRadius * Math.cos(data.angle),
+        0,
+        data.orbitalRadius * Math.sin(data.angle)
+      );
+
+      const orbitLine = createOrbitLine(data.orbitalRadius, data.color);
+
+      return {
+        ...data,
+        mesh,
+        orbitLine
+      };
+    }
+
+    function addPlanetToScene(planet) {
+      scene.add(planet.mesh);
+      scene.add(planet.orbitLine);
+      planets.push(planet);
+      updateHUD();
+    }
+
+    function removePlanetFromScene(planet) {
+      scene.remove(planet.mesh);
+      scene.remove(planet.orbitLine);
+
+      const index = planets.indexOf(planet);
+      if (index !== -1) {
+        planets.splice(index, 1);
+      }
+      updateHUD();
+    }
+
+    function createPlanet({
+      name,
+      color,
+      radius,
+      orbitalRadius,
+      angularSpeed,
+      angle = 0
+    }) {
+      return buildPlanetObject({
+        name,
+        color,
+        radius,
+        orbitalRadius,
+        angularSpeed,
+        angle
+      });
+    }
+
+    function addPlanetAction(planet, recordHistory = true) {
+      addPlanetToScene(planet);
+      if (recordHistory) {
+        historyStack.push({ type: 'add', planet });
+        redoStack.length = 0;
+      }
+      updateUndoRedoButtons();
+    }
+
+    function removePlanetAction(planet, recordHistory = true) {
+      removePlanetFromScene(planet);
+      if (recordHistory) {
+        historyStack.push({ type: 'remove', planet });
+        redoStack.length = 0;
+      }
+      updateUndoRedoButtons();
+    }
+
+    function createRandomPlanet() {
+      const color = new THREE.Color(Math.random(), Math.random(), Math.random()).getHex();
+      const orbitalRadius = THREE.MathUtils.randFloat(8, 40);
+      const angularSpeed = THREE.MathUtils.randFloat(0.003, 0.02);
+      const radius = THREE.MathUtils.randFloat(0.5, 1.5);
+      return createPlanet({
+        name: `Planet ${planetIdCounter++}`,
+        color,
+        radius,
+        orbitalRadius,
+        angularSpeed,
+        angle: 0
+      });
+    }
+
+    function undoAction() {
+      if (!historyStack.length) return;
+
+      const action = historyStack.pop();
+      if (action.type === 'add') {
+        removePlanetFromScene(action.planet);
+      } else if (action.type === 'remove') {
+        addPlanetToScene(action.planet);
+      }
+      redoStack.push(action);
+      updateUndoRedoButtons();
+    }
+
+    function redoAction() {
+      if (!redoStack.length) return;
+
+      const action = redoStack.pop();
+      if (action.type === 'add') {
+        addPlanetToScene(action.planet);
+      } else if (action.type === 'remove') {
+        removePlanetFromScene(action.planet);
+      }
+      historyStack.push(action);
+      updateUndoRedoButtons();
+    }
+
+    function updateUndoRedoButtons() {
+      undoBtn.disabled = historyStack.length === 0;
+      redoBtn.disabled = redoStack.length === 0;
+    }
+
+    function updateHUD() {
+      planetCountSpan.textContent = String(planets.length);
+      speedDisplaySpan.textContent = speedMultiplier.toFixed(1);
+      simStatusSpan.textContent = isPaused ? 'Paused' : 'Running';
+      pauseBtn.textContent = isPaused ? 'Resume' : 'Pause';
+    }
+
+    function update3DState() {
+      window.__3D_STATE__ = {
+        planetCount: planets.length,
+        isPaused,
+        speedMultiplier,
+        historyLength: historyStack.length,
+        redoLength: redoStack.length,
+        undoBtnDisabled: undoBtn.disabled,
+        redoBtnDisabled: redoBtn.disabled,
+        stationLoaded,
+        stationOrbitAngle,
+        planets: planets.map(p => ({
+          name: p.name,
+          orbitalRadius: p.orbitalRadius,
+          angularSpeed: p.angularSpeed,
+          angle: p.angle
+        }))
+      };
+    }
+
+    addPlanetBtn.addEventListener('click', () => {
+      const planet = createRandomPlanet();
+      addPlanetAction(planet, true);
+    });
+
+    removeLastBtn.addEventListener('click', () => {
+      if (!planets.length) return;
+      const planet = planets[planets.length - 1];
+      removePlanetAction(planet, true);
+    });
+
+    undoBtn.addEventListener('click', undoAction);
+    redoBtn.addEventListener('click', redoAction);
+
+    pauseBtn.addEventListener('click', () => {
+      isPaused = !isPaused;
+      updateHUD();
+    });
+
+    speedSlider.addEventListener('input', () => {
+      speedMultiplier = parseFloat(speedSlider.value);
+      updateHUD();
+    });
+
+    const defaultPlanet = createPlanet({
+      name: `Planet ${planetIdCounter++}`,
+      color: 0x3366ff,
+      radius: 1,
+      orbitalRadius: 15,
+      angularSpeed: 0.01,
+      angle: 0
+    });
+    addPlanetAction(defaultPlanet, false);
+
+    const gltfLoader = new GLTFLoader();
+    gltfLoader.load(
+      'ABeautifulGame.glb',
+      (gltf) => {
+        station = gltf.scene;
+        station.scale.setScalar(0.02);
+        station.position.set(20, 0, 0);
+        scene.add(station);
+        stationLoaded = true;
+      },
+      undefined,
+      (error) => {
+        console.warn('Failed to load ABeautifulGame.glb:', error);
+      }
+    );
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      if (!isPaused) {
+        for (const planet of planets) {
+          planet.angle += planet.angularSpeed * speedMultiplier;
+          planet.mesh.position.set(
+            planet.orbitalRadius * Math.cos(planet.angle),
+            0,
+            planet.orbitalRadius * Math.sin(planet.angle)
+          );
+        }
+
+        stationOrbitAngle += stationAngularSpeed * speedMultiplier;
+      }
+
+      if (station) {
+        station.position.set(
+          stationOrbitRadius * Math.cos(stationOrbitAngle),
+          0,
+          stationOrbitRadius * Math.sin(stationOrbitAngle)
+        );
+      }
+
+      controls.update();
+      updateHUD();
+      update3DState();
+      renderer.render(scene, camera);
+    }
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    updateHUD();
+    updateUndoRedoButtons();
+    update3DState();
+    animate();
+  </script>
+</body>
+</html>

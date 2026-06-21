@@ -1,0 +1,477 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3D Gyroscope Simulation</title>
+<script type="importmap">
+{ "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+} }
+</script>
+<style>
+body { margin: 0; overflow: hidden; font-family: 'Courier New', monospace; background: #223344; }
+canvas { display: block; }
+#hud {
+    position: absolute; top: 10px; left: 10px;
+    color: #00ff88; background: rgba(0,0,0,0.7);
+    padding: 12px 16px; border-radius: 8px; font-size: 13px;
+    line-height: 1.6; pointer-events: none; min-width: 260px;
+    border: 1px solid rgba(0,255,136,0.3);
+}
+#hud span { color: #ffcc44; }
+#controls {
+    position: absolute; bottom: 10px; left: 10px;
+    color: #ccc; background: rgba(0,0,0,0.7);
+    padding: 12px 16px; border-radius: 8px; font-size: 13px;
+    min-width: 300px; border: 1px solid rgba(255,255,255,0.2);
+}
+#controls label { display: block; margin: 6px 0 2px; color: #aaddff; }
+#controls input[type="range"] { width: 260px; cursor: pointer; }
+#controls .keys { margin-top: 10px; color: #888; font-size: 11px; }
+</style>
+</head>
+<body>
+<div id="hud">
+    <div>Spin Speed: <span id="hud-spin">40</span> rad/s</div>
+    <div>Precession Rate: <span id="hud-precession">0.000</span> rad/s</div>
+    <div>Tilt Angle: <span id="hud-tilt">45.0</span>°</div>
+    <div>Angular Momentum: <span id="hud-L">0.00</span></div>
+    <div>Nutation Amp: <span id="hud-nutation">0.0</span>°</div>
+    <div>Status: <span id="hud-paused">Playing</span></div>
+</div>
+<div id="controls">
+    <label>Spin Speed (ω): <span id="label-spin">40</span> rad/s</label>
+    <input type="range" id="slider-spin-speed" min="5" max="100" step="5" value="40">
+    <label>Tilt Angle: <span id="label-tilt">45</span>°</label>
+    <input type="range" id="slider-tilt" min="10" max="80" step="5" value="45">
+    <div class="keys">R: Reset | Space: Pause/Play | V: Toggle Vectors</div>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// Scene setup
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x223344);
+
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+camera.position.set(5, 4, 5);
+camera.lookAt(0, 2, 0);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(window.devicePixelRatio);
+document.body.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 2, 0);
+controls.update();
+
+// Lights
+const ambientLight = new THREE.AmbientLight(0x445566, 0.4);
+scene.add(ambientLight);
+const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+dirLight.position.set(5, 10, 5);
+scene.add(dirLight);
+
+// Grid
+const grid = new THREE.GridHelper(8, 16);
+scene.add(grid);
+
+// Pedestal
+const pedestalGeo = new THREE.CylinderGeometry(0.15, 0.15, 2.0, 32);
+const pedestalMat = new THREE.MeshStandardMaterial({ color: 0x888888, metalness: 0.8, roughness: 0.3 });
+const pedestal = new THREE.Mesh(pedestalGeo, pedestalMat);
+pedestal.position.set(0, 1.0, 0);
+scene.add(pedestal);
+
+// Small pivot ball on top of pedestal
+const pivotBallGeo = new THREE.SphereGeometry(0.08, 16, 16);
+const pivotBallMat = new THREE.MeshStandardMaterial({ color: 0xcccccc, metalness: 0.9, roughness: 0.2 });
+const pivotBall = new THREE.Mesh(pivotBallGeo, pivotBallMat);
+pivotBall.position.set(0, 2.0, 0);
+scene.add(pivotBall);
+
+// Gyroscope group - pivot at (0, 2, 0)
+const gyroGroup = new THREE.Group();
+gyroGroup.position.set(0, 2, 0);
+scene.add(gyroGroup);
+
+// Axle - length 3.0, centered at origin of gyroGroup means it goes from -1.5 to +1.5 along local Y
+// But pivot is at one end, so we offset: axle center at (0, 1.5, 0) in local space
+// meaning axle goes from (0,0,0) to (0,3,0) in local space
+const axleLength = 3.0;
+const axleGeo = new THREE.CylinderGeometry(0.04, 0.04, axleLength, 16);
+const axleMat = new THREE.MeshStandardMaterial({ color: 0xaaaaaa, metalness: 0.6, roughness: 0.3 });
+const axle = new THREE.Mesh(axleGeo, axleMat);
+axle.position.set(0, axleLength / 2, 0);
+gyroGroup.add(axle);
+
+// Rotor (flywheel) - at center of axle
+const rotorGeo = new THREE.TorusGeometry(0.6, 0.15, 24, 48);
+const rotorMat = new THREE.MeshStandardMaterial({ color: 0xff4444, metalness: 0.7, roughness: 0.3 });
+const rotor = new THREE.Mesh(rotorGeo, rotorMat);
+rotor.position.set(0, axleLength / 2, 0);
+// Torus is in XY plane by default, we want it perpendicular to the axle (local Y)
+// Torus default: lies in XZ plane when rotated by PI/2 around X... actually default torus is in XY plane
+// We need it perpendicular to Y axis, so in XZ plane -> rotate PI/2 around X
+rotor.rotation.x = Math.PI / 2;
+gyroGroup.add(rotor);
+
+// Add spokes to rotor for visual spin feedback
+const spokeGroup = new THREE.Group();
+spokeGroup.position.set(0, axleLength / 2, 0);
+for (let i = 0; i < 4; i++) {
+    const spokeGeo = new THREE.CylinderGeometry(0.02, 0.02, 1.2, 8);
+    const spokeMat = new THREE.MeshStandardMaterial({ color: 0xcc3333, metalness: 0.5 });
+    const spoke = new THREE.Mesh(spokeGeo, spokeMat);
+    spoke.rotation.z = Math.PI / 2;
+    spoke.rotation.y = (i * Math.PI) / 4;
+    spokeGroup.add(spoke);
+}
+gyroGroup.add(spokeGroup);
+
+// Counterweight
+const cwGeo = new THREE.SphereGeometry(0.1, 16, 16);
+const cwMat = new THREE.MeshStandardMaterial({ color: 0x4444ff, metalness: 0.5, roughness: 0.4 });
+const counterweight = new THREE.Mesh(cwGeo, cwMat);
+counterweight.position.set(0, axleLength, 0);
+gyroGroup.add(counterweight);
+
+// Arrow helpers for angular momentum and torque
+const arrowL = new THREE.ArrowHelper(
+    new THREE.Vector3(0, 1, 0), new THREE.Vector3(0, 0, 0), 2, 0x4488ff, 0.15, 0.1
+);
+scene.add(arrowL);
+
+const arrowTorque = new THREE.ArrowHelper(
+    new THREE.Vector3(1, 0, 0), new THREE.Vector3(0, 0, 0), 1, 0xff4444, 0.12, 0.08
+);
+scene.add(arrowTorque);
+
+let vectorsVisible = true;
+
+// Precession circle (dashed)
+const precCircleGeo = new THREE.BufferGeometry();
+const precCirclePoints = [];
+const numPrecPoints = 128;
+for (let i = 0; i <= numPrecPoints; i++) {
+    const angle = (i / numPrecPoints) * Math.PI * 2;
+    precCirclePoints.push(Math.cos(angle), 0, Math.sin(angle));
+}
+precCircleGeo.setAttribute('position', new THREE.Float32BufferAttribute(precCirclePoints, 3));
+const precCircleMat = new THREE.LineDashedMaterial({ color: 0x88ff88, dashSize: 0.15, gapSize: 0.1, opacity: 0.5, transparent: true });
+const precCircle = new THREE.Line(precCircleGeo, precCircleMat);
+precCircle.computeLineDistances();
+scene.add(precCircle);
+
+// Trail
+const maxTrailPoints = 200;
+const trailPositions = new Float32Array(maxTrailPoints * 3);
+const trailColors = new Float32Array(maxTrailPoints * 3);
+const trailGeo = new THREE.BufferGeometry();
+trailGeo.setAttribute('position', new THREE.Float32BufferAttribute(trailPositions, 3));
+trailGeo.setAttribute('color', new THREE.Float32BufferAttribute(trailColors, 3));
+const trailMat = new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.8 });
+const trail = new THREE.Line(trailGeo, trailMat);
+scene.add(trail);
+
+let trailIndex = 0;
+let trailCount = 0;
+const trailHistory = [];
+
+// Physics parameters
+const g = 9.81;
+const M = 2.0; // rotor mass
+const R = 0.6; // rotor radius
+const I_rotor = 0.5 * M * R * R; // moment of inertia of rotor (thin ring approx: MR², disk: 0.5MR²)
+const d = 0.7; // distance from pivot to center of mass (roughly center of axle where rotor is)
+
+// State variables
+let spinSpeed = 40;
+let tiltAngleDeg = 45;
+let tiltAngle = THREE.MathUtils.degToRad(tiltAngleDeg); // theta - angle from vertical
+let precessionAngle = 0; // phi - angle around vertical
+let nutationPhase = 0;
+let isPaused = false;
+let frameCount = 0;
+
+// Nutation parameters
+let nutationAmplitude = 2.0; // degrees
+let nutationFreq = 0; // will be computed
+let baseTiltAngle = tiltAngle;
+
+// Track min/max tilt for nutation measurement
+let tiltMin = tiltAngle;
+let tiltMax = tiltAngle;
+let measuredNutationAmp = 0;
+
+function computePrecessionRate() {
+    const L = I_rotor * spinSpeed;
+    if (L < 0.001) return 0;
+    // Ω_p = (M * g * d) / (I * ω_spin) = τ / L
+    return (M * g * d) / (I_rotor * spinSpeed);
+}
+
+function computeNutationFreq() {
+    // Nutation frequency ≈ L / I_perp where I_perp is moment of inertia about axis perpendicular to spin
+    // For simplicity: ω_n ≈ I_rotor * spinSpeed / I_perp
+    // I_perp ≈ M * d^2 (pendulum-like)
+    const I_perp = M * d * d + 0.25 * M * R * R; // approximate
+    const L = I_rotor * spinSpeed;
+    if (I_perp < 0.001) return 0;
+    return L / I_perp;
+}
+
+function resetSimulation() {
+    spinSpeed = parseFloat(document.getElementById('slider-spin-speed').value);
+    tiltAngleDeg = parseFloat(document.getElementById('slider-tilt').value);
+    tiltAngle = THREE.MathUtils.degToRad(tiltAngleDeg);
+    baseTiltAngle = tiltAngle;
+    precessionAngle = 0;
+    nutationPhase = 0;
+    nutationAmplitude = 2.0; // degrees initial nutation
+    nutationFreq = computeNutationFreq();
+    tiltMin = tiltAngle;
+    tiltMax = tiltAngle;
+    measuredNutationAmp = 0;
+    trailHistory.length = 0;
+    trailCount = 0;
+    trailIndex = 0;
+}
+
+resetSimulation();
+
+// UI elements
+const sliderSpin = document.getElementById('slider-spin-speed');
+const sliderTilt = document.getElementById('slider-tilt');
+const labelSpin = document.getElementById('label-spin');
+const labelTilt = document.getElementById('label-tilt');
+
+sliderSpin.addEventListener('input', () => {
+    spinSpeed = parseFloat(sliderSpin.value);
+    labelSpin.textContent = spinSpeed;
+    nutationFreq = computeNutationFreq();
+});
+
+sliderTilt.addEventListener('input', () => {
+    tiltAngleDeg = parseFloat(sliderTilt.value);
+    labelTilt.textContent = tiltAngleDeg;
+});
+
+// Keyboard
+document.addEventListener('keydown', (e) => {
+    if (e.code === 'KeyR') {
+        resetSimulation();
+    } else if (e.code === 'Space') {
+        e.preventDefault();
+        isPaused = !isPaused;
+    } else if (e.code === 'KeyV') {
+        vectorsVisible = !vectorsVisible;
+        arrowL.visible = vectorsVisible;
+        arrowTorque.visible = vectorsVisible;
+    }
+});
+
+// HUD elements
+const hudSpin = document.getElementById('hud-spin');
+const hudPrecession = document.getElementById('hud-precession');
+const hudTilt = document.getElementById('hud-tilt');
+const hudL = document.getElementById('hud-L');
+const hudNutation = document.getElementById('hud-nutation');
+const hudPaused = document.getElementById('hud-paused');
+
+// State
+window.__3D_STATE__ = {
+    spinSpeed: spinSpeed,
+    precessionRate: 0,
+    tiltAngle: tiltAngleDeg,
+    angularMomentum: 0,
+    nutationAmplitude: 0,
+    precessionAngle: 0,
+    isPaused: false,
+    vectorsVisible: true,
+    frameCount: 0,
+    gyroValid: true
+};
+
+const dt = 1 / 60;
+let rotorVisualAngle = 0;
+
+function updatePrecessionCircle() {
+    // The precession circle is at the height of the pedestal top, showing where the axle tip traces
+    // Axle tip is at distance axleLength from pivot, projected onto ground
+    const tipDist = axleLength * Math.sin(tiltAngle);
+    const tipHeight = 2.0 + axleLength * Math.cos(tiltAngle);
+
+    const positions = precCircle.geometry.attributes.position.array;
+    for (let i = 0; i <= numPrecPoints; i++) {
+        const angle = (i / numPrecPoints) * Math.PI * 2;
+        positions[i * 3] = tipDist * Math.cos(angle);
+        positions[i * 3 + 1] = tipHeight;
+        positions[i * 3 + 2] = tipDist * Math.sin(angle);
+    }
+    precCircle.geometry.attributes.position.needsUpdate = true;
+    precCircle.computeLineDistances();
+}
+
+function animate() {
+    requestAnimationFrame(animate);
+
+    if (!isPaused) {
+        // Compute physics
+        const precRate = computePrecessionRate();
+        nutationFreq = computeNutationFreq();
+
+        // Update precession angle
+        precessionAngle += precRate * dt;
+
+        // Nutation: oscillation of tilt angle
+        nutationPhase += nutationFreq * dt;
+        const nutAmpRad = THREE.MathUtils.degToRad(nutationAmplitude);
+        tiltAngle = baseTiltAngle + nutAmpRad * Math.sin(nutationPhase);
+
+        // Clamp tilt
+        tiltAngle = THREE.MathUtils.clamp(tiltAngle, THREE.MathUtils.degToRad(5), THREE.MathUtils.degToRad(85));
+
+        // Track nutation
+        const currentTiltDeg = THREE.MathUtils.radToDeg(tiltAngle);
+        if (nutationPhase > 0.1) {
+            tiltMin = Math.min(tiltMin, tiltAngle);
+            tiltMax = Math.max(tiltMax, tiltAngle);
+            measuredNutationAmp = THREE.MathUtils.radToDeg(tiltMax - tiltMin);
+        }
+
+        // Update gyroscope orientation
+        // The gyroscope axle points from pivot upward at angle tiltAngle from vertical,
+        // rotating around vertical axis by precessionAngle
+        gyroGroup.rotation.set(0, 0, 0);
+        gyroGroup.quaternion.identity();
+
+        // First rotate around Y by precession angle, then tilt
+        const qPrecession = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), precessionAngle);
+        const qTilt = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), tiltAngle);
+        gyroGroup.quaternion.copy(qPrecession).multiply(qTilt);
+
+        // Spin the rotor visually
+        const visualSpinRate = Math.min(spinSpeed, 10);
+        rotorVisualAngle += visualSpinRate * dt;
+        rotor.rotation.x = Math.PI / 2;
+        rotor.rotation.y = rotorVisualAngle;
+        spokeGroup.rotation.y = rotorVisualAngle;
+
+        // Compute axle direction in world space
+        const axleDir = new THREE.Vector3(0, 1, 0).applyQuaternion(gyroGroup.quaternion).normalize();
+
+        // Angular momentum vector
+        const L_mag = I_rotor * spinSpeed;
+        const arrowOrigin = new THREE.Vector3(0, 2, 0).add(axleDir.clone().multiplyScalar(axleLength / 2));
+        const arrowLen = Math.min(L_mag * 0.15, 3);
+        arrowL.position.copy(arrowOrigin);
+        arrowL.setDirection(axleDir);
+        arrowL.setLength(arrowLen, 0.15, 0.1);
+
+        // Torque vector: τ = r × F, where r is along axle, F is gravity (downward)
+        // r = d * axleDir, F = -M*g*ŷ
+        // τ = d * axleDir × (-M*g*ŷ) = -M*g*d * (axleDir × ŷ)
+        const torqueDir = new THREE.Vector3().crossVectors(axleDir, new THREE.Vector3(0, -1, 0)).normalize();
+        const torqueMag = M * g * d * Math.sin(tiltAngle);
+        const torqueLen = Math.min(torqueMag * 0.05, 2);
+        arrowTorque.position.copy(new THREE.Vector3(0, 2, 0));
+        if (torqueDir.length() > 0.001) {
+            arrowTorque.setDirection(torqueDir);
+        }
+        arrowTorque.setLength(Math.max(torqueLen, 0.1), 0.12, 0.08);
+
+        // Update precession circle
+        updatePrecessionCircle();
+
+        // Trail - position of the far end of axle
+        const tipPos = new THREE.Vector3(0, axleLength, 0).applyQuaternion(gyroGroup.quaternion).add(new THREE.Vector3(0, 2, 0));
+
+        trailHistory.push(tipPos.clone());
+        if (trailHistory.length > maxTrailPoints) {
+            trailHistory.shift();
+        }
+
+        // Update trail geometry
+        const tPositions = trail.geometry.attributes.position.array;
+        const tColors = trail.geometry.attributes.color.array;
+        for (let i = 0; i < maxTrailPoints; i++) {
+            if (i < trailHistory.length) {
+                const p = trailHistory[i];
+                tPositions[i * 3] = p.x;
+                tPositions[i * 3 + 1] = p.y;
+                tPositions[i * 3 + 2] = p.z;
+                const fade = i / trailHistory.length;
+                tColors[i * 3] = 0.2 + 0.8 * fade;
+                tColors[i * 3 + 1] = 1.0 * fade;
+                tColors[i * 3 + 2] = 0.3 + 0.7 * fade;
+            } else {
+                tPositions[i * 3] = 0;
+                tPositions[i * 3 + 1] = 0;
+                tPositions[i * 3 + 2] = 0;
+                tColors[i * 3] = 0;
+                tColors[i * 3 + 1] = 0;
+                tColors[i * 3 + 2] = 0;
+            }
+        }
+        trail.geometry.attributes.position.needsUpdate = true;
+        trail.geometry.attributes.color.needsUpdate = true;
+        trail.geometry.setDrawRange(0, trailHistory.length);
+
+        // Update HUD
+        const currentTilt = THREE.MathUtils.radToDeg(tiltAngle);
+        hudSpin.textContent = spinSpeed;
+        hudPrecession.textContent = precRate.toFixed(3);
+        hudTilt.textContent = currentTilt.toFixed(1);
+        hudL.textContent = L_mag.toFixed(2);
+        hudNutation.textContent = measuredNutationAmp.toFixed(1);
+        hudPaused.textContent = 'Playing';
+
+        // Check validity
+        const q = gyroGroup.quaternion;
+        const gyroValid = !isNaN(q.x) && !isNaN(q.y) && !isNaN(q.z) && !isNaN(q.w);
+
+        // Update state
+        window.__3D_STATE__ = {
+            spinSpeed: spinSpeed,
+            precessionRate: parseFloat(precRate.toFixed(4)),
+            tiltAngle: parseFloat(currentTilt.toFixed(2)),
+            angularMomentum: parseFloat(L_mag.toFixed(3)),
+            nutationAmplitude: parseFloat(measuredNutationAmp.toFixed(2)),
+            precessionAngle: parseFloat(precessionAngle.toFixed(3)),
+            isPaused: false,
+            vectorsVisible: vectorsVisible,
+            frameCount: frameCount,
+            gyroValid: gyroValid
+        };
+    } else {
+        hudPaused.textContent = 'Paused';
+        window.__3D_STATE__.isPaused = true;
+        window.__3D_STATE__.frameCount = frameCount;
+        window.__3D_STATE__.vectorsVisible = vectorsVisible;
+    }
+
+    frameCount++;
+    controls.update();
+    renderer.render(scene, camera);
+}
+
+// Handle resize
+window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// Initial precession circle
+updatePrecessionCircle();
+
+animate();
+</script>
+</body>
+</html>

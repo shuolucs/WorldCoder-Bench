@@ -1,0 +1,744 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Three.js Heightmap Terrain with Rolling Ball Physics</title>
+
+  <script type="importmap">
+  { "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+  } }
+  </script>
+
+  <style>
+    html, body {
+      margin: 0;
+      overflow: hidden;
+      background: #87ceeb;
+      font-family: Arial, sans-serif;
+    }
+
+    #ui {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      z-index: 10;
+      color: white;
+      background: rgba(0,0,0,0.45);
+      padding: 12px;
+      border-radius: 8px;
+      min-width: 260px;
+      user-select: none;
+    }
+
+    #hud {
+      font-size: 14px;
+      line-height: 1.4;
+      margin-bottom: 10px;
+    }
+
+    .row {
+      margin: 8px 0;
+    }
+
+    label {
+      display: block;
+      font-size: 13px;
+      margin-bottom: 4px;
+    }
+
+    input[type="range"] {
+      width: 220px;
+    }
+
+    #help {
+      font-size: 12px;
+      margin-top: 10px;
+      opacity: 0.9;
+    }
+  </style>
+</head>
+<body>
+  <div id="ui">
+    <div id="hud">
+      <div>Ball count: <span id="hud-balls">0</span></div>
+      <div>Total KE: <span id="hud-ke">0.0</span></div>
+      <div>Collisions/frame: <span id="hud-collisions">0</span></div>
+      <div>Terrain seed: <span id="hud-seed">0</span></div>
+      <div>Gravity: <span id="hud-gravity">9.8</span></div>
+      <div>State: <span id="hud-paused">Playing</span></div>
+    </div>
+
+    <div class="row">
+      <label for="slider-gravity">Gravity</label>
+      <input id="slider-gravity" type="range" min="1" max="30" step="1" value="10">
+    </div>
+
+    <div class="row">
+      <label for="slider-friction">Friction</label>
+      <input id="slider-friction" type="range" min="0" max="1" step="0.05" value="0.3">
+    </div>
+
+    <div id="help">
+      Click terrain: spawn ball<br>
+      B: random ball<br>
+      C: clear balls<br>
+      R: regenerate terrain<br>
+      Space: pause/play
+    </div>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+    // ------------------------------------------------------------
+    // Basic setup
+    // ------------------------------------------------------------
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x87ceeb);
+
+    const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 500);
+    camera.position.set(30, 25, 30);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    document.body.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.set(0, 0, 0);
+    controls.enableDamping = true;
+
+    const ambientLight = new THREE.AmbientLight(0x6688aa, 0.5);
+    scene.add(ambientLight);
+
+    const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+    dirLight.position.set(15, 30, 15);
+    dirLight.castShadow = true;
+    dirLight.shadow.mapSize.set(2048, 2048);
+    dirLight.shadow.camera.near = 1;
+    dirLight.shadow.camera.far = 100;
+    dirLight.shadow.camera.left = -30;
+    dirLight.shadow.camera.right = 30;
+    dirLight.shadow.camera.top = 30;
+    dirLight.shadow.camera.bottom = -30;
+    scene.add(dirLight);
+
+    // ------------------------------------------------------------
+    // UI refs
+    // ------------------------------------------------------------
+    const hudBalls = document.getElementById('hud-balls');
+    const hudKE = document.getElementById('hud-ke');
+    const hudCollisions = document.getElementById('hud-collisions');
+    const hudSeed = document.getElementById('hud-seed');
+    const hudGravity = document.getElementById('hud-gravity');
+    const hudPaused = document.getElementById('hud-paused');
+
+    const gravitySlider = document.getElementById('slider-gravity');
+    const frictionSlider = document.getElementById('slider-friction');
+
+    // ------------------------------------------------------------
+    // Texture
+    // ------------------------------------------------------------
+    const textureLoader = new THREE.TextureLoader();
+    const terrainTexture = textureLoader.load(
+      'https://threejs.org/examples/textures/brick_diffuse.jpg'
+    );
+    terrainTexture.wrapS = THREE.RepeatWrapping;
+    terrainTexture.wrapT = THREE.RepeatWrapping;
+    terrainTexture.repeat.set(8, 8);
+    terrainTexture.colorSpace = THREE.SRGBColorSpace;
+
+    // ------------------------------------------------------------
+    // Noise utilities
+    // ------------------------------------------------------------
+    function mulberry32(seed) {
+      return function() {
+        let t = seed += 0x6D2B79F5;
+        t = Math.imul(t ^ (t >>> 15), t | 1);
+        t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+      };
+    }
+
+    class PerlinNoise {
+      constructor(seed = 1) {
+        this.p = new Uint8Array(512);
+        const perm = new Uint8Array(256);
+        for (let i = 0; i < 256; i++) perm[i] = i;
+        const rand = mulberry32(seed);
+
+        for (let i = 255; i > 0; i--) {
+          const j = Math.floor(rand() * (i + 1));
+          [perm[i], perm[j]] = [perm[j], perm[i]];
+        }
+
+        for (let i = 0; i < 512; i++) {
+          this.p[i] = perm[i & 255];
+        }
+      }
+
+      fade(t) {
+        return t * t * t * (t * (t * 6 - 15) + 10);
+      }
+
+      lerp(a, b, t) {
+        return a + (b - a) * t;
+      }
+
+      grad(hash, x, y) {
+        const h = hash & 7;
+        const u = h < 4 ? x : y;
+        const v = h < 4 ? y : x;
+        return ((h & 1) ? -u : u) + ((h & 2) ? -2 * v : 2 * v);
+      }
+
+      noise(x, y) {
+        const X = Math.floor(x) & 255;
+        const Y = Math.floor(y) & 255;
+
+        x -= Math.floor(x);
+        y -= Math.floor(y);
+
+        const u = this.fade(x);
+        const v = this.fade(y);
+
+        const aa = this.p[this.p[X] + Y];
+        const ab = this.p[this.p[X] + Y + 1];
+        const ba = this.p[this.p[X + 1] + Y];
+        const bb = this.p[this.p[X + 1] + Y + 1];
+
+        const g1 = this.grad(aa, x, y);
+        const g2 = this.grad(ba, x - 1, y);
+        const g3 = this.grad(ab, x, y - 1);
+        const g4 = this.grad(bb, x - 1, y - 1);
+
+        const l1 = this.lerp(g1, g2, u);
+        const l2 = this.lerp(g3, g4, u);
+        return this.lerp(l1, l2, v) * 0.5;
+      }
+
+      octaveNoise(x, y, octaves = 3, persistence = 0.5, lacunarity = 2.0) {
+        let amplitude = 1;
+        let frequency = 1;
+        let total = 0;
+        let maxValue = 0;
+
+        for (let i = 0; i < octaves; i++) {
+          total += this.noise(x * frequency, y * frequency) * amplitude;
+          maxValue += amplitude;
+          amplitude *= persistence;
+          frequency *= lacunarity;
+        }
+
+        return total / maxValue;
+      }
+    }
+
+    // ------------------------------------------------------------
+    // Terrain data
+    // ------------------------------------------------------------
+    const TERRAIN_SIZE = 40;
+    const TERRAIN_SEGMENTS = 64;
+    const GRID_RES = TERRAIN_SEGMENTS + 1;
+    const HALF_SIZE = TERRAIN_SIZE / 2;
+
+    let terrainMesh = null;
+    let terrainGeometry = null;
+    let terrainSeed = Math.floor(Math.random() * 1000000);
+    let terrainNoise = null;
+    let heightField = [];
+    let normalField = [];
+
+    const terrainMaterial = new THREE.MeshStandardMaterial({
+      map: terrainTexture,
+      vertexColors: true,
+      roughness: 1.0,
+      metalness: 0.0
+    });
+
+    function terrainIndex(ix, iz) {
+      return iz * GRID_RES + ix;
+    }
+
+    function generateTerrain() {
+      if (terrainMesh) {
+        scene.remove(terrainMesh);
+        terrainGeometry.dispose();
+      }
+
+      terrainSeed = Math.floor(Math.random() * 1000000);
+      terrainNoise = new PerlinNoise(terrainSeed);
+
+      terrainGeometry = new THREE.PlaneGeometry(
+        TERRAIN_SIZE,
+        TERRAIN_SIZE,
+        TERRAIN_SEGMENTS,
+        TERRAIN_SEGMENTS
+      );
+      terrainGeometry.rotateX(-Math.PI / 2);
+
+      const pos = terrainGeometry.attributes.position;
+      const colors = [];
+      heightField = new Array(GRID_RES * GRID_RES);
+      normalField = new Array(GRID_RES * GRID_RES);
+
+      let minH = Infinity;
+      let maxH = -Infinity;
+
+      for (let iz = 0; iz < GRID_RES; iz++) {
+        for (let ix = 0; ix < GRID_RES; ix++) {
+          const idx = terrainIndex(ix, iz);
+          const vx = pos.getX(idx);
+          const vz = pos.getZ(idx);
+
+          const nx = (vx + 1000) * 0.08;
+          const nz = (vz + 1000) * 0.08;
+
+          let h = terrainNoise.octaveNoise(nx, nz, 3, 0.5, 2.0);
+          h = (h + 1) * 0.5;
+          h = Math.pow(h, 1.25) * 6.0;
+
+          pos.setY(idx, h);
+          heightField[idx] = h;
+
+          minH = Math.min(minH, h);
+          maxH = Math.max(maxH, h);
+        }
+      }
+
+      // Vertex colors
+      const lowColor = new THREE.Color(0x336633);
+      const midColor = new THREE.Color(0x886644);
+      const highColor = new THREE.Color(0xeeeeff);
+      const c = new THREE.Color();
+
+      for (let i = 0; i < pos.count; i++) {
+        const h = pos.getY(i);
+        const t = (h - minH) / Math.max(0.0001, (maxH - minH));
+
+        if (t < 0.5) {
+          c.copy(lowColor).lerp(midColor, t / 0.5);
+        } else {
+          c.copy(midColor).lerp(highColor, (t - 0.5) / 0.5);
+        }
+
+        colors.push(c.r, c.g, c.b);
+      }
+
+      terrainGeometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+      terrainGeometry.computeVertexNormals();
+
+      const normalsAttr = terrainGeometry.attributes.normal;
+      for (let i = 0; i < normalsAttr.count; i++) {
+        normalField[i] = new THREE.Vector3(
+          normalsAttr.getX(i),
+          normalsAttr.getY(i),
+          normalsAttr.getZ(i)
+        ).normalize();
+      }
+
+      terrainMesh = new THREE.Mesh(terrainGeometry, terrainMaterial);
+      terrainMesh.castShadow = true;
+      terrainMesh.receiveShadow = true;
+      scene.add(terrainMesh);
+
+      hudSeed.textContent = terrainSeed;
+    }
+
+    function clamp(v, a, b) {
+      return Math.max(a, Math.min(b, v));
+    }
+
+    function getGridCoords(x, z) {
+      const fx = ((x + HALF_SIZE) / TERRAIN_SIZE) * TERRAIN_SEGMENTS;
+      const fz = ((z + HALF_SIZE) / TERRAIN_SIZE) * TERRAIN_SEGMENTS;
+      return {
+        fx: clamp(fx, 0, TERRAIN_SEGMENTS),
+        fz: clamp(fz, 0, TERRAIN_SEGMENTS)
+      };
+    }
+
+    function sampleTerrainHeight(x, z) {
+      const { fx, fz } = getGridCoords(x, z);
+
+      const x0 = Math.floor(fx);
+      const z0 = Math.floor(fz);
+      const x1 = Math.min(x0 + 1, TERRAIN_SEGMENTS);
+      const z1 = Math.min(z0 + 1, TERRAIN_SEGMENTS);
+
+      const tx = fx - x0;
+      const tz = fz - z0;
+
+      const h00 = heightField[terrainIndex(x0, z0)];
+      const h10 = heightField[terrainIndex(x1, z0)];
+      const h01 = heightField[terrainIndex(x0, z1)];
+      const h11 = heightField[terrainIndex(x1, z1)];
+
+      const hx0 = THREE.MathUtils.lerp(h00, h10, tx);
+      const hx1 = THREE.MathUtils.lerp(h01, h11, tx);
+      return THREE.MathUtils.lerp(hx0, hx1, tz);
+    }
+
+    function sampleTerrainNormal(x, z) {
+      const { fx, fz } = getGridCoords(x, z);
+
+      const x0 = Math.floor(fx);
+      const z0 = Math.floor(fz);
+      const x1 = Math.min(x0 + 1, TERRAIN_SEGMENTS);
+      const z1 = Math.min(z0 + 1, TERRAIN_SEGMENTS);
+
+      const tx = fx - x0;
+      const tz = fz - z0;
+
+      const n00 = normalField[terrainIndex(x0, z0)];
+      const n10 = normalField[terrainIndex(x1, z0)];
+      const n01 = normalField[terrainIndex(x0, z1)];
+      const n11 = normalField[terrainIndex(x1, z1)];
+
+      const nx0 = new THREE.Vector3().copy(n00).lerp(n10, tx);
+      const nx1 = new THREE.Vector3().copy(n01).lerp(n11, tx);
+      return nx0.lerp(nx1, tz).normalize();
+    }
+
+    // ------------------------------------------------------------
+    // Balls
+    // ------------------------------------------------------------
+    const MAX_BALLS = 20;
+    const BALL_RADIUS = 0.4;
+    const BALL_MASS = 1.0;
+    const BALL_PALETTE = [0xff4444, 0x44ff44, 0x4444ff, 0xffff44, 0xff44ff];
+
+    const ballGeometry = new THREE.SphereGeometry(BALL_RADIUS, 24, 24);
+    const balls = [];
+
+    function randomPaletteColor() {
+      return BALL_PALETTE[Math.floor(Math.random() * BALL_PALETTE.length)];
+    }
+
+    function createBall(position) {
+      if (balls.length >= MAX_BALLS) return;
+
+      const material = new THREE.MeshStandardMaterial({
+        color: randomPaletteColor(),
+        metalness: 0.3,
+        roughness: 0.5
+      });
+
+      const mesh = new THREE.Mesh(ballGeometry, material);
+      mesh.castShadow = true;
+      mesh.receiveShadow = true;
+      mesh.position.copy(position);
+      scene.add(mesh);
+
+      balls.push({
+        mesh,
+        position: mesh.position.clone(),
+        previous: mesh.position.clone(),
+        acceleration: new THREE.Vector3(),
+        radius: BALL_RADIUS,
+        mass: BALL_MASS
+      });
+    }
+
+    function clearBalls() {
+      for (const b of balls) {
+        scene.remove(b.mesh);
+        b.mesh.material.dispose();
+      }
+      balls.length = 0;
+    }
+
+    function spawnRandomBall() {
+      if (balls.length >= MAX_BALLS) return;
+      const x = THREE.MathUtils.randFloat(-15, 15);
+      const z = THREE.MathUtils.randFloat(-15, 15);
+      const y = sampleTerrainHeight(x, z) + 5;
+      createBall(new THREE.Vector3(x, y, z));
+    }
+
+    // ------------------------------------------------------------
+    // Physics
+    // ------------------------------------------------------------
+    let isPaused = false;
+    let frameCount = 0;
+    let collisionsThisFrame = 0;
+
+    function getGravityValue() {
+      return parseFloat(gravitySlider.value);
+    }
+
+    function getFrictionValue() {
+      return parseFloat(frictionSlider.value);
+    }
+
+    function getVelocity(ball, dt) {
+      return ball.position.clone().sub(ball.previous).divideScalar(dt);
+    }
+
+    function setVelocity(ball, velocity, dt) {
+      ball.previous.copy(ball.position).sub(velocity.clone().multiplyScalar(dt));
+    }
+
+    function integrateBall(ball, dt, gravityMag) {
+      const gravity = new THREE.Vector3(0, -gravityMag, 0);
+      const velocity = ball.position.clone().sub(ball.previous);
+      const next = ball.position.clone()
+        .add(velocity)
+        .add(gravity.multiplyScalar(dt * dt));
+
+      ball.previous.copy(ball.position);
+      ball.position.copy(next);
+    }
+
+    function solveTerrainCollision(ball, dt, gravityMag, friction, restitution) {
+      const terrainHeight = sampleTerrainHeight(ball.position.x, ball.position.z);
+      const n = sampleTerrainNormal(ball.position.x, ball.position.z);
+
+      if (ball.position.y - ball.radius < terrainHeight) {
+        ball.position.y = terrainHeight + ball.radius;
+
+        let velocity = getVelocity(ball, dt);
+
+        const vn = n.clone().multiplyScalar(velocity.dot(n));
+        const vt = velocity.clone().sub(vn);
+
+        if (velocity.dot(n) < 0) {
+          velocity = vt.multiplyScalar(1 - friction).sub(vn.multiplyScalar(restitution));
+        } else {
+          velocity = vt.multiplyScalar(1 - friction).add(vn);
+        }
+
+        // downhill acceleration from gravity projected onto tangent plane
+        const g = new THREE.Vector3(0, -gravityMag, 0);
+        const tangentG = g.clone().sub(n.clone().multiplyScalar(g.dot(n)));
+        velocity.add(tangentG.multiplyScalar(dt));
+
+        setVelocity(ball, velocity, dt);
+      }
+    }
+
+    function solveBallBallCollisions(dt) {
+      for (let i = 0; i < balls.length; i++) {
+        for (let j = i + 1; j < balls.length; j++) {
+          const a = balls[i];
+          const b = balls[j];
+
+          const delta = b.position.clone().sub(a.position);
+          let dist = delta.length();
+          const minDist = a.radius + b.radius;
+
+          if (dist < minDist) {
+            collisionsThisFrame++;
+
+            if (dist < 1e-8) {
+              delta.set(1, 0, 0);
+              dist = 1e-8;
+            }
+
+            const normal = delta.clone().divideScalar(dist);
+            const penetration = minDist - dist;
+
+            // Positional correction
+            const correction = normal.clone().multiplyScalar(penetration * 0.5);
+            a.position.addScaledVector(correction, -1);
+            b.position.add(correction);
+
+            let va = getVelocity(a, dt);
+            let vb = getVelocity(b, dt);
+
+            const relVel = vb.clone().sub(va);
+            const velAlongNormal = relVel.dot(normal);
+
+            if (velAlongNormal < 0) {
+              const restitution = 0.7;
+              const jImpulse = -(1 + restitution) * velAlongNormal / (1 / a.mass + 1 / b.mass);
+              const impulse = normal.clone().multiplyScalar(jImpulse);
+
+              va.addScaledVector(impulse, -1 / a.mass);
+              vb.addScaledVector(impulse,  1 / b.mass);
+
+              setVelocity(a, va, dt);
+              setVelocity(b, vb, dt);
+            }
+          }
+        }
+      }
+    }
+
+    function physicsStep(dt) {
+      const gravityMag = getGravityValue();
+      const friction = getFrictionValue();
+
+      for (const ball of balls) {
+        integrateBall(ball, dt, gravityMag);
+      }
+
+      for (const ball of balls) {
+        solveTerrainCollision(ball, dt, gravityMag, friction, 0.4);
+      }
+
+      solveBallBallCollisions(dt);
+
+      for (const ball of balls) {
+        // keep within terrain footprint bounds
+        ball.position.x = clamp(ball.position.x, -HALF_SIZE + ball.radius, HALF_SIZE - ball.radius);
+        ball.position.z = clamp(ball.position.z, -HALF_SIZE + ball.radius, HALF_SIZE - ball.radius);
+
+        // secondary terrain correction after ball-ball pushes
+        solveTerrainCollision(ball, dt, gravityMag, friction, 0.4);
+
+        ball.mesh.position.copy(ball.position);
+      }
+    }
+
+    // ------------------------------------------------------------
+    // Interaction
+    // ------------------------------------------------------------
+    const raycaster = new THREE.Raycaster();
+    const mouse = new THREE.Vector2();
+
+    function onPointerDown(event) {
+      mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+      mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+      raycaster.setFromCamera(mouse, camera);
+      const hits = terrainMesh ? raycaster.intersectObject(terrainMesh, false) : [];
+      if (hits.length > 0 && balls.length < MAX_BALLS) {
+        const p = hits[0].point.clone();
+        p.y += 5;
+        createBall(p);
+      }
+    }
+
+    window.addEventListener('pointerdown', onPointerDown);
+
+    window.addEventListener('keydown', (e) => {
+      if (e.code === 'KeyB') {
+        spawnRandomBall();
+      } else if (e.code === 'KeyC') {
+        clearBalls();
+      } else if (e.code === 'KeyR') {
+        generateTerrain();
+      } else if (e.code === 'Space') {
+        e.preventDefault();
+        isPaused = !isPaused;
+      }
+    });
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    // ------------------------------------------------------------
+    // State / HUD
+    // ------------------------------------------------------------
+    window.__3D_STATE__ = {
+      ballCount: 0,
+      totalKE: 0,
+      collisionsThisFrame: 0,
+      terrainSeed: terrainSeed,
+      gravity: getGravityValue(),
+      friction: getFrictionValue(),
+      isPaused: isPaused,
+      frameCount: 0,
+      ballsValid: true,
+      allBallsAboveTerrain: true,
+      avgBallY: 0
+    };
+
+    function updateHUDAndState(dt) {
+      let totalKE = 0;
+      let ballsValid = true;
+      let allBallsAboveTerrain = true;
+      let avgBallY = 0;
+
+      for (const ball of balls) {
+        const vel = getVelocity(ball, dt);
+        const speedSq = vel.lengthSq();
+        totalKE += 0.5 * ball.mass * speedSq;
+
+        if (
+          !Number.isFinite(ball.position.x) ||
+          !Number.isFinite(ball.position.y) ||
+          !Number.isFinite(ball.position.z)
+        ) {
+          ballsValid = false;
+        }
+
+        const th = sampleTerrainHeight(ball.position.x, ball.position.z);
+        if (ball.position.y < th - 0.1) {
+          allBallsAboveTerrain = false;
+        }
+
+        avgBallY += ball.position.y;
+      }
+
+      avgBallY = balls.length > 0 ? avgBallY / balls.length : 0;
+
+      hudBalls.textContent = balls.length;
+      hudKE.textContent = totalKE.toFixed(1);
+      hudCollisions.textContent = collisionsThisFrame;
+      hudSeed.textContent = terrainSeed;
+      hudGravity.textContent = getGravityValue().toFixed(1);
+      hudPaused.textContent = isPaused ? 'Paused' : 'Playing';
+
+      window.__3D_STATE__ = {
+        ballCount: balls.length,
+        totalKE: Math.round(totalKE * 1000) / 1000,
+        collisionsThisFrame,
+        terrainSeed,
+        gravity: getGravityValue(),
+        friction: getFrictionValue(),
+        isPaused,
+        frameCount,
+        ballsValid,
+        allBallsAboveTerrain,
+        avgBallY: Math.round(avgBallY * 100) / 100
+      };
+    }
+
+    // ------------------------------------------------------------
+    // Init
+    // ------------------------------------------------------------
+    generateTerrain();
+
+    // Some starter balls
+    for (let i = 0; i < 5; i++) {
+      spawnRandomBall();
+    }
+
+    // ------------------------------------------------------------
+    // Animation loop
+    // ------------------------------------------------------------
+    const FIXED_DT = 1 / 60;
+    const SUBSTEPS = 3;
+
+    function animate() {
+      requestAnimationFrame(animate);
+      frameCount++;
+      collisionsThisFrame = 0;
+
+      controls.update();
+
+      if (!isPaused) {
+        for (let i = 0; i < SUBSTEPS; i++) {
+          physicsStep(FIXED_DT / SUBSTEPS);
+        }
+      }
+
+      updateHUDAndState(FIXED_DT / SUBSTEPS);
+      renderer.render(scene, camera);
+    }
+
+    animate();
+  </script>
+</body>
+</html>

@@ -1,0 +1,805 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>3D Magnetic Field Lines Learning Tool</title>
+  <style>
+    html, body {
+      margin: 0;
+      overflow: hidden;
+      background: #0a0a1a;
+      font-family: monospace;
+      color: white;
+    }
+    #app {
+      width: 100vw;
+      height: 100vh;
+      display: block;
+      position: relative;
+    }
+    .hud {
+      position: absolute;
+      background: rgba(10, 10, 26, 0.72);
+      color: white;
+      padding: 10px 12px;
+      border: 1px solid rgba(255,255,255,0.12);
+      border-radius: 8px;
+      pointer-events: auto;
+      user-select: none;
+      white-space: pre-line;
+      line-height: 1.4;
+    }
+    #hudLeft { top: 10px; left: 10px; min-width: 190px; }
+    #hudRight { top: 10px; right: 10px; min-width: 170px; text-align: right; }
+    #hudBottom {
+      bottom: 10px;
+      left: 50%;
+      transform: translateX(-50%);
+      max-width: 760px;
+      text-align: center;
+    }
+    #quizControls {
+      margin-top: 8px;
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    button {
+      background: rgba(255,255,255,0.08);
+      color: white;
+      border: 1px solid rgba(255,255,255,0.2);
+      border-radius: 6px;
+      padding: 8px 10px;
+      cursor: pointer;
+      font-family: monospace;
+    }
+    button:hover {
+      background: rgba(255,255,255,0.14);
+    }
+    #fieldLabel {
+      position: absolute;
+      background: rgba(0,0,0,0.75);
+      color: #aeeeff;
+      padding: 4px 6px;
+      border-radius: 6px;
+      font-size: 12px;
+      pointer-events: none;
+      display: none;
+      border: 1px solid rgba(255,255,255,0.1);
+      transform: translate(12px, 12px);
+    }
+  </style>
+</head>
+<body>
+  <div id="app"></div>
+
+  <div id="hudLeft" class="hud">
+    <div id="statsText"></div>
+    <div id="quizPrompt" style="margin-top:8px;"></div>
+    <div id="quizControls">
+      <button id="quizBtn">Start Quiz</button>
+      <button id="endQuizBtn" style="display:none;">End Quiz</button>
+    </div>
+  </div>
+
+  <div id="hudRight" class="hud">
+    <div id="quizScoreText">Quiz Score: 0/0</div>
+    <div id="quizResultText" style="margin-top:8px;"></div>
+  </div>
+
+  <div id="hudBottom" class="hud">
+    <div id="instructionsText">
+      Drag dipoles on the ground plane. Click a dipole to select it, then press R/T to rotate.
+      Press 1-5 to change difficulty. Hover to inspect |B|. Use mouse to orbit/zoom.
+    </div>
+  </div>
+
+  <div id="fieldLabel"></div>
+
+  <script type="module">
+    import * as THREE from 'https://unpkg.com/three@0.159.0/build/three.module.js';
+    import { OrbitControls } from 'https://unpkg.com/three@0.159.0/examples/jsm/controls/OrbitControls.js';
+
+    const app = document.getElementById('app');
+    const statsText = document.getElementById('statsText');
+    const quizScoreText = document.getElementById('quizScoreText');
+    const quizResultText = document.getElementById('quizResultText');
+    const quizPrompt = document.getElementById('quizPrompt');
+    const instructionsText = document.getElementById('instructionsText');
+    const quizBtn = document.getElementById('quizBtn');
+    const endQuizBtn = document.getElementById('endQuizBtn');
+    const fieldLabel = document.getElementById('fieldLabel');
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0a0a1a);
+
+    const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+    camera.position.set(0, 8, 15);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    app.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.target.set(0, 0.8, 0);
+
+    const ambient = new THREE.AmbientLight(0x334466, 0.4);
+    scene.add(ambient);
+
+    const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+    dirLight.position.set(5, 10, 5);
+    scene.add(dirLight);
+
+    const grid = new THREE.GridHelper(20, 20, 0x222244, 0x222244);
+    grid.position.y = 0;
+    grid.material.opacity = 0.45;
+    grid.material.transparent = true;
+    scene.add(grid);
+
+    const groundPlane = new THREE.Mesh(
+      new THREE.PlaneGeometry(40, 40),
+      new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: 0, side: THREE.DoubleSide })
+    );
+    groundPlane.rotation.x = -Math.PI / 2;
+    groundPlane.position.y = 0;
+    scene.add(groundPlane);
+
+    const raycaster = new THREE.Raycaster();
+    const mouse = new THREE.Vector2();
+
+    const MU = 1.0;
+    const DIPOLE_MOMENT_MAG = 2.2;
+    const NORTH_LOCAL = new THREE.Vector3(0, 0.75, 0);
+    const SOUTH_LOCAL = new THREE.Vector3(0, -0.75, 0);
+    const FIELD_STEP = 0.15;
+    const FIELD_MAX_STEPS = 200;
+    const FIELD_STOP_RADIUS = 0.4;
+    const FIELD_MAX_RADIUS = 12;
+    const BASE_SEED_RADIUS = 0.24;
+
+    let dipoles = [];
+    let selectedDipoleIndex = -1;
+    let hoveredPoint = null;
+    let isDragging = false;
+    let dragOffset = new THREE.Vector3();
+    let dragPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+    let fieldLineGroup = new THREE.Group();
+    scene.add(fieldLineGroup);
+    let arrowGroup = new THREE.Group();
+    scene.add(arrowGroup);
+
+    let fieldArrowHelpers = [];
+    let regenTimer = null;
+
+    let difficultyLevel = 1;
+
+    const difficultyConfig = {
+      1: { dipoles: 2, linesPerDipole: 8, arrows: false },
+      2: { dipoles: 2, linesPerDipole: 12, arrows: false },
+      3: { dipoles: 3, linesPerDipole: 10, arrows: false },
+      4: { dipoles: 4, linesPerDipole: 10, arrows: false },
+      5: { dipoles: 4, linesPerDipole: 14, arrows: true }
+    };
+
+    const baseDipoleConfigs = [
+      { pos: new THREE.Vector3(-3, 0.75, 0), rotY: 0 },
+      { pos: new THREE.Vector3( 3, 0.75, 0), rotY: 0 },
+      { pos: new THREE.Vector3( 0, 0.75, 3), rotY: 0 },
+      { pos: new THREE.Vector3( 0, 0.75,-3), rotY: 0 }
+    ];
+
+    let quizState = {
+      active: false,
+      answered: false,
+      targetPoint: null,
+      targetMesh: null,
+      actualArrow: null,
+      guessArrow: null,
+      quizzesTaken: 0,
+      quizCorrectCount: 0,
+      lastAngularError: NaN
+    };
+
+    window.__3D_STATE__ = {
+      difficultyLevel: 1,
+      dipoleCount: 0,
+      fieldLineCount: 0,
+      dipolePositions: [],
+      dipoleRotations: [],
+      selectedDipoleIndex: -1,
+      quizActive: false,
+      quizzesTaken: 0,
+      quizCorrectCount: 0,
+      lastQuizAngularError: NaN,
+      fieldMagnitudeAtOrigin: 0,
+      isDragging: false,
+      cameraDistance: 0
+    };
+
+    function createDipole() {
+      const group = new THREE.Group();
+
+      const matN = new THREE.MeshStandardMaterial({ color: 0xff3333, roughness: 0.45, metalness: 0.1 });
+      const matM = new THREE.MeshStandardMaterial({ color: 0x888888, roughness: 0.6, metalness: 0.2 });
+      const matS = new THREE.MeshStandardMaterial({ color: 0x3333ff, roughness: 0.45, metalness: 0.1 });
+
+      const geom = new THREE.CylinderGeometry(0.3, 0.3, 0.5, 24);
+      const midGeom = new THREE.CylinderGeometry(0.3, 0.3, 0.5, 24);
+
+      const north = new THREE.Mesh(geom, matN);
+      north.position.y = 0.5;
+      const mid = new THREE.Mesh(midGeom, matM);
+      mid.position.y = 0.0;
+      const south = new THREE.Mesh(geom, matS);
+      south.position.y = -0.5;
+
+      const pickGeom = new THREE.CylinderGeometry(0.42, 0.42, 1.5, 24);
+      const pickMat = new THREE.MeshBasicMaterial({ transparent: true, opacity: 0.0 });
+      const picker = new THREE.Mesh(pickGeom, pickMat);
+      picker.userData.isDipolePicker = true;
+
+      group.add(north, mid, south, picker);
+
+      group.userData.northMesh = north;
+      group.userData.southMesh = south;
+      group.userData.middleMesh = mid;
+      group.userData.picker = picker;
+
+      scene.add(group);
+      return group;
+    }
+
+    function configureDifficulty(level) {
+      difficultyLevel = level;
+      const cfg = difficultyConfig[level];
+
+      while (dipoles.length < cfg.dipoles) {
+        dipoles.push(createDipole());
+      }
+      for (let i = 0; i < dipoles.length; i++) {
+        dipoles[i].visible = i < cfg.dipoles;
+        if (i < cfg.dipoles && !dipoles[i].userData.initialized) {
+          dipoles[i].position.copy(baseDipoleConfigs[i].pos);
+          dipoles[i].rotation.y = baseDipoleConfigs[i].rotY;
+          dipoles[i].userData.initialized = true;
+        }
+      }
+      if (selectedDipoleIndex >= cfg.dipoles) selectedDipoleIndex = -1;
+      scheduleFieldRegeneration();
+      updateHUD();
+    }
+
+    function getActiveDipoles() {
+      return dipoles.filter(d => d.visible);
+    }
+
+    function dipoleMoment(group) {
+      const m = new THREE.Vector3(0, DIPOLE_MOMENT_MAG, 0);
+      m.applyAxisAngle(new THREE.Vector3(0,1,0), group.rotation.y);
+      return m;
+    }
+
+    function getPoleWorldPosition(group, localVec) {
+      return group.localToWorld(localVec.clone());
+    }
+
+    function finiteVec(v) {
+      return Number.isFinite(v.x) && Number.isFinite(v.y) && Number.isFinite(v.z);
+    }
+
+    function computeFieldAt(point) {
+      const B = new THREE.Vector3(0,0,0);
+      const active = getActiveDipoles();
+
+      for (const d of active) {
+        const center = d.position.clone();
+        const r = point.clone().sub(center);
+        const rLen = r.length();
+
+        if (rLen < 0.25) continue;
+
+        const rHat = r.clone().divideScalar(rLen);
+        const m = dipoleMoment(d);
+        const mdotr = m.dot(rHat);
+
+        const term = rHat.clone().multiplyScalar(3 * mdotr).sub(m);
+        const scale = (MU / (4 * Math.PI)) / Math.max(rLen * rLen * rLen, 1e-4);
+        term.multiplyScalar(scale);
+
+        if (finiteVec(term)) B.add(term);
+      }
+
+      if (!finiteVec(B)) return new THREE.Vector3(0,0,0);
+      return B;
+    }
+
+    function rk4Step(pos, h) {
+      const dir = p => {
+        const b = computeFieldAt(p);
+        const len = b.length();
+        if (len < 1e-8 || !Number.isFinite(len)) return new THREE.Vector3(0,0,0);
+        return b.divideScalar(len);
+      };
+
+      const k1 = dir(pos);
+      const k2 = dir(pos.clone().add(k1.clone().multiplyScalar(h * 0.5)));
+      const k3 = dir(pos.clone().add(k2.clone().multiplyScalar(h * 0.5)));
+      const k4 = dir(pos.clone().add(k3.clone().multiplyScalar(h)));
+
+      const delta = k1.clone()
+        .add(k2.clone().multiplyScalar(2))
+        .add(k3.clone().multiplyScalar(2))
+        .add(k4)
+        .multiplyScalar(h / 6);
+
+      const next = pos.clone().add(delta);
+      if (!finiteVec(next)) return pos.clone();
+      return next;
+    }
+
+    function getSouthPoles() {
+      return getActiveDipoles().map(d => getPoleWorldPosition(d, SOUTH_LOCAL));
+    }
+
+    function traceFieldLine(seed) {
+      const points = [];
+      const mags = [];
+      const southPoles = getSouthPoles();
+      let p = seed.clone();
+
+      for (let i = 0; i < FIELD_MAX_STEPS; i++) {
+        if (!finiteVec(p)) break;
+
+        const B = computeFieldAt(p);
+        const mag = B.length();
+
+        if (!Number.isFinite(mag)) break;
+        points.push(p.clone());
+        mags.push(mag);
+
+        if (p.length() > FIELD_MAX_RADIUS) break;
+
+        let nearSouth = false;
+        for (const s of southPoles) {
+          if (p.distanceTo(s) < FIELD_STOP_RADIUS) {
+            nearSouth = true;
+            break;
+          }
+        }
+        if (nearSouth) break;
+
+        const next = rk4Step(p, FIELD_STEP);
+        if (next.distanceToSquared(p) < 1e-8) break;
+        p = next;
+      }
+
+      return { points, mags };
+    }
+
+    function colorFromMagnitude(mag, minMag, maxMag) {
+      let t = 0;
+      if (maxMag > minMag) t = (mag - minMag) / (maxMag - minMag);
+      t = THREE.MathUtils.clamp(t, 0, 1);
+
+      const cool = new THREE.Color(0x33ccff);
+      const mid = new THREE.Color(0xffcc33);
+      const warm = new THREE.Color(0xff8833);
+
+      if (t < 0.5) {
+        return cool.clone().lerp(mid, t * 2.0);
+      } else {
+        return mid.clone().lerp(warm, (t - 0.5) * 2.0);
+      }
+    }
+
+    function clearFieldLines() {
+      while (fieldLineGroup.children.length) {
+        const obj = fieldLineGroup.children.pop();
+        if (obj.geometry) obj.geometry.dispose();
+        if (obj.material) {
+          if (Array.isArray(obj.material)) obj.material.forEach(m => m.dispose());
+          else obj.material.dispose();
+        }
+      }
+    }
+
+    function clearFieldArrows() {
+      for (const a of fieldArrowHelpers) scene.remove(a);
+      fieldArrowHelpers = [];
+    }
+
+    function generateFieldArrows() {
+      clearFieldArrows();
+      if (!difficultyConfig[difficultyLevel].arrows || quizState.active) return;
+
+      const size = 5;
+      const spacing = 3;
+      for (let ix = 0; ix < size; ix++) {
+        for (let iz = 0; iz < size; iz++) {
+          const x = (ix - 2) * spacing;
+          const z = (iz - 2) * spacing;
+          const p = new THREE.Vector3(x, 0.5, z);
+          const B = computeFieldAt(p);
+          const mag = B.length();
+          if (mag < 1e-6 || !Number.isFinite(mag)) continue;
+          const dir = B.clone().normalize();
+          const len = THREE.MathUtils.clamp(0.4 + mag * 0.8, 0.4, 1.6);
+          const arrow = new THREE.ArrowHelper(dir, p, len, 0x88ffcc, len * 0.35, len * 0.2);
+          scene.add(arrow);
+          fieldArrowHelpers.push(arrow);
+        }
+      }
+    }
+
+    function generateFieldLines() {
+      clearFieldLines();
+      generateFieldArrows();
+
+      if (quizState.active) return;
+
+      const cfg = difficultyConfig[difficultyLevel];
+      const active = getActiveDipoles();
+      const allLines = [];
+
+      for (const d of active) {
+        const north = getPoleWorldPosition(d, NORTH_LOCAL);
+        const up = new THREE.Vector3(0,1,0).applyAxisAngle(new THREE.Vector3(0,1,0), d.rotation.y);
+        const basis1 = new THREE.Vector3(1,0,0).applyAxisAngle(new THREE.Vector3(0,1,0), d.rotation.y);
+        const basis2 = new THREE.Vector3(0,0,1).applyAxisAngle(new THREE.Vector3(0,1,0), d.rotation.y);
+
+        for (let i = 0; i < cfg.linesPerDipole; i++) {
+          const a = (i / cfg.linesPerDipole) * Math.PI * 2;
+          const offset = basis1.clone().multiplyScalar(Math.cos(a) * BASE_SEED_RADIUS)
+            .add(basis2.clone().multiplyScalar(Math.sin(a) * BASE_SEED_RADIUS))
+            .add(up.clone().multiplyScalar(0.06));
+          const seed = north.clone().add(offset);
+          const traced = traceFieldLine(seed);
+          if (traced.points.length > 2) allLines.push(traced);
+        }
+      }
+
+      let minMag = Infinity;
+      let maxMag = 0;
+      for (const line of allLines) {
+        for (const m of line.mags) {
+          if (Number.isFinite(m)) {
+            minMag = Math.min(minMag, m);
+            maxMag = Math.max(maxMag, m);
+          }
+        }
+      }
+      if (!Number.isFinite(minMag)) minMag = 0;
+      if (!Number.isFinite(maxMag) || maxMag <= 0) maxMag = 1;
+
+      for (const line of allLines) {
+        const pts = line.points;
+        const positions = new Float32Array(pts.length * 3);
+        const colors = new Float32Array(pts.length * 3);
+
+        for (let i = 0; i < pts.length; i++) {
+          positions[i*3+0] = pts[i].x;
+          positions[i*3+1] = pts[i].y;
+          positions[i*3+2] = pts[i].z;
+
+          const c = colorFromMagnitude(line.mags[i], minMag, maxMag);
+          colors[i*3+0] = c.r;
+          colors[i*3+1] = c.g;
+          colors[i*3+2] = c.b;
+        }
+
+        const geo = new THREE.BufferGeometry();
+        geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+        geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+        const mat = new THREE.LineBasicMaterial({
+          vertexColors: true,
+          transparent: true,
+          opacity: 0.95
+        });
+
+        const curve = new THREE.Line(geo, mat);
+        fieldLineGroup.add(curve);
+      }
+
+      updateHUD();
+    }
+
+    function scheduleFieldRegeneration() {
+      if (regenTimer) clearTimeout(regenTimer);
+      regenTimer = setTimeout(() => {
+        generateFieldLines();
+      }, 80);
+    }
+
+    function updateHUD() {
+      const cfg = difficultyConfig[difficultyLevel];
+      const active = getActiveDipoles();
+      statsText.textContent =
+`Difficulty: ${difficultyLevel}
+Dipoles: ${active.length}
+Field Lines: ${quizState.active ? 0 : fieldLineGroup.children.length}`;
+
+      if (quizState.active) {
+        quizScoreText.textContent = `Quiz Score: ${quizState.quizCorrectCount}/${quizState.quizzesTaken}`;
+      } else {
+        quizScoreText.textContent = `Quiz Score: ${quizState.quizCorrectCount}/${quizState.quizzesTaken}`;
+      }
+
+      if (!quizState.active) {
+        quizPrompt.textContent = '';
+        quizResultText.textContent = '';
+      }
+    }
+
+    function setSelectedDipole(index) {
+      selectedDipoleIndex = index;
+      dipoles.forEach((d, i) => {
+        const scale = i === index ? 1.08 : 1.0;
+        d.scale.setScalar(scale);
+      });
+    }
+
+    function screenToNDC(event) {
+      const rect = renderer.domElement.getBoundingClientRect();
+      mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+      mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+    }
+
+    function pickDipole(event) {
+      screenToNDC(event);
+      raycaster.setFromCamera(mouse, camera);
+      const activePickers = getActiveDipoles().map(d => d.userData.picker);
+      const hits = raycaster.intersectObjects(activePickers, false);
+      if (hits.length) {
+        const picker = hits[0].object;
+        const idx = dipoles.findIndex(d => d.userData.picker === picker);
+        return idx;
+      }
+      return -1;
+    }
+
+    function getGroundPoint(event, y = 0) {
+      screenToNDC(event);
+      raycaster.setFromCamera(mouse, camera);
+      const plane = new THREE.Plane(new THREE.Vector3(0,1,0), -y);
+      const out = new THREE.Vector3();
+      const ok = raycaster.ray.intersectPlane(plane, out);
+      return ok ? out : null;
+    }
+
+    function startQuiz() {
+      quizState.active = true;
+      quizState.answered = false;
+      clearQuizVisuals();
+      clearFieldLines();
+      clearFieldArrows();
+      spawnQuizTarget();
+      quizBtn.textContent = 'Next Question';
+      endQuizBtn.style.display = 'inline-block';
+      quizPrompt.textContent = 'Click to indicate field direction at the green point';
+      quizResultText.textContent = '';
+      updateHUD();
+    }
+
+    function endQuiz() {
+      quizState.active = false;
+      quizState.answered = false;
+      clearQuizVisuals();
+      quizBtn.textContent = 'Start Quiz';
+      endQuizBtn.style.display = 'none';
+      quizPrompt.textContent = '';
+      quizResultText.textContent = '';
+      scheduleFieldRegeneration();
+      updateHUD();
+    }
+
+    function clearQuizVisuals() {
+      if (quizState.targetMesh) {
+        scene.remove(quizState.targetMesh);
+        quizState.targetMesh.geometry.dispose();
+        quizState.targetMesh.material.dispose();
+        quizState.targetMesh = null;
+      }
+      if (quizState.actualArrow) {
+        scene.remove(quizState.actualArrow);
+        quizState.actualArrow = null;
+      }
+      if (quizState.guessArrow) {
+        scene.remove(quizState.guessArrow);
+        quizState.guessArrow = null;
+      }
+      quizState.targetPoint = null;
+    }
+
+    function spawnQuizTarget() {
+      clearQuizVisuals();
+      quizState.answered = false;
+
+      const x = THREE.MathUtils.randFloat(-6, 6);
+      const z = THREE.MathUtils.randFloat(-6, 6);
+      const p = new THREE.Vector3(x, 0.5, z);
+      quizState.targetPoint = p;
+
+      const mesh = new THREE.Mesh(
+        new THREE.SphereGeometry(0.2, 24, 24),
+        new THREE.MeshBasicMaterial({ color: 0x33ff66 })
+      );
+      mesh.position.copy(p);
+      scene.add(mesh);
+      quizState.targetMesh = mesh;
+    }
+
+    function answerQuiz(clickPoint) {
+      if (!quizState.active || quizState.answered || !quizState.targetPoint) return;
+
+      const target = quizState.targetPoint.clone();
+      const guessDir = clickPoint.clone().sub(target);
+      guessDir.y = 0;
+
+      if (guessDir.length() < 0.001) return;
+      guessDir.normalize();
+
+      const B = computeFieldAt(target);
+      if (B.length() < 1e-7) return;
+      const actualDir = B.clone().normalize();
+
+      const dot = THREE.MathUtils.clamp(actualDir.dot(guessDir), -1, 1);
+      const angle = THREE.MathUtils.radToDeg(Math.acos(dot));
+      quizState.lastAngularError = angle;
+      quizState.quizzesTaken += 1;
+      if (angle <= 45) quizState.quizCorrectCount += 1;
+
+      const actualArrow = new THREE.ArrowHelper(actualDir, target, 2, 0xffff33, 0.5, 0.25);
+      const guessArrow = new THREE.ArrowHelper(guessDir, target, 2, 0xffffff, 0.5, 0.25);
+      scene.add(actualArrow);
+      scene.add(guessArrow);
+      quizState.actualArrow = actualArrow;
+      quizState.guessArrow = guessArrow;
+
+      let rating = 'Poor';
+      if (angle <= 15) rating = 'Excellent';
+      else if (angle <= 45) rating = 'Good';
+      else if (angle <= 90) rating = 'Fair';
+
+      quizResultText.textContent = `Result: ${rating}
+Angular Error: ${angle.toFixed(1)}°`;
+
+      quizPrompt.textContent = 'Yellow = actual field, White = your guess. Press Next Question.';
+      quizState.answered = true;
+      updateHUD();
+    }
+
+    quizBtn.addEventListener('click', () => {
+      if (!quizState.active) {
+        startQuiz();
+      } else {
+        spawnQuizTarget();
+        quizPrompt.textContent = 'Click to indicate field direction at the green point';
+        quizResultText.textContent = '';
+      }
+    });
+
+    endQuizBtn.addEventListener('click', () => {
+      endQuiz();
+    });
+
+    renderer.domElement.addEventListener('pointerdown', (event) => {
+      if (quizState.active && !quizState.answered && quizState.targetPoint) {
+        const p = getGroundPoint(event, 0.5);
+        if (p) answerQuiz(p);
+        return;
+      }
+
+      const idx = pickDipole(event);
+      if (idx >= 0) {
+        setSelectedDipole(idx);
+        isDragging = true;
+        controls.enabled = false;
+        const hitPoint = getGroundPoint(event, 0);
+        if (hitPoint) {
+          dragOffset.copy(dipoles[idx].position).sub(hitPoint).setY(0.75);
+        } else {
+          dragOffset.set(0, 0.75, 0);
+        }
+      } else {
+        setSelectedDipole(-1);
+      }
+    });
+
+    window.addEventListener('pointermove', (event) => {
+      const p05 = getGroundPoint(event, 0.5);
+      hoveredPoint = p05;
+
+      if (!isDragging && p05) {
+        const mag = computeFieldAt(p05).length();
+        if (Number.isFinite(mag)) {
+          fieldLabel.style.display = 'block';
+          fieldLabel.style.left = `${event.clientX}px`;
+          fieldLabel.style.top = `${event.clientY}px`;
+          fieldLabel.textContent = `|B| = ${mag.toFixed(2)}`;
+        } else {
+          fieldLabel.style.display = 'none';
+        }
+      } else {
+        fieldLabel.style.display = 'none';
+      }
+
+      if (!isDragging || selectedDipoleIndex < 0) return;
+      const gp = getGroundPoint(event, 0);
+      if (!gp) return;
+
+      const d = dipoles[selectedDipoleIndex];
+      d.position.x = THREE.MathUtils.clamp(gp.x + dragOffset.x, -8, 8);
+      d.position.z = THREE.MathUtils.clamp(gp.z + dragOffset.z, -8, 8);
+      d.position.y = 0.75;
+      scheduleFieldRegeneration();
+    });
+
+    window.addEventListener('pointerup', () => {
+      isDragging = false;
+      controls.enabled = true;
+    });
+
+    window.addEventListener('keydown', (event) => {
+      const key = event.key.toLowerCase();
+
+      if (key >= '1' && key <= '5') {
+        configureDifficulty(parseInt(key));
+      }
+
+      if (selectedDipoleIndex >= 0) {
+        const d = dipoles[selectedDipoleIndex];
+        if (key === 'r') {
+          d.rotation.y += THREE.MathUtils.degToRad(15);
+          scheduleFieldRegeneration();
+        }
+        if (key === 't') {
+          d.rotation.y -= THREE.MathUtils.degToRad(15);
+          scheduleFieldRegeneration();
+        }
+      }
+    });
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    function updateState() {
+      const active = getActiveDipoles();
+      const originField = computeFieldAt(new THREE.Vector3(0, 0.5, 0)).length();
+
+      window.__3D_STATE__.difficultyLevel = difficultyLevel;
+      window.__3D_STATE__.dipoleCount = active.length;
+      window.__3D_STATE__.fieldLineCount = quizState.active ? 0 : fieldLineGroup.children.length;
+      window.__3D_STATE__.dipolePositions = active.map(d => ({ x: d.position.x, y: d.position.y, z: d.position.z }));
+      window.__3D_STATE__.dipoleRotations = active.map(d => THREE.MathUtils.radToDeg(d.rotation.y));
+      window.__3D_STATE__.selectedDipoleIndex = selectedDipoleIndex;
+      window.__3D_STATE__.quizActive = quizState.active;
+      window.__3D_STATE__.quizzesTaken = quizState.quizzesTaken;
+      window.__3D_STATE__.quizCorrectCount = quizState.quizCorrectCount;
+      window.__3D_STATE__.lastQuizAngularError = quizState.lastAngularError;
+      window.__3D_STATE__.fieldMagnitudeAtOrigin = Number.isFinite(originField) ? originField : 0;
+      window.__3D_STATE__.isDragging = isDragging;
+      window.__3D_STATE__.cameraDistance = camera.position.distanceTo(new THREE.Vector3(0,0,0));
+    }
+
+    function animate() {
+      requestAnimationFrame(animate);
+      controls.update();
+      updateState();
+      renderer.render(scene, camera);
+    }
+
+    configureDifficulty(1);
+    generateFieldLines();
+    updateHUD();
+    animate();
+  </script>
+</body>
+</html>

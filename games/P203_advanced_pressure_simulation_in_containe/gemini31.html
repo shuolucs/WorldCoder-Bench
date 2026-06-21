@@ -1,0 +1,502 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Advanced Pressure Simulation</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #1a1a2e;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            user-select: none;
+        }
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+        }
+        #hud {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            background: rgba(15, 15, 30, 0.85);
+            border: 1px solid #4a4a6a;
+            border-radius: 8px;
+            padding: 15px 20px;
+            color: #e0e0e0;
+            pointer-events: none;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.5);
+            min-width: 220px;
+        }
+        .hud-row {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 8px;
+            font-size: 14px;
+        }
+        .hud-row:last-child {
+            margin-bottom: 0;
+        }
+        .hud-label {
+            font-weight: bold;
+            color: #8a8ad0;
+        }
+        .hud-value {
+            font-family: monospace;
+            font-size: 15px;
+        }
+        #score-display {
+            color: #ffd700;
+            font-size: 18px;
+            font-weight: bold;
+        }
+        #pressure-display {
+            color: #ff5555;
+            font-weight: bold;
+        }
+        #status-display {
+            text-align: center;
+            font-weight: bold;
+            margin-top: 10px;
+            padding-top: 10px;
+            border-top: 1px solid #4a4a6a;
+        }
+        .status-running { color: #55ff55; }
+        .status-paused { color: #ffaa00; }
+        
+        #instructions {
+            position: absolute;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: rgba(15, 15, 30, 0.85);
+            border: 1px solid #4a4a6a;
+            border-radius: 8px;
+            padding: 15px;
+            color: #b0b0d0;
+            text-align: center;
+            font-size: 13px;
+            pointer-events: none;
+            line-height: 1.5;
+        }
+        kbd {
+            background: #2a2a4a;
+            border: 1px solid #5a5a8a;
+            border-radius: 3px;
+            padding: 2px 5px;
+            color: #fff;
+            font-family: monospace;
+        }
+    </style>
+    <!-- Import maps polyfill -->
+    <script async src="https://unpkg.com/es-module-shims@1.8.0/dist/es-module-shims.js"></script>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="canvas-container"></div>
+    
+    <div id="hud">
+        <div class="hud-row"><span class="hud-label">SCORE</span> <span class="hud-value" id="score-display">0</span></div>
+        <div class="hud-row"><span class="hud-label">Pressure (P)</span> <span class="hud-value" id="pressure-display">0.00</span></div>
+        <div class="hud-row"><span class="hud-label">Temperature (T)</span> <span class="hud-value" id="temperature-display">300</span></div>
+        <div class="hud-row"><span class="hud-label">Volume (V)</span> <span class="hud-value" id="volume-display">144.00</span></div>
+        <div class="hud-row"><span class="hud-label">Particles (n)</span> <span class="hud-value" id="particle-display">100</span></div>
+        <div class="hud-row"><span class="hud-label">Piston Height</span> <span class="hud-value" id="piston-display">4.00</span></div>
+        <div id="status-display" class="status-running">RUNNING</div>
+    </div>
+
+    <div id="instructions">
+        <kbd>↑</kbd>/<kbd>↓</kbd> Move Piston | 
+        <kbd>H</kbd> Heat (+50) | 
+        <kbd>C</kbd> Cool (-50) | 
+        <kbd>Space</kbd> Release Valve<br>
+        <kbd>Click Container</kbd> Add Particles | 
+        <kbd>P</kbd> Pause | 
+        <kbd>R</kbd> Reset
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+        // --- State Management ---
+        window.__3D_STATE__ = {
+            pressure: 0,
+            temperature: 300,
+            volume: 144,
+            pistonY: 4,
+            particleCount: 100,
+            score: 0,
+            paused: false,
+            fishScale: 2.0,
+            maxPressureReached: 0,
+            particleAvgSpeed: 0,
+            fishLoaded: false,
+            frameCount: 0
+        };
+
+        const CONSTANTS = {
+            R: 0.01,
+            BASE_SPEED: 0.02,
+            MAX_PARTICLES: 200,
+            MIN_TEMP: 100,
+            MAX_TEMP: 600,
+            MIN_PISTON_Y: 1,
+            MAX_PISTON_Y: 4,
+            CONTAINER_W: 6,
+            CONTAINER_D: 6
+        };
+
+        let milestones = { m5: false, m10: false, m15: false };
+
+        // --- Scene Setup ---
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x1a1a2e);
+
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+        camera.position.set(0, 5, 12);
+        camera.lookAt(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        container.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.05;
+        controls.target.set(0, 2, 0);
+
+        // Lights
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+        dirLight.position.set(5, 10, 5);
+        scene.add(dirLight);
+
+        // Grid
+        const gridHelper = new THREE.GridHelper(20, 20, 0x444466, 0x222244);
+        scene.add(gridHelper);
+
+        // --- Objects ---
+        
+        // Container (Visual representation from y=0 to y=8 to allow piston at y=4)
+        const containerGeo = new THREE.BoxGeometry(CONSTANTS.CONTAINER_W, 8, CONSTANTS.CONTAINER_D);
+        const containerMat = new THREE.MeshStandardMaterial({
+            color: 0x88ccff,
+            transparent: true,
+            opacity: 0.15,
+            depthWrite: false,
+            side: THREE.DoubleSide
+        });
+        const containerMesh = new THREE.Mesh(containerGeo, containerMat);
+        containerMesh.position.set(0, 4, 0); // Base at y=0
+        scene.add(containerMesh);
+
+        // Container Edges
+        const edges = new THREE.EdgesGeometry(containerGeo);
+        const line = new THREE.LineSegments(edges, new THREE.LineBasicMaterial({ color: 0x4488ff, transparent: true, opacity: 0.5 }));
+        line.position.copy(containerMesh.position);
+        scene.add(line);
+
+        // Piston
+        const pistonGeo = new THREE.BoxGeometry(5.9, 0.3, 5.9);
+        const pistonMat = new THREE.MeshStandardMaterial({
+            color: 0x888899,
+            metalness: 0.6,
+            roughness: 0.4
+        });
+        const pistonMesh = new THREE.Mesh(pistonGeo, pistonMat);
+        pistonMesh.position.set(0, window.__3D_STATE__.pistonY, 0);
+        scene.add(pistonMesh);
+
+        // Fish
+        let fishModel = null;
+        const loader = new GLTFLoader();
+        loader.load(
+            'https://raw.githubusercontent.com/mrdoob/three.js/master/examples/models/gltf/BarramundiFish.glb',
+            (gltf) => {
+                fishModel = gltf.scene;
+                fishModel.scale.setScalar(2.0);
+                fishModel.position.set(0, 2, 0);
+                
+                // Store original colors for tinting
+                fishModel.traverse((child) => {
+                    if (child.isMesh) {
+                        child.material = child.material.clone(); // Clone to avoid shared material issues
+                        child.userData.originalColor = child.material.color.clone();
+                    }
+                });
+                
+                scene.add(fishModel);
+                window.__3D_STATE__.fishLoaded = true;
+            },
+            undefined,
+            (error) => console.error('Error loading fish model:', error)
+        );
+
+        // Particles
+        const particles = [];
+        const particleGeo = new THREE.SphereGeometry(0.05, 8, 8);
+        const particleMat = new THREE.MeshBasicMaterial({ color: 0x00aaff });
+
+        function createParticle() {
+            const mesh = new THREE.Mesh(particleGeo, particleMat.clone());
+            // Spawn inside active volume
+            mesh.position.set(
+                (Math.random() - 0.5) * 5.8,
+                Math.random() * (window.__3D_STATE__.pistonY - 0.2) + 0.1,
+                (Math.random() - 0.5) * 5.8
+            );
+            scene.add(mesh);
+            
+            return {
+                mesh: mesh,
+                velocity: new THREE.Vector3(
+                    Math.random() - 0.5,
+                    Math.random() - 0.5,
+                    Math.random() - 0.5
+                ).normalize(),
+                baseSpeed: CONSTANTS.BASE_SPEED + (Math.random() * 0.01 - 0.005)
+            };
+        }
+
+        for (let i = 0; i < window.__3D_STATE__.particleCount; i++) {
+            particles.push(createParticle());
+        }
+
+        // --- Interaction ---
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        window.addEventListener('keydown', (e) => {
+            const state = window.__3D_STATE__;
+            switch(e.key.toLowerCase()) {
+                case 'arrowup':
+                    state.pistonY = Math.min(CONSTANTS.MAX_PISTON_Y, state.pistonY + 0.2);
+                    break;
+                case 'arrowdown':
+                    state.pistonY = Math.max(CONSTANTS.MIN_PISTON_Y, state.pistonY - 0.2);
+                    break;
+                case 'h':
+                    state.temperature = Math.min(CONSTANTS.MAX_TEMP, state.temperature + 50);
+                    break;
+                case 'c':
+                    state.temperature = Math.max(CONSTANTS.MIN_TEMP, state.temperature - 50);
+                    break;
+                case 'p':
+                    state.paused = !state.paused;
+                    updateStatusUI();
+                    break;
+                case ' ': // Spacebar
+                    state.pistonY = CONSTANTS.MAX_PISTON_Y;
+                    break;
+                case 'r':
+                    resetSimulation();
+                    break;
+            }
+        });
+
+        window.addEventListener('click', (e) => {
+            mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+            
+            raycaster.setFromCamera(mouse, camera);
+            const intersects = raycaster.intersectObject(containerMesh);
+            
+            if (intersects.length > 0) {
+                addParticles(10);
+            }
+        });
+
+        function addParticles(amount) {
+            const state = window.__3D_STATE__;
+            if (state.particleCount >= CONSTANTS.MAX_PARTICLES) return;
+            
+            const toAdd = Math.min(amount, CONSTANTS.MAX_PARTICLES - state.particleCount);
+            for(let i=0; i<toAdd; i++) {
+                particles.push(createParticle());
+            }
+            state.particleCount += toAdd;
+            state.score += 5;
+        }
+
+        function resetSimulation() {
+            const state = window.__3D_STATE__;
+            state.temperature = 300;
+            state.pistonY = 4;
+            state.score = Math.max(0, state.score - 10);
+            state.paused = false;
+            
+            // Remove excess particles
+            while(particles.length > 100) {
+                const p = particles.pop();
+                scene.remove(p.mesh);
+                p.mesh.geometry.dispose();
+                p.mesh.material.dispose();
+            }
+            state.particleCount = 100;
+            milestones = { m5: false, m10: false, m15: false };
+            updateStatusUI();
+        }
+
+        // --- UI Updates ---
+        const ui = {
+            pressure: document.getElementById('pressure-display'),
+            temp: document.getElementById('temperature-display'),
+            vol: document.getElementById('volume-display'),
+            part: document.getElementById('particle-display'),
+            score: document.getElementById('score-display'),
+            piston: document.getElementById('piston-display'),
+            status: document.getElementById('status-display')
+        };
+
+        function updateStatusUI() {
+            if (window.__3D_STATE__.paused) {
+                ui.status.textContent = 'PAUSED';
+                ui.status.className = 'status-paused';
+            } else {
+                ui.status.textContent = 'RUNNING';
+                ui.status.className = 'status-running';
+            }
+        }
+
+        function updateHUD() {
+            const state = window.__3D_STATE__;
+            ui.pressure.textContent = state.pressure.toFixed(2);
+            ui.temp.textContent = state.temperature;
+            ui.vol.textContent = state.volume.toFixed(2);
+            ui.part.textContent = state.particleCount;
+            ui.score.textContent = state.score;
+            ui.piston.textContent = state.pistonY.toFixed(2);
+        }
+
+        // --- Animation Loop ---
+        const clock = new THREE.Clock();
+
+        function animate() {
+            requestAnimationFrame(animate);
+            
+            const state = window.__3D_STATE__;
+            state.frameCount++;
+            const time = clock.getElapsedTime();
+            const delta = clock.getDelta();
+
+            controls.update();
+
+            // Physics Calculations
+            state.volume = CONSTANTS.CONTAINER_W * CONSTANTS.CONTAINER_D * state.pistonY;
+            state.pressure = (state.particleCount * CONSTANTS.R * state.temperature) / state.volume;
+            
+            if (state.pressure > state.maxPressureReached) {
+                state.maxPressureReached = state.pressure;
+            }
+
+            // Scoring Milestones
+            if (state.pressure > 5.0 && !milestones.m5) { state.score += 10; milestones.m5 = true; }
+            if (state.pressure > 10.0 && !milestones.m10) { state.score += 25; milestones.m10 = true; }
+            if (state.pressure > 15.0 && !milestones.m15) { state.score += 50; milestones.m15 = true; }
+
+            // Update Piston Visual
+            pistonMesh.position.y = state.pistonY;
+
+            if (!state.paused) {
+                // Update Fish
+                if (fishModel) {
+                    // Bobbing
+                    fishModel.position.y = (state.pistonY / 2) + Math.sin(time * 1.0) * 0.3;
+                    
+                    // Scaling based on pressure (P: ~0.6 to ~35)
+                    // Map P(0.5 -> 20) to Scale(2.0 -> 1.0)
+                    let targetScale = 2.0 - ((state.pressure - 0.5) / 19.5);
+                    targetScale = Math.max(1.0, Math.min(2.0, targetScale));
+                    state.fishScale = targetScale;
+                    fishModel.scale.setScalar(targetScale);
+
+                    // Color Tinting
+                    let tintFactor = Math.min(1.0, state.pressure / 15.0);
+                    const blueTint = new THREE.Color(0x4488ff);
+                    const redTint = new THREE.Color(0xff4444);
+                    const targetTint = blueTint.clone().lerp(redTint, tintFactor);
+
+                    fishModel.traverse((child) => {
+                        if (child.isMesh && child.userData.originalColor) {
+                            child.material.color.copy(child.userData.originalColor).lerp(targetTint, 0.6);
+                        }
+                    });
+                }
+
+                // Update Particles
+                // Map pressure to speed factor (1.0 to 3.0)
+                let pressureFactor = 1.0 + (state.pressure / 10.0) * 2.0;
+                pressureFactor = Math.max(1.0, Math.min(3.0, pressureFactor));
+                
+                let totalSpeed = 0;
+
+                const halfW = CONSTANTS.CONTAINER_W / 2 - 0.1;
+                const halfD = CONSTANTS.CONTAINER_D / 2 - 0.1;
+
+                particles.forEach(p => {
+                    let currentSpeed = p.baseSpeed * pressureFactor;
+                    totalSpeed += currentSpeed;
+
+                    // Move
+                    p.mesh.position.add(p.velocity.clone().multiplyScalar(currentSpeed));
+
+                    // Bounce
+                    if (p.mesh.position.x > halfW) { p.mesh.position.x = halfW; p.velocity.x *= -1; }
+                    if (p.mesh.position.x < -halfW) { p.mesh.position.x = -halfW; p.velocity.x *= -1; }
+                    
+                    if (p.mesh.position.z > halfD) { p.mesh.position.z = halfD; p.velocity.z *= -1; }
+                    if (p.mesh.position.z < -halfD) { p.mesh.position.z = -halfD; p.velocity.z *= -1; }
+                    
+                    // Y bounds: 0.1 to pistonY - 0.2 (to account for piston thickness)
+                    const topBound = state.pistonY - 0.2;
+                    if (p.mesh.position.y > topBound) { 
+                        p.mesh.position.y = topBound; 
+                        p.velocity.y *= -1; 
+                    }
+                    if (p.mesh.position.y < 0.1) { 
+                        p.mesh.position.y = 0.1; 
+                        p.velocity.y *= -1; 
+                    }
+
+                    // Color based on speed
+                    // Speed ranges roughly from 0.015 to 0.09
+                    let speedRatio = (currentSpeed - 0.015) / 0.075;
+                    speedRatio = Math.max(0, Math.min(1, speedRatio));
+                    // Hue: 0.6 (Blue) to 0.0 (Red)
+                    p.mesh.material.color.setHSL(0.6 - (speedRatio * 0.6), 1.0, 0.5);
+                });
+
+                state.particleAvgSpeed = particles.length > 0 ? totalSpeed / particles.length : 0;
+            }
+
+            updateHUD();
+            renderer.render(scene, camera);
+        }
+
+        // Start
+        animate();
+
+    </script>
+</body>
+</html>

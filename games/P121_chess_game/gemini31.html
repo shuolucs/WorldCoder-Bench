@@ -1,0 +1,507 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D 国际象棋</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #1a1a1a;
+            font-family: sans-serif;
+        }
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+        }
+        #hud {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            background: rgba(0, 0, 0, 0.7);
+            color: white;
+            padding: 15px 20px;
+            border-radius: 8px;
+            pointer-events: none;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+            border: 1px solid rgba(255,255,255,0.1);
+        }
+        #hud h2 {
+            margin: 0 0 10px 0;
+            font-size: 18px;
+            color: #ffd700;
+        }
+        .hud-item {
+            margin: 5px 0;
+            font-size: 14px;
+        }
+        .hud-value {
+            font-weight: bold;
+            color: #4caf50;
+        }
+        #loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: white;
+            font-size: 24px;
+            background: rgba(0,0,0,0.8);
+            padding: 20px 40px;
+            border-radius: 10px;
+            pointer-events: none;
+        }
+    </style>
+    <script type="importmap">
+    { "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+    } }
+    </script>
+</head>
+<body>
+    <div id="hud">
+        <h2>3D Chess</h2>
+        <div class="hud-item">当前回合: <span id="currentTurn" class="hud-value">白方</span></div>
+        <div class="hud-item">移动次数: <span id="moveCount" class="hud-value">0</span></div>
+        <div class="hud-item">被吃棋子: <span id="capturedCount" class="hud-value">0</span></div>
+        <div class="hud-item">选中棋子: <span id="selectedPiece" class="hud-value">无</span></div>
+    </div>
+    <div id="loading">加载模型中...</div>
+    <div id="canvas-container"></div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        // --- Global State ---
+        window.__3D_STATE__ = {
+            modelLoaded: false,
+            currentTurn: "white",
+            moveCount: 0,
+            capturedCount: 0,
+            selectedPiece: "",
+            boardState: Array(64).fill("")
+        };
+
+        // --- Scene Setup ---
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x222222);
+
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.set(0, 15, 20);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        container.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.05;
+        controls.maxPolarAngle = Math.PI / 2 - 0.05; // Don't go below ground
+
+        // --- Lighting ---
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 1.5);
+        dirLight.position.set(10, 20, 10);
+        dirLight.castShadow = true;
+        dirLight.shadow.mapSize.width = 2048;
+        dirLight.shadow.mapSize.height = 2048;
+        dirLight.shadow.camera.near = 0.5;
+        dirLight.shadow.camera.far = 50;
+        dirLight.shadow.camera.left = -15;
+        dirLight.shadow.camera.right = 15;
+        dirLight.shadow.camera.top = 15;
+        dirLight.shadow.camera.bottom = -15;
+        scene.add(dirLight);
+
+        // --- Game Variables ---
+        let pieceData = []; // Array of { object, center, color, row, col, originalMaterials }
+        let board = Array(8).fill(null).map(() => Array(8).fill(null));
+        let minCX = 0, minCZ = 0, squareSizeX = 1, squareSizeZ = 1, minCY = 0;
+        let boardPlane = null;
+        const highlightGroup = new THREE.Group();
+        scene.add(highlightGroup);
+
+        let selectedPiece = null;
+        let animating = false;
+        let animData = null;
+
+        // --- Load Model ---
+        const loader = new GLTFLoader();
+        loader.load('assets/ABeautifulGame.glb', (gltf) => {
+            document.getElementById('loading').style.display = 'none';
+            const model = gltf.scene;
+            
+            // Enable shadows
+            model.traverse((node) => {
+                if (node.isMesh) {
+                    node.castShadow = true;
+                    node.receiveShadow = true;
+                }
+            });
+
+            // Center the model
+            const box = new THREE.Box3().setFromObject(model);
+            const center = box.getCenter(new THREE.Vector3());
+            model.position.sub(center);
+            model.updateMatrixWorld(true);
+            scene.add(model);
+
+            parseModelAndSetupGame(model);
+            
+            window.__3D_STATE__.modelLoaded = true;
+            updateHUD();
+        }, undefined, (error) => {
+            console.error('Error loading model:', error);
+            document.getElementById('loading').innerText = '模型加载失败';
+        });
+
+        // --- Heuristic Parsing Logic ---
+        function parseModelAndSetupGame(model) {
+            const newBox = new THREE.Box3().setFromObject(model);
+            const maxDim = Math.max(newBox.max.x - newBox.min.x, newBox.max.z - newBox.min.z);
+            const maxPieceVol = Math.pow(maxDim / 5, 3); // Heuristic: pieces are relatively small
+
+            const potentialPieces = [];
+            model.traverse(child => {
+                if (child.isMesh) {
+                    const cBox = new THREE.Box3().setFromObject(child);
+                    const size = cBox.getSize(new THREE.Vector3());
+                    const vol = size.x * size.y * size.z;
+                    
+                    // Filter out board/table (large volume) and flat planes
+                    if (vol < maxPieceVol && size.y > 0.05) {
+                        // Find top-level parent under the scene to group multi-mesh pieces
+                        let p = child;
+                        while (p.parent && p.parent !== model && p.parent.type !== 'Scene') {
+                            p = p.parent;
+                        }
+                        if (!potentialPieces.includes(p)) {
+                            potentialPieces.push(p);
+                        }
+                    }
+                }
+            });
+
+            // Calculate centers and luminance
+            potentialPieces.forEach(p => {
+                const pBox = new THREE.Box3().setFromObject(p);
+                pieceData.push({
+                    object: p,
+                    center: pBox.getCenter(new THREE.Vector3()),
+                    lum: calculateLuminance(p)
+                });
+            });
+
+            // Determine colors by sorting luminance
+            pieceData.sort((a, b) => a.lum - b.lum);
+            pieceData.forEach((pd, i) => {
+                pd.color = i < pieceData.length / 2 ? 'black' : 'white';
+            });
+
+            // Determine Grid Bounds based on piece centers
+            let maxCX = -Infinity, maxCZ = -Infinity;
+            minCX = Infinity; minCZ = Infinity; minCY = Infinity;
+            
+            pieceData.forEach(pd => {
+                minCX = Math.min(minCX, pd.center.x);
+                maxCX = Math.max(maxCX, pd.center.x);
+                minCZ = Math.min(minCZ, pd.center.z);
+                maxCZ = Math.max(maxCZ, pd.center.z);
+                minCY = Math.min(minCY, pd.center.y);
+            });
+
+            // Calculate square size (assuming 8x8 grid, so 7 intervals between centers)
+            squareSizeX = (maxCX - minCX) / 7;
+            squareSizeZ = (maxCZ - minCZ) / 7;
+
+            // Fallback if calculation fails (e.g., only 1 piece found)
+            if (squareSizeX === 0) squareSizeX = 1;
+            if (squareSizeZ === 0) squareSizeZ = 1;
+
+            // Populate logical board
+            pieceData.forEach(pd => {
+                const col = Math.round((pd.center.x - minCX) / squareSizeX);
+                const row = Math.round((pd.center.z - minCZ) / squareSizeZ);
+                if (col >= 0 && col <= 7 && row >= 0 && row <= 7) {
+                    board[row][col] = pd;
+                    pd.row = row;
+                    pd.col = col;
+                }
+            });
+
+            // Create invisible plane for board raycasting
+            const planeGeo = new THREE.PlaneGeometry(maxDim * 1.2, maxDim * 1.2);
+            const planeMat = new THREE.MeshBasicMaterial({ visible: false });
+            boardPlane = new THREE.Mesh(planeGeo, planeMat);
+            boardPlane.rotation.x = -Math.PI / 2;
+            boardPlane.position.y = minCY - 0.1; // Slightly below pieces
+            scene.add(boardPlane);
+        }
+
+        function calculateLuminance(obj) {
+            let r = 0, g = 0, b = 0, count = 0;
+            obj.traverse(c => {
+                if (c.isMesh && c.material) {
+                    // Handle array of materials
+                    const mats = Array.isArray(c.material) ? c.material : [c.material];
+                    mats.forEach(mat => {
+                        if (mat.color) {
+                            r += mat.color.r; g += mat.color.g; b += mat.color.b; count++;
+                        }
+                    });
+                }
+            });
+            if (count === 0) return Math.random();
+            return (r / count) * 0.299 + (g / count) * 0.587 + (b / count) * 0.114;
+        }
+
+        // --- Interaction ---
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+
+        window.addEventListener('pointerdown', (event) => {
+            if (!window.__3D_STATE__.modelLoaded || animating) return;
+
+            mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+            raycaster.setFromCamera(mouse, camera);
+
+            // 1. Check intersection with pieces
+            const pieceMeshes = [];
+            pieceData.forEach(pd => pd.object.traverse(c => { if (c.isMesh) pieceMeshes.push(c); }));
+            
+            const intersects = raycaster.intersectObjects(pieceMeshes, false);
+
+            if (intersects.length > 0) {
+                const hitMesh = intersects[0].object;
+                let clickedPiece = null;
+                for (let pd of pieceData) {
+                    let found = false;
+                    pd.object.traverse(c => { if (c === hitMesh) found = true; });
+                    if (found) { clickedPiece = pd; break; }
+                }
+
+                if (clickedPiece) {
+                    handlePieceClick(clickedPiece);
+                    return;
+                }
+            }
+
+            // 2. Check intersection with board plane
+            if (boardPlane && selectedPiece) {
+                const boardIntersects = raycaster.intersectObject(boardPlane);
+                if (boardIntersects.length > 0) {
+                    handleBoardClick(boardIntersects[0].point);
+                } else {
+                    deselect();
+                }
+            } else {
+                deselect();
+            }
+        });
+
+        function handlePieceClick(piece) {
+            if (piece.color === window.__3D_STATE__.currentTurn) {
+                selectPiece(piece);
+            } else if (selectedPiece) {
+                // Try to capture
+                tryMove(selectedPiece, piece.col, piece.row);
+            }
+        }
+
+        function handleBoardClick(point) {
+            const col = Math.round((point.x - minCX) / squareSizeX);
+            const row = Math.round((point.z - minCZ) / squareSizeZ);
+            
+            if (col >= 0 && col <= 7 && row >= 0 && row <= 7) {
+                tryMove(selectedPiece, col, row);
+            } else {
+                deselect();
+            }
+        }
+
+        function tryMove(piece, targetCol, targetRow) {
+            const targetSquare = board[targetRow][targetCol];
+
+            // Simplified rule: valid if empty or occupied by opponent
+            if (!targetSquare || targetSquare.color !== piece.color) {
+                executeMove(piece, targetCol, targetRow, targetSquare);
+            } else {
+                deselect();
+            }
+        }
+
+        function executeMove(piece, tCol, tRow, targetPiece) {
+            deselect();
+
+            const startCol = piece.col;
+            const startRow = piece.row;
+
+            // Update logical board
+            board[startRow][startCol] = null;
+            board[tRow][tCol] = piece;
+            piece.col = tCol;
+            piece.row = tRow;
+
+            // Calculate target world position
+            const deltaX = (tCol - startCol) * squareSizeX;
+            const deltaZ = (tRow - startRow) * squareSizeZ;
+            const targetPos = piece.object.position.clone().add(new THREE.Vector3(deltaX, 0, deltaZ));
+
+            startAnimation(piece, targetPos, () => {
+                if (targetPiece) {
+                    // Capture
+                    targetPiece.object.removeFromParent();
+                    window.__3D_STATE__.capturedCount++;
+                    const idx = pieceData.indexOf(targetPiece);
+                    if (idx > -1) pieceData.splice(idx, 1);
+                }
+                
+                // End turn
+                window.__3D_STATE__.currentTurn = window.__3D_STATE__.currentTurn === 'white' ? 'black' : 'white';
+                window.__3D_STATE__.moveCount++;
+                updateHUD();
+            });
+        }
+
+        // --- Highlighting ---
+        function selectPiece(piece) {
+            deselect();
+            selectedPiece = piece;
+
+            // Highlight mesh
+            piece.originalMaterials = [];
+            piece.object.traverse(c => {
+                if (c.isMesh && c.material) {
+                    // Clone material to avoid affecting other pieces sharing it
+                    if (!c.userData.matCloned) {
+                        c.material = c.material.clone();
+                        c.userData.matCloned = true;
+                    }
+                    piece.originalMaterials.push({
+                        mesh: c,
+                        emissive: c.material.emissive ? c.material.emissive.clone() : new THREE.Color(0x000000),
+                        intensity: c.material.emissiveIntensity || 0
+                    });
+                    c.material.emissive = new THREE.Color(0xffff00);
+                    c.material.emissiveIntensity = 0.6;
+                }
+            });
+
+            // Show valid moves
+            const geo = new THREE.PlaneGeometry(squareSizeX * 0.9, squareSizeZ * 0.9);
+            const mat = new THREE.MeshBasicMaterial({ color: 0x00ff00, transparent: true, opacity: 0.4, side: THREE.DoubleSide });
+
+            for (let r = 0; r < 8; r++) {
+                for (let c = 0; c < 8; c++) {
+                    const target = board[r][c];
+                    if (!target || target.color !== piece.color) {
+                        const mesh = new THREE.Mesh(geo, mat);
+                        mesh.rotation.x = -Math.PI / 2;
+                        mesh.position.set(minCX + c * squareSizeX, minCY + 0.02, minCZ + r * squareSizeZ);
+                        highlightGroup.add(mesh);
+                    }
+                }
+            }
+            updateHUD();
+        }
+
+        function deselect() {
+            if (selectedPiece) {
+                selectedPiece.originalMaterials.forEach(m => {
+                    if (m.mesh.material.emissive) {
+                        m.mesh.material.emissive.copy(m.emissive);
+                        m.mesh.material.emissiveIntensity = m.intensity;
+                    }
+                });
+                selectedPiece = null;
+            }
+            highlightGroup.clear();
+            updateHUD();
+        }
+
+        // --- Animation ---
+        function startAnimation(piece, targetPos, onComplete) {
+            animating = true;
+            animData = {
+                piece: piece,
+                startPos: piece.object.position.clone(),
+                targetPos: targetPos.clone(),
+                startTime: performance.now(),
+                duration: 400, // ms
+                onComplete: onComplete
+            };
+        }
+
+        function updateAnimation() {
+            if (!animating || !animData) return;
+
+            let t = (performance.now() - animData.startTime) / animData.duration;
+            if (t >= 1) {
+                t = 1;
+                animating = false;
+                animData.piece.object.position.copy(animData.targetPos);
+                const cb = animData.onComplete;
+                animData = null;
+                if (cb) cb();
+            } else {
+                // Ease in out
+                const ease = t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t;
+                animData.piece.object.position.lerpVectors(animData.startPos, animData.targetPos, ease);
+                // Add parabolic arc
+                const jumpHeight = Math.max(squareSizeX, squareSizeZ) * 1.5;
+                animData.piece.object.position.y = animData.startPos.y + Math.sin(t * Math.PI) * jumpHeight;
+            }
+        }
+
+        // --- HUD & State ---
+        function updateHUD() {
+            const state = window.__3D_STATE__;
+            document.getElementById('currentTurn').innerText = state.currentTurn === 'white' ? '白方' : '黑方';
+            document.getElementById('currentTurn').style.color = state.currentTurn === 'white' ? '#ffffff' : '#aaaaaa';
+            document.getElementById('moveCount').innerText = state.moveCount;
+            document.getElementById('capturedCount').innerText = state.capturedCount;
+            document.getElementById('selectedPiece').innerText = selectedPiece ? (selectedPiece.color === 'white' ? '白棋' : '黑棋') : '无';
+
+            // Update flat board state
+            const flatBoard = [];
+            for (let r = 0; r < 8; r++) {
+                for (let c = 0; c < 8; c++) {
+                    flatBoard.push(board[r][c] ? board[r][c].color : "");
+                }
+            }
+            state.boardState = flatBoard;
+            state.selectedPiece = selectedPiece ? selectedPiece.color : "";
+        }
+
+        // --- Resize ---
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // --- Render Loop ---
+        function animate() {
+            requestAnimationFrame(animate);
+            controls.update();
+            updateAnimation();
+            renderer.render(scene, camera);
+        }
+        animate();
+
+    </script>
+</body>
+</html>

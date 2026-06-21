@@ -1,0 +1,416 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Projectile Motion Simulation</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #87CEEB; /* Sky blue background */
+            font-family: sans-serif;
+        }
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+        }
+        .hud {
+            position: absolute;
+            color: white;
+            background: rgba(0, 0, 0, 0.5);
+            padding: 10px;
+            border-radius: 5px;
+            pointer-events: none;
+            font-size: 14px;
+        }
+        #positionHUD { top: 10px; left: 10px; }
+        #launchCountHUD { top: 40px; left: 10px; }
+        #maxHeightHUD { top: 70px; left: 10px; }
+        
+        #controlPanel {
+            position: absolute;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: rgba(0, 0, 0, 0.7);
+            padding: 15px;
+            border-radius: 8px;
+            display: flex;
+            gap: 20px;
+            align-items: center;
+            color: white;
+        }
+        .control-group {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 5px;
+        }
+        button {
+            padding: 8px 16px;
+            cursor: pointer;
+            background-color: #4CAF50;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            font-weight: bold;
+        }
+        button:hover { background-color: #45a049; }
+        button:disabled {
+            background-color: #555;
+            color: #888;
+            cursor: not-allowed;
+        }
+        #resetBtn { background-color: #f44336; }
+        #resetBtn:hover { background-color: #da190b; }
+        #undoBtn, #redoBtn { background-color: #2196F3; }
+        #undoBtn:hover, #redoBtn:hover { background-color: #0b7dda; }
+    </style>
+    <!-- Import maps polyfill -->
+    <script async src="https://unpkg.com/es-module-shims@1.8.0/dist/es-module-shims.js"></script>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="canvas-container"></div>
+
+    <div id="positionHUD" class="hud">Pos: (0.0, 0.0)</div>
+    <div id="launchCountHUD" class="hud">Launches: 0</div>
+    <div id="maxHeightHUD" class="hud">Max Height: 0.0</div>
+
+    <div id="controlPanel">
+        <div class="control-group">
+            <label>Angle: <span id="angleLabel">45</span>°</label>
+            <input type="range" id="angleSlider" min="10" max="80" value="45">
+        </div>
+        <div class="control-group">
+            <label>Speed: <span id="speedLabel">20</span> m/s</label>
+            <input type="range" id="speedSlider" min="5" max="40" value="20">
+        </div>
+        <button id="launchBtn">Launch</button>
+        <button id="undoBtn" disabled>Undo</button>
+        <button id="redoBtn" disabled>Redo</button>
+        <button id="resetBtn">Reset</button>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+        // --- State Management ---
+        window.__3D_STATE__ = {
+            projectileX: -30, projectileY: 0.5, projectileZ: 0,
+            velocityX: 0, velocityY: 0, velocityZ: 0,
+            isFlying: false, hasLanded: false,
+            launchAngle: 45, launchSpeed: 20,
+            launchCount: 0, undoStackSize: 0, redoStackSize: 0,
+            trailPointCount: 0, distanceToTarget: 0,
+            dragEnabled: true, maxHeight: 0
+        };
+
+        // Physics Constants
+        const Cd = 0.47;
+        const rho = 1.225;
+        const A = 0.1;
+        const mass = 1.0;
+        const g = 9.81;
+        const dt = 1 / 60;
+
+        // Application State
+        let isFlying = false;
+        let hasLanded = false;
+        let velocity = new THREE.Vector3();
+        let trailPoints = [];
+        let maxHeight = 0;
+        let launchCount = 0;
+
+        const undoStack = [];
+        const redoStack = [];
+        const startPosition = new THREE.Vector3(-30, 0.5, 0);
+        const targetPosition = new THREE.Vector3(20, 0.5, 0);
+
+        const initialState = {
+            pos: startPosition.clone(),
+            trail: [],
+            maxHeight: 0
+        };
+
+        // --- Scene Setup ---
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        
+        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.set(0, 10, 30);
+        camera.lookAt(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        container.appendChild(renderer.domElement);
+
+        // Lights
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
+        scene.add(ambientLight);
+        const directionalLight = new THREE.DirectionalLight(0xffffff, 1.0);
+        directionalLight.position.set(10, 20, 10);
+        scene.add(directionalLight);
+
+        // Ground
+        const groundGeo = new THREE.PlaneGeometry(100, 100);
+        const groundMat = new THREE.MeshStandardMaterial({ color: 0x228B22 }); // Green
+        const ground = new THREE.Mesh(groundGeo, groundMat);
+        ground.rotation.x = -Math.PI / 2;
+        scene.add(ground);
+
+        // Grid
+        const gridHelper = new THREE.GridHelper(100, 100);
+        scene.add(gridHelper);
+
+        // Target Marker
+        const targetGeo = new THREE.SphereGeometry(0.5, 16, 16);
+        const targetMat = new THREE.MeshBasicMaterial({ color: 0xff0000 });
+        const targetMarker = new THREE.Mesh(targetGeo, targetMat);
+        targetMarker.position.copy(targetPosition);
+        scene.add(targetMarker);
+
+        // Projectile (Corset)
+        const projectileGroup = new THREE.Group();
+        projectileGroup.position.copy(startPosition);
+        scene.add(projectileGroup);
+
+        const loader = new GLTFLoader();
+        // Using a reliable CDN for the Corset model
+        loader.load('https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Models/master/2.0/Corset/glTF-Binary/Corset.glb', (gltf) => {
+            const model = gltf.scene;
+            model.scale.set(3, 3, 3);
+            projectileGroup.add(model);
+        }, undefined, (error) => {
+            console.error('Error loading model, using fallback sphere.', error);
+            const fallbackGeo = new THREE.SphereGeometry(0.5);
+            const fallbackMat = new THREE.MeshStandardMaterial({ color: 0x888888 });
+            projectileGroup.add(new THREE.Mesh(fallbackGeo, fallbackMat));
+        });
+
+        // Trajectory Line
+        const maxTrailPoints = 5000;
+        const trailPositions = new Float32Array(maxTrailPoints * 3);
+        const trailGeo = new THREE.BufferGeometry();
+        trailGeo.setAttribute('position', new THREE.BufferAttribute(trailPositions, 3));
+        trailGeo.setDrawRange(0, 0);
+        const trailMat = new THREE.LineBasicMaterial({ color: 0xffff00, linewidth: 2 });
+        const trailLine = new THREE.Line(trailGeo, trailMat);
+        scene.add(trailLine);
+
+        // --- Functions ---
+
+        function updateTrailVisuals() {
+            const count = Math.min(trailPoints.length, maxTrailPoints);
+            for (let i = 0; i < count; i++) {
+                trailPositions[i * 3] = trailPoints[i].x;
+                trailPositions[i * 3 + 1] = trailPoints[i].y;
+                trailPositions[i * 3 + 2] = trailPoints[i].z;
+            }
+            trailGeo.attributes.position.needsUpdate = true;
+            trailGeo.setDrawRange(0, count);
+        }
+
+        function updateUI() {
+            document.getElementById('positionHUD').innerText = `Pos: (${projectileGroup.position.x.toFixed(1)}, ${projectileGroup.position.y.toFixed(1)})`;
+            document.getElementById('launchCountHUD').innerText = `Launches: ${launchCount}`;
+            document.getElementById('maxHeightHUD').innerText = `Max Height: ${maxHeight.toFixed(1)}`;
+            
+            document.getElementById('undoBtn').disabled = undoStack.length === 0;
+            document.getElementById('redoBtn').disabled = redoStack.length === 0;
+        }
+
+        function updateGlobalState() {
+            window.__3D_STATE__.projectileX = projectileGroup.position.x;
+            window.__3D_STATE__.projectileY = projectileGroup.position.y;
+            window.__3D_STATE__.projectileZ = projectileGroup.position.z;
+            window.__3D_STATE__.velocityX = velocity.x;
+            window.__3D_STATE__.velocityY = velocity.y;
+            window.__3D_STATE__.velocityZ = velocity.z;
+            window.__3D_STATE__.isFlying = isFlying;
+            window.__3D_STATE__.hasLanded = hasLanded;
+            window.__3D_STATE__.launchAngle = parseFloat(document.getElementById('angleSlider').value);
+            window.__3D_STATE__.launchSpeed = parseFloat(document.getElementById('speedSlider').value);
+            window.__3D_STATE__.launchCount = launchCount;
+            window.__3D_STATE__.undoStackSize = undoStack.length;
+            window.__3D_STATE__.redoStackSize = redoStack.length;
+            window.__3D_STATE__.trailPointCount = trailPoints.length;
+            window.__3D_STATE__.distanceToTarget = projectileGroup.position.distanceTo(targetPosition);
+            window.__3D_STATE__.maxHeight = maxHeight;
+        }
+
+        function launch() {
+            if (isFlying) return;
+
+            const angleDeg = parseFloat(document.getElementById('angleSlider').value);
+            const speed = parseFloat(document.getElementById('speedSlider').value);
+            const angleRad = THREE.MathUtils.degToRad(angleDeg);
+
+            velocity.set(
+                speed * Math.cos(angleRad),
+                speed * Math.sin(angleRad),
+                0
+            );
+
+            isFlying = true;
+            hasLanded = false;
+            trailPoints = [projectileGroup.position.clone()];
+            maxHeight = projectileGroup.position.y;
+            
+            redoStack.length = 0; // Clear redo stack on new action
+            launchCount++;
+            updateUI();
+        }
+
+        function saveState() {
+            undoStack.push({
+                pos: projectileGroup.position.clone(),
+                trail: [...trailPoints],
+                maxHeight: maxHeight
+            });
+            updateUI();
+        }
+
+        function undo() {
+            if (undoStack.length === 0) return;
+            
+            const stateToUndo = undoStack.pop();
+            redoStack.push(stateToUndo);
+
+            let stateToRestore = initialState;
+            if (undoStack.length > 0) {
+                stateToRestore = undoStack[undoStack.length - 1];
+            }
+
+            projectileGroup.position.copy(stateToRestore.pos);
+            trailPoints = [...stateToRestore.trail];
+            maxHeight = stateToRestore.maxHeight;
+            
+            isFlying = false;
+            hasLanded = undoStack.length > 0;
+            velocity.set(0,0,0);
+            
+            updateTrailVisuals();
+            updateUI();
+        }
+
+        function redo() {
+            if (redoStack.length === 0) return;
+            
+            const stateToRestore = redoStack.pop();
+            undoStack.push(stateToRestore);
+
+            projectileGroup.position.copy(stateToRestore.pos);
+            trailPoints = [...stateToRestore.trail];
+            maxHeight = stateToRestore.maxHeight;
+            
+            isFlying = false;
+            hasLanded = true;
+            velocity.set(0,0,0);
+
+            updateTrailVisuals();
+            updateUI();
+        }
+
+        function reset() {
+            isFlying = false;
+            hasLanded = false;
+            projectileGroup.position.copy(startPosition);
+            velocity.set(0,0,0);
+            trailPoints = [];
+            maxHeight = 0;
+            launchCount = 0;
+            undoStack.length = 0;
+            redoStack.length = 0;
+            
+            updateTrailVisuals();
+            updateUI();
+        }
+
+        // --- Event Listeners ---
+        document.getElementById('angleSlider').addEventListener('input', (e) => {
+            document.getElementById('angleLabel').innerText = e.target.value;
+        });
+        document.getElementById('speedSlider').addEventListener('input', (e) => {
+            document.getElementById('speedLabel').innerText = e.target.value;
+        });
+
+        document.getElementById('launchBtn').addEventListener('click', launch);
+        document.getElementById('undoBtn').addEventListener('click', undo);
+        document.getElementById('redoBtn').addEventListener('click', redo);
+        document.getElementById('resetBtn').addEventListener('click', reset);
+
+        window.addEventListener('keydown', (e) => {
+            if (e.code === 'Space') {
+                e.preventDefault();
+                launch();
+            }
+        });
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // --- Main Loop ---
+        function animate() {
+            requestAnimationFrame(animate);
+
+            if (isFlying) {
+                const vMag = velocity.length();
+                
+                // Drag Force: Fd = -0.5 * Cd * rho * A * |v| * v
+                const fdMag = 0.5 * Cd * rho * A * vMag * vMag;
+                const fDrag = velocity.clone().normalize().multiplyScalar(-fdMag);
+                
+                // Gravity Force: Fg = m * g
+                const fGrav = new THREE.Vector3(0, -mass * g, 0);
+                
+                // Total Force & Acceleration
+                const fNet = fDrag.add(fGrav);
+                const acc = fNet.divideScalar(mass);
+                
+                // Euler Integration
+                velocity.add(acc.multiplyScalar(dt));
+                projectileGroup.position.add(velocity.clone().multiplyScalar(dt));
+
+                // Update Max Height
+                if (projectileGroup.position.y > maxHeight) {
+                    maxHeight = projectileGroup.position.y;
+                }
+
+                // Record Trail
+                trailPoints.push(projectileGroup.position.clone());
+                updateTrailVisuals();
+
+                // Ground Collision
+                if (projectileGroup.position.y <= 0.5) {
+                    projectileGroup.position.y = 0.5;
+                    isFlying = false;
+                    hasLanded = true;
+                    velocity.set(0,0,0);
+                    saveState();
+                }
+            }
+
+            updateUI();
+            updateGlobalState();
+            renderer.render(scene, camera);
+        }
+
+        animate();
+    </script>
+</body>
+</html>

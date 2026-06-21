@@ -1,0 +1,629 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Thin Lens Optics - Split Screen</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { overflow: hidden; background: #1a1a2e; font-family: 'Courier New', monospace; }
+#hud {
+    position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+    background: rgba(10,10,30,0.9); color: #eee; padding: 8px 16px;
+    font-size: 13px; display: flex; justify-content: space-between; align-items: center;
+    border-bottom: 1px solid #333;
+}
+#hud-info { flex: 1; text-align: center; }
+#hud-info span.p1 { color: #ff4444; }
+#hud-info span.p2 { color: #44ff44; }
+#controls {
+    position: fixed; bottom: 0; left: 0; right: 0; z-index: 100;
+    background: rgba(10,10,30,0.9); color: #eee; padding: 10px 20px;
+    display: flex; justify-content: center; align-items: center; gap: 20px;
+    border-top: 1px solid #333; font-size: 13px;
+}
+#controls label { display: flex; align-items: center; gap: 6px; }
+#controls select, #controls input[type=range] { cursor: pointer; }
+#controls button {
+    padding: 6px 14px; background: #2a2a4e; color: #eee; border: 1px solid #555;
+    border-radius: 4px; cursor: pointer; font-family: inherit;
+}
+#controls button:hover { background: #3a3a6e; }
+#canvasContainer { width: 100vw; height: 100vh; }
+canvas { display: block; }
+.divider {
+    position: fixed; top: 0; bottom: 0; left: 50%; width: 2px;
+    background: #555; z-index: 50; pointer-events: none;
+}
+.viewport-label {
+    position: fixed; top: 36px; z-index: 60; color: rgba(255,255,255,0.3);
+    font-size: 14px; font-family: 'Courier New', monospace;
+}
+.viewport-label.left { left: 20px; }
+.viewport-label.right { right: 20px; }
+.key-hint {
+    position: fixed; z-index: 60; color: rgba(255,255,255,0.25);
+    font-size: 11px; font-family: 'Courier New', monospace; bottom: 50px;
+}
+.key-hint.left { left: 20px; }
+.key-hint.right { right: 20px; }
+</style>
+</head>
+<body>
+
+<div id="hud">
+    <div id="hud-info">
+        <span class="p1">P1: do=8.00, di=0.00, m=0.00</span> &nbsp;|&nbsp;
+        <span class="p2">P2: do=6.00, di=0.00, m=0.00</span>
+    </div>
+</div>
+
+<div class="divider"></div>
+<div class="viewport-label left">Player 1 (A/D)</div>
+<div class="viewport-label right">Player 2 (←/→)</div>
+<div class="key-hint left">A ← → D</div>
+<div class="key-hint right">← ArrowLeft &nbsp; ArrowRight →</div>
+
+<div id="controls">
+    <label>Lens Type:
+        <select id="lensType">
+            <option value="convex">Convex</option>
+            <option value="concave">Concave</option>
+        </select>
+    </label>
+    <label>Focal Length: <span id="focalLabel">3.0</span>
+        <input type="range" id="focalSlider" min="1.0" max="8.0" step="0.1" value="3.0">
+    </label>
+    <button id="resetBtn">Reset All</button>
+    <button id="swapBtn">Swap Objects</button>
+</div>
+
+<canvas id="mainCanvas"></canvas>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+(function() {
+    // State
+    const state = {
+        p1_obj_x: -8,
+        p2_obj_x: -6,
+        focal_abs: 3.0,
+        lens_type: 'convex',
+        obj_height: 2
+    };
+
+    const MOVE_STEP = 0.5;
+    const CLAMP_MIN = -12;
+    const CLAMP_MAX = -0.5;
+
+    // Derived state exposed globally
+    window.__3D_STATE__ = {};
+
+    function computeLens() {
+        const f = state.lens_type === 'convex' ? state.focal_abs : -state.focal_abs;
+        
+        const do1 = Math.abs(state.p1_obj_x);
+        let di1 = 1 / (1/f - 1/do1);
+        if (!isFinite(di1)) di1 = 99999;
+        const m1 = -di1 / do1;
+        const p1_real = di1 > 0;
+        const p1_ih = m1 * state.obj_height;
+
+        const do2 = Math.abs(state.p2_obj_x);
+        let di2 = 1 / (1/f - 1/do2);
+        if (!isFinite(di2)) di2 = 99999;
+        const m2 = -di2 / do2;
+        const p2_real = di2 > 0;
+        const p2_ih = m2 * state.obj_height;
+
+        window.__3D_STATE__ = {
+            p1_do: do1,
+            p1_di: di1,
+            p1_mag: m1,
+            p1_obj_x: state.p1_obj_x,
+            p2_do: do2,
+            p2_di: di2,
+            p2_mag: m2,
+            p2_obj_x: state.p2_obj_x,
+            focal_length: f,
+            lens_type: state.lens_type,
+            p1_image_real: p1_real,
+            p2_image_real: p2_real,
+            ray_count_p1: 3,
+            ray_count_p2: 3,
+            p1_image_height: p1_ih,
+            p2_image_height: p2_ih
+        };
+
+        return window.__3D_STATE__;
+    }
+
+    // Canvas & Renderer
+    const canvas = document.getElementById('mainCanvas');
+    const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+    renderer.setPixelRatio(window.devicePixelRatio);
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.autoClear = false;
+
+    // Scenes
+    const scene1 = new THREE.Scene();
+    scene1.background = new THREE.Color(0x1a1a2e);
+    const scene2 = new THREE.Scene();
+    scene2.background = new THREE.Color(0x1a1a2e);
+
+    // Cameras
+    const viewW = 15;
+    const viewH = 10;
+    let cam1, cam2;
+
+    function makeCam() {
+        const aspect = (window.innerWidth / 2) / window.innerHeight;
+        const h = viewH;
+        const w = h * aspect;
+        return new THREE.OrthographicCamera(-w, w, h/2, -h/2, -10, 10);
+    }
+
+    cam1 = makeCam();
+    cam2 = makeCam();
+    cam1.position.z = 5;
+    cam2.position.z = 5;
+
+    // Helpers
+    function createDashedLine(points, color, dashSize, gapSize) {
+        const geom = new THREE.BufferGeometry().setFromPoints(points);
+        const mat = new THREE.LineDashedMaterial({ color, dashSize: dashSize || 0.3, gapSize: gapSize || 0.2 });
+        const line = new THREE.Line(geom, mat);
+        line.computeLineDistances();
+        return line;
+    }
+
+    function createSolidLine(points, color, opacity) {
+        const geom = new THREE.BufferGeometry().setFromPoints(points);
+        const mat = new THREE.LineBasicMaterial({ color, transparent: opacity < 1, opacity });
+        return new THREE.Line(geom, mat);
+    }
+
+    function createArrow(x, height, color, dashed) {
+        const group = new THREE.Group();
+        const headSize = Math.min(0.3, Math.abs(height) * 0.2);
+        const dir = height >= 0 ? 1 : -1;
+        const absH = Math.abs(height);
+
+        if (dashed) {
+            // Shaft
+            const shaft = createDashedLine(
+                [new THREE.Vector3(x, 0, 0), new THREE.Vector3(x, height, 0)],
+                color, 0.15, 0.1
+            );
+            group.add(shaft);
+            // Arrowhead lines
+            if (absH > 0.01) {
+                const tipY = height;
+                const baseY = height - dir * headSize;
+                const lh = createDashedLine([
+                    new THREE.Vector3(x - headSize * 0.5, baseY, 0),
+                    new THREE.Vector3(x, tipY, 0)
+                ], color, 0.1, 0.08);
+                const rh = createDashedLine([
+                    new THREE.Vector3(x + headSize * 0.5, baseY, 0),
+                    new THREE.Vector3(x, tipY, 0)
+                ], color, 0.1, 0.08);
+                group.add(lh, rh);
+            }
+            group.traverse(c => {
+                if (c.material) { c.material.transparent = true; c.material.opacity = 0.5; }
+            });
+        } else {
+            // Solid shaft
+            const shaft = createSolidLine(
+                [new THREE.Vector3(x, 0, 0), new THREE.Vector3(x, height, 0)],
+                color, 1
+            );
+            group.add(shaft);
+            // Arrowhead
+            if (absH > 0.01) {
+                const tipY = height;
+                const baseY = height - dir * headSize;
+                const lh = createSolidLine([
+                    new THREE.Vector3(x - headSize * 0.5, baseY, 0),
+                    new THREE.Vector3(x, tipY, 0)
+                ], color, 1);
+                const rh = createSolidLine([
+                    new THREE.Vector3(x + headSize * 0.5, baseY, 0),
+                    new THREE.Vector3(x, tipY, 0)
+                ], color, 1);
+                group.add(lh, rh);
+            }
+        }
+        return group;
+    }
+
+    function createLens(f, scene) {
+        const group = new THREE.Group();
+        const lensH = 6;
+        const isConvex = f > 0;
+
+        if (isConvex) {
+            // Bi-convex lens shape
+            const curve1 = new THREE.QuadraticBezierCurve(
+                new THREE.Vector2(0, -lensH/2),
+                new THREE.Vector2(0.6, 0),
+                new THREE.Vector2(0, lensH/2)
+            );
+            const curve2 = new THREE.QuadraticBezierCurve(
+                new THREE.Vector2(0, lensH/2),
+                new THREE.Vector2(-0.6, 0),
+                new THREE.Vector2(0, -lensH/2)
+            );
+            const pts1 = curve1.getPoints(30).map(p => new THREE.Vector3(p.x, p.y, 0));
+            const pts2 = curve2.getPoints(30).map(p => new THREE.Vector3(p.x, p.y, 0));
+            group.add(createSolidLine(pts1, 0x00ffff, 1));
+            group.add(createSolidLine(pts2, 0x00ffff, 1));
+            // Arrowheads at top and bottom
+            const ah = 0.3;
+            group.add(createSolidLine([
+                new THREE.Vector3(-ah, lensH/2 - ah, 0),
+                new THREE.Vector3(0, lensH/2, 0),
+                new THREE.Vector3(ah, lensH/2 - ah, 0)
+            ], 0x00ffff, 1));
+            group.add(createSolidLine([
+                new THREE.Vector3(-ah, -lensH/2 + ah, 0),
+                new THREE.Vector3(0, -lensH/2, 0),
+                new THREE.Vector3(ah, -lensH/2 + ah, 0)
+            ], 0x00ffff, 1));
+        } else {
+            // Concave lens shape
+            const curve1 = new THREE.QuadraticBezierCurve(
+                new THREE.Vector2(0, -lensH/2),
+                new THREE.Vector2(-0.5, 0),
+                new THREE.Vector2(0, lensH/2)
+            );
+            const curve2 = new THREE.QuadraticBezierCurve(
+                new THREE.Vector2(0, lensH/2),
+                new THREE.Vector2(0.5, 0),
+                new THREE.Vector2(0, -lensH/2)
+            );
+            const pts1 = curve1.getPoints(30).map(p => new THREE.Vector3(p.x, p.y, 0));
+            const pts2 = curve2.getPoints(30).map(p => new THREE.Vector3(p.x, p.y, 0));
+            group.add(createSolidLine(pts1, 0x00ffff, 1));
+            group.add(createSolidLine(pts2, 0x00ffff, 1));
+            // Arrowheads pointing inward at top
+            const ah = 0.3;
+            group.add(createSolidLine([
+                new THREE.Vector3(-ah, lensH/2 + ah, 0),
+                new THREE.Vector3(0, lensH/2, 0),
+                new THREE.Vector3(ah, lensH/2 + ah, 0)
+            ], 0x00ffff, 1));
+            group.add(createSolidLine([
+                new THREE.Vector3(-ah, -lensH/2 - ah, 0),
+                new THREE.Vector3(0, -lensH/2, 0),
+                new THREE.Vector3(ah, -lensH/2 - ah, 0)
+            ], 0x00ffff, 1));
+        }
+        return group;
+    }
+
+    function createFocalMarker(x, color) {
+        const group = new THREE.Group();
+        const s = 0.15;
+        const pts = [
+            new THREE.Vector3(x, s, 0),
+            new THREE.Vector3(x + s, 0, 0),
+            new THREE.Vector3(x, -s, 0),
+            new THREE.Vector3(x - s, 0, 0),
+            new THREE.Vector3(x, s, 0)
+        ];
+        group.add(createSolidLine(pts, color, 1));
+        return group;
+    }
+
+    function createRays(objX, objH, imgX, imgH, f, color, isReal) {
+        const group = new THREE.Group();
+        const tipX = objX;
+        const tipY = objH;
+        const imgTipX = imgX;
+        const imgTipY = imgH;
+        const opacity = 0.5;
+        const rayExtend = 20;
+
+        // Ray 1: Parallel to axis from object tip, then refracts through far focal point
+        // Incoming: horizontal from object tip to lens
+        // At lens (x=0), y = tipY
+        // Outgoing: from (0, tipY) through (f, 0) — for convex
+        // For concave: appears to come from (-|f|, 0) on same side, so diverges
+        {
+            // Incoming ray: from object tip horizontally to lens
+            const inPts = [new THREE.Vector3(tipX, tipY, 0), new THREE.Vector3(0, tipY, 0)];
+            group.add(createSolidLine(inPts, color, opacity));
+
+            // Outgoing ray: from (0, tipY) toward far focal point
+            if (f > 0) {
+                // Converges through (f, 0)
+                const dx = f - 0;
+                const dy = 0 - tipY;
+                const len = Math.sqrt(dx*dx + dy*dy);
+                const dirX = dx / len;
+                const dirY = dy / len;
+                const outPts = [
+                    new THREE.Vector3(0, tipY, 0),
+                    new THREE.Vector3(0 + dirX * rayExtend, tipY + dirY * rayExtend, 0)
+                ];
+                group.add(createSolidLine(outPts, color, opacity));
+            } else {
+                // Concave: diverges as if coming from (f, 0) which is at x=f<0
+                // Direction from (f,0) to (0, tipY)
+                const dx = 0 - f;
+                const dy = tipY - 0;
+                const len = Math.sqrt(dx*dx + dy*dy);
+                const dirX = dx / len;
+                const dirY = dy / len;
+                const outPts = [
+                    new THREE.Vector3(0, tipY, 0),
+                    new THREE.Vector3(0 + dirX * rayExtend, tipY + dirY * rayExtend, 0)
+                ];
+                group.add(createSolidLine(outPts, color, opacity));
+                // Virtual extension back to focal point
+                const virtPts = [
+                    new THREE.Vector3(0, tipY, 0),
+                    new THREE.Vector3(f, 0, 0)
+                ];
+                const vLine = createDashedLine(virtPts, color, 0.15, 0.1);
+                vLine.material.transparent = true;
+                vLine.material.opacity = 0.3;
+                group.add(vLine);
+            }
+        }
+
+        // Ray 2: Through near focal point, refracts parallel
+        // For convex: incoming aims at (-f, 0), hits lens, exits parallel
+        // For concave: incoming aims at (|f|, 0) = (-f, 0) since f<0 means -f>0... 
+        // Actually for concave, f<0, near focal point is at f (negative side)
+        // Ray directed toward far focal point on other side... 
+        // Let me reconsider: for concave lens, ray heading toward the focal point on the far side (+|f| side? No.)
+        // Standard: Ray 2 for concave: ray directed toward the focal point on the far side (x = -f = |f|), 
+        // after refraction exits parallel.
+        {
+            if (f > 0) {
+                // Ray from tip aimed at near focal point (-f, 0)
+                const focalNear = -f;
+                const dx = focalNear - tipX;
+                const dy = 0 - tipY;
+                // Find y at x=0 (lens)
+                const t = (0 - tipX) / dx;
+                const yAtLens = tipY + t * dy;
+
+                const inPts = [new THREE.Vector3(tipX, tipY, 0), new THREE.Vector3(0, yAtLens, 0)];
+                group.add(createSolidLine(inPts, color, opacity));
+
+                // Exits parallel at height yAtLens
+                const outPts = [
+                    new THREE.Vector3(0, yAtLens, 0),
+                    new THREE.Vector3(rayExtend, yAtLens, 0)
+                ];
+                group.add(createSolidLine(outPts, color, opacity));
+            } else {
+                // Concave: ray aimed toward far focal point at x = -f = |f| (positive side)
+                const focalFar = -f; // positive value
+                const dx = focalFar - tipX;
+                const dy = 0 - tipY;
+                const t = (0 - tipX) / dx;
+                const yAtLens = tipY + t * dy;
+
+                const inPts = [new THREE.Vector3(tipX, tipY, 0), new THREE.Vector3(0, yAtLens, 0)];
+                group.add(createSolidLine(inPts, color, opacity));
+
+                // Exits parallel at height yAtLens
+                const outPts = [
+                    new THREE.Vector3(0, yAtLens, 0),
+                    new THREE.Vector3(rayExtend, yAtLens, 0)
+                ];
+                group.add(createSolidLine(outPts, color, opacity));
+
+                // Virtual extension: from lens back toward focal point on same side
+                // The virtual image is formed by extending the outgoing rays backward
+                // Actually for this ray, the outgoing is parallel, extended back doesn't converge
+                // The virtual extension for concave is from (0, yAtLens) backward
+                const virtPts = [
+                    new THREE.Vector3(0, yAtLens, 0),
+                    new THREE.Vector3(-rayExtend, yAtLens, 0)
+                ];
+                const vLine = createDashedLine(virtPts, color, 0.15, 0.1);
+                vLine.material.transparent = true;
+                vLine.material.opacity = 0.2;
+                group.add(vLine);
+            }
+        }
+
+        // Ray 3: Through center of lens, undeviated
+        {
+            const dx = 0 - tipX;
+            const dy = 0 - tipY;
+            const len = Math.sqrt(dx*dx + dy*dy);
+            const dirX = dx / len;
+            const dirY = dy / len;
+
+            const inPts = [new THREE.Vector3(tipX, tipY, 0), new THREE.Vector3(0, 0, 0)];
+            group.add(createSolidLine(inPts, color, opacity));
+
+            const outPts = [
+                new THREE.Vector3(0, 0, 0),
+                new THREE.Vector3(dirX * rayExtend, dirY * rayExtend, 0)
+            ];
+            group.add(createSolidLine(outPts, color, opacity));
+        }
+
+        return group;
+    }
+
+    function buildScene(scene, objX, objHeight, objColor, imgColor, f) {
+        // Clear scene
+        while (scene.children.length > 0) scene.remove(scene.children[0]);
+
+        const aspect = (window.innerWidth / 2) / window.innerHeight;
+        const h = viewH;
+        const w = h * aspect;
+
+        // Principal axis (dashed)
+        const axis = createDashedLine(
+            [new THREE.Vector3(-w - 5, 0, 0), new THREE.Vector3(w + 5, 0, 0)],
+            0xffffff, 0.3, 0.2
+        );
+        axis.material.opacity = 0.5;
+        axis.material.transparent = true;
+        scene.add(axis);
+
+        // Lens
+        scene.add(createLens(f, scene));
+
+        // Focal markers
+        scene.add(createFocalMarker(f, 0xffff00));
+        scene.add(createFocalMarker(-f, 0xffff00));
+        // Labels for F and F'
+        // Small "F" text - we'll use small cross marks instead
+        // Add small "F" indicators as additional markers
+        const fLabelSize = 0.1;
+        // Positive f marker extra ring
+        const fmr1 = createFocalMarker(f, 0xffff00);
+        fmr1.scale.set(0.6, 0.6, 0.6);
+        fmr1.position.y = -0.3;
+        scene.add(fmr1);
+        const fmr2 = createFocalMarker(-f, 0xffff00);
+        fmr2.scale.set(0.6, 0.6, 0.6);
+        fmr2.position.y = -0.3;
+        scene.add(fmr2);
+
+        // Compute image
+        const do_val = Math.abs(objX);
+        let di = 1 / (1/f - 1/do_val);
+        if (!isFinite(di)) di = 99999;
+        const m = -di / do_val;
+        const imgHeight = m * objHeight;
+        const imgX = di;
+        const isReal = di > 0;
+
+        // Object arrow
+        scene.add(createArrow(objX, objHeight, objColor, false));
+
+        // Image arrow
+        if (Math.abs(di) < 50) {
+            scene.add(createArrow(imgX, imgHeight, imgColor, !isReal));
+        }
+
+        // Rays
+        scene.add(createRays(objX, objHeight, imgX, imgHeight, f, objColor, isReal));
+
+        return { di, m, imgHeight };
+    }
+
+    function updateAll() {
+        const s = computeLens();
+        const f = s.focal_length;
+
+        const r1 = buildScene(scene1, state.p1_obj_x, state.obj_height, 0xff4444, 0x4488ff, f);
+        const r2 = buildScene(scene2, state.p2_obj_x, state.obj_height, 0x44ff44, 0xffff44, f);
+
+        // Update HUD
+        const hudInfo = document.getElementById('hud-info');
+        hudInfo.innerHTML = 
+            `<span class="p1">P1: do=${s.p1_do.toFixed(2)}, di=${s.p1_di.toFixed(2)}, m=${s.p1_mag.toFixed(2)}</span> &nbsp;|&nbsp; ` +
+            `<span class="p2">P2: do=${s.p2_do.toFixed(2)}, di=${s.p2_di.toFixed(2)}, m=${s.p2_mag.toFixed(2)}</span>`;
+    }
+
+    function onResize() {
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        cam1 = makeCam();
+        cam2 = makeCam();
+        cam1.position.z = 5;
+        cam2.position.z = 5;
+        updateAll();
+    }
+
+    window.addEventListener('resize', onResize);
+
+    // Controls
+    document.getElementById('lensType').addEventListener('change', function() {
+        state.lens_type = this.value;
+        updateAll();
+    });
+
+    document.getElementById('focalSlider').addEventListener('input', function() {
+        state.focal_abs = parseFloat(this.value);
+        document.getElementById('focalLabel').textContent = state.focal_abs.toFixed(1);
+        updateAll();
+    });
+
+    document.getElementById('resetBtn').addEventListener('click', function() {
+        state.p1_obj_x = -8;
+        state.p2_obj_x = -6;
+        state.focal_abs = 3.0;
+        state.lens_type = 'convex';
+        document.getElementById('lensType').value = 'convex';
+        document.getElementById('focalSlider').value = 3.0;
+        document.getElementById('focalLabel').textContent = '3.0';
+        updateAll();
+    });
+
+    document.getElementById('swapBtn').addEventListener('click', function() {
+        const tmp = state.p1_obj_x;
+        state.p1_obj_x = state.p2_obj_x;
+        state.p2_obj_x = tmp;
+        updateAll();
+    });
+
+    document.addEventListener('keydown', function(e) {
+        let handled = false;
+        switch(e.key) {
+            case 'a':
+            case 'A':
+                state.p1_obj_x = Math.max(CLAMP_MIN, state.p1_obj_x - MOVE_STEP);
+                handled = true;
+                break;
+            case 'd':
+            case 'D':
+                state.p1_obj_x = Math.min(CLAMP_MAX, state.p1_obj_x + MOVE_STEP);
+                handled = true;
+                break;
+            case 'ArrowLeft':
+                state.p2_obj_x = Math.max(CLAMP_MIN, state.p2_obj_x - MOVE_STEP);
+                handled = true;
+                break;
+            case 'ArrowRight':
+                state.p2_obj_x = Math.min(CLAMP_MAX, state.p2_obj_x + MOVE_STEP);
+                handled = true;
+                break;
+        }
+        if (handled) {
+            e.preventDefault();
+            updateAll();
+        }
+    });
+
+    // Render loop
+    function animate() {
+        requestAnimationFrame(animate);
+        renderer.clear();
+
+        const w = window.innerWidth;
+        const h = window.innerHeight;
+        const halfW = Math.floor(w / 2);
+
+        // Left viewport - Player 1
+        renderer.setViewport(0, 0, halfW, h);
+        renderer.setScissor(0, 0, halfW, h);
+        renderer.setScissorTest(true);
+        renderer.render(scene1, cam1);
+
+        // Right viewport - Player 2
+        renderer.setViewport(halfW, 0, w - halfW, h);
+        renderer.setScissor(halfW, 0, w - halfW, h);
+        renderer.setScissorTest(true);
+        renderer.render(scene2, cam2);
+    }
+
+    // Initial build
+    updateAll();
+    animate();
+})();
+</script>
+</body>
+</html>

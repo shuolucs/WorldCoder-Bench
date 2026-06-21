@@ -1,0 +1,426 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Abstract Particle Art Scene</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #050510;
+            font-family: monospace;
+            user-select: none;
+        }
+        canvas {
+            display: block;
+        }
+        #hud {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(0, 0, 0, 0.7);
+            color: white;
+            padding: 15px;
+            border-radius: 8px;
+            pointer-events: none;
+            line-height: 1.5;
+            min-width: 250px;
+            border: 1px solid #333;
+        }
+        #snapshot-btn {
+            position: absolute;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            padding: 10px 20px;
+            background: rgba(255, 255, 255, 0.1);
+            color: white;
+            border: 1px solid white;
+            border-radius: 4px;
+            cursor: pointer;
+            font-family: monospace;
+            font-size: 16px;
+            transition: background 0.2s;
+        }
+        #snapshot-btn:hover {
+            background: rgba(255, 255, 255, 0.3);
+        }
+        #snapshot-btn:active {
+            background: rgba(255, 255, 255, 0.5);
+        }
+    </style>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="hud">
+        <div>Difficulty: <span id="hud-diff">1</span></div>
+        <div>Particles: <span id="hud-count">500</span></div>
+        <div>Attractors: <span id="hud-attr">1</span></div>
+        <div>Camera: <span id="hud-cam">orbit</span></div>
+        <div>Status: <span id="hud-pause">Running</span></div>
+        <div>Kinetic Energy: <span id="hud-ke">0.00</span></div>
+    </div>
+    <button id="snapshot-btn">Snapshot</button>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        // State Management
+        window.__3D_STATE__ = {
+            modelLoaded: false,
+            difficultyLevel: 1,
+            particleCount: 500,
+            activeAttractors: 1,
+            cameraMode: 'orbit',
+            paused: false,
+            totalKineticEnergy: 0,
+            repulsorCount: 0,
+            snapshotCentroid: null,
+            particlesInBounds: 500,
+            elapsedTime: 0,
+            modelAnimationPlaying: false
+        };
+
+        const state = window.__3D_STATE__;
+
+        // Scene Setup
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x050510);
+
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+        camera.position.set(0, 2, 8);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        document.body.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enabled = false;
+
+        // Lights
+        const ambientLight = new THREE.AmbientLight(0x404040, 0.5);
+        scene.add(ambientLight);
+
+        const pointLight = new THREE.PointLight(0xffffff, 1.5);
+        pointLight.position.set(5, 10, 5);
+        scene.add(pointLight);
+
+        // Model Loading
+        let mixer;
+        const loader = new GLTFLoader();
+        loader.load('https://cdn.jsdelivr.net/gh/mrdoob/three.js@r160/examples/models/gltf/BrainStem/glTF-Binary/BrainStem.glb', (gltf) => {
+            const model = gltf.scene;
+            
+            const box = new THREE.Box3().setFromObject(model);
+            const center = box.getCenter(new THREE.Vector3());
+            const size = box.getSize(new THREE.Vector3());
+            const maxDim = Math.max(size.x, size.y, size.z);
+            
+            // Scale to fit within a 2-unit bounding sphere (radius 2, diameter 4)
+            const scale = 4.0 / maxDim; 
+            model.position.sub(center.multiplyScalar(scale));
+            
+            const wrapper = new THREE.Group();
+            wrapper.add(model);
+            wrapper.scale.setScalar(scale);
+            scene.add(wrapper);
+
+            if (gltf.animations && gltf.animations.length > 0) {
+                mixer = new THREE.AnimationMixer(wrapper);
+                gltf.animations.forEach(clip => {
+                    mixer.clipAction(clip).play();
+                });
+                state.modelAnimationPlaying = !state.paused;
+            }
+            state.modelLoaded = true;
+        });
+
+        // Particle System
+        const particleCount = 500;
+        const geometry = new THREE.BufferGeometry();
+        const positions = new Float32Array(particleCount * 3);
+        const colors = new Float32Array(particleCount * 3);
+        const velocities = [];
+
+        function initParticles() {
+            for (let i = 0; i < particleCount; i++) {
+                const r = 5 * Math.cbrt(Math.random());
+                const theta = Math.random() * 2 * Math.PI;
+                const phi = Math.acos(2 * Math.random() - 1);
+                
+                positions[i * 3] = r * Math.sin(phi) * Math.cos(theta);
+                positions[i * 3 + 1] = r * Math.sin(phi) * Math.sin(theta);
+                positions[i * 3 + 2] = r * Math.cos(phi);
+
+                if (velocities.length < particleCount) {
+                    velocities.push(new THREE.Vector3(0, 0, 0));
+                } else {
+                    velocities[i].set(0, 0, 0);
+                }
+            }
+            geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+            geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+            updateParticleColors();
+        }
+
+        function updateParticleColors() {
+            const color = new THREE.Color();
+            for (let i = 0; i < particleCount; i++) {
+                if (state.difficultyLevel === 1) {
+                    color.setHSL(0.6, 1.0, 0.5); // Blue
+                } else if (state.difficultyLevel === 2) {
+                    color.setHSL(0.5, 1.0, 0.5); // Blue-green
+                } else if (state.difficultyLevel === 3) {
+                    color.setHSL(i / particleCount, 1.0, 0.5); // Rainbow
+                } else if (state.difficultyLevel === 4) {
+                    color.setHSL(Math.random() > 0.5 ? 0.83 : 0.5, 1.0, 0.5); // Neon Magenta/Cyan
+                } else {
+                    color.setHSL(Math.random(), 1.0, 0.5); // Full spectrum
+                }
+                colors[i * 3] = color.r;
+                colors[i * 3 + 1] = color.g;
+                colors[i * 3 + 2] = color.b;
+            }
+            geometry.attributes.color.needsUpdate = true;
+        }
+
+        initParticles();
+
+        const material = new THREE.PointsMaterial({
+            size: 0.08,
+            vertexColors: true,
+            blending: THREE.AdditiveBlending,
+            depthWrite: false,
+            transparent: true
+        });
+
+        const particles = new THREE.Points(geometry, material);
+        scene.add(particles);
+
+        // Physics State
+        let attractors = [];
+        let repulsors = [];
+
+        // Interactions
+        window.addEventListener('keydown', (e) => {
+            const key = e.key;
+            if (key >= '1' && key <= '5') {
+                state.difficultyLevel = parseInt(key);
+                state.activeAttractors = state.difficultyLevel;
+                updateParticleColors();
+            } else if (key.toLowerCase() === 'r') {
+                state.difficultyLevel = 1;
+                state.activeAttractors = 1;
+                initParticles();
+            } else if (key.toLowerCase() === 'p') {
+                state.paused = !state.paused;
+                state.modelAnimationPlaying = state.modelLoaded && !state.paused;
+            } else if (key.toLowerCase() === 'c') {
+                const modes = ['orbit', 'top', 'free'];
+                const idx = modes.indexOf(state.cameraMode);
+                state.cameraMode = modes[(idx + 1) % modes.length];
+                
+                if (state.cameraMode === 'free') {
+                    controls.enabled = true;
+                } else {
+                    controls.enabled = false;
+                }
+            }
+        });
+
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+        const zPlane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0);
+
+        window.addEventListener('click', (e) => {
+            if (e.target.id === 'snapshot-btn') return;
+            
+            mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+            
+            raycaster.setFromCamera(mouse, camera);
+            const target = new THREE.Vector3();
+            raycaster.ray.intersectPlane(zPlane, target);
+            
+            if (target) {
+                repulsors.push({ position: target, timer: 3.0 });
+            }
+        });
+
+        document.getElementById('snapshot-btn').addEventListener('click', () => {
+            let cx = 0, cy = 0, cz = 0;
+            const posAttr = geometry.attributes.position;
+            for (let i = 0; i < particleCount; i++) {
+                cx += posAttr.getX(i);
+                cy += posAttr.getY(i);
+                cz += posAttr.getZ(i);
+            }
+            state.snapshotCentroid = {
+                x: cx / particleCount,
+                y: cy / particleCount,
+                z: cz / particleCount
+            };
+            console.log("Snapshot taken:", state.snapshotCentroid);
+        });
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // HUD Elements
+        const elDiff = document.getElementById('hud-diff');
+        const elAttr = document.getElementById('hud-attr');
+        const elCam = document.getElementById('hud-cam');
+        const elPause = document.getElementById('hud-pause');
+        const elKe = document.getElementById('hud-ke');
+
+        // Animation Loop
+        const clock = new THREE.Clock();
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            let dt = clock.getDelta();
+            if (dt > 0.1) dt = 0.1; // Clamp dt
+
+            if (!state.paused) {
+                state.elapsedTime += dt;
+
+                if (mixer) mixer.update(dt);
+
+                // Update Attractors
+                attractors = [];
+                const lvl = state.difficultyLevel;
+                const t = state.elapsedTime;
+                
+                if (lvl === 1) {
+                    attractors.push(new THREE.Vector3(0, 0, 0));
+                } else if (lvl === 2) {
+                    attractors.push(new THREE.Vector3(-2, 0, 0));
+                    attractors.push(new THREE.Vector3(2, 0, 0));
+                } else {
+                    for (let i = 0; i < lvl; i++) {
+                        const angularSpeed = 0.5 * (i + 1);
+                        const angle = t * angularSpeed + (i * Math.PI * 2 / lvl);
+                        let r = 3;
+                        let y = 0;
+                        
+                        if (lvl >= 4) {
+                            y = Math.sin(t * (i + 1)) * 2;
+                        }
+                        if (lvl === 5) {
+                            r += Math.sin(t * 2 + i); // Turbulence noise
+                        }
+                        
+                        attractors.push(new THREE.Vector3(r * Math.cos(angle), y, r * Math.sin(angle)));
+                    }
+                }
+
+                // Update Repulsors
+                for (let i = repulsors.length - 1; i >= 0; i--) {
+                    repulsors[i].timer -= dt;
+                    if (repulsors[i].timer <= 0) {
+                        repulsors.splice(i, 1);
+                    }
+                }
+                state.repulsorCount = repulsors.length;
+
+                // Physics Loop
+                const speedMult = lvl * 0.5;
+                let totalKE = 0;
+                let inBoundsCount = 0;
+                const posAttr = geometry.attributes.position;
+
+                for (let i = 0; i < particleCount; i++) {
+                    const p = new THREE.Vector3(posAttr.getX(i), posAttr.getY(i), posAttr.getZ(i));
+                    const v = velocities[i];
+
+                    // Attractor Forces
+                    for (const a of attractors) {
+                        const dir = new THREE.Vector3().subVectors(a, p);
+                        const distSq = dir.lengthSq();
+                        if (distSq > 0.01) {
+                            let force = 0.5 / distSq;
+                            if (force > 2.0) force = 2.0;
+                            v.add(dir.normalize().multiplyScalar(force * dt * speedMult));
+                        }
+                    }
+
+                    // Repulsor Forces
+                    for (const r of repulsors) {
+                        const dir = new THREE.Vector3().subVectors(p, r.position);
+                        const distSq = dir.lengthSq();
+                        if (distSq > 0.01) {
+                            const force = 1.0 / distSq;
+                            v.add(dir.normalize().multiplyScalar(force * dt * speedMult));
+                        }
+                    }
+
+                    v.multiplyScalar(0.98); // Damping
+                    p.addScaledVector(v, dt);
+
+                    // Boundary Check
+                    if (p.length() > 10) {
+                        const r = 3 * Math.cbrt(Math.random());
+                        const theta = Math.random() * 2 * Math.PI;
+                        const phi = Math.acos(2 * Math.random() - 1);
+                        p.set(
+                            r * Math.sin(phi) * Math.cos(theta),
+                            r * Math.sin(phi) * Math.sin(theta),
+                            r * Math.cos(phi)
+                        );
+                        v.set(0, 0, 0);
+                    } else {
+                        inBoundsCount++;
+                    }
+
+                    posAttr.setXYZ(i, p.x, p.y, p.z);
+                    totalKE += 0.5 * v.lengthSq();
+                }
+
+                posAttr.needsUpdate = true;
+                state.totalKineticEnergy = totalKE;
+                state.particlesInBounds = inBoundsCount;
+            }
+
+            // Camera Update
+            if (state.cameraMode === 'orbit') {
+                camera.position.x = 8 * Math.sin(state.elapsedTime * 0.5);
+                camera.position.z = 8 * Math.cos(state.elapsedTime * 0.5);
+                camera.position.y = 2;
+                camera.lookAt(0, 0, 0);
+            } else if (state.cameraMode === 'top') {
+                camera.position.set(0, 12, 0);
+                camera.lookAt(0, 0, 0);
+            } else if (state.cameraMode === 'free') {
+                controls.update();
+            }
+
+            // Update HUD
+            elDiff.innerText = state.difficultyLevel;
+            elAttr.innerText = state.activeAttractors;
+            elCam.innerText = state.cameraMode;
+            elPause.innerText = state.paused ? 'Paused' : 'Running';
+            elPause.style.color = state.paused ? '#ff5555' : '#55ff55';
+            elKe.innerText = state.totalKineticEnergy.toFixed(2);
+
+            renderer.render(scene, camera);
+        }
+
+        animate();
+    </script>
+</body>
+</html>

@@ -1,0 +1,485 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Weather Radar</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #0a0a1a;
+            font-family: monospace;
+            user-select: none;
+        }
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+        }
+        .hud {
+            position: absolute;
+            color: white;
+            font-size: 20px;
+            pointer-events: none;
+            text-shadow: 1px 1px 2px black;
+            z-index: 10;
+        }
+        #top-left {
+            top: 20px;
+            left: 20px;
+        }
+        #top-right {
+            top: 20px;
+            right: 20px;
+            text-align: right;
+        }
+        #threat-bar-container {
+            width: 200px;
+            height: 10px;
+            background: #333;
+            margin-top: 5px;
+            border: 1px solid #fff;
+        }
+        #threat-bar {
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(90deg, #00ff00, #ff0000);
+            transform-origin: left;
+            transition: transform 0.3s ease;
+        }
+        #bottom-left {
+            bottom: 20px;
+            left: 20px;
+        }
+        #bottom-center {
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            pointer-events: auto;
+        }
+        #resetBtn {
+            background: #334455;
+            color: white;
+            border: 2px solid #fff;
+            padding: 10px 20px;
+            font-family: monospace;
+            font-size: 18px;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        #resetBtn:hover {
+            background: #556677;
+        }
+        #clearMsg {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: #00ff00;
+            font-size: 60px;
+            font-weight: bold;
+            text-shadow: 0 0 20px #00ff00;
+            display: none;
+            pointer-events: none;
+            z-index: 20;
+        }
+        #controls-help {
+            position: absolute;
+            bottom: 20px;
+            right: 20px;
+            font-size: 14px;
+            color: #aaa;
+            text-align: right;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="canvas-container"></div>
+
+    <div id="top-left" class="hud">
+        <div id="scoreDisplay">Score: 0</div>
+        <div id="comboDisplay">Combo: 1x</div>
+    </div>
+
+    <div id="top-right" class="hud">
+        <div id="threatDisplay">Threat Level: 15/15</div>
+        <div id="threat-bar-container">
+            <div id="threat-bar"></div>
+        </div>
+    </div>
+
+    <div id="bottom-left" class="hud">
+        <div id="analyzedDisplay">Cells Analyzed: 0/5</div>
+    </div>
+
+    <div id="bottom-center" class="hud">
+        <button id="resetBtn">RESET RADAR</button>
+    </div>
+
+    <div id="controls-help" class="hud">
+        [P] Pause/Unpause<br>
+        [T] Toggle Coverage Dome
+    </div>
+
+    <div id="clearMsg">RADAR CLEAR</div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+
+    <script>
+        // --- State Management ---
+        window.__3D_STATE__ = {
+            radarAngle: 0,
+            paused: false,
+            score: 0,
+            combo: 1,
+            cellsAnalyzed: 0,
+            threatLevel: 15,
+            domeVisible: false,
+            weatherCells: [],
+            lastAnalyzedSeverity: 0,
+            allClear: false
+        };
+
+        const state = window.__3D_STATE__;
+
+        // --- DOM Elements ---
+        const scoreEl = document.getElementById('scoreDisplay');
+        const comboEl = document.getElementById('comboDisplay');
+        const threatEl = document.getElementById('threatDisplay');
+        const threatBarEl = document.getElementById('threat-bar');
+        const analyzedEl = document.getElementById('analyzedDisplay');
+        const clearMsgEl = document.getElementById('clearMsg');
+        const resetBtn = document.getElementById('resetBtn');
+
+        // --- Three.js Setup ---
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x0a0a1a);
+
+        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.set(0, 80, 120);
+        camera.lookAt(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        container.appendChild(renderer.domElement);
+
+        const controls = new THREE.OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.05;
+        controls.maxPolarAngle = Math.PI / 2 - 0.05; // Don't go below ground
+
+        // --- Lighting ---
+        const ambientLight = new THREE.AmbientLight(0x334455, 0.4);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+        dirLight.position.set(50, 100, 50);
+        scene.add(dirLight);
+
+        // --- Scene Objects ---
+        // Ground
+        const groundGeo = new THREE.CircleGeometry(100, 64);
+        const groundMat = new THREE.MeshLambertMaterial({ color: 0x1a3a1a });
+        const ground = new THREE.Mesh(groundGeo, groundMat);
+        ground.rotation.x = -Math.PI / 2;
+        scene.add(ground);
+
+        // Radar Pedestal
+        const pedestalGeo = new THREE.CylinderGeometry(2, 2, 15, 16);
+        const pedestalMat = new THREE.MeshLambertMaterial({ color: 0x444444 });
+        const pedestal = new THREE.Mesh(pedestalGeo, pedestalMat);
+        pedestal.position.y = 7.5;
+        scene.add(pedestal);
+
+        // Radar Dish Group (Rotates)
+        const radarGroup = new THREE.Group();
+        radarGroup.position.y = 15;
+        scene.add(radarGroup);
+
+        const dishGeo = new THREE.ConeGeometry(5, 3, 16);
+        const dishMat = new THREE.MeshLambertMaterial({ color: 0x888888 });
+        const dish = new THREE.Mesh(dishGeo, dishMat);
+        dish.rotation.x = Math.PI / 2;
+        radarGroup.add(dish);
+
+        // Radar Sweep
+        const sweepGeo = new THREE.CircleGeometry(90, 32, 0, Math.PI / 6);
+        const sweepMat = new THREE.MeshBasicMaterial({ 
+            color: 0x00ff44, 
+            transparent: true, 
+            opacity: 0.15, 
+            side: THREE.DoubleSide,
+            depthWrite: false
+        });
+        const sweep = new THREE.Mesh(sweepGeo, sweepMat);
+        sweep.rotation.x = -Math.PI / 2;
+        sweep.position.y = -14.9; // Just above ground relative to radarGroup
+        radarGroup.add(sweep);
+
+        // Coverage Dome
+        const domeGeo = new THREE.SphereGeometry(90, 32, 16, 0, Math.PI * 2, 0, Math.PI / 2);
+        const domeMat = new THREE.MeshBasicMaterial({
+            color: 0x00ffff,
+            wireframe: true,
+            transparent: true,
+            opacity: 0.1
+        });
+        const dome = new THREE.Mesh(domeGeo, domeMat);
+        dome.visible = false;
+        scene.add(dome);
+
+        // --- Weather Cells ---
+        const cellsGroup = new THREE.Group();
+        scene.add(cellsGroup);
+
+        const severityColors = {
+            1: 0x00ff00,
+            2: 0xffff00,
+            3: 0xff8800,
+            4: 0xff0000,
+            5: 0xff00ff
+        };
+
+        function createWeatherCells() {
+            // Clear existing
+            while(cellsGroup.children.length > 0){ 
+                const child = cellsGroup.children[0];
+                cellsGroup.remove(child); 
+            }
+            state.weatherCells = [];
+
+            for (let i = 1; i <= 5; i++) {
+                const severity = i;
+                const color = severityColors[severity];
+                const maxRadius = severity * 4;
+                
+                const cellGroup = new THREE.Group();
+                
+                // 3 nested spheres
+                const radii = [maxRadius, maxRadius * 0.7, maxRadius * 0.4];
+                const opacities = [0.2, 0.4, 0.7];
+
+                radii.forEach((r, idx) => {
+                    const geo = new THREE.SphereGeometry(r, 16, 16);
+                    const mat = new THREE.MeshLambertMaterial({
+                        color: color,
+                        transparent: true,
+                        opacity: opacities[idx],
+                        depthWrite: false,
+                        blending: THREE.AdditiveBlending
+                    });
+                    const mesh = new THREE.Mesh(geo, mat);
+                    cellGroup.add(mesh);
+                });
+
+                // Random position within radius 80
+                const angle = Math.random() * Math.PI * 2;
+                const dist = Math.random() * 80;
+                cellGroup.position.set(Math.cos(angle) * dist, 5, Math.sin(angle) * dist);
+
+                // Random velocity
+                const vAngle = Math.random() * Math.PI * 2;
+                const speed = severity * 0.5;
+                const velocity = new THREE.Vector2(Math.cos(vAngle) * speed, Math.sin(vAngle) * speed);
+
+                cellGroup.userData = {
+                    severity: severity,
+                    analyzed: false,
+                    velocity: velocity,
+                    offset: Math.random() * Math.PI * 2,
+                    ring: null
+                };
+
+                cellsGroup.add(cellGroup);
+                
+                state.weatherCells.push({
+                    severity: severity,
+                    analyzed: false,
+                    x: cellGroup.position.x,
+                    z: cellGroup.position.z
+                });
+            }
+        }
+
+        createWeatherCells();
+
+        // --- Interaction & Raycasting ---
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+
+        function addGlowingRing(cellGroup) {
+            const radius = cellGroup.userData.severity * 4 + 2;
+            const ringGeo = new THREE.TorusGeometry(radius, 0.5, 16, 64);
+            const ringMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
+            const ring = new THREE.Mesh(ringGeo, ringMat);
+            ring.rotation.x = Math.PI / 2;
+            cellGroup.add(ring);
+            cellGroup.userData.ring = ring;
+        }
+
+        window.addEventListener('click', (event) => {
+            if (state.paused || state.allClear) return;
+            if (event.target.id === 'resetBtn') return;
+
+            mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+            raycaster.setFromCamera(mouse, camera);
+
+            // Intersect with meshes inside cell groups
+            const intersects = raycaster.intersectObjects(cellsGroup.children, true);
+
+            if (intersects.length > 0) {
+                // Find the parent group (the cell)
+                let object = intersects[0].object;
+                while (object.parent && object.parent !== cellsGroup) {
+                    object = object.parent;
+                }
+
+                if (object && object.userData && !object.userData.analyzed) {
+                    analyzeCell(object);
+                }
+            }
+        });
+
+        function analyzeCell(cellGroup) {
+            const sev = cellGroup.userData.severity;
+            cellGroup.userData.analyzed = true;
+            
+            // Update state array
+            const stateCell = state.weatherCells.find(c => c.severity === sev);
+            if(stateCell) stateCell.analyzed = true;
+
+            state.cellsAnalyzed++;
+            state.threatLevel -= sev;
+
+            // Combo logic
+            if (state.lastAnalyzedSeverity === 0) {
+                state.combo = 1;
+            } else if (sev > state.lastAnalyzedSeverity) {
+                state.combo = Math.min(5, state.combo + 1);
+            } else {
+                state.combo = 1;
+            }
+
+            state.score += sev * 100 * state.combo;
+            state.lastAnalyzedSeverity = sev;
+
+            addGlowingRing(cellGroup);
+
+            if (state.cellsAnalyzed === 5) {
+                state.allClear = true;
+                clearMsgEl.style.display = 'block';
+            }
+
+            updateUI();
+        }
+
+        // --- UI Updates ---
+        function updateUI() {
+            scoreEl.innerText = `Score: ${state.score}`;
+            comboEl.innerText = `Combo: ${state.combo}x`;
+            threatEl.innerText = `Threat Level: ${state.threatLevel}/15`;
+            analyzedEl.innerText = `Cells Analyzed: ${state.cellsAnalyzed}/5`;
+            
+            const threatRatio = state.threatLevel / 15;
+            threatBarEl.style.transform = `scaleX(${threatRatio})`;
+        }
+
+        // --- Reset Logic ---
+        resetBtn.addEventListener('click', () => {
+            state.score = 0;
+            state.combo = 1;
+            state.cellsAnalyzed = 0;
+            state.threatLevel = 15;
+            state.lastAnalyzedSeverity = 0;
+            state.allClear = false;
+            clearMsgEl.style.display = 'none';
+            
+            createWeatherCells();
+            updateUI();
+        });
+
+        // --- Keyboard Controls ---
+        window.addEventListener('keydown', (e) => {
+            if (e.key.toLowerCase() === 'p') {
+                state.paused = !state.paused;
+            }
+            if (e.key.toLowerCase() === 't') {
+                state.domeVisible = !state.domeVisible;
+                dome.visible = state.domeVisible;
+            }
+        });
+
+        // --- Window Resize ---
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // --- Animation Loop ---
+        const clock = new THREE.Clock();
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const delta = clock.getDelta();
+            const time = clock.getElapsedTime();
+
+            if (!state.paused) {
+                // Radar Rotation
+                radarGroup.rotation.y -= 0.5 * delta;
+                state.radarAngle = radarGroup.rotation.y;
+
+                // Weather Cells Update
+                cellsGroup.children.forEach((cell, index) => {
+                    const data = cell.userData;
+                    
+                    // Drift
+                    let pos2D = new THREE.Vector2(cell.position.x, cell.position.z);
+                    pos2D.addScaledVector(data.velocity, delta);
+
+                    // Bounce off radius 80
+                    if (pos2D.length() > 80) {
+                        const normal = pos2D.clone().normalize();
+                        const dot = data.velocity.dot(normal);
+                        data.velocity.sub(normal.multiplyScalar(2 * dot));
+                        pos2D.copy(normal.multiplyScalar(80));
+                    }
+
+                    cell.position.x = pos2D.x;
+                    cell.position.z = pos2D.y;
+
+                    // Bobbing
+                    cell.position.y = 5 + Math.sin(time * (Math.PI * 2 / 3) + data.offset) * 2;
+
+                    // Update state array
+                    if(state.weatherCells[index]) {
+                        state.weatherCells[index].x = cell.position.x;
+                        state.weatherCells[index].z = cell.position.z;
+                    }
+
+                    // Animate ring if analyzed
+                    if (data.analyzed && data.ring) {
+                        data.ring.rotation.z += delta;
+                        data.ring.scale.setScalar(1 + Math.sin(time * 5) * 0.05);
+                    }
+                });
+            }
+
+            controls.update();
+            renderer.render(scene, camera);
+        }
+
+        updateUI();
+        animate();
+
+    </script>
+</body>
+</html>

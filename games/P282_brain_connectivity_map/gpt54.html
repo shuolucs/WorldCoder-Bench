@@ -1,0 +1,465 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>3D Brain Connectivity Map</title>
+  <style>
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #0a0a1a;
+      font-family: monospace;
+    }
+
+    canvas {
+      display: block;
+    }
+
+    #hud {
+      position: fixed;
+      top: 12px;
+      left: 12px;
+      padding: 10px 14px;
+      background: rgba(10, 10, 26, 0.72);
+      color: white;
+      border: 1px solid rgba(255,255,255,0.15);
+      border-radius: 8px;
+      font-size: 14px;
+      z-index: 10;
+      pointer-events: none;
+      white-space: nowrap;
+    }
+
+    #instructions {
+      position: fixed;
+      left: 50%;
+      bottom: 12px;
+      transform: translateX(-50%);
+      padding: 10px 14px;
+      background: rgba(10, 10, 26, 0.72);
+      color: white;
+      border: 1px solid rgba(255,255,255,0.15);
+      border-radius: 8px;
+      font-size: 13px;
+      z-index: 10;
+      pointer-events: none;
+      text-align: center;
+      max-width: 90vw;
+      line-height: 1.4;
+    }
+  </style>
+</head>
+<body>
+  <div id="hud">Loading...</div>
+  <div id="instructions">
+    Click node: select/deselect |
+    Move mouse: hover |
+    G: cycle group filter |
+    R: toggle rotation |
+    W: uniform/weighted edges |
+    P: pulse nodes |
+    + / -: zoom |
+    T: show/hide scaffold
+  </div>
+
+  <script type="module">
+    import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js';
+    import { GLTFLoader } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/GLTFLoader.js';
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0a0a1a);
+
+    const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+    camera.position.set(0, 3, 8);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    document.body.appendChild(renderer.domElement);
+
+    const ambientLight = new THREE.AmbientLight(0x334466, 0.4);
+    scene.add(ambientLight);
+
+    const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
+    directionalLight.position.set(5, 10, 5);
+    scene.add(directionalLight);
+
+    window.__3D_STATE__ = {
+      modelLoaded: false,
+      nodeCount: 20,
+      edgeCount: 30,
+      selectedNode: -1,
+      hoveredNode: -1,
+      activeGroup: -1,
+      connectionStrengthMode: 'uniform',
+      rotationEnabled: true,
+      rotationSpeed: 0.002,
+      currentRotationY: 0,
+      visibleNodes: 20,
+      visibleEdges: 30,
+      highlightedEdges: 0,
+      pulseActive: false,
+      modelOpacity: 0.3,
+      zoomLevel: 1.0
+    };
+
+    const hud = document.getElementById('hud');
+
+    const raycaster = new THREE.Raycaster();
+    const mouse = new THREE.Vector2();
+    const clock = new THREE.Clock();
+
+    const rootGroup = new THREE.Group();
+    scene.add(rootGroup);
+
+    const modelGroup = new THREE.Group();
+    const graphGroup = new THREE.Group();
+    rootGroup.add(modelGroup);
+    rootGroup.add(graphGroup);
+
+    let brainModel = null;
+
+    const loader = new GLTFLoader();
+    loader.load(
+      'https://threejs.org/examples/models/gltf/LittlestTokyo.glb',
+      (gltf) => {
+        brainModel = gltf.scene;
+
+        const box = new THREE.Box3().setFromObject(brainModel);
+        const center = box.getCenter(new THREE.Vector3());
+        const size = box.getSize(new THREE.Vector3());
+        const radius = size.length() * 0.5 || 1;
+        const scale = 3 / radius;
+
+        brainModel.position.sub(center);
+        brainModel.scale.setScalar(scale);
+
+        const scaledBox = new THREE.Box3().setFromObject(brainModel);
+        const scaledCenter = scaledBox.getCenter(new THREE.Vector3());
+        brainModel.position.sub(scaledCenter);
+
+        brainModel.traverse((obj) => {
+          if (obj.isMesh) {
+            obj.material = obj.material.clone();
+            obj.material.transparent = true;
+            obj.material.opacity = 0.3;
+            obj.material.depthWrite = false;
+          }
+        });
+
+        modelGroup.add(brainModel);
+        window.__3D_STATE__.modelLoaded = true;
+      },
+      undefined,
+      (err) => {
+        console.warn('Failed to load LittlestTokyo.glb:', err);
+      }
+    );
+
+    const groupColors = [
+      new THREE.Color(0xff3333),
+      new THREE.Color(0x3366ff),
+      new THREE.Color(0x33ff66),
+      new THREE.Color(0xffcc33)
+    ];
+
+    const nodes = [];
+    const nodeMeta = [];
+    const edges = [];
+
+    const nodeGeometry = new THREE.SphereGeometry(0.15, 20, 20);
+
+    for (let i = 0; i < 20; i++) {
+      const group = Math.floor(i / 5);
+      const color = groupColors[group];
+      const material = new THREE.MeshStandardMaterial({
+        color,
+        emissive: color.clone().multiplyScalar(0.25),
+        transparent: true,
+        opacity: 0.95
+      });
+
+      const node = new THREE.Mesh(nodeGeometry, material);
+
+      const x = 2.5 * Math.cos(i * 0.314) * Math.sin(i * 0.5);
+      const y = 1.5 * Math.sin(i * 0.628);
+      const z = 2.0 * Math.cos(i * 0.5) * Math.cos(i * 0.314);
+
+      node.position.set(x, y, z);
+      node.userData.index = i;
+      node.userData.group = group;
+      node.userData.baseScale = 1;
+
+      nodes.push(node);
+      nodeMeta.push({ index: i, group, color, position: node.position.clone() });
+      graphGroup.add(node);
+    }
+
+    const uniqueConnections = new Map();
+
+    function addConnection(a, b) {
+      const key = [Math.min(a, b), Math.max(a, b)].join('-');
+      if (!uniqueConnections.has(key)) {
+        uniqueConnections.set(key, { a, b });
+      }
+    }
+
+    for (let i = 0; i < 10; i++) addConnection(i, i + 10);
+    for (let i = 0; i < 10; i++) addConnection(i, (i + 3) % 20);
+    for (let i = 0; i < 10; i++) addConnection(i, (i + 7) % 20);
+
+    const connectionList = Array.from(uniqueConnections.values()).slice(0, 30);
+
+    let maxDistance = 0;
+    for (const c of connectionList) {
+      const d = nodes[c.a].position.distanceTo(nodes[c.b].position);
+      if (d > maxDistance) maxDistance = d;
+    }
+
+    function blendedColor(a, b) {
+      return groupColors[Math.floor(a / 5)].clone().lerp(groupColors[Math.floor(b / 5)], 0.5);
+    }
+
+    for (const c of connectionList) {
+      const points = [nodes[c.a].position.clone(), nodes[c.b].position.clone()];
+      const geometry = new THREE.BufferGeometry().setFromPoints(points);
+      const color = blendedColor(c.a, c.b);
+
+      const material = new THREE.LineBasicMaterial({
+        color,
+        transparent: true,
+        opacity: 0.3
+      });
+
+      const line = new THREE.Line(geometry, material);
+      line.userData = {
+        a: c.a,
+        b: c.b,
+        baseColor: color.clone(),
+        highlighted: false,
+        distance: nodes[c.a].position.distanceTo(nodes[c.b].position)
+      };
+
+      edges.push(line);
+      graphGroup.add(line);
+    }
+
+    function getWeightedOpacity(edge) {
+      return 0.1 + 0.9 * (1 - edge.userData.distance / maxDistance);
+    }
+
+    function applyModelOpacity() {
+      if (!brainModel) return;
+      brainModel.traverse((obj) => {
+        if (obj.isMesh && obj.material) {
+          obj.material.opacity = window.__3D_STATE__.modelOpacity;
+          obj.visible = window.__3D_STATE__.modelOpacity > 0;
+        }
+      });
+    }
+
+    function updateEdgesAppearance() {
+      let highlightedCount = 0;
+
+      for (const edge of edges) {
+        const { a, b } = edge.userData;
+        const selected = window.__3D_STATE__.selectedNode;
+        const isHighlighted = selected !== -1 && (a === selected || b === selected);
+        edge.userData.highlighted = isHighlighted;
+
+        const inActiveGroup = (
+          window.__3D_STATE__.activeGroup === -1 ||
+          nodeMeta[a].group === window.__3D_STATE__.activeGroup ||
+          nodeMeta[b].group === window.__3D_STATE__.activeGroup
+        );
+
+        edge.visible = inActiveGroup;
+
+        let baseOpacity = window.__3D_STATE__.connectionStrengthMode === 'weighted'
+          ? getWeightedOpacity(edge)
+          : 0.3;
+
+        edge.material.opacity = isHighlighted ? 1.0 : baseOpacity;
+        edge.material.color.copy(edge.userData.baseColor);
+        if (isHighlighted) {
+          edge.material.color.offsetHSL(0, 0, 0.2);
+          highlightedCount++;
+        }
+      }
+
+      window.__3D_STATE__.highlightedEdges = highlightedCount;
+    }
+
+    function updateVisibility() {
+      let visibleNodes = 0;
+      let visibleEdges = 0;
+      const activeGroup = window.__3D_STATE__.activeGroup;
+
+      for (const node of nodes) {
+        const visible = activeGroup === -1 || node.userData.group === activeGroup;
+        node.visible = visible;
+        if (visible) visibleNodes++;
+      }
+
+      for (const edge of edges) {
+        const { a, b } = edge.userData;
+        const visible = activeGroup === -1 ||
+          nodeMeta[a].group === activeGroup ||
+          nodeMeta[b].group === activeGroup;
+        edge.visible = visible;
+        if (visible) visibleEdges++;
+      }
+
+      window.__3D_STATE__.visibleNodes = visibleNodes;
+      window.__3D_STATE__.visibleEdges = visibleEdges;
+
+      updateEdgesAppearance();
+      updateHUD();
+    }
+
+    function updateHUD() {
+      const s = window.__3D_STATE__;
+      hud.textContent = `Nodes: ${s.visibleNodes}/20 | Edges: ${s.visibleEdges}/30 | Selected: ${s.selectedNode} | Group: ${s.activeGroup}`;
+    }
+
+    function setSelectedNode(index) {
+      window.__3D_STATE__.selectedNode = index;
+      updateEdgesAppearance();
+      updateHUD();
+    }
+
+    function updateHover(clientX, clientY) {
+      const rect = renderer.domElement.getBoundingClientRect();
+      mouse.x = ((clientX - rect.left) / rect.width) * 2 - 1;
+      mouse.y = -((clientY - rect.top) / rect.height) * 2 + 1;
+
+      raycaster.setFromCamera(mouse, camera);
+      const intersects = raycaster.intersectObjects(nodes.filter(n => n.visible), false);
+
+      const prev = window.__3D_STATE__.hoveredNode;
+      let next = -1;
+
+      if (intersects.length > 0) {
+        next = intersects[0].object.userData.index;
+      }
+
+      window.__3D_STATE__.hoveredNode = next;
+
+      for (const node of nodes) {
+        if (node.userData.index !== next && !window.__3D_STATE__.pulseActive) {
+          node.scale.setScalar(1);
+        }
+      }
+    }
+
+    window.addEventListener('mousemove', (e) => {
+      updateHover(e.clientX, e.clientY);
+    });
+
+    window.addEventListener('click', (e) => {
+      const rect = renderer.domElement.getBoundingClientRect();
+      mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+      mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+
+      raycaster.setFromCamera(mouse, camera);
+      const intersects = raycaster.intersectObjects(nodes.filter(n => n.visible), false);
+
+      if (intersects.length > 0) {
+        setSelectedNode(intersects[0].object.userData.index);
+      } else {
+        setSelectedNode(-1);
+      }
+    });
+
+    window.addEventListener('keydown', (e) => {
+      const key = e.key;
+
+      if (key === 'g' || key === 'G') {
+        const current = window.__3D_STATE__.activeGroup;
+        window.__3D_STATE__.activeGroup = current === 3 ? -1 : current + 1;
+        if (window.__3D_STATE__.selectedNode !== -1) {
+          const selectedGroup = nodeMeta[window.__3D_STATE__.selectedNode].group;
+          if (window.__3D_STATE__.activeGroup !== -1 && selectedGroup !== window.__3D_STATE__.activeGroup) {
+            window.__3D_STATE__.selectedNode = -1;
+          }
+        }
+        updateVisibility();
+      }
+
+      if (key === 'r' || key === 'R') {
+        window.__3D_STATE__.rotationEnabled = !window.__3D_STATE__.rotationEnabled;
+      }
+
+      if (key === 'w' || key === 'W') {
+        window.__3D_STATE__.connectionStrengthMode =
+          window.__3D_STATE__.connectionStrengthMode === 'uniform' ? 'weighted' : 'uniform';
+        updateEdgesAppearance();
+      }
+
+      if (key === 'p' || key === 'P') {
+        window.__3D_STATE__.pulseActive = !window.__3D_STATE__.pulseActive;
+      }
+
+      if (key === '+' || key === '=') {
+        window.__3D_STATE__.zoomLevel = Math.min(3.0, window.__3D_STATE__.zoomLevel + 0.2);
+        camera.position.set(0, 3, 8 / window.__3D_STATE__.zoomLevel);
+      }
+
+      if (key === '-') {
+        window.__3D_STATE__.zoomLevel = Math.max(0.4, window.__3D_STATE__.zoomLevel - 0.2);
+        camera.position.set(0, 3, 8 / window.__3D_STATE__.zoomLevel);
+      }
+
+      if (key === 't' || key === 'T') {
+        window.__3D_STATE__.modelOpacity = window.__3D_STATE__.modelOpacity > 0 ? 0.0 : 0.3;
+        applyModelOpacity();
+      }
+
+      updateHUD();
+    });
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    updateVisibility();
+    updateHUD();
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      const elapsed = clock.getElapsedTime();
+
+      if (window.__3D_STATE__.rotationEnabled) {
+        graphGroup.rotation.y += window.__3D_STATE__.rotationSpeed;
+        window.__3D_STATE__.currentRotationY = graphGroup.rotation.y;
+      }
+
+      for (const node of nodes) {
+        let scale = 1;
+
+        if (window.__3D_STATE__.pulseActive) {
+          scale *= 1.0 + 0.2 * Math.sin(elapsed * 3 + node.userData.index * 0.35);
+        }
+
+        if (window.__3D_STATE__.hoveredNode === node.userData.index) {
+          scale *= 1.5;
+        }
+
+        node.scale.setScalar(scale);
+      }
+
+      camera.lookAt(0, 0, 0);
+      renderer.render(scene, camera);
+    }
+
+    animate();
+  </script>
+</body>
+</html>

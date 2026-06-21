@@ -1,0 +1,728 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>3D Population Density Globe</title>
+  <style>
+    html, body {
+      margin: 0;
+      overflow: hidden;
+      background: #0a0a1a;
+      font-family: Arial, sans-serif;
+      color: white;
+    }
+    canvas { display: block; }
+
+    .hud {
+      position: fixed;
+      z-index: 10;
+      color: white;
+      font-size: 18px;
+      pointer-events: none;
+      text-shadow: 0 0 6px rgba(0,0,0,0.7);
+      user-select: none;
+    }
+    #hudDifficulty { top: 12px; left: 12px; }
+    #hudPoints { top: 12px; right: 12px; }
+    #hudAutoRotate { bottom: 12px; left: 12px; }
+    #hudHeatmap {
+      bottom: 12px;
+      left: 50%;
+      transform: translateX(-50%);
+    }
+    #hudFPS { bottom: 12px; right: 12px; }
+
+    #tooltip {
+      position: fixed;
+      z-index: 20;
+      display: none;
+      pointer-events: none;
+      background: rgba(8, 12, 30, 0.92);
+      border: 1px solid rgba(255,255,255,0.25);
+      color: white;
+      font-size: 14px;
+      padding: 8px 10px;
+      border-radius: 6px;
+      white-space: nowrap;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.35);
+    }
+
+    #help {
+      position: fixed;
+      top: 46px;
+      left: 12px;
+      z-index: 10;
+      font-size: 12px;
+      color: rgba(255,255,255,0.7);
+      pointer-events: none;
+      line-height: 1.4;
+      text-shadow: 0 0 6px rgba(0,0,0,0.7);
+    }
+  </style>
+</head>
+<body>
+  <div id="hudDifficulty" class="hud">Difficulty: 1/5</div>
+  <div id="hudPoints" class="hud">Points Visible: 0</div>
+  <div id="hudAutoRotate" class="hud">Auto-Rotate: ON</div>
+  <div id="hudHeatmap" class="hud">Heatmap: OFF</div>
+  <div id="hudFPS" class="hud">FPS: 0</div>
+  <div id="tooltip"></div>
+  <div id="help">
+    Drag: rotate · Wheel: zoom · Click bar: inspect<br/>
+    D: difficulty · R: reset · P: auto-rotate · H: heatmap · S: sort animation
+  </div>
+
+  <script type="module">
+    import * as THREE from "https://unpkg.com/three@0.160.0/build/three.module.js";
+    import { OrbitControls } from "https://unpkg.com/three@0.160.0/examples/jsm/controls/OrbitControls.js";
+
+    const BG = "#0a0a1a";
+    const GLOBE_RADIUS = 1.0;
+    const TOTAL_POINTS = 240;
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(BG);
+
+    const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+    camera.position.set(0, 0, 3.5);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance" });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    document.body.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.05;
+    controls.minDistance = 2.0;
+    controls.maxDistance = 6.0;
+    controls.target.set(0, 0, 0);
+
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.3);
+    scene.add(ambientLight);
+
+    const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+    dirLight.position.set(5, 3, 5);
+    scene.add(dirLight);
+
+    const globeGroup = new THREE.Group();
+    scene.add(globeGroup);
+
+    const barsGroup = new THREE.Group();
+    globeGroup.add(barsGroup);
+
+    const particlesGroup = new THREE.Group();
+    globeGroup.add(particlesGroup);
+
+    const globeGeometry = new THREE.SphereGeometry(GLOBE_RADIUS, 64, 64);
+    const globeMaterial = new THREE.MeshPhongMaterial({
+      color: new THREE.Color("#1a1a3e"),
+      transparent: true,
+      opacity: 0.9,
+      shininess: 30
+    });
+    const globe = new THREE.Mesh(globeGeometry, globeMaterial);
+    globeGroup.add(globe);
+
+    const wireframe = new THREE.LineSegments(
+      new THREE.WireframeGeometry(globeGeometry),
+      new THREE.LineBasicMaterial({
+        color: new THREE.Color("#00ffff"),
+        transparent: true,
+        opacity: 0.15
+      })
+    );
+    globeGroup.add(wireframe);
+
+    const heatCanvas = document.createElement("canvas");
+    heatCanvas.width = 1024;
+    heatCanvas.height = 512;
+    const heatCtx = heatCanvas.getContext("2d");
+    const heatTexture = new THREE.CanvasTexture(heatCanvas);
+    heatTexture.wrapS = THREE.ClampToEdgeWrapping;
+    heatTexture.wrapT = THREE.ClampToEdgeWrapping;
+    heatTexture.needsUpdate = true;
+
+    const heatMaterial = new THREE.MeshPhongMaterial({
+      color: new THREE.Color("#1a1a3e"),
+      map: heatTexture,
+      transparent: true,
+      opacity: 0.95,
+      shininess: 20
+    });
+
+    const raycaster = new THREE.Raycaster();
+    const mouse = new THREE.Vector2();
+    const clock = new THREE.Clock();
+
+    const tooltip = document.getElementById("tooltip");
+    const hudDifficulty = document.getElementById("hudDifficulty");
+    const hudPoints = document.getElementById("hudPoints");
+    const hudAutoRotate = document.getElementById("hudAutoRotate");
+    const hudHeatmap = document.getElementById("hudHeatmap");
+    const hudFPS = document.getElementById("hudFPS");
+
+    let populationData = [];
+    let particleData = [];
+    let autoRotate = true;
+    let heatmapMode = false;
+    let sortingActive = false;
+    let sortDirection = 0;
+    let sortProgress = 0;
+    let selectedBarIndex = null;
+    let frameCount = 0;
+    let fps = 0;
+    let fpsFrames = 0;
+    let fpsLastTime = performance.now();
+
+    const difficultySettings = {
+      1: { visible: 40,  width: 0.02,  rotation: 0.002, pulse: false, particles: false, glow: false },
+      2: { visible: 80,  width: 0.015, rotation: 0.004, pulse: false, particles: false, glow: false },
+      3: { visible: 120, width: 0.01,  rotation: 0.006, pulse: true,  particles: false, glow: false },
+      4: { visible: 160, width: 0.008, rotation: 0.008, pulse: true,  particles: true,  glow: false },
+      5: { visible: TOTAL_POINTS, width: 0.005, rotation: 0.010, pulse: true, particles: true, glow: true }
+    };
+
+    window.__3D_STATE__ = {
+      difficultyLevel: 1,
+      visibleBars: 0,
+      totalBars: 0,
+      autoRotate: true,
+      heatmapMode: false,
+      sortingActive: false,
+      cameraDistance: 3.5,
+      selectedBar: null,
+      rotationSpeed: difficultySettings[1].rotation,
+      globeRadius: GLOBE_RADIUS,
+      fps: 0,
+      barWidthCurrent: difficultySettings[1].width,
+      particlesActive: false,
+      frameCount: 0
+    };
+
+    function clampCameraDistance() {
+      const dist = camera.position.length();
+      if (!Number.isFinite(dist)) {
+        camera.position.set(0, 0, 3.5);
+      }
+      const dir = camera.position.clone().normalize();
+      const clamped = THREE.MathUtils.clamp(camera.position.length(), 2.0, 6.0);
+      camera.position.copy(dir.multiplyScalar(clamped));
+      window.__3D_STATE__.cameraDistance = clamped;
+    }
+
+    function latLngToVector3(lat, lng, radius) {
+      const phi = (90 - lat) * (Math.PI / 180);
+      const theta = (lng + 180) * (Math.PI / 180);
+      const x = -(radius * Math.sin(phi) * Math.cos(theta));
+      const z = (radius * Math.sin(phi) * Math.sin(theta));
+      const y = (radius * Math.cos(phi));
+      return new THREE.Vector3(x, y, z);
+    }
+
+    function densityToColor(density) {
+      const low = new THREE.Color("#00ff88");
+      const mid = new THREE.Color("#ffff00");
+      const high = new THREE.Color("#ff3333");
+      if (density < 0.5) {
+        return low.clone().lerp(mid, density / 0.5);
+      } else {
+        return mid.clone().lerp(high, (density - 0.5) / 0.5);
+      }
+    }
+
+    function heatColor(d) {
+      const c = densityToColor(THREE.MathUtils.clamp(d, 0, 1));
+      return `rgb(${Math.round(c.r * 255)}, ${Math.round(c.g * 255)}, ${Math.round(c.b * 255)})`;
+    }
+
+    function seededRandom(seed) {
+      let x = Math.sin(seed) * 10000;
+      return x - Math.floor(x);
+    }
+
+    function regionName(lat, lng, idx) {
+      const ns = lat >= 0 ? "N" : "S";
+      const ew = lng >= 0 ? "E" : "W";
+      return `Region-${idx.toString().padStart(3, "0")} (${Math.abs(lat).toFixed(1)}°${ns}, ${Math.abs(lng).toFixed(1)}°${ew})`;
+    }
+
+    function generatePopulationData() {
+      const hotspots = [
+        { lat: 40.7, lng: -74.0, power: 1.0 },
+        { lat: 34.0, lng: -118.2, power: 0.82 },
+        { lat: 19.4, lng: -99.1, power: 0.85 },
+        { lat: -23.5, lng: -46.6, power: 0.88 },
+        { lat: 51.5, lng: -0.1, power: 0.86 },
+        { lat: 48.8, lng: 2.3, power: 0.83 },
+        { lat: 52.5, lng: 13.4, power: 0.72 },
+        { lat: 55.7, lng: 37.6, power: 0.74 },
+        { lat: 30.0, lng: 31.2, power: 0.79 },
+        { lat: 6.5, lng: 3.4, power: 0.84 },
+        { lat: 28.6, lng: 77.2, power: 0.98 },
+        { lat: 19.1, lng: 72.9, power: 0.95 },
+        { lat: 13.1, lng: 80.3, power: 0.80 },
+        { lat: 23.8, lng: 90.4, power: 0.97 },
+        { lat: 31.2, lng: 121.5, power: 0.94 },
+        { lat: 39.9, lng: 116.4, power: 0.92 },
+        { lat: 22.3, lng: 114.2, power: 0.88 },
+        { lat: 35.7, lng: 139.7, power: 0.96 },
+        { lat: 37.6, lng: 127.0, power: 0.82 },
+        { lat: -6.2, lng: 106.8, power: 0.93 },
+        { lat: 14.6, lng: 121.0, power: 0.89 },
+        { lat: -33.9, lng: 151.2, power: 0.68 },
+        { lat: -26.2, lng: 28.0, power: 0.66 }
+      ];
+
+      const temp = [];
+
+      for (let i = 0; i < TOTAL_POINTS; i++) {
+        let lat, lng;
+
+        if (i < hotspots.length * 5) {
+          const hs = hotspots[i % hotspots.length];
+          lat = hs.lat + (seededRandom(i * 3.1) - 0.5) * 18;
+          lng = hs.lng + (seededRandom(i * 7.3) - 0.5) * 18;
+        } else {
+          lat = -70 + seededRandom(i * 11.17) * 140;
+          lng = -180 + seededRandom(i * 17.31) * 360;
+        }
+
+        lat = THREE.MathUtils.clamp(lat, -80, 80);
+        lng = ((lng + 180) % 360 + 360) % 360 - 180;
+
+        let density = 0.08 + seededRandom(i * 29.13) * 0.2;
+
+        for (const hs of hotspots) {
+          const dLat = lat - hs.lat;
+          const dLng = Math.min(Math.abs(lng - hs.lng), 360 - Math.abs(lng - hs.lng));
+          const dist = Math.sqrt(dLat * dLat + dLng * dLng);
+          density += hs.power * Math.exp(-(dist * dist) / 450);
+        }
+
+        density = THREE.MathUtils.clamp(density / 1.4, 0, 1);
+
+        const height = THREE.MathUtils.lerp(0.02, 0.5, density);
+        const color = densityToColor(density);
+        const width = difficultySettings[1].width;
+
+        const geom = new THREE.BoxGeometry(width, height, width);
+        const mat = new THREE.MeshPhongMaterial({
+          color,
+          emissive: color.clone().multiplyScalar(0.15),
+          transparent: true,
+          opacity: 0.95
+        });
+        const bar = new THREE.Mesh(geom, mat);
+
+        const normal = latLngToVector3(lat, lng, 1).normalize();
+        const basePos = normal.clone().multiplyScalar(GLOBE_RADIUS + height / 2);
+        bar.position.copy(basePos);
+        bar.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), normal);
+
+        if (![bar.position.x, bar.position.y, bar.position.z].every(Number.isFinite)) {
+          bar.position.set(0, 0, 0);
+        }
+
+        barsGroup.add(bar);
+
+        temp.push({
+          lat,
+          lng,
+          density,
+          height,
+          name: regionName(lat, lng, i + 1),
+          barMesh: bar,
+          normal: normal.clone(),
+          geoPosition: basePos.clone(),
+          geoQuaternion: bar.quaternion.clone(),
+          sortPosition: new THREE.Vector3(),
+          sortQuaternion: new THREE.Quaternion(),
+          baseScaleY: 1,
+          highlighted: false,
+          originalColor: color.clone()
+        });
+      }
+
+      temp.sort((a, b) => b.density - a.density);
+
+      for (let i = 0; i < temp.length; i++) {
+        const t = i / Math.max(1, temp.length - 1);
+        const lat = 85 - t * 170;
+        const spiralTurns = 8;
+        const lng = (t * 360 * spiralTurns) % 360 - 180;
+        const sortNormal = latLngToVector3(lat, lng, 1).normalize();
+        const sortPos = sortNormal.clone().multiplyScalar(GLOBE_RADIUS + temp[i].height / 2);
+        const sortQuat = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 1, 0), sortNormal);
+        temp[i].sortPosition.copy(sortPos);
+        temp[i].sortQuaternion.copy(sortQuat);
+      }
+
+      populationData = temp;
+      window.__3D_STATE__.totalBars = populationData.length;
+    }
+
+    function clearParticles() {
+      particleData = [];
+      while (particlesGroup.children.length) {
+        const child = particlesGroup.children.pop();
+        if (child.geometry) child.geometry.dispose();
+        if (child.material) child.material.dispose();
+      }
+    }
+
+    function buildParticles() {
+      clearParticles();
+      const settings = difficultySettings[window.__3D_STATE__.difficultyLevel];
+      if (!settings.particles) return;
+
+      const visible = settings.visible;
+      for (let i = 0; i < visible; i++) {
+        const d = populationData[i];
+        if (d.density < 0.7) continue;
+
+        for (let p = 0; p < 3; p++) {
+          const geom = new THREE.SphereGeometry(0.006, 6, 6);
+          const mat = new THREE.MeshBasicMaterial({
+            color: d.originalColor.clone(),
+            transparent: true,
+            opacity: 0.7
+          });
+          const m = new THREE.Mesh(geom, mat);
+          const offset = (p / 3) * d.height;
+          m.position.copy(d.normal.clone().multiplyScalar(GLOBE_RADIUS + d.height + offset));
+          particlesGroup.add(m);
+
+          particleData.push({
+            mesh: m,
+            parentIndex: i,
+            phase: Math.random() * Math.PI * 2,
+            speed: 0.2 + Math.random() * 0.3,
+            drift: (Math.random() - 0.5) * 0.03
+          });
+        }
+      }
+    }
+
+    function updateHeatmapTexture() {
+      const w = heatCanvas.width;
+      const h = heatCanvas.height;
+      const img = heatCtx.createImageData(w, h);
+      const data = img.data;
+
+      for (let y = 0; y < h; y++) {
+        const lat = 90 - (y / h) * 180;
+        for (let x = 0; x < w; x++) {
+          const lng = (x / w) * 360 - 180;
+          let acc = 0;
+          let weightSum = 0;
+
+          for (let i = 0; i < populationData.length; i++) {
+            const p = populationData[i];
+            const dLat = lat - p.lat;
+            const dLngRaw = Math.abs(lng - p.lng);
+            const dLng = Math.min(dLngRaw, 360 - dLngRaw);
+            const dist2 = dLat * dLat + dLng * dLng;
+            const weight = Math.exp(-dist2 / 220);
+            acc += p.density * weight;
+            weightSum += weight;
+          }
+
+          const d = weightSum > 0 ? acc / weightSum : 0;
+          const c = densityToColor(d);
+          const idx = (y * w + x) * 4;
+          data[idx] = Math.round(c.r * 255 * 0.65 + 26);
+          data[idx + 1] = Math.round(c.g * 255 * 0.65 + 26);
+          data[idx + 2] = Math.round(c.b * 255 * 0.65 + 62);
+          data[idx + 3] = 255;
+        }
+      }
+
+      heatCtx.putImageData(img, 0, 0);
+      heatTexture.needsUpdate = true;
+    }
+
+    function applyDifficulty(level) {
+      window.__3D_STATE__.difficultyLevel = level;
+      const settings = difficultySettings[level];
+      window.__3D_STATE__.rotationSpeed = settings.rotation;
+      window.__3D_STATE__.barWidthCurrent = settings.width;
+      window.__3D_STATE__.particlesActive = settings.particles;
+
+      populationData.forEach((d, idx) => {
+        const visible = idx < settings.visible;
+        d.barMesh.visible = visible;
+
+        d.barMesh.geometry.dispose();
+        d.barMesh.geometry = new THREE.BoxGeometry(settings.width, d.height, settings.width);
+
+        d.barMesh.position.copy(sortingActive && sortDirection !== 0 ? d.sortPosition : d.geoPosition);
+        d.barMesh.quaternion.copy(sortingActive && sortDirection !== 0 ? d.sortQuaternion : d.geoQuaternion);
+
+        if (settings.glow) {
+          d.barMesh.material.emissive.copy(d.originalColor.clone().multiplyScalar(0.55));
+        } else {
+          d.barMesh.material.emissive.copy(d.originalColor.clone().multiplyScalar(0.15));
+        }
+      });
+
+      window.__3D_STATE__.visibleBars = settings.visible;
+      if (settings.particles) buildParticles();
+      else clearParticles();
+
+      updateHUD();
+    }
+
+    function updateHUD() {
+      hudDifficulty.textContent = `Difficulty: ${window.__3D_STATE__.difficultyLevel}/5`;
+      hudPoints.textContent = `Points Visible: ${window.__3D_STATE__.visibleBars}`;
+      hudAutoRotate.textContent = `Auto-Rotate: ${autoRotate ? "ON" : "OFF"}`;
+      hudHeatmap.textContent = `Heatmap: ${heatmapMode ? "ON" : "OFF"}`;
+      hudFPS.textContent = `FPS: ${Math.round(fps)}`;
+
+      window.__3D_STATE__.autoRotate = autoRotate;
+      window.__3D_STATE__.heatmapMode = heatmapMode;
+      window.__3D_STATE__.sortingActive = sortingActive;
+      window.__3D_STATE__.fps = Math.round(fps);
+    }
+
+    function resetSelection() {
+      if (selectedBarIndex !== null && populationData[selectedBarIndex]) {
+        const d = populationData[selectedBarIndex];
+        d.barMesh.material.color.copy(d.originalColor);
+        const settings = difficultySettings[window.__3D_STATE__.difficultyLevel];
+        d.barMesh.material.emissive.copy(
+          settings.glow ? d.originalColor.clone().multiplyScalar(0.55) : d.originalColor.clone().multiplyScalar(0.15)
+        );
+      }
+      selectedBarIndex = null;
+      tooltip.style.display = "none";
+      window.__3D_STATE__.selectedBar = null;
+    }
+
+    function selectBar(index, event) {
+      resetSelection();
+      const d = populationData[index];
+      selectedBarIndex = index;
+      d.barMesh.material.color.set("#ffffff");
+      d.barMesh.material.emissive.set("#444444");
+
+      tooltip.style.display = "block";
+      tooltip.style.left = `${event.clientX + 12}px`;
+      tooltip.style.top = `${event.clientY + 12}px`;
+      tooltip.innerHTML = `Region: ${d.name}<br>Density: ${d.density.toFixed(3)}<br>Lat: ${d.lat.toFixed(2)}<br>Lng: ${d.lng.toFixed(2)}`;
+
+      window.__3D_STATE__.selectedBar = {
+        index,
+        density: d.density,
+        lat: d.lat,
+        lng: d.lng
+      };
+    }
+
+    function toggleHeatmap() {
+      heatmapMode = !heatmapMode;
+      globe.material = heatmapMode ? heatMaterial : globeMaterial;
+      updateHUD();
+    }
+
+    function resetCameraAndRotation() {
+      camera.position.set(0, 0, 3.5);
+      controls.target.set(0, 0, 0);
+      controls.update();
+      globeGroup.rotation.set(0, 0, 0);
+      clampCameraDistance();
+    }
+
+    function toggleSortAnimation() {
+      if (sortingActive) return;
+      sortingActive = true;
+      sortDirection = 1;
+      sortProgress = 0;
+      updateHUD();
+    }
+
+    function onPointerMove(event) {
+      if (tooltip.style.display === "block") {
+        tooltip.style.left = `${event.clientX + 12}px`;
+        tooltip.style.top = `${event.clientY + 12}px`;
+      }
+    }
+
+    function onClick(event) {
+      mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+      mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+      raycaster.setFromCamera(mouse, camera);
+
+      const visibleMeshes = populationData
+        .filter((d, i) => d.barMesh.visible && i < window.__3D_STATE__.visibleBars)
+        .map(d => d.barMesh);
+
+      const hits = raycaster.intersectObjects(visibleMeshes, false);
+      if (hits.length > 0) {
+        const mesh = hits[0].object;
+        const index = populationData.findIndex(d => d.barMesh === mesh);
+        if (index >= 0) selectBar(index, event);
+      } else {
+        resetSelection();
+      }
+    }
+
+    function onKeyDown(event) {
+      const key = event.key.toLowerCase();
+      if (key === "d") {
+        let next = window.__3D_STATE__.difficultyLevel + 1;
+        if (next > 5) next = 1;
+        applyDifficulty(next);
+      } else if (key === "r") {
+        resetCameraAndRotation();
+      } else if (key === "p") {
+        autoRotate = !autoRotate;
+        updateHUD();
+      } else if (key === "h") {
+        toggleHeatmap();
+      } else if (key === "s") {
+        toggleSortAnimation();
+      }
+    }
+
+    function onResize() {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    }
+
+    function ensureNoNaNBarTransforms() {
+      for (const d of populationData) {
+        const p = d.barMesh.position;
+        const s = d.barMesh.scale;
+        const q = d.barMesh.quaternion;
+        if (![p.x, p.y, p.z, s.x, s.y, s.z, q.x, q.y, q.z, q.w].every(Number.isFinite)) {
+          d.barMesh.position.copy(d.geoPosition);
+          d.barMesh.quaternion.copy(d.geoQuaternion);
+          d.barMesh.scale.set(1, 1, 1);
+        }
+      }
+    }
+
+    function animate() {
+      requestAnimationFrame(animate);
+      frameCount++;
+      window.__3D_STATE__.frameCount = frameCount;
+
+      const elapsed = clock.getElapsedTime();
+      const dt = clock.getDelta();
+
+      controls.update();
+      clampCameraDistance();
+
+      const level = window.__3D_STATE__.difficultyLevel;
+      const settings = difficultySettings[level];
+
+      if (autoRotate) {
+        globeGroup.rotation.y += settings.rotation;
+        if (!Number.isFinite(globeGroup.rotation.y)) globeGroup.rotation.y = 0;
+      }
+
+      const pulse = settings.pulse ? 1 + 0.1 * Math.sin(elapsed * Math.PI) : 1;
+      for (let i = 0; i < populationData.length; i++) {
+        const d = populationData[i];
+        if (!d.barMesh.visible) continue;
+
+        if (settings.pulse) {
+          d.barMesh.scale.set(1, pulse, 1);
+        } else {
+          d.barMesh.scale.set(1, 1, 1);
+        }
+      }
+
+      if (sortingActive) {
+        sortProgress += dt * 0.5;
+        const t = THREE.MathUtils.smootherstep(Math.min(sortProgress, 1), 0, 1);
+
+        for (const d of populationData) {
+          if (sortDirection === 1) {
+            d.barMesh.position.lerpVectors(d.geoPosition, d.sortPosition, t);
+            THREE.Quaternion.slerp(d.geoQuaternion, d.sortQuaternion, d.barMesh.quaternion, t);
+          } else if (sortDirection === -1) {
+            d.barMesh.position.lerpVectors(d.sortPosition, d.geoPosition, t);
+            THREE.Quaternion.slerp(d.sortQuaternion, d.geoQuaternion, d.barMesh.quaternion, t);
+          }
+        }
+
+        if (sortProgress >= 1) {
+          if (sortDirection === 1) {
+            sortDirection = -1;
+            sortProgress = 0;
+          } else {
+            sortingActive = false;
+            sortDirection = 0;
+            sortProgress = 0;
+          }
+          updateHUD();
+        }
+      }
+
+      if (settings.particles) {
+        for (const p of particleData) {
+          const parent = populationData[p.parentIndex];
+          if (!parent || !parent.barMesh.visible) {
+            p.mesh.visible = false;
+            continue;
+          }
+          p.mesh.visible = true;
+          const base = parent.normal.clone().multiplyScalar(GLOBE_RADIUS + parent.height);
+          const floatAmt = ((Math.sin(elapsed * p.speed + p.phase) + 1) * 0.5) * 0.12;
+          const side = new THREE.Vector3(
+            Math.cos(p.phase) * p.drift,
+            Math.sin(p.phase * 0.7) * p.drift,
+            Math.sin(p.phase) * p.drift
+          );
+          const pos = base.clone().add(parent.normal.clone().multiplyScalar(floatAmt)).add(side);
+          p.mesh.position.copy(pos);
+          p.mesh.material.opacity = 0.35 + 0.35 * Math.sin(elapsed * 2 + p.phase);
+        }
+      }
+
+      ensureNoNaNBarTransforms();
+
+      fpsFrames++;
+      const now = performance.now();
+      if (now - fpsLastTime >= 500) {
+        fps = (fpsFrames * 1000) / (now - fpsLastTime);
+        fpsFrames = 0;
+        fpsLastTime = now;
+        updateHUD();
+      }
+
+      renderer.render(scene, camera);
+    }
+
+    generatePopulationData();
+    updateHeatmapTexture();
+    applyDifficulty(1);
+    updateHUD();
+    animate();
+
+    window.addEventListener("resize", onResize);
+    window.addEventListener("pointermove", onPointerMove);
+    window.addEventListener("click", onClick);
+    window.addEventListener("keydown", onKeyDown);
+
+    // Continuous state sync
+    setInterval(() => {
+      window.__3D_STATE__.cameraDistance = THREE.MathUtils.clamp(camera.position.length(), 2.0, 6.0);
+      window.__3D_STATE__.autoRotate = autoRotate;
+      window.__3D_STATE__.heatmapMode = heatmapMode;
+      window.__3D_STATE__.sortingActive = sortingActive;
+      window.__3D_STATE__.rotationSpeed = difficultySettings[window.__3D_STATE__.difficultyLevel].rotation;
+      window.__3D_STATE__.barWidthCurrent = difficultySettings[window.__3D_STATE__.difficultyLevel].width;
+      window.__3D_STATE__.particlesActive = difficultySettings[window.__3D_STATE__.difficultyLevel].particles;
+      window.__3D_STATE__.visibleBars = difficultySettings[window.__3D_STATE__.difficultyLevel].visible;
+      window.__3D_STATE__.fps = Math.round(fps);
+    }, 100);
+  </script>
+</body>
+</html>

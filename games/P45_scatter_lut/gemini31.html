@@ -1,0 +1,455 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Scatter Plot Viewer</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #111;
+            color: #eee;
+            font-family: sans-serif;
+            user-select: none;
+        }
+        #canvas-container {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100vw;
+            height: 100vh;
+        }
+        #ui-panel {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(30, 30, 30, 0.85);
+            padding: 15px;
+            border-radius: 8px;
+            border: 1px solid #444;
+            pointer-events: auto;
+            z-index: 10;
+            width: 280px;
+        }
+        .control-group {
+            margin-bottom: 12px;
+        }
+        .control-group label {
+            display: block;
+            margin-bottom: 5px;
+            font-size: 13px;
+            color: #aaa;
+        }
+        select, input[type="range"] {
+            width: 100%;
+            box-sizing: border-box;
+        }
+        .stats-box {
+            background: rgba(0, 0, 0, 0.5);
+            padding: 10px;
+            border-radius: 4px;
+            font-size: 13px;
+            margin-top: 10px;
+        }
+        .stats-row {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 4px;
+        }
+        .stats-row span:first-child {
+            color: #888;
+        }
+        #brush-overlay {
+            position: absolute;
+            border: 1px solid rgba(255, 255, 255, 0.8);
+            background: rgba(255, 255, 255, 0.2);
+            pointer-events: none;
+            display: none;
+            z-index: 20;
+        }
+        .axis-label {
+            font-size: 12px;
+            font-family: monospace;
+            text-shadow: 1px 1px 0 #000, -1px -1px 0 #000, 1px -1px 0 #000, -1px 1px 0 #000;
+            pointer-events: none;
+        }
+        .instructions {
+            font-size: 11px;
+            color: #888;
+            margin-top: 10px;
+            text-align: center;
+        }
+    </style>
+    <script type="importmap">
+    { "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+    } }
+    </script>
+</head>
+<body>
+    <div id="canvas-container"></div>
+    <div id="brush-overlay"></div>
+
+    <div id="ui-panel">
+        <div class="control-group">
+            <label for="colormap">Colormap</label>
+            <select id="colormap">
+                <option value="rainbow">Rainbow</option>
+                <option value="cooltowarm">Cool to Warm</option>
+                <option value="blackbody">Blackbody</option>
+            </select>
+        </div>
+        <div class="control-group">
+            <label>Value Range Filter: <span id="range-val">0.00 - 1.00</span></label>
+            <input type="range" id="valueMin" min="0" max="1" step="0.01" value="0">
+            <input type="range" id="valueMax" min="0" max="1" step="0.01" value="1">
+        </div>
+        
+        <div class="stats-box">
+            <div class="stats-row"><span>Visible Points:</span> <span id="visibleCount">500</span></div>
+            <div class="stats-row"><span>Selected Points:</span> <span id="selectedCount">0</span></div>
+            <hr style="border: 0; border-top: 1px solid #444; margin: 8px 0;">
+            <div class="stats-row"><span>Mean:</span> <span id="s-mean">0.0000</span></div>
+            <div class="stats-row"><span>Std Dev:</span> <span id="s-std">0.0000</span></div>
+            <div class="stats-row"><span>Min:</span> <span id="s-min">0.0000</span></div>
+            <div class="stats-row"><span>Max:</span> <span id="s-max">0.0000</span></div>
+        </div>
+
+        <div class="instructions">
+            Shift + Left Click & Drag to Brush Select<br>
+            Click empty space to clear selection
+        </div>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { Lut } from 'three/addons/math/Lut.js';
+        import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer.js';
+
+        // --- State Initialization ---
+        window.__3D_STATE__ = {
+            totalPoints: 500,
+            visiblePoints: 500,
+            selectedCount: 0,
+            colormap: 'rainbow',
+            valueRange: { min: 0, max: 1 },
+            stats: { mean: 0, std: 0, min: 0, max: 0 }
+        };
+
+        // --- Data Generation ---
+        let seedState = 42;
+        function lcg() {
+            seedState = (seedState * 1664525 + 1013904223) & 0xFFFFFFFF;
+            return (seedState >>> 0) / 4294967296;
+        }
+
+        const rawData = [];
+        let minRaw = Infinity, maxRaw = -Infinity;
+        for (let i = 0; i < 500; i++) {
+            const x = lcg() * 20 - 10;
+            const y = lcg() * 20 - 10;
+            const z = lcg() * 20 - 10;
+            const val = Math.sin(x * 0.5) * Math.cos(z * 0.3) + 0.5 * (y / 10);
+            minRaw = Math.min(minRaw, val);
+            maxRaw = Math.max(maxRaw, val);
+            rawData.push({ x, y, z, rawVal: val });
+        }
+
+        const data = rawData.map(d => {
+            const value = (d.rawVal - minRaw) / (maxRaw - minRaw);
+            let label = 'A';
+            if (value > 0.8) label = 'E';
+            else if (value > 0.6) label = 'D';
+            else if (value > 0.4) label = 'C';
+            else if (value > 0.2) label = 'B';
+            return { ...d, value, label, visible: true, selected: false };
+        });
+
+        // --- Three.js Setup ---
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.set(20, 15, 20);
+        camera.lookAt(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        container.appendChild(renderer.domElement);
+
+        const labelRenderer = new CSS2DRenderer();
+        labelRenderer.setSize(window.innerWidth, window.innerHeight);
+        labelRenderer.domElement.style.position = 'absolute';
+        labelRenderer.domElement.style.top = '0px';
+        labelRenderer.domElement.style.pointerEvents = 'none';
+        container.appendChild(labelRenderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+
+        // --- Axes & Labels ---
+        const axesMaterial = new THREE.LineBasicMaterial({ color: 0x555555 });
+        const axesGeo = new THREE.BufferGeometry().setFromPoints([
+            new THREE.Vector3(-10, 0, 0), new THREE.Vector3(10, 0, 0),
+            new THREE.Vector3(0, -10, 0), new THREE.Vector3(0, 10, 0),
+            new THREE.Vector3(0, 0, -10), new THREE.Vector3(0, 0, 10)
+        ]);
+        scene.add(new THREE.LineSegments(axesGeo, axesMaterial));
+
+        const createLabel = (text, x, y, z, color) => {
+            const div = document.createElement('div');
+            div.className = 'axis-label';
+            div.textContent = text;
+            div.style.color = color;
+            const label = new CSS2DObject(div);
+            label.position.set(x, y, z);
+            scene.add(label);
+        };
+
+        const ticksGeo = [];
+        [-10, -5, 5, 10].forEach(val => {
+            ticksGeo.push(new THREE.Vector3(val, -0.2, 0), new THREE.Vector3(val, 0.2, 0));
+            createLabel(val.toString(), val, -0.8, 0, '#ff8888');
+            
+            ticksGeo.push(new THREE.Vector3(-0.2, val, 0), new THREE.Vector3(0.2, val, 0));
+            createLabel(val.toString(), -1.2, val, 0, '#88ff88');
+            
+            ticksGeo.push(new THREE.Vector3(0, -0.2, val), new THREE.Vector3(0, 0.2, val));
+            createLabel(val.toString(), 0, -0.8, val, '#8888ff');
+        });
+        createLabel('0', -0.8, -0.8, 0, '#ffffff');
+        createLabel('X', 11, 0, 0, '#ff4444');
+        createLabel('Y', 0, 11, 0, '#44ff44');
+        createLabel('Z', 0, 0, 11, '#4444ff');
+        scene.add(new THREE.LineSegments(new THREE.BufferGeometry().setFromPoints(ticksGeo), axesMaterial));
+
+        // --- Points Setup ---
+        const geometry = new THREE.BufferGeometry();
+        const positions = new Float32Array(500 * 3);
+        const colors = new Float32Array(500 * 3);
+        const sizes = new Float32Array(500);
+
+        data.forEach((d, i) => {
+            positions[i * 3] = d.x;
+            positions[i * 3 + 1] = d.y;
+            positions[i * 3 + 2] = d.z;
+        });
+
+        geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+        geometry.setAttribute('customColor', new THREE.BufferAttribute(colors, 3));
+        geometry.setAttribute('size', new THREE.BufferAttribute(sizes, 1));
+
+        const material = new THREE.ShaderMaterial({
+            vertexShader: `
+                attribute float size;
+                attribute vec3 customColor;
+                varying vec3 vColor;
+                void main() {
+                    vColor = customColor;
+                    vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+                    gl_PointSize = size * 400.0 / -mvPosition.z;
+                    gl_Position = projectionMatrix * mvPosition;
+                }
+            `,
+            fragmentShader: `
+                varying vec3 vColor;
+                void main() {
+                    vec2 xy = gl_PointCoord.xy - vec2(0.5);
+                    if(length(xy) > 0.5) discard;
+                    gl_FragColor = vec4(vColor, 1.0);
+                }
+            `,
+            transparent: true
+        });
+
+        const points = new THREE.Points(geometry, material);
+        scene.add(points);
+
+        const lut = new Lut('rainbow', 512);
+
+        // --- Update Logic ---
+        function updateVisualization() {
+            const minF = parseFloat(document.getElementById('valueMin').value);
+            const maxF = parseFloat(document.getElementById('valueMax').value);
+            const cmap = document.getElementById('colormap').value;
+
+            if (minF > maxF) {
+                document.getElementById('valueMin').value = maxF;
+            }
+            document.getElementById('range-val').innerText = `${minF.toFixed(2)} - ${maxF.toFixed(2)}`;
+
+            let visMin = Infinity, visMax = -Infinity;
+            let visCount = 0, sum = 0, sumSq = 0;
+
+            // Pass 1: Visibility & Stats
+            for (let i = 0; i < 500; i++) {
+                const d = data[i];
+                d.visible = (d.value >= minF && d.value <= maxF);
+                if (d.visible) {
+                    visMin = Math.min(visMin, d.value);
+                    visMax = Math.max(visMax, d.value);
+                    visCount++;
+                    sum += d.value;
+                } else {
+                    d.selected = false;
+                }
+            }
+
+            let mean = 0, std = 0;
+            if (visCount > 0) {
+                mean = sum / visCount;
+                for (let i = 0; i < 500; i++) {
+                    if (data[i].visible) sumSq += Math.pow(data[i].value - mean, 2);
+                }
+                std = Math.sqrt(sumSq / visCount);
+            } else {
+                visMin = 0; visMax = 0;
+            }
+
+            // Update DOM Stats
+            document.getElementById('s-mean').innerText = mean.toFixed(4);
+            document.getElementById('s-std').innerText = std.toFixed(4);
+            document.getElementById('s-min').innerText = visMin.toFixed(4);
+            document.getElementById('s-max').innerText = visMax.toFixed(4);
+            document.getElementById('visibleCount').innerText = visCount;
+
+            // Update Lut
+            lut.setColorMap(cmap);
+            if (visMax === visMin) {
+                lut.setMin(0); lut.setMax(1);
+            } else {
+                lut.setMin(visMin); lut.setMax(visMax);
+            }
+
+            // Pass 2: Attributes
+            const colorAttr = geometry.attributes.customColor;
+            const sizeAttr = geometry.attributes.size;
+            let selCount = 0;
+
+            for (let i = 0; i < 500; i++) {
+                const d = data[i];
+                if (d.visible) {
+                    let baseSize = 0.1 + d.value * 0.4;
+                    if (d.selected) {
+                        baseSize *= 1.8;
+                        colorAttr.setXYZ(i, 1, 1, 1);
+                        selCount++;
+                    } else {
+                        const c = lut.getColor(d.value);
+                        colorAttr.setXYZ(i, c.r, c.g, c.b);
+                    }
+                    sizeAttr.setX(i, baseSize);
+                } else {
+                    sizeAttr.setX(i, 0);
+                }
+            }
+            colorAttr.needsUpdate = true;
+            sizeAttr.needsUpdate = true;
+
+            document.getElementById('selectedCount').innerText = selCount;
+
+            // Update State
+            window.__3D_STATE__.visiblePoints = visCount;
+            window.__3D_STATE__.selectedCount = selCount;
+            window.__3D_STATE__.colormap = cmap;
+            window.__3D_STATE__.valueRange = { min: minF, max: maxF };
+            window.__3D_STATE__.stats = {
+                mean: parseFloat(mean.toFixed(4)),
+                std: parseFloat(std.toFixed(4)),
+                min: parseFloat(visMin.toFixed(4)),
+                max: parseFloat(visMax.toFixed(4))
+            };
+        }
+
+        // --- Event Listeners ---
+        document.getElementById('colormap').addEventListener('change', updateVisualization);
+        document.getElementById('valueMin').addEventListener('input', updateVisualization);
+        document.getElementById('valueMax').addEventListener('input', updateVisualization);
+
+        // --- Brush Selection ---
+        const brushOverlay = document.getElementById('brush-overlay');
+        let isBrushing = false;
+        let startX, startY;
+
+        window.addEventListener('mousedown', (e) => {
+            if (e.target.closest('#ui-panel')) return;
+            
+            if (e.shiftKey && e.button === 0) {
+                isBrushing = true;
+                controls.enabled = false;
+                startX = e.clientX;
+                startY = e.clientY;
+                brushOverlay.style.display = 'block';
+                brushOverlay.style.left = startX + 'px';
+                brushOverlay.style.top = startY + 'px';
+                brushOverlay.style.width = '0px';
+                brushOverlay.style.height = '0px';
+            } else if (e.button === 0) {
+                let changed = false;
+                data.forEach(d => { if (d.selected) { d.selected = false; changed = true; } });
+                if (changed) updateVisualization();
+            }
+        });
+
+        window.addEventListener('mousemove', (e) => {
+            if (!isBrushing) return;
+            const currentX = e.clientX;
+            const currentY = e.clientY;
+            brushOverlay.style.left = Math.min(startX, currentX) + 'px';
+            brushOverlay.style.top = Math.min(startY, currentY) + 'px';
+            brushOverlay.style.width = Math.abs(startX - currentX) + 'px';
+            brushOverlay.style.height = Math.abs(startY - currentY) + 'px';
+        });
+
+        window.addEventListener('mouseup', (e) => {
+            if (!isBrushing) return;
+            isBrushing = false;
+            controls.enabled = true;
+            brushOverlay.style.display = 'none';
+
+            const endX = e.clientX;
+            const endY = e.clientY;
+            const left = Math.min(startX, endX);
+            const right = Math.max(startX, endX);
+            const top = Math.min(startY, endY);
+            const bottom = Math.max(startY, endY);
+
+            if (right - left > 2 && bottom - top > 2) {
+                data.forEach(d => {
+                    if (!d.visible) return;
+                    const vec = new THREE.Vector3(d.x, d.y, d.z).project(camera);
+                    if (vec.z > 1 || vec.z < -1) return; // Behind camera
+                    const sx = (vec.x + 1) * window.innerWidth / 2;
+                    const sy = (-vec.y + 1) * window.innerHeight / 2;
+                    if (sx >= left && sx <= right && sy >= top && sy <= bottom) {
+                        d.selected = true;
+                    }
+                });
+                updateVisualization();
+            }
+        });
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            labelRenderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // --- Init & Loop ---
+        updateVisualization();
+
+        function animate() {
+            requestAnimationFrame(animate);
+            controls.update();
+            renderer.render(scene, camera);
+            labelRenderer.render(scene, camera);
+        }
+        animate();
+    </script>
+</body>
+</html>

@@ -1,0 +1,417 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>3D Double Spring Simulation</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      background: #111;
+      font-family: sans-serif;
+    }
+
+    #hud {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      color: #fff;
+      background: rgba(0, 0, 0, 0.65);
+      padding: 10px 12px;
+      border-radius: 6px;
+      font-family: monospace;
+      font-size: 13px;
+      line-height: 1.4;
+      z-index: 10;
+      white-space: pre-line;
+    }
+
+    #controls {
+      position: absolute;
+      top: 10px;
+      right: 10px;
+      z-index: 10;
+      display: flex;
+      gap: 8px;
+    }
+
+    button {
+      padding: 10px 14px;
+      border: none;
+      border-radius: 6px;
+      background: #2b2b2b;
+      color: white;
+      cursor: pointer;
+      font-size: 14px;
+    }
+
+    button:hover {
+      background: #444;
+    }
+  </style>
+</head>
+<body>
+  <div id="hud">Initializing...</div>
+  <div id="controls">
+    <button id="resetBtn">Reset</button>
+    <button id="impulseBtn">Impulse Mass B</button>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
+    import { GLTFLoader } from 'https://unpkg.com/three@0.160.0/examples/jsm/loaders/GLTFLoader.js';
+
+    window.__3D_STATE__ = {
+      massA_y: 0,
+      massB_y: 0,
+      massA_vy: 0,
+      massB_vy: 0,
+      timeScale: 1.0,
+      paused: false,
+      totalEnergy: 0,
+      simTime: 0,
+      springForce1: 0,
+      springForce2: 0,
+      impulseCount: 0,
+      resetCount: 0,
+      antiqueCameraLoaded: false,
+      antiqueCamera: null,
+      initialized: false
+    };
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x111111);
+
+    const camera = new THREE.PerspectiveCamera(
+      60,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      1000
+    );
+    camera.position.set(0, 3, 10);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    document.body.appendChild(renderer.domElement);
+
+    // Lights
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
+    scene.add(ambientLight);
+
+    const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
+    directionalLight.position.set(5, 10, 5);
+    scene.add(directionalLight);
+
+    // Ground
+    const groundGeo = new THREE.PlaneGeometry(50, 50);
+    const groundMat = new THREE.MeshStandardMaterial({
+      color: 0x808080,
+      side: THREE.DoubleSide
+    });
+    const ground = new THREE.Mesh(groundGeo, groundMat);
+    ground.rotation.x = -Math.PI / 2;
+    ground.position.y = 0;
+    scene.add(ground);
+
+    const gridHelper = new THREE.GridHelper(50, 50, 0xffffff, 0x666666);
+    gridHelper.position.y = 0.001;
+    scene.add(gridHelper);
+
+    // Decorative GLTF model
+    const loader = new GLTFLoader();
+    loader.load(
+      'https://threejs.org/examples/models/gltf/AntiqueCamera.glb',
+      (gltf) => {
+        const model = gltf.scene;
+        model.scale.setScalar(0.005);
+        model.position.set(5, 0, -3);
+        scene.add(model);
+        window.__3D_STATE__.antiqueCamera = model;
+        window.__3D_STATE__.antiqueCameraLoaded = true;
+      },
+      undefined,
+      (err) => {
+        console.error('Failed to load AntiqueCamera.glb:', err);
+      }
+    );
+
+    // Ceiling bar
+    const ceilingY = 8;
+    const ceilingGeo = new THREE.BoxGeometry(2, 0.2, 0.2);
+    const ceilingMat = new THREE.MeshStandardMaterial({ color: 0x444444 });
+    const ceilingBar = new THREE.Mesh(ceilingGeo, ceilingMat);
+    ceilingBar.position.set(0, ceilingY, 0);
+    scene.add(ceilingBar);
+
+    // Masses
+    const sphereGeo = new THREE.SphereGeometry(0.3, 32, 32);
+
+    const massAMat = new THREE.MeshStandardMaterial({ color: 0xff3333 });
+    const massA = new THREE.Mesh(sphereGeo, massAMat);
+    scene.add(massA);
+
+    const massBMat = new THREE.MeshStandardMaterial({ color: 0x3388ff });
+    const massB = new THREE.Mesh(sphereGeo, massBMat);
+    scene.add(massB);
+
+    // Spring visuals
+    function createSpringLine(color) {
+      const points = new Array(32).fill(0).map(() => new THREE.Vector3());
+      const geometry = new THREE.BufferGeometry().setFromPoints(points);
+      const material = new THREE.LineBasicMaterial({ color });
+      const line = new THREE.Line(geometry, material);
+      scene.add(line);
+      return line;
+    }
+
+    const spring1Line = createSpringLine(0xffffff);
+    const spring2Line = createSpringLine(0xffff00);
+
+    function updateSpringVisual(line, start, end, coils = 10, amplitude = 0.15) {
+      const points = [];
+      const dir = new THREE.Vector3().subVectors(end, start);
+      const length = dir.length();
+      const unit = dir.clone().normalize();
+
+      let perp = new THREE.Vector3(1, 0, 0);
+      if (Math.abs(unit.dot(perp)) > 0.99) perp = new THREE.Vector3(0, 0, 1);
+      perp = perp.sub(unit.clone().multiplyScalar(unit.dot(perp))).normalize();
+
+      const segments = coils * 2;
+      for (let i = 0; i <= segments; i++) {
+        const t = i / segments;
+        const base = start.clone().add(dir.clone().multiplyScalar(t));
+        let offset = 0;
+        if (i !== 0 && i !== segments) {
+          offset = (i % 2 === 0 ? -1 : 1) * amplitude;
+        }
+        base.add(perp.clone().multiplyScalar(offset));
+        points.push(base);
+      }
+
+      line.geometry.dispose();
+      line.geometry = new THREE.BufferGeometry().setFromPoints(points);
+    }
+
+    // Physics constants
+    const g = 9.81;
+    const mA = 1.0;
+    const mB = 1.5;
+    const k1 = 20.0;
+    const k2 = 15.0;
+    const rest1 = 2.0;
+    const rest2 = 2.0;
+    const damping = 0.3;
+    const baseDt = 0.016;
+
+    const initialA = 6.0;
+    const initialB = 4.0;
+
+    let yA = initialA;
+    let yB = initialB;
+    let vA = 0.0;
+    let vB = 0.0;
+
+    let timeScale = 1.0;
+    let paused = false;
+    let previousTimeScale = 1.0;
+    let simTime = 0.0;
+
+    massA.position.set(0, yA, 0);
+    massB.position.set(0, yB, 0);
+
+    function clampMasses() {
+      if (yA < -2) {
+        yA = -2;
+        if (vA < 0) vA = 0;
+      }
+      if (yA > 8) {
+        yA = 8;
+        if (vA > 0) vA = 0;
+      }
+      if (yB < -2) {
+        yB = -2;
+        if (vB < 0) vB = 0;
+      }
+      if (yB > 8) {
+        yB = 8;
+        if (vB > 0) vB = 0;
+      }
+    }
+
+    function resetSystem() {
+      yA = initialA;
+      yB = initialB;
+      vA = 0;
+      vB = 0;
+      simTime = 0;
+      window.__3D_STATE__.resetCount += 1;
+    }
+
+    function impulseMassB() {
+      vB += -5.0;
+      window.__3D_STATE__.impulseCount += 1;
+    }
+
+    function impulseMassAUp() {
+      vA += 5.0;
+      window.__3D_STATE__.impulseCount += 1;
+    }
+
+    function computePhysics(dt) {
+      const ceilingAnchor = ceilingY;
+
+      const len1 = Math.abs(ceilingAnchor - yA);
+      const dir1 = (yA >= ceilingAnchor) ? 1 : -1;
+      const ext1 = len1 - rest1;
+      const forceSpring1 = -k1 * ext1 * dir1;
+
+      const len2 = Math.abs(yA - yB);
+      const dir2_AtoB = (yB >= yA) ? 1 : -1;
+      const ext2 = len2 - rest2;
+
+      const forceOnBFromSpring2 = -k2 * ext2 * dir2_AtoB;
+      const forceOnAFromSpring2 = -forceOnBFromSpring2;
+
+      const forceDampA = -damping * vA;
+      const forceDampB = -damping * vB;
+
+      const forceGravityA = -mA * g;
+      const forceGravityB = -mB * g;
+
+      const netFA = forceGravityA + forceSpring1 + forceOnAFromSpring2 + forceDampA;
+      const netFB = forceGravityB + forceOnBFromSpring2 + forceDampB;
+
+      const aA = netFA / mA;
+      const aB = netFB / mB;
+
+      // Semi-implicit Euler
+      vA += aA * dt;
+      vB += aB * dt;
+      yA += vA * dt;
+      yB += vB * dt;
+
+      clampMasses();
+
+      window.__3D_STATE__.springForce1 = Math.abs(k1 * ext1);
+      window.__3D_STATE__.springForce2 = Math.abs(k2 * ext2);
+    }
+
+    function computeTotalEnergy() {
+      const ke = 0.5 * mA * vA * vA + 0.5 * mB * vB * vB;
+      const peGravity = mA * g * yA + mB * g * yB;
+      const ext1 = Math.abs(ceilingY - yA) - rest1;
+      const ext2 = Math.abs(yA - yB) - rest2;
+      const peSpring = 0.5 * k1 * ext1 * ext1 + 0.5 * k2 * ext2 * ext2;
+      return ke + peGravity + peSpring;
+    }
+
+    const hud = document.getElementById('hud');
+    const resetBtn = document.getElementById('resetBtn');
+    const impulseBtn = document.getElementById('impulseBtn');
+
+    resetBtn.addEventListener('click', resetSystem);
+    impulseBtn.addEventListener('click', impulseMassB);
+
+    window.addEventListener('keydown', (e) => {
+      const key = e.key.toLowerCase();
+
+      if (key === '1') {
+        timeScale = 0.25;
+        paused = false;
+      } else if (key === '2') {
+        timeScale = 1.0;
+        paused = false;
+      } else if (key === '3') {
+        timeScale = 2.0;
+        paused = false;
+      } else if (key === 'p') {
+        if (!paused) {
+          previousTimeScale = timeScale === 0 ? 1.0 : timeScale;
+          timeScale = 0;
+          paused = true;
+        } else {
+          timeScale = previousTimeScale || 1.0;
+          paused = false;
+        }
+      } else if (key === 'r') {
+        resetSystem();
+      } else if (e.code === 'Space') {
+        e.preventDefault();
+        impulseMassB();
+      } else if (key === 'w') {
+        impulseMassAUp();
+      }
+    });
+
+    function updateHUD() {
+      const totalEnergy = computeTotalEnergy();
+      const state = window.__3D_STATE__;
+
+      state.massA_y = yA;
+      state.massB_y = yB;
+      state.massA_vy = vA;
+      state.massB_vy = vB;
+      state.timeScale = timeScale;
+      state.paused = paused;
+      state.totalEnergy = totalEnergy;
+      state.simTime = simTime;
+
+      hud.textContent =
+`timeScale: ${timeScale.toFixed(2)}
+massA y: ${yA.toFixed(2)}
+massB y: ${yB.toFixed(2)}
+massA vy: ${vA.toFixed(2)}
+massB vy: ${vB.toFixed(2)}
+totalEnergy: ${totalEnergy.toFixed(2)}
+paused: ${paused}
+elapsedTime: ${simTime.toFixed(2)} s`;
+    }
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      const dt = baseDt * timeScale;
+      if (!paused && dt > 0) {
+        computePhysics(dt);
+        simTime += dt;
+      }
+
+      massA.position.y = yA;
+      massB.position.y = yB;
+
+      updateSpringVisual(
+        spring1Line,
+        new THREE.Vector3(0, ceilingY, 0),
+        massA.position.clone(),
+        10,
+        0.12
+      );
+
+      updateSpringVisual(
+        spring2Line,
+        massA.position.clone(),
+        massB.position.clone(),
+        10,
+        0.12
+      );
+
+      updateHUD();
+      renderer.render(scene, camera);
+    }
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    window.__3D_STATE__.initialized = true;
+    animate();
+  </script>
+</body>
+</html>
