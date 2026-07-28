@@ -51,7 +51,7 @@ export async function runEvaluation(opts) {
   const htmlFile = opts.htmlFile || 'ground_truth.html';
   const quiet = opts.quiet || false;
 
-  const contract = JSON.parse(await readFile(join(taskDir, 'contract.json'), 'utf-8'));
+  const contract = JSON.parse(await readFile(join(taskDir, 'icg.json'), 'utf-8'));
   const task = JSON.parse(await readFile(join(taskDir, 'task.json'), 'utf-8'));
 
   if (!quiet) {
@@ -60,10 +60,10 @@ export async function runEvaluation(opts) {
   }
 
   // ── Stage 1: Sandbox ──
-  // A task directory is three levels below the release root.  Deriving the
+  // A task directory is four levels below the release root. Deriving the
   // root here keeps shared assets available when library callers omit the
   // optional releaseRoot argument.
-  const releaseRoot = opts.releaseRoot ? resolve(opts.releaseRoot) : resolve(taskDir, '../../..');
+  const releaseRoot = opts.releaseRoot ? resolve(opts.releaseRoot) : resolve(taskDir, '../../../..');
   const sandbox = new Sandbox({ taskDir, releaseRoot, htmlFile, htmlPath: opts.htmlPath, headless: opts.headless !== false });
   let page, consoleErrors;
   try {

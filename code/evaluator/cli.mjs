@@ -3,16 +3,17 @@
 /**
  * Portable WorldCoder-Bench evaluator.
  *
- * The release contains task definitions and behavioral contracts, but no
+ * The release contains task definitions and SIG/behavioral-contract rubrics, but no
  * model-generated HTML.  Pass a model artifact with --html-path when running
  * an evaluation.  The HTTP server always serves the release root so shared
- * assets resolve from assets/shared regardless of the task directory.
+ * assets resolve from data/assets/shared regardless of the task directory.
  */
 import { chromium } from 'playwright';
 import { createServer } from 'node:http';
 import { existsSync, readFileSync } from 'node:fs';
 import { readFile, writeFile, mkdir, readdir } from 'node:fs/promises';
 import { basename, dirname, extname, join, resolve, sep } from 'node:path';
+import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { assertionCoverage, assertionsOfTransition, zeroAssertionCoverage } from './metrics.mjs';
 import { actionDuration, executeAction } from '../stateprobe/actions.mjs';
@@ -85,7 +86,7 @@ function under(root, target) {
 function sharedBasenamePath(root, requestPath) {
   const name = basename(requestPath);
   if (!name || name === '.' || name === '..' || name.includes('\\')) return null;
-  const candidate = join(root, 'assets', 'shared', name);
+  const candidate = join(root, 'data', 'assets', 'shared', name);
   return existsSync(candidate) ? candidate : null;
 }
 
@@ -93,22 +94,22 @@ function routePath(root, split, requestPath) {
   const clean = decodeURIComponent(requestPath.split('?')[0]);
   let rel;
   if (clean.startsWith(`/tasks/${split}/`)) rel = clean.slice(`/tasks/${split}/`.length);
-  else if (clean.startsWith(`/assets/${split}/`)) return join(root, 'assets', split, clean.slice(`/assets/${split}/`.length));
-  else if (clean.startsWith('/shared_assets/')) return join(root, 'assets', 'shared', clean.slice('/shared_assets/'.length));
+  else if (clean.startsWith(`/assets/${split}/`)) return join(root, 'data', 'assets', split, clean.slice(`/assets/${split}/`.length));
+  else if (clean.startsWith('/shared_assets/')) return join(root, 'data', 'assets', 'shared', clean.slice('/shared_assets/'.length));
   else if (clean.startsWith('/assets/')) {
-    const direct = join(root, clean.slice(1));
-    return existsSync(direct) ? direct : join(root, 'assets', 'shared', clean.slice('/assets/'.length));
+    const direct = join(root, 'data', clean.slice(1));
+    return existsSync(direct) ? direct : join(root, 'data', 'assets', 'shared', clean.slice('/assets/'.length));
   }
   else return sharedBasenamePath(root, clean);
-  const taskPath = join(root, 'tasks', split, rel);
+  const taskPath = join(root, 'data', 'tasks', split, rel);
   if (existsSync(taskPath)) return taskPath;
   const shared = rel.indexOf('/shared_assets/');
-  if (shared >= 0) return join(root, 'assets', 'shared', rel.slice(shared + '/shared_assets/'.length));
+  if (shared >= 0) return join(root, 'data', 'assets', 'shared', rel.slice(shared + '/shared_assets/'.length));
   const taskAssets = rel.indexOf('/assets/');
   if (taskAssets >= 0) {
     const assetRel = rel.slice(taskAssets + '/assets/'.length);
-    if (assetRel.startsWith('shared/')) return join(root, 'assets', 'shared', assetRel.slice('shared/'.length));
-    return join(root, 'assets', 'shared', assetRel);
+    if (assetRel.startsWith('shared/')) return join(root, 'data', 'assets', 'shared', assetRel.slice('shared/'.length));
+    return join(root, 'data', 'assets', 'shared', assetRel);
   }
   return sharedBasenamePath(root, rel) || taskPath;
 }
@@ -238,8 +239,8 @@ function verifierPreChecks(verifier) {
 }
 
 async function evaluateTask({ root, split, taskName, htmlName, htmlPath = null, offline, show }) {
-  const taskDir = join(root, 'tasks', split, taskName);
-  const contract = await json(join(taskDir, 'contract.json'));
+  const taskDir = join(root, 'data', 'tasks', split, taskName);
+  const contract = await json(join(taskDir, 'icg.json'));
   if (!contract) return { task_id: taskName, mode: 'BAD_CONTRACT', tCov: 0, vCov: 0, aCov: 0, sCov: 0, vCovStats: { ...zeroAssertionCoverage(null), policy: 'unweighted_assertion_ratio' } };
   const zeroVerification = zeroAssertionCoverage(contract);
   const zeroMetrics = { tCov: 0, vCov: 0, aCov: 0, sCov: 0, vCovStats: { ...zeroVerification, policy: 'unweighted_assertion_ratio' } };
@@ -323,8 +324,8 @@ async function evaluateTask({ root, split, taskName, htmlName, htmlPath = null, 
 }
 
 async function taskNames(root, split) {
-  const dir = join(root, 'tasks', split);
-  return (await readdir(dir, { withFileTypes: true })).filter(e => e.isDirectory() && e.name.startsWith('P')).map(e => e.name).filter(n => existsSync(join(dir, n, 'task.json')) && existsSync(join(dir, n, 'contract.json'))).sort((a, b) => (Number(a.match(/^P(\d+)/)?.[1] || 0) - Number(b.match(/^P(\d+)/)?.[1] || 0)) || a.localeCompare(b));
+  const dir = join(root, 'data', 'tasks', split);
+  return (await readdir(dir, { withFileTypes: true })).filter(e => e.isDirectory() && e.name.startsWith('P')).map(e => e.name).filter(n => existsSync(join(dir, n, 'task.json')) && existsSync(join(dir, n, 'icg.json'))).sort((a, b) => (Number(a.match(/^P(\d+)/)?.[1] || 0) - Number(b.match(/^P(\d+)/)?.[1] || 0)) || a.localeCompare(b));
 }
 
 async function mapConcurrent(items, limit, fn) {
@@ -346,14 +347,16 @@ async function main() {
   if (opts.htmlPath && names.length !== 1) throw new Error('--html-path can evaluate exactly one task');
   const htmlName = opts.htmlPath ? basename(opts.htmlPath) : (opts.html || (opts.model ? `llm_${opts.model}.html` : null));
   const outputs = await mapConcurrent(names, opts.concurrency, async task => {
-    const out = opts.output && names.length === 1 ? resolve(opts.output) : join(opts.root, 'results', opts.split, opts.model || 'custom', `${task}.json`);
+    const out = opts.output && names.length === 1
+      ? resolve(opts.output)
+      : join(tmpdir(), 'worldcoder-results', opts.split, opts.model || 'custom', `${task}.json`);
     if (opts.resume && existsSync(out)) return JSON.parse(await readFile(out, 'utf8'));
     const result = await evaluateTask({ root: opts.root, split: opts.split, taskName: task, htmlName, htmlPath: opts.htmlPath, offline: opts.offline, show: opts.show });
     await mkdir(dirname(out), { recursive: true }); await writeFile(out, `${JSON.stringify(result, null, 2)}\n`);
     console.log(`${task}\t${result.mode}\tT=${result.tCov ?? 0}%\tV=${result.vCov ?? 0}%\tA=${result.aCov ?? 0}%\tS=${result.sCov ?? 0}%`);
     return result;
   });
-  if (names.length > 1) { const summary = { split: opts.split, model: opts.model, tasks: outputs.length, meanTCov: outputs.length ? +(outputs.reduce((s, x) => s + (x.tCov || 0), 0) / outputs.length).toFixed(1) : 0, meanVCov: outputs.length ? +(outputs.reduce((s, x) => s + (x.vCov || 0), 0) / outputs.length).toFixed(1) : 0, modes: Object.fromEntries([...new Set(outputs.map(x => x.mode))].map(m => [m, outputs.filter(x => x.mode === m).length])) }; const path = join(opts.root, 'results', opts.split, opts.model || 'custom', 'summary.json'); await writeFile(path, `${JSON.stringify(summary, null, 2)}\n`); console.log(JSON.stringify(summary, null, 2)); }
+  if (names.length > 1) { const summary = { split: opts.split, model: opts.model, tasks: outputs.length, meanTCov: outputs.length ? +(outputs.reduce((s, x) => s + (x.tCov || 0), 0) / outputs.length).toFixed(1) : 0, meanVCov: outputs.length ? +(outputs.reduce((s, x) => s + (x.vCov || 0), 0) / outputs.length).toFixed(1) : 0, modes: Object.fromEntries([...new Set(outputs.map(x => x.mode))].map(m => [m, outputs.filter(x => x.mode === m).length])) }; const path = join(tmpdir(), 'worldcoder-results', opts.split, opts.model || 'custom', 'summary.json'); await mkdir(dirname(path), { recursive: true }); await writeFile(path, `${JSON.stringify(summary, null, 2)}\n`); console.log(JSON.stringify(summary, null, 2)); }
 }
 
 main().catch(error => { console.error(`ERROR: ${error.message}`); process.exit(1); });

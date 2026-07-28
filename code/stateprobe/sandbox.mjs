@@ -97,19 +97,19 @@ export class Sandbox {
         }
         let filePath = join(rootDir, requestPath === '/' ? 'index.html' : requestPath);
         if (requestPath.startsWith('/assets/shared/')) {
-          filePath = join(this.releaseRoot, 'assets', 'shared', requestPath.slice('/assets/shared/'.length));
+          filePath = join(this.releaseRoot, 'data', 'assets', 'shared', requestPath.slice('/assets/shared/'.length));
         } else if (requestPath.startsWith('/shared_assets/')) {
-          filePath = join(this.releaseRoot, 'assets', 'shared', requestPath.slice('/shared_assets/'.length));
+          filePath = join(this.releaseRoot, 'data', 'assets', 'shared', requestPath.slice('/shared_assets/'.length));
         } else if (requestPath.startsWith('/assets/')) {
-          filePath = join(this.releaseRoot, 'assets', 'shared', requestPath.slice('/assets/'.length));
+          filePath = join(this.releaseRoot, 'data', 'assets', 'shared', requestPath.slice('/assets/'.length));
         }
         // Historical prompts sometimes use ./asset.ext. Those binaries are
-        // now deduplicated under assets/shared, so resolve an exact basename
+        // now deduplicated under data/assets/shared, so resolve an exact basename
         // only when the requested path did not resolve directly.
         if (!existsSync(filePath)) {
           const name = basename(requestPath);
           if (name && name !== '.' && name !== '..' && !name.includes('\\')) {
-            const fallback = join(this.releaseRoot, 'assets', 'shared', name);
+            const fallback = join(this.releaseRoot, 'data', 'assets', 'shared', name);
             if (existsSync(fallback)) filePath = fallback;
           }
         }
