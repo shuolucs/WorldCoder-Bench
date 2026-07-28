@@ -13,7 +13,7 @@ This package is deliberately conservative about what it claims. It was assembled
 | `assets/shared/` | 91 files (85 GLB + 6 textures) | Hash-deduplicated task assets referenced by task material. |
 | `contract.json` | 2,004 | Per-task source snapshots, marked provisional in `manifests/tasks.jsonl`. |
 
-The 2,004 tasks in this package must not be advertised as the paper's complete 2,026-task canonical release, nor should `hf_snapshot_1799` be renamed to the paper's Extended split without an independent provenance check. The package currently contains no independently verifiable public Dev-contract set; see [`contracts_dev/STATUS.json`](contracts_dev/STATUS.json).
+The 2,004 tasks in this package must not be advertised as the paper's complete 2,026-task canonical release, nor should `hf_snapshot_1799` be renamed to the paper's Extended split without an independent provenance check. The package currently contains no independently verifiable public Dev-contract set; `release.json` records `public_dev_contracts: 0`.
 
 ## What is included
 
@@ -23,8 +23,6 @@ The 2,004 tasks in this package must not be advertised as the paper's complete 2
 - An asset checksum list in [`assets_checksum.txt`](assets_checksum.txt) (the complete release checksum is [`manifests/files.sha256`](manifests/files.sha256)).
 - A deterministic AppleDouble-alias repair record in [`manifests/asset_alias_repairs.json`](manifests/asset_alias_repairs.json).
 - The WorldCoder-Toolkit-compatible StateProbe/evaluator source under `code/`.
-- Paper-aligned M1-M6 mutation-input generation code under `code/mutation/`;
-  no model pages or mutation outcomes are bundled.
 - Manifests and checksums under `manifests/`.
 - The paper-to-release terminology map in [`docs/terminology.md`](docs/terminology.md).
 
@@ -32,10 +30,9 @@ The 2,004 tasks in this package must not be advertised as the paper's complete 2
 
 This release contains **zero model-generated HTML files, trajectories, screenshots, reports, or model run logs**. A generated program is an evaluator input supplied by the user; it is not part of the task distribution. No hidden leaderboard contract or private assertion set is implied by this repository.
 
-The mutation generator is inspectable tooling, not evidence that every
-contract is mutation-hardened. This source snapshot contains no complete
-per-task injected/killed/survived manifest and makes no benchmark-wide mutation
-kill-rate claim.
+Mutation-generation source, derived mutant pages, calibration logs, and
+mutation outcomes are outside this release. This source snapshot makes no
+benchmark-wide mutation-hardening or kill-rate claim.
 
 ## Quick start
 
@@ -71,10 +68,8 @@ tasks/<source-split>/<task-id>/task.json       visible task specification
 tasks/<source-split>/<task-id>/contract.json   behavioral-contract snapshot
 assets/shared/*                                 deduplicated task assets
 code/evaluator/                                 command-line evaluator
-code/mutation/                                  M1-M6 mutation-input generator
 code/stateprobe/                               state probing modules
-code/tools/                                    normalization and audit tools
-contracts_dev/                                 Dev-contract availability/status
+code/tools/audit_release.mjs                   release audit tool
 manifests/                                     task, asset, hash, and audit manifests
 splits/                                        explicit archival split membership lists
 docs/                                          schemas and metric definitions

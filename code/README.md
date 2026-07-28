@@ -13,8 +13,6 @@ evaluates the task's behavioral contract.
 - `code/stateprobe/` contains the StateProbe protocol, action executor,
   checker plugins, and sandbox lifecycle.
 - `code/evaluator/cli.mjs` is the batch/single-task command-line entry point.
-- `code/mutation/` contains the paper-aligned M1-M6 source mutation generator.
-  It ships without model HTML, traces, or benchmark-wide calibration results.
 - `window.__3D_STATE__` is the only standardized runtime state interface.
   Optional task-specific helpers use the `window.__STATEPROBE_*` prefix.
 - Evaluation reports expose the paper metrics as `aCov`, `sCov`, `tCov`, and
@@ -48,8 +46,3 @@ node code/evaluator/cli.mjs \
 
 Generated HTML is deliberately kept outside this repository. See the root
 README and `SECURITY.md` before running untrusted programs.
-
-To inspect or generate M1-M6 calibration inputs from a user-supplied validated
-reference page, run `node code/mutation/cli.mjs --help`. Generated mutants and
-their manifests should remain outside the repository unless they have been
-reviewed for release.

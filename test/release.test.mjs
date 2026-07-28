@@ -1,5 +1,4 @@
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, lstatSync } from 'node:fs';
 import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
@@ -221,6 +220,9 @@ test('checksum manifest covers the release and no model artifacts are packaged',
   }
   const modelArtifacts = files.filter(path => /\.html$/i.test(path) || /(^|\/)(trajectory|trace|report)_/i.test(path));
   assert.deepEqual(modelArtifacts, [], 'model HTML/trajectory/report artifacts must remain external to this release');
+  assert.equal(existsSync(join(ROOT, 'code', 'mutation')), false, 'mutation-generation source must remain external');
+  assert.equal(existsSync(join(ROOT, 'contracts_dev')), false, 'empty Dev placeholder directory must not be packaged');
+  assert.equal(existsSync(join(ROOT, 'results')), false, 'empty results placeholder directory must not be packaged');
 });
 
 test('external asset migration manifest is anonymous and complete', async () => {
@@ -272,7 +274,7 @@ test('V-Cov follows the paper unweighted assertion ratio', async () => {
   assert.deepEqual(relabeled, coverage, 'tier labels must not reweight V-Cov');
 });
 
-test('Croissant metadata and asset normalizer match the shared release layout', async () => {
+test('Croissant metadata matches the shared release layout', async () => {
   const croissant = await readJson(join(ROOT, 'croissant.json'));
   const properties = new Map((croissant.additionalProperty || []).map(property => [property.name, property.value]));
   const unresolved = await readJson(join(ROOT, 'manifests', 'unresolved_assets.json'));
@@ -287,41 +289,6 @@ test('Croissant metadata and asset normalizer match the shared release layout', 
   const pathRewrite = await readJson(join(ROOT, 'manifests', 'asset_path_rewrite.json'));
   assert.equal(consolidation.final_shared_assets, sharedFiles.length, 'consolidation report is stale');
   assert.equal(pathRewrite.final_shared_assets, sharedFiles.length, 'path rewrite report is stale');
-
-  const fixture = await mkdtemp(join(tmpdir(), 'worldcoder-normalize-'));
-  try {
-    const taskA = join(fixture, 'tasks', 'core_205', 'P1_fixture');
-    const taskB = join(fixture, 'tasks', 'hf_snapshot_1799', 'P2_fixture');
-    await Promise.all([
-      mkdir(join(taskA, 'assets'), { recursive: true }),
-      mkdir(join(taskB, 'assets'), { recursive: true }),
-      mkdir(join(fixture, 'manifests'), { recursive: true }),
-    ]);
-    const glb = Buffer.from('shared-glb-fixture');
-    const texture = Buffer.from('shared-texture-fixture');
-    await writeFile(join(taskA, 'assets', 'first.glb'), glb);
-    await writeFile(join(taskB, 'assets', 'second.glb'), glb);
-    await writeFile(join(taskA, 'assets', 'floor.jpg'), texture);
-    await writeFile(join(taskA, 'task.json'), JSON.stringify({ assets: ['assets/first.glb', 'assets/floor.jpg'] }));
-    await writeFile(join(taskB, 'task.json'), JSON.stringify({ required_assets: ['shared_assets/second.glb', 'shared_assets/floor.jpg'] }));
-    await writeFile(join(taskA, 'preview.html'), '<model src="shared_assets/first.glb"></model>');
-    await writeFile(join(taskB, 'preview.html'), '<model src="second.glb"></model>');
-
-    execFileSync(process.execPath, [join(ROOT, 'code', 'tools', 'normalize_assets.mjs'), fixture], { encoding: 'utf8' });
-
-    const shared = join(fixture, 'assets', 'shared');
-    assert.ok(existsSync(join(shared, 'first.glb')), 'first binary should be copied to assets/shared');
-    assert.equal((await readdir(shared)).filter(name => /\.(?:glb|jpg)$/i.test(name)).length, 2, 'identical binaries should be deduplicated across splits');
-    assert.equal(existsSync(join(taskA, 'assets', 'first.glb')), false);
-    assert.equal(existsSync(join(taskB, 'assets', 'second.glb')), false);
-    assert.equal(existsSync(join(taskA, 'assets', 'floor.jpg')), false);
-    assert.deepEqual((await readJson(join(taskA, 'task.json'))).assets, ['../../../assets/shared/first.glb', '../../../assets/shared/floor.jpg']);
-    assert.deepEqual((await readJson(join(taskB, 'task.json'))).required_assets, ['../../../assets/shared/first.glb', '../../../assets/shared/floor.jpg']);
-    assert.match(await readFile(join(taskA, 'preview.html'), 'utf8'), /\.\.\/\.\.\/\.\.\/assets\/shared\/first\.glb/);
-    assert.match(await readFile(join(taskB, 'preview.html'), 'utf8'), /\.\.\/\.\.\/\.\.\/assets\/shared\/first\.glb/);
-  } finally {
-    await rm(fixture, { recursive: true, force: true });
-  }
 });
 
 test('public names follow the paper terminology', async () => {
@@ -378,62 +345,6 @@ test('StateProbe sandbox serves canonical shared-asset paths', async () => {
     assert.equal(await textureResponse.text(), 'texture-body');
   } finally {
     if (server) await new Promise(resolveClose => server.close(resolveClose));
-    await rm(fixture, { recursive: true, force: true });
-  }
-});
-
-test('paper M1-M6 mutation generator applies exact source spans and fails closed', async () => {
-  const { applyMutationPlan, MUTATION_OPERATORS } = await import('../code/mutation/operators.mjs');
-  assert.deepEqual(Object.keys(MUTATION_OPERATORS), ['M1', 'M2', 'M3', 'M4', 'M5', 'M6']);
-  const source = [
-    "window.addEventListener('keydown', onKey);",
-    'stepEngine(); updateHud();',
-    'const gravity = 9.8;',
-    'window.__3D_STATE__ = state;',
-    'const initialVelocity = 0;',
-    'const restitution = 0.8;',
-  ].join('\n');
-  const plan = [
-    { case_id: 'm1-event', operator: 'M1', search: "window.addEventListener('keydown', onKey);", replacement: '' },
-    { case_id: 'm2-sync', operator: 'M2', search: 'stepEngine(); updateHud();', replacement: 'stepEngine();' },
-    { case_id: 'm3-gravity', operator: 'M3', search: 'const gravity = 9.8;', replacement: 'const gravity = 2.0;' },
-    { case_id: 'm4-probe', operator: 'M4', search: 'window.__3D_STATE__ = state;', replacement: '' },
-    { case_id: 'm5-init', operator: 'M5', search: 'const initialVelocity = 0;', replacement: 'const initialVelocity = 20;' },
-    { case_id: 'm6-constraint', operator: 'M6', search: 'const restitution = 0.8;', replacement: 'const restitution = 1.2;' },
-  ];
-  const mutants = applyMutationPlan(source, plan);
-  assert.equal(mutants.length, 6);
-  for (const [index, mutant] of mutants.entries()) {
-    assert.equal(mutant.operator, `M${index + 1}`);
-    assert.equal(mutant.matches, 1);
-    assert.notEqual(mutant.source, source);
-  }
-  assert.throws(
-    () => applyMutationPlan(source, [{ case_id: 'missing', operator: 'M3', search: 'gravity = 1;', replacement: 'gravity = 2;' }]),
-    /expected 1 exact match\(es\), found 0/,
-  );
-});
-
-test('mutation CLI writes hash-linked generated-not-evaluated outputs', async () => {
-  const fixture = await mkdtemp(join(tmpdir(), 'worldcoder-mutation-'));
-  try {
-    const input = join(fixture, 'reference.html');
-    const plan = join(fixture, 'plan.json');
-    const output = join(fixture, 'mutants');
-    const source = '<script>const gravity = 9.8;</script>';
-    await writeFile(input, source);
-    await writeFile(plan, JSON.stringify({ mutations: [{
-      case_id: 'm3-gravity', operator: 'M3', search: 'const gravity = 9.8;', replacement: 'const gravity = 2.0;',
-    }] }));
-    execFileSync(process.execPath, [join(ROOT, 'code', 'mutation', 'cli.mjs'),
-      '--input', input, '--plan', plan, '--output-dir', output], { encoding: 'utf8' });
-    const manifest = await readJson(join(output, 'manifest.json'));
-    const mutant = await readFile(join(output, 'm3-gravity.html'), 'utf8');
-    assert.equal(manifest.source_sha256, sha256(source));
-    assert.equal(manifest.mutants[0].sha256, sha256(mutant));
-    assert.equal(manifest.mutants[0].status, 'generated_not_evaluated');
-    assert.match(mutant, /gravity = 2\.0/);
-  } finally {
     await rm(fixture, { recursive: true, force: true });
   }
 });

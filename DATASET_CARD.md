@@ -27,7 +27,7 @@ Assets are stored once under `assets/shared/`; task metadata uses relative refer
 
 ## Split and provenance caveat
 
-The directory names are archival labels. They should not be interpreted as proof that this package reproduces the paper's WorldCoder-Core, WorldCoder-Extended, WorldCoder-Robust, or WorldCoder-Dev membership. In particular, the package has no independently verifiable public set of 200 Dev contracts at this time. [`contracts_dev/STATUS.json`](contracts_dev/STATUS.json) records this status.
+The directory names are archival labels. They should not be interpreted as proof that this package reproduces the paper's WorldCoder-Core, WorldCoder-Extended, WorldCoder-Robust, or WorldCoder-Dev membership. In particular, the package has no independently verifiable public set of 200 Dev contracts at this time. `release.json` records `public_dev_contracts: 0`.
 
 The historical snapshot includes conversion metadata on many contracts. Such records are useful for parser and evaluator development, but are marked `source_snapshot_provisional` in `manifests/tasks.jsonl` and should not be treated as hidden ground truth.
 

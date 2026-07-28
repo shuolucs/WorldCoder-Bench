@@ -77,4 +77,6 @@ For a reproducible result, record:
 - handling of unresolved assets and unsupported historical checks;
 - whether V-Cov was aggregated per task before averaging.
 
-Because the packaged contracts are source snapshots and the Dev directory is currently unavailable, scores from this release are engineering diagnostics, not official leaderboard numbers.
+Because the packaged contracts are source snapshots and `release.json` reports
+`public_dev_contracts: 0`, scores from this release are engineering diagnostics,
+not official leaderboard numbers.
