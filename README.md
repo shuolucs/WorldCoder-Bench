@@ -110,11 +110,10 @@ Task definitions are released under [CC BY 4.0](https://creativecommons.org/lice
 If you use WorldCoder-Bench in your research, please cite:
 
 ```bibtex
-@article{lu2026worldcoder,
-  title   = {WorldCoder-Bench: Benchmarking Physically Grounded 3D World Synthesis},
-  author  = {Lu, Shuo and Xu, Yinuo and Yu, Kecheng and Jiang, Siru and Yu, Yongcan and Wang, Yubin and Yang, Haitao and Zhang, Yuxiang and Wang, Bin and He, Ran and Liang, Jian},
-  journal = {arXiv preprint arXiv:2606.01869},
-  year    = {2026},
-  url     = {https://arxiv.org/abs/2606.01869}
+@inproceedings{lu2026worldcoder,
+  title={WorldCoder-Bench: Benchmarking Physically Grounded 3D World Synthesis},
+  author={Lu, Shuo and Xu, Yinuo and Yu, Kecheng and Jiang, Siru and Yu, Yongcan and Wang, Yubin and Yang, Haitao and Zhang, Yuxiang and Wang, Bin and He, Ran and others},
+  booktitle={Proc. NeurIPS},
+  year={2026}
 }
 ```
